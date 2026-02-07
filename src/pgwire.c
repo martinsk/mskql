@@ -86,10 +86,9 @@ static void msgbuf_ensure(struct msgbuf *m, size_t extra)
     if (m->len + extra > m->cap) {
         size_t newcap = m->cap ? m->cap * 2 : 256;
         while (newcap < m->len + extra) newcap *= 2;
-        // TODO: CRASH RISK: realloc return value is not checked for NULL. If allocation
-        // fails, m->data is set to NULL, losing the original pointer (leak) and causing
-        // a NULL dereference in the subsequent memcpy in msgbuf_push.
-        m->data = realloc(m->data, newcap);
+        void *tmp = realloc(m->data, newcap);
+        if (!tmp) { fprintf(stderr, "msgbuf_ensure: out of memory\n"); abort(); }
+        m->data = tmp;
         m->cap  = newcap;
     }
 }
