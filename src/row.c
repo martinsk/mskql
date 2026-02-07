@@ -1,11 +1,14 @@
 #include "row.h"
+#include <stdio.h>
 #include <string.h>
 
 void rows_push(struct rows *rows, struct row row)
 {
     if (rows->count >= rows->capacity) {
         rows->capacity = rows->capacity == 0 ? 8 : rows->capacity * 2;
-        rows->data = realloc(rows->data, rows->capacity * sizeof(struct row));
+        void *tmp = realloc(rows->data, rows->capacity * sizeof(struct row));
+        if (!tmp) { fprintf(stderr, "rows_push: out of memory\n"); abort(); }
+        rows->data = tmp;
     }
     rows->data[rows->count++] = row;
 }

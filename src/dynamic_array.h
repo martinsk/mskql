@@ -18,7 +18,9 @@
     do {                                                                         \
         if ((da)->count >= (da)->capacity) {                                     \
             (da)->capacity = (da)->capacity == 0 ? 8 : (da)->capacity * 2;      \
-            (da)->items = realloc((da)->items, (da)->capacity * sizeof(*(da)->items)); \
+            void *_tmp = realloc((da)->items, (da)->capacity * sizeof(*(da)->items)); \
+            if (!_tmp) { fprintf(stderr, "da_push: out of memory\n"); abort(); } \
+            (da)->items = _tmp;                                                  \
         }                                                                        \
         (da)->items[(da)->count++] = (item);                                     \
     } while (0)

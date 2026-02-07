@@ -226,13 +226,38 @@ static int do_single_join(struct table *t1, struct table *t2,
     free(t1_matched);
     free(t2_matched);
 
-    /* build merged column list in out_meta */
-    for (size_t c = 0; c < t1->columns.count; c++)
-        da_push(&out_meta->columns, t1->columns.items[c]);
-    for (size_t c = 0; c < t2->columns.count; c++)
-        da_push(&out_meta->columns, t2->columns.items[c]);
+    /* build merged column list in out_meta (deep-copy names to avoid dangling pointers) */
+    for (size_t c = 0; c < t1->columns.count; c++) {
+        struct column col = t1->columns.items[c];
+        col.name = strdup(col.name);
+        col.enum_type_name = col.enum_type_name ? strdup(col.enum_type_name) : NULL;
+        da_push(&out_meta->columns, col);
+    }
+    for (size_t c = 0; c < t2->columns.count; c++) {
+        struct column col = t2->columns.items[c];
+        col.name = strdup(col.name);
+        col.enum_type_name = col.enum_type_name ? strdup(col.enum_type_name) : NULL;
+        da_push(&out_meta->columns, col);
+    }
 
     return 0;
+}
+
+/* free strdup'd column names in a merged table descriptor */
+static void free_merged_columns(struct table *mt)
+{
+    for (size_t c = 0; c < mt->columns.count; c++) {
+        free(mt->columns.items[c].name);
+        free(mt->columns.items[c].enum_type_name);
+    }
+    da_free(&mt->columns);
+}
+
+static void free_merged_rows(struct rows *mr)
+{
+    for (size_t i = 0; i < mr->count; i++)
+        row_free(&mr->data[i]);
+    free(mr->data);
 }
 
 static int exec_join(struct database *db, struct query *q, struct rows *result)
@@ -241,8 +266,10 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
     if (!t1) { fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(q->table)); return -1; }
 
     /* build merged table through successive joins */
-    DYNAMIC_ARRAY(struct column) merged_cols;
-    da_init(&merged_cols);
+    struct table merged_t = {0};
+    da_init(&merged_t.columns);
+    da_init(&merged_t.rows);
+    da_init(&merged_t.indexes);
     struct rows merged = {0};
 
     /* first join */
@@ -250,31 +277,33 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
     struct table *t2 = db_find_table_sv(db, ji->join_table);
     if (!t2) { fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(ji->join_table)); return -1; }
     if (do_single_join(t1, t2, ji->join_left_col, ji->join_right_col, ji->join_type,
-                       &merged, &merged_cols) != 0) return -1;
+                       &merged, &merged_t) != 0) return -1;
 
     /* subsequent joins: build a temp table from merged results, join with next */
     for (size_t jn = 1; jn < q->joins.count; jn++) {
         ji = &q->joins.items[jn];
         struct table *tn = db_find_table_sv(db, ji->join_table);
-        if (!tn) { fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(ji->join_table)); return -1; }
+        if (!tn) {
+            fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(ji->join_table));
+            free_merged_rows(&merged);
+            free_merged_columns(&merged_t);
+            return -1;
+        }
 
-        /* build temp table descriptor from merged state */
-        struct table tmp_t = {0};
-        da_init(&tmp_t.columns);
-        da_init(&tmp_t.rows);
-        da_init(&tmp_t.indexes);
-        for (size_t c = 0; c < merged_cols.count; c++)
-            da_push(&tmp_t.columns, merged_cols.items[c]);
-        tmp_t.rows.items = merged.data;
-        tmp_t.rows.count = merged.count;
-        tmp_t.rows.capacity = merged.count;
+        /* use merged_t as the left table descriptor */
+        merged_t.rows.items = merged.data;
+        merged_t.rows.count = merged.count;
+        merged_t.rows.capacity = merged.count;
 
         struct rows next_merged = {0};
-        DYNAMIC_ARRAY(struct column) next_cols;
-        da_init(&next_cols);
-        if (do_single_join(&tmp_t, tn, ji->join_left_col, ji->join_right_col, ji->join_type,
-                           &next_merged, &next_cols) != 0) {
-            da_free(&tmp_t.columns);
+        struct table next_meta = {0};
+        da_init(&next_meta.columns);
+        da_init(&next_meta.rows);
+        da_init(&next_meta.indexes);
+        if (do_single_join(&merged_t, tn, ji->join_left_col, ji->join_right_col, ji->join_type,
+                           &next_merged, &next_meta) != 0) {
+            free_merged_rows(&merged);
+            free_merged_columns(&merged_t);
             return -1;
         }
 
@@ -282,25 +311,18 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
         for (size_t i = 0; i < merged.count; i++)
             row_free(&merged.data[i]);
         free(merged.data);
-        da_free(&merged_cols);
-        da_free(&tmp_t.columns);
+        free_merged_columns(&merged_t);
 
         merged = next_merged;
-        merged_cols = next_cols;
+        merged_t = next_meta;
     }
-
-    /* build a merged table descriptor for WHERE/ORDER BY */
-    struct table merged_t = {0};
-    da_init(&merged_t.columns);
-    da_init(&merged_t.rows);
-    da_init(&merged_t.indexes);
-    for (size_t c = 0; c < merged_cols.count; c++)
-        da_push(&merged_t.columns, merged_cols.items[c]);
 
     /* WHERE filter */
     if (q->has_where && q->where_cond) {
         struct rows filtered = {0};
         for (size_t i = 0; i < merged.count; i++) {
+            merged_t.rows.items = merged.data;
+            merged_t.rows.count = merged.count;
             if (eval_condition(q->where_cond, &merged.data[i], &merged_t)) {
                 rows_push(&filtered, merged.data[i]);
                 merged.data[i] = (struct row){0};
@@ -317,8 +339,8 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
         char obuf[256];
         const char *ord_name = extract_col_name(q->order_by_col, obuf, sizeof(obuf));
         int ord_col = -1;
-        for (size_t c = 0; c < merged_cols.count; c++) {
-            if (strcmp(merged_cols.items[c].name, ord_name) == 0) {
+        for (size_t c = 0; c < merged_t.columns.count; c++) {
+            if (strcmp(merged_t.columns.items[c].name, ord_name) == 0) {
                 ord_col = (int)c; break;
             }
         }
@@ -377,13 +399,12 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
                 char *as_pos = strstr(clean, " AS ");
                 if (!as_pos) as_pos = strstr(clean, " as ");
                 if (as_pos) *as_pos = '\0';
-                /* trim trailing spaces */
                 size_t cl = strlen(clean);
                 while (cl > 0 && clean[cl-1] == ' ') clean[--cl] = '\0';
 
                 int idx = -1;
-                for (size_t c = 0; c < merged_cols.count; c++) {
-                    if (strcmp(merged_cols.items[c].name, clean) == 0) {
+                for (size_t c = 0; c < merged_t.columns.count; c++) {
+                    if (strcmp(merged_t.columns.items[c].name, clean) == 0) {
                         idx = (int)c; break;
                     }
                 }
@@ -401,13 +422,54 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
     }
 
     /* free merged rows */
-    for (size_t i = 0; i < merged.count; i++)
-        row_free(&merged.data[i]);
-    free(merged.data);
-    da_free(&merged_cols);
-    da_free(&merged_t.columns);
+    free_merged_rows(&merged);
+    free_merged_columns(&merged_t);
 
     return 0;
+}
+
+/* recursively resolve subqueries in condition tree */
+static void resolve_subqueries(struct database *db, struct condition *c)
+{
+    if (!c) return;
+    if (c->type == COND_AND || c->type == COND_OR) {
+        resolve_subqueries(db, c->left);
+        resolve_subqueries(db, c->right);
+        return;
+    }
+    if (c->type == COND_COMPARE && c->subquery_sql &&
+        (c->op == CMP_IN || c->op == CMP_NOT_IN)) {
+        // TODO: MEMORY LEAK: The parsed subquery struct sq contains heap-allocated
+        // members that are never freed after use. A query_free() function should be
+        // called after db_exec completes.
+        struct query sq = {0};
+        if (query_parse(c->subquery_sql, &sq) == 0) {
+            struct rows sq_result = {0};
+            if (db_exec(db, &sq, &sq_result) == 0) {
+                da_init(&c->in_values);
+                for (size_t i = 0; i < sq_result.count; i++) {
+                    if (sq_result.data[i].cells.count > 0) {
+                        struct cell v = {0};
+                        struct cell *src = &sq_result.data[i].cells.items[0];
+                        v.type = src->type;
+                        v.is_null = src->is_null;
+                        if ((src->type == COLUMN_TYPE_TEXT || src->type == COLUMN_TYPE_ENUM)
+                            && src->value.as_text)
+                            v.value.as_text = strdup(src->value.as_text);
+                        else
+                            v.value = src->value;
+                        da_push(&c->in_values, v);
+                    }
+                }
+                for (size_t i = 0; i < sq_result.count; i++)
+                    row_free(&sq_result.data[i]);
+                free(sq_result.data);
+            }
+            query_free(&sq);
+        }
+        free(c->subquery_sql);
+        c->subquery_sql = NULL;
+    }
 }
 
 int db_exec(struct database *db, struct query *q, struct rows *result)
@@ -520,12 +582,16 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             return -1;
         }
         case QUERY_TYPE_SELECT:
+            /* resolve any IN (SELECT ...) subqueries */
+            if (q->has_where && q->where_cond)
+                resolve_subqueries(db, q->where_cond);
             if (q->table.len == 0 && q->insert_row && result) {
                 /* SELECT <literal> — no table, return literal values */
                 struct row dst = {0};
                 da_init(&dst.cells);
                 for (size_t i = 0; i < q->insert_row->cells.count; i++) {
-                    struct cell c;
+                    struct cell c = {0};
+                    c.is_null = q->insert_row->cells.items[i].is_null;
                     c.type = q->insert_row->cells.items[i].type;
                     if ((c.type == COLUMN_TYPE_TEXT || c.type == COLUMN_TYPE_ENUM)
                         && q->insert_row->cells.items[i].value.as_text)
@@ -552,7 +618,9 @@ int db_exec_sql(struct database *db, const char *sql, struct rows *result)
 {
     struct query q = {0};
     if (query_parse(sql, &q) != 0) return -1;
-    return db_exec(db, &q, result);
+    int rc = db_exec(db, &q, result);
+    query_free(&q);
+    return rc;
 }
 
 void db_free(struct database *db)

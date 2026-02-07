@@ -35,6 +35,8 @@ static int cell_compare(const struct cell *a, const struct cell *b)
 
 static struct btree_node *node_alloc(int is_leaf)
 {
+    // TODO: CRASH RISK: calloc return value is not checked for NULL. If allocation
+    // fails, the next line dereferences NULL, causing a segfault.
     struct btree_node *n = calloc(1, sizeof(*n));
     n->is_leaf = is_leaf;
     n->count = 0;

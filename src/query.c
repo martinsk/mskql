@@ -39,8 +39,79 @@ void condition_free(struct condition *c)
         if ((c->value.type == COLUMN_TYPE_TEXT || c->value.type == COLUMN_TYPE_ENUM)
             && c->value.value.as_text)
             free(c->value.value.as_text);
+        /* free IN / NOT IN value list */
+        for (size_t i = 0; i < c->in_values.count; i++) {
+            if ((c->in_values.items[i].type == COLUMN_TYPE_TEXT ||
+                 c->in_values.items[i].type == COLUMN_TYPE_ENUM) &&
+                c->in_values.items[i].value.as_text)
+                free(c->in_values.items[i].value.as_text);
+        }
+        da_free(&c->in_values);
+        /* free BETWEEN high value */
+        if ((c->between_high.type == COLUMN_TYPE_TEXT || c->between_high.type == COLUMN_TYPE_ENUM)
+            && c->between_high.value.as_text)
+            free(c->between_high.value.as_text);
+        /* free unresolved subquery SQL */
+        free(c->subquery_sql);
     }
     free(c);
+}
+
+static void free_cell_text(struct cell *c)
+{
+    if ((c->type == COLUMN_TYPE_TEXT || c->type == COLUMN_TYPE_ENUM) && c->value.as_text)
+        free(c->value.as_text);
+}
+
+void query_free(struct query *q)
+{
+    /* where / having conditions */
+    condition_free(q->where_cond);
+    q->where_cond = NULL;
+    condition_free(q->having_cond);
+    q->having_cond = NULL;
+
+    /* where_value (legacy single-condition path) */
+    free_cell_text(&q->where_value);
+
+    /* insert_row */
+    if (q->insert_row) {
+        for (size_t i = 0; i < q->insert_row->cells.count; i++)
+            free_cell_text(&q->insert_row->cells.items[i]);
+        da_free(&q->insert_row->cells);
+        free(q->insert_row);
+        q->insert_row = NULL;
+    }
+
+    /* insert_rows (multi-row INSERT) */
+    for (size_t i = 0; i < q->insert_rows.count; i++) {
+        for (size_t j = 0; j < q->insert_rows.items[i].cells.count; j++)
+            free_cell_text(&q->insert_rows.items[i].cells.items[j]);
+        da_free(&q->insert_rows.items[i].cells);
+    }
+    da_free(&q->insert_rows);
+
+    /* create_columns (strdup'd names) */
+    for (size_t i = 0; i < q->create_columns.count; i++) {
+        free(q->create_columns.items[i].name);
+        free(q->create_columns.items[i].enum_type_name);
+    }
+    da_free(&q->create_columns);
+
+    /* set_clauses (UPDATE SET) */
+    for (size_t i = 0; i < q->set_clauses.count; i++)
+        free_cell_text(&q->set_clauses.items[i].value);
+    da_free(&q->set_clauses);
+
+    /* enum_values */
+    for (size_t i = 0; i < q->enum_values.count; i++)
+        free(q->enum_values.items[i]);
+    da_free(&q->enum_values);
+
+    /* aggregates, select_exprs, joins — no heap pointers inside, just da_free */
+    da_free(&q->aggregates);
+    da_free(&q->select_exprs);
+    da_free(&q->joins);
 }
 
 static int cell_cmp(const struct cell *a, const struct cell *b)
@@ -159,6 +230,386 @@ static int cell_match(const struct cell *a, const struct cell *b)
     return 0;
 }
 
+static double resolve_operand(sv tok_sv, struct table *t, struct row *src);
+
+/* check if sv starts with a keyword (case-insensitive) */
+static int sv_starts_with_ci(sv s, const char *prefix)
+{
+    size_t plen = strlen(prefix);
+    if (s.len < plen) return 0;
+    for (size_t i = 0; i < plen; i++) {
+        if (tolower((unsigned char)s.data[i]) != tolower((unsigned char)prefix[i])) return 0;
+    }
+    /* must be followed by non-alnum or end */
+    if (s.len > plen && isalnum((unsigned char)s.data[plen])) return 0;
+    return 1;
+}
+
+/* evaluate COALESCE(arg1, arg2, ...) — returns first non-NULL argument */
+static struct cell eval_coalesce(sv expr, struct table *t, struct row *src)
+{
+    /* skip "COALESCE(" and find matching ")" */
+    size_t start = 0;
+    while (start < expr.len && expr.data[start] != '(') start++;
+    start++; /* skip '(' */
+    size_t end = expr.len;
+    if (end > 0 && expr.data[end - 1] == ')') end--;
+
+    sv args = sv_from(expr.data + start, end - start);
+
+    /* split on commas (respecting parentheses) */
+    int depth = 0;
+    size_t arg_start = 0;
+    for (size_t i = 0; i <= args.len; i++) {
+        char c = (i < args.len) ? args.data[i] : '\0';
+        if (c == '(') depth++;
+        else if (c == ')') depth--;
+        else if ((c == ',' && depth == 0) || i == args.len) {
+            sv arg = sv_from(args.data + arg_start, i - arg_start);
+            /* trim */
+            while (arg.len > 0 && (arg.data[0] == ' ' || arg.data[0] == '\t'))
+                { arg.data++; arg.len--; }
+            while (arg.len > 0 && (arg.data[arg.len-1] == ' ' || arg.data[arg.len-1] == '\t'))
+                arg.len--;
+
+            /* check if it's a string literal */
+            if (arg.len >= 2 && arg.data[0] == '\'') {
+                struct cell c2 = {0};
+                c2.type = COLUMN_TYPE_TEXT;
+                c2.value.as_text = malloc(arg.len - 1);
+                memcpy(c2.value.as_text, arg.data + 1, arg.len - 2);
+                c2.value.as_text[arg.len - 2] = '\0';
+                return c2;
+            }
+
+            /* check if it's a column reference */
+            sv col = arg;
+            for (size_t k = 0; k < col.len; k++) {
+                if (col.data[k] == '.') { col = sv_from(col.data + k + 1, col.len - k - 1); break; }
+            }
+            for (size_t j = 0; j < t->columns.count; j++) {
+                if (sv_eq_cstr(col, t->columns.items[j].name)) {
+                    struct cell *sc = &src->cells.items[j];
+                    if (!sc->is_null && !((sc->type == COLUMN_TYPE_TEXT || sc->type == COLUMN_TYPE_ENUM) && !sc->value.as_text)) {
+                        struct cell copy = { .type = sc->type };
+                        if ((sc->type == COLUMN_TYPE_TEXT || sc->type == COLUMN_TYPE_ENUM) && sc->value.as_text)
+                            copy.value.as_text = strdup(sc->value.as_text);
+                        else
+                            copy.value = sc->value;
+                        return copy;
+                    }
+                    break; /* column found but is NULL, try next arg */
+                }
+            }
+
+            /* try as number literal */
+            if (arg.len > 0 && (isdigit((unsigned char)arg.data[0]) || arg.data[0] == '-')) {
+                char buf[64];
+                size_t n = arg.len < 63 ? arg.len : 63;
+                memcpy(buf, arg.data, n); buf[n] = '\0';
+                struct cell c2 = {0};
+                if (strchr(buf, '.')) {
+                    c2.type = COLUMN_TYPE_FLOAT;
+                    c2.value.as_float = atof(buf);
+                } else {
+                    c2.type = COLUMN_TYPE_INT;
+                    c2.value.as_int = atoi(buf);
+                }
+                return c2;
+            }
+
+            arg_start = i + 1;
+        }
+    }
+
+    /* all NULL */
+    struct cell null_cell = { .type = COLUMN_TYPE_TEXT, .is_null = 1 };
+    return null_cell;
+}
+
+/* evaluate CASE WHEN cond THEN val [WHEN cond THEN val]* [ELSE val] END */
+static struct cell eval_case_when(sv expr, struct table *t, struct row *src)
+{
+    /* skip "CASE " */
+    size_t pos = 4;
+    while (pos < expr.len && (expr.data[pos] == ' ' || expr.data[pos] == '\t')) pos++;
+
+    sv rest = sv_from(expr.data + pos, expr.len - pos);
+
+    /* strip trailing END (case-insensitive) */
+    while (rest.len > 0 && (rest.data[rest.len-1] == ' ' || rest.data[rest.len-1] == '\t')) rest.len--;
+    if (rest.len >= 3) {
+        sv tail = sv_from(rest.data + rest.len - 3, 3);
+        if (sv_eq_ignorecase_cstr(tail, "END")) rest.len -= 3;
+    }
+    while (rest.len > 0 && (rest.data[rest.len-1] == ' ' || rest.data[rest.len-1] == '\t')) rest.len--;
+
+    /* parse WHEN...THEN...ELSE blocks by scanning for keywords */
+    /* simple approach: find WHEN, THEN, ELSE keywords at word boundaries */
+    const char *p = rest.data;
+    const char *end = rest.data + rest.len;
+
+    while (p < end) {
+        /* skip whitespace */
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        if (p >= end) break;
+
+        /* check for WHEN */
+        if ((size_t)(end - p) >= 4 && strncasecmp(p, "WHEN", 4) == 0 &&
+            (p + 4 >= end || p[4] == ' ' || p[4] == '\t')) {
+            p += 4;
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+
+            /* find THEN */
+            const char *then_pos = NULL;
+            for (const char *s = p; s + 4 <= end; s++) {
+                if (strncasecmp(s, "THEN", 4) == 0 &&
+                    (s == p || s[-1] == ' ' || s[-1] == '\t') &&
+                    (s + 4 >= end || s[4] == ' ' || s[4] == '\t')) {
+                    then_pos = s; break;
+                }
+            }
+            if (!then_pos) break;
+
+            sv cond_sv = sv_from(p, (size_t)(then_pos - p));
+            while (cond_sv.len > 0 && (cond_sv.data[cond_sv.len-1] == ' ')) cond_sv.len--;
+
+            const char *val_start = then_pos + 4;
+            while (val_start < end && (*val_start == ' ' || *val_start == '\t')) val_start++;
+
+            /* find next WHEN or ELSE or end */
+            const char *val_end = end;
+            for (const char *s = val_start; s + 4 <= end; s++) {
+                if ((strncasecmp(s, "WHEN", 4) == 0 || strncasecmp(s, "ELSE", 4) == 0) &&
+                    (s == val_start || s[-1] == ' ' || s[-1] == '\t') &&
+                    (s + 4 >= end || s[4] == ' ' || s[4] == '\t')) {
+                    val_end = s; break;
+                }
+            }
+
+            sv val_sv = sv_from(val_start, (size_t)(val_end - val_start));
+            while (val_sv.len > 0 && (val_sv.data[val_sv.len-1] == ' ')) val_sv.len--;
+
+            /* evaluate condition: simple "col op value" */
+            int cond_match = 0;
+            for (size_t i = 0; i < cond_sv.len; i++) {
+                char cc = cond_sv.data[i];
+                /* skip operators inside quoted strings */
+                if (cc == '\'') { i++; while (i < cond_sv.len && cond_sv.data[i] != '\'') i++; continue; }
+                if (cc == '=' || cc == '>' || cc == '<' || cc == '!') {
+                    sv col_part = sv_from(cond_sv.data, i);
+                    while (col_part.len > 0 && col_part.data[col_part.len-1] == ' ') col_part.len--;
+                    size_t op_end = i + 1;
+                    if (op_end < cond_sv.len && cond_sv.data[op_end] == '=') op_end++;
+                    sv val_part = sv_from(cond_sv.data + op_end, cond_sv.len - op_end);
+                    while (val_part.len > 0 && val_part.data[0] == ' ') { val_part.data++; val_part.len--; }
+
+                    /* check if either side is a string literal */
+                    int is_text_cmp = 0;
+                    if (val_part.len >= 2 && val_part.data[0] == '\'') is_text_cmp = 1;
+
+                    if (is_text_cmp) {
+                        /* resolve LHS as text from column */
+                        const char *lhs_text = NULL;
+                        sv col_sv = col_part;
+                        for (size_t k = 0; k < col_sv.len; k++) {
+                            if (col_sv.data[k] == '.') { col_sv = sv_from(col_sv.data + k + 1, col_sv.len - k - 1); break; }
+                        }
+                        for (size_t j = 0; j < t->columns.count; j++) {
+                            if (sv_eq_cstr(col_sv, t->columns.items[j].name)) {
+                                struct cell *sc = &src->cells.items[j];
+                                if ((sc->type == COLUMN_TYPE_TEXT || sc->type == COLUMN_TYPE_ENUM) && sc->value.as_text)
+                                    lhs_text = sc->value.as_text;
+                                break;
+                            }
+                        }
+                        /* extract RHS string (strip quotes) */
+                        char rhs_buf[256];
+                        size_t rlen = val_part.len - 2 < 255 ? val_part.len - 2 : 255;
+                        memcpy(rhs_buf, val_part.data + 1, rlen);
+                        rhs_buf[rlen] = '\0';
+
+                        if (lhs_text) {
+                            int scmp = strcmp(lhs_text, rhs_buf);
+                            if (cc == '=' && op_end == i + 1) cond_match = (scmp == 0);
+                            else if (cc == '!' && op_end == i + 2) cond_match = (scmp != 0);
+                            else if (cc == '>' && op_end == i + 1) cond_match = (scmp > 0);
+                            else if (cc == '>' && op_end == i + 2) cond_match = (scmp >= 0);
+                            else if (cc == '<' && op_end == i + 1) cond_match = (scmp < 0);
+                            else if (cc == '<' && op_end == i + 2) cond_match = (scmp <= 0);
+                        }
+                    } else {
+                        double lhs = resolve_operand(col_part, t, src);
+                        double rhs = resolve_operand(val_part, t, src);
+
+                        if (cc == '=' && op_end == i + 1) cond_match = (lhs == rhs);
+                        else if (cc == '!' && op_end == i + 2) cond_match = (lhs != rhs);
+                        else if (cc == '>' && op_end == i + 1) cond_match = (lhs > rhs);
+                        else if (cc == '>' && op_end == i + 2) cond_match = (lhs >= rhs);
+                        else if (cc == '<' && op_end == i + 1) cond_match = (lhs < rhs);
+                        else if (cc == '<' && op_end == i + 2) cond_match = (lhs <= rhs);
+                    }
+                    break;
+                }
+            }
+
+            if (cond_match) {
+                /* return the THEN value */
+                if (val_sv.len >= 2 && val_sv.data[0] == '\'') {
+                    struct cell c2 = { .type = COLUMN_TYPE_TEXT };
+                    c2.value.as_text = malloc(val_sv.len - 1);
+                    memcpy(c2.value.as_text, val_sv.data + 1, val_sv.len - 2);
+                    c2.value.as_text[val_sv.len - 2] = '\0';
+                    return c2;
+                }
+                double v = resolve_operand(val_sv, t, src);
+                struct cell c2 = {0};
+                if (v == (double)(int)v) { c2.type = COLUMN_TYPE_INT; c2.value.as_int = (int)v; }
+                else { c2.type = COLUMN_TYPE_FLOAT; c2.value.as_float = v; }
+                return c2;
+            }
+
+            p = val_end;
+            continue;
+        }
+
+        /* check for ELSE */
+        if ((size_t)(end - p) >= 4 && strncasecmp(p, "ELSE", 4) == 0 &&
+            (p + 4 >= end || p[4] == ' ' || p[4] == '\t')) {
+            p += 4;
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+            sv else_val = sv_from(p, (size_t)(end - p));
+            while (else_val.len > 0 && (else_val.data[else_val.len-1] == ' ')) else_val.len--;
+
+            if (else_val.len >= 2 && else_val.data[0] == '\'') {
+                struct cell c2 = { .type = COLUMN_TYPE_TEXT };
+                c2.value.as_text = malloc(else_val.len - 1);
+                memcpy(c2.value.as_text, else_val.data + 1, else_val.len - 2);
+                c2.value.as_text[else_val.len - 2] = '\0';
+                return c2;
+            }
+            double v = resolve_operand(else_val, t, src);
+            struct cell c2 = {0};
+            if (v == (double)(int)v) { c2.type = COLUMN_TYPE_INT; c2.value.as_int = (int)v; }
+            else { c2.type = COLUMN_TYPE_FLOAT; c2.value.as_float = v; }
+            return c2;
+        }
+
+        break;
+    }
+
+    struct cell null_cell = { .type = COLUMN_TYPE_TEXT, .is_null = 1 };
+    return null_cell;
+}
+
+/* check if an sv segment contains an arithmetic operator */
+static int has_arith_op(sv s)
+{
+    for (size_t i = 0; i < s.len; i++) {
+        char c = s.data[i];
+        if (c == '+' || c == '/' || c == '-') return 1;
+        if (c == '*') {
+            /* distinguish SELECT * from multiplication: * is arith only if not alone */
+            if (s.len > 1) return 1;
+        }
+    }
+    return 0;
+}
+
+/* resolve a single token (column name or literal) to a double */
+static double resolve_operand(sv tok_sv, struct table *t, struct row *src)
+{
+    /* trim whitespace */
+    while (tok_sv.len > 0 && (tok_sv.data[0] == ' ' || tok_sv.data[0] == '\t'))
+        { tok_sv.data++; tok_sv.len--; }
+    while (tok_sv.len > 0 && (tok_sv.data[tok_sv.len-1] == ' ' || tok_sv.data[tok_sv.len-1] == '\t'))
+        tok_sv.len--;
+    if (tok_sv.len == 0) return 0.0;
+
+    /* try as number literal */
+    char first = tok_sv.data[0];
+    if (isdigit((unsigned char)first) || (first == '-' && tok_sv.len > 1)) {
+        char buf[64];
+        size_t n = tok_sv.len < 63 ? tok_sv.len : 63;
+        memcpy(buf, tok_sv.data, n);
+        buf[n] = '\0';
+        return atof(buf);
+    }
+
+    /* strip table prefix */
+    for (size_t k = 0; k < tok_sv.len; k++) {
+        if (tok_sv.data[k] == '.') {
+            tok_sv = sv_from(tok_sv.data + k + 1, tok_sv.len - k - 1);
+            break;
+        }
+    }
+
+    /* look up column */
+    for (size_t j = 0; j < t->columns.count; j++) {
+        if (sv_eq_cstr(tok_sv, t->columns.items[j].name)) {
+            struct cell *c = &src->cells.items[j];
+            if (c->type == COLUMN_TYPE_INT) return (double)c->value.as_int;
+            if (c->type == COLUMN_TYPE_FLOAT) return c->value.as_float;
+            return 0.0;
+        }
+    }
+    return 0.0;
+}
+
+/* evaluate a simple arithmetic expression: operand [op operand]* */
+static struct cell eval_arith_expr(sv expr, struct table *t, struct row *src)
+{
+    struct cell result = {0};
+    result.type = COLUMN_TYPE_FLOAT;
+
+    /* tokenize: split on +, -, *, / keeping operators */
+    double vals[32];
+    char ops[32];
+    int nvals = 0, nops = 0;
+
+    size_t start = 0;
+    for (size_t i = 0; i <= expr.len && nvals < 32; i++) {
+        char c = (i < expr.len) ? expr.data[i] : '\0';
+        int is_op = (c == '+' || c == '-' || c == '/' || c == '*');
+        /* '-' after another operator or at start is unary, not binary */
+        if (c == '-' && (nvals == 0 || (nvals == nops + 1 ? 0 : 1) == 0)) is_op = 0;
+
+        if (is_op || i == expr.len) {
+            sv operand = sv_from(expr.data + start, i - start);
+            vals[nvals++] = resolve_operand(operand, t, src);
+            if (is_op && nops < 32) ops[nops++] = c;
+            start = i + 1;
+        }
+    }
+
+    /* evaluate: first pass for * and / */
+    for (int i = 0; i < nops; i++) {
+        if (ops[i] == '*' || ops[i] == '/') {
+            if (ops[i] == '*') vals[i] = vals[i] * vals[i+1];
+            else vals[i] = (vals[i+1] != 0.0) ? vals[i] / vals[i+1] : 0.0;
+            /* shift remaining */
+            for (int j = i+1; j < nvals - 1; j++) vals[j] = vals[j+1];
+            for (int j = i; j < nops - 1; j++) ops[j] = ops[j+1];
+            nvals--; nops--; i--;
+        }
+    }
+    /* second pass for + and - */
+    double v = (nvals > 0) ? vals[0] : 0.0;
+    for (int i = 0; i < nops; i++) {
+        if (ops[i] == '+') v += vals[i+1];
+        else if (ops[i] == '-') v -= vals[i+1];
+    }
+
+    /* output as int if result is a whole number and no float literals involved */
+    if (v == (double)(int)v) {
+        result.type = COLUMN_TYPE_INT;
+        result.value.as_int = (int)v;
+    } else {
+        result.value.as_float = v;
+    }
+    return result;
+}
+
 static void emit_row(struct table *t, struct query *q, struct row *src,
                      struct rows *result, int select_all)
 {
@@ -183,25 +634,46 @@ static void emit_row(struct table *t, struct query *q, struct row *src,
             /* trim leading whitespace */
             while (cols.len > 0 && (cols.data[0] == ' ' || cols.data[0] == '\t'))
                 { cols.data++; cols.len--; }
-            /* find end of this column name (comma or end) */
+            /* find end of this column name (comma or end), respecting parens and CASE..END */
             size_t end = 0;
-            while (end < cols.len && cols.data[end] != ',') end++;
+            int paren_depth = 0;
+            int case_depth = 0;
+            while (end < cols.len) {
+                char ch = cols.data[end];
+                if (ch == '(') paren_depth++;
+                else if (ch == ')') { if (paren_depth > 0) paren_depth--; }
+                else if (paren_depth == 0 && case_depth == 0 && ch == ',') break;
+                /* track CASE...END */
+                if (paren_depth == 0 && end + 4 <= cols.len &&
+                    strncasecmp(cols.data + end, "CASE", 4) == 0 &&
+                    (end == 0 || cols.data[end-1] == ' ' || cols.data[end-1] == ',') &&
+                    (end + 4 >= cols.len || cols.data[end+4] == ' '))
+                    case_depth++;
+                if (paren_depth == 0 && case_depth > 0 && end + 3 <= cols.len &&
+                    strncasecmp(cols.data + end, "END", 3) == 0 &&
+                    (end == 0 || cols.data[end-1] == ' ') &&
+                    (end + 3 >= cols.len || cols.data[end+3] == ' ' || cols.data[end+3] == ','))
+                    case_depth--;
+                end++;
+            }
             sv one = sv_from(cols.data, end);
             /* trim trailing whitespace */
             while (one.len > 0 && (one.data[one.len - 1] == ' ' || one.data[one.len - 1] == '\t'))
                 one.len--;
 
-            /* strip column alias: "col AS alias" -> "col" */
-            for (size_t k = 0; k + 1 < one.len; k++) {
-                if ((one.data[k] == ' ' || one.data[k] == '\t') &&
-                    (k + 3 <= one.len) &&
-                    (one.data[k+1] == 'A' || one.data[k+1] == 'a') &&
-                    (one.data[k+2] == 'S' || one.data[k+2] == 's') &&
-                    (k + 3 == one.len || one.data[k+3] == ' ' || one.data[k+3] == '\t')) {
-                    one.len = k;
-                    while (one.len > 0 && (one.data[one.len-1] == ' ' || one.data[one.len-1] == '\t'))
-                        one.len--;
-                    break;
+            /* strip column alias: "col AS alias" -> "col" (skip for COALESCE/CASE) */
+            if (!sv_starts_with_ci(one, "COALESCE") && !sv_starts_with_ci(one, "CASE")) {
+                for (size_t k = 0; k + 1 < one.len; k++) {
+                    if ((one.data[k] == ' ' || one.data[k] == '\t') &&
+                        (k + 3 <= one.len) &&
+                        (one.data[k+1] == 'A' || one.data[k+1] == 'a') &&
+                        (one.data[k+2] == 'S' || one.data[k+2] == 's') &&
+                        (k + 3 == one.len || one.data[k+3] == ' ' || one.data[k+3] == '\t')) {
+                        one.len = k;
+                        while (one.len > 0 && (one.data[one.len-1] == ' ' || one.data[one.len-1] == '\t'))
+                            one.len--;
+                        break;
+                    }
                 }
             }
 
@@ -213,17 +685,28 @@ static void emit_row(struct table *t, struct query *q, struct row *src,
                 }
             }
 
-            for (size_t j = 0; j < t->columns.count; j++) {
-                if (sv_eq_cstr(one, t->columns.items[j].name)) {
-                    struct cell c = src->cells.items[j];
-                    struct cell copy = { .type = c.type, .is_null = c.is_null };
-                    if ((c.type == COLUMN_TYPE_TEXT || c.type == COLUMN_TYPE_ENUM)
-                        && c.value.as_text)
-                        copy.value.as_text = strdup(c.value.as_text);
-                    else
-                        copy.value = c.value;
-                    da_push(&dst.cells, copy);
-                    break;
+            if (sv_starts_with_ci(one, "COALESCE")) {
+                struct cell c = eval_coalesce(one, t, src);
+                da_push(&dst.cells, c);
+            } else if (sv_starts_with_ci(one, "CASE")) {
+                struct cell c = eval_case_when(one, t, src);
+                da_push(&dst.cells, c);
+            } else if (has_arith_op(one)) {
+                struct cell c = eval_arith_expr(one, t, src);
+                da_push(&dst.cells, c);
+            } else {
+                for (size_t j = 0; j < t->columns.count; j++) {
+                    if (sv_eq_cstr(one, t->columns.items[j].name)) {
+                        struct cell c = src->cells.items[j];
+                        struct cell copy = { .type = c.type, .is_null = c.is_null };
+                        if ((c.type == COLUMN_TYPE_TEXT || c.type == COLUMN_TYPE_ENUM)
+                            && c.value.as_text)
+                            copy.value.as_text = strdup(c.value.as_text);
+                        else
+                            copy.value = c.value;
+                        da_push(&dst.cells, copy);
+                        break;
+                    }
                 }
             }
 
@@ -753,6 +1236,8 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
                     case AGG_SUM:   agg_name = "sum";   break;
                     case AGG_COUNT: agg_name = "count"; break;
                     case AGG_AVG:   agg_name = "avg";   break;
+                    case AGG_MIN:   agg_name = "min";   break;
+                    case AGG_MAX:   agg_name = "max";   break;
                     default: break;
                 }
                 struct column col_a = { .name = (char *)agg_name,
@@ -789,6 +1274,8 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
                     case AGG_SUM:   agg_name = "sum";   break;
                     case AGG_COUNT: agg_name = "count"; break;
                     case AGG_AVG:   agg_name = "avg";   break;
+                    case AGG_MIN:   agg_name = "min";   break;
+                    case AGG_MAX:   agg_name = "max";   break;
                     default: break;
                 }
                 if (sv_eq_cstr(q->order_by_col, agg_name)) {

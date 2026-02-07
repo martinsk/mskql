@@ -22,6 +22,9 @@ enum token_type {
     TOK_GREATER,
     TOK_LESS_EQ,
     TOK_GREATER_EQ,
+    TOK_PLUS,
+    TOK_SLASH,
+    TOK_MINUS,
     TOK_EOF,
     TOK_UNKNOWN
 };
@@ -116,6 +119,18 @@ static struct token lexer_next(struct lexer *l)
         l->pos++;
         return tok;
     }
+    if (c == '+') {
+        tok.type = TOK_PLUS;
+        tok.value = sv_from(&l->input[l->pos], 1);
+        l->pos++;
+        return tok;
+    }
+    if (c == '/') {
+        tok.type = TOK_SLASH;
+        tok.value = sv_from(&l->input[l->pos], 1);
+        l->pos++;
+        return tok;
+    }
     if (c == '=' ) {
         tok.type = TOK_EQUALS;
         tok.value = sv_from(&l->input[l->pos], 1);
@@ -170,6 +185,30 @@ static struct token lexer_next(struct lexer *l)
         tok.type = TOK_STRING;
         if (l->input[l->pos] == quote) l->pos++;
         return tok;
+    }
+
+    /* minus: as unary negative only at start or after operator/keyword/comma/lparen */
+    if (c == '-' && !isdigit((unsigned char)l->input[l->pos + 1])) {
+        tok.type = TOK_MINUS;
+        tok.value = sv_from(&l->input[l->pos], 1);
+        l->pos++;
+        return tok;
+    }
+    if (c == '-' && isdigit((unsigned char)l->input[l->pos + 1])) {
+        /* look back to decide: if previous non-space is digit, identifier char, or ')' -> binary minus */
+        int binary = 0;
+        if (l->pos > 0) {
+            size_t bp = l->pos - 1;
+            while (bp > 0 && (l->input[bp] == ' ' || l->input[bp] == '\t')) bp--;
+            char prev = l->input[bp];
+            if (isalnum((unsigned char)prev) || prev == '_' || prev == ')') binary = 1;
+        }
+        if (binary) {
+            tok.type = TOK_MINUS;
+            tok.value = sv_from(&l->input[l->pos], 1);
+            l->pos++;
+            return tok;
+        }
     }
 
     /* number (integer or float) */
@@ -428,6 +467,35 @@ parse_in_list:
             fprintf(stderr, "parse error: expected '(' after IN\n");
             free(c); return NULL;
         }
+        /* check for subquery: IN (SELECT ...) */
+        {
+            struct token peek_sel = lexer_peek(l);
+            if (peek_sel.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek_sel.value, "SELECT")) {
+                /* capture everything from SELECT to matching ')' as subquery SQL */
+                const char *sq_start = peek_sel.value.data;
+                int depth = 1;
+                while (depth > 0) {
+                    tok = lexer_next(l);
+                    if (tok.type == TOK_LPAREN) depth++;
+                    else if (tok.type == TOK_RPAREN) depth--;
+                    else if (tok.type == TOK_EOF) {
+                        fprintf(stderr, "parse error: unterminated subquery\n");
+                        free(c); return NULL;
+                    }
+                }
+                /* tok is now the closing ')' */
+                const char *sq_end = tok.value.data; /* points at ')' */
+                size_t sq_len = (size_t)(sq_end - sq_start);
+                c->subquery_sql = malloc(sq_len + 1);
+                memcpy(c->subquery_sql, sq_start, sq_len);
+                c->subquery_sql[sq_len] = '\0';
+                /* trim trailing whitespace */
+                while (sq_len > 0 && (c->subquery_sql[sq_len-1] == ' ' || c->subquery_sql[sq_len-1] == '\t'))
+                    c->subquery_sql[--sq_len] = '\0';
+                da_init(&c->in_values);
+                return c;
+            }
+        }
         da_init(&c->in_values);
         for (;;) {
             tok = lexer_next(l);
@@ -437,6 +505,9 @@ parse_in_list:
             if (tok.type == TOK_RPAREN) break;
             if (tok.type != TOK_COMMA) {
                 fprintf(stderr, "parse error: expected ',' or ')' in IN list\n");
+                // TODO: MEMORY LEAK: On this error path, c->in_values cells that contain
+                // heap-allocated as_text strings (from parse_literal_value) are not freed
+                // before freeing c. Should iterate in_values, free text cells, then da_free.
                 free(c); return NULL;
             }
         }
@@ -573,7 +644,7 @@ static void parse_order_limit(struct lexer *l, struct query *out)
         struct token by = lexer_next(l);
         if (by.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(by.value, "BY")) return;
         struct token col = lexer_next(l);
-        if (col.type != TOK_IDENTIFIER) return;
+        if (col.type != TOK_IDENTIFIER && col.type != TOK_KEYWORD) return;
         out->has_order_by = 1;
         out->order_by_col = consume_identifier(l, col);
         out->order_desc = 0;
@@ -942,6 +1013,9 @@ static int parse_select(struct lexer *l, struct query *out)
     } else if (tok.type == TOK_NUMBER || tok.type == TOK_STRING) {
         /* SELECT <literal> — no FROM needed */
         out->columns = tok.value;
+        // TODO: MEMORY LEAK: insert_row is heap-allocated here with calloc but is never
+        // freed by any caller. The cells within it (including strdup'd text values) also
+        // leak. A query_free() function should free this and its contents.
         out->insert_row = calloc(1, sizeof(struct row));
         da_init(&out->insert_row->cells);
         struct cell c = {0};
@@ -980,13 +1054,45 @@ static int parse_select(struct lexer *l, struct query *out)
             }
         }
         return 0;
-    } else if (tok.type == TOK_IDENTIFIER) {
+    } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
         const char *col_start = tok.value.data;
         sv last = consume_identifier(l, tok);
         const char *col_end = last.data + last.len;
+        /* if this is CASE, consume until END */
+        if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "CASE")) {
+            int depth = 1;
+            while (depth > 0) {
+                struct token ct = lexer_next(l);
+                if (ct.type == TOK_EOF) break;
+                if (ct.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(ct.value, "CASE")) depth++;
+                if (ct.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(ct.value, "END")) depth--;
+                col_end = ct.value.data + ct.value.len;
+            }
+        }
         for (;;) {
-            /* skip optional column alias: AS alias */
             struct token peek = lexer_peek(l);
+            /* consume parenthesized expressions: COALESCE(...), func(...) */
+            if (peek.type == TOK_LPAREN) {
+                int depth = 1;
+                lexer_next(l); /* consume ( */
+                while (depth > 0) {
+                    struct token pt = lexer_next(l);
+                    if (pt.type == TOK_EOF) break;
+                    if (pt.type == TOK_LPAREN) depth++;
+                    if (pt.type == TOK_RPAREN) depth--;
+                    col_end = pt.value.data + pt.value.len;
+                }
+                continue;
+            }
+            /* consume arithmetic operators and operands as part of expression */
+            if (peek.type == TOK_STAR || peek.type == TOK_PLUS ||
+                peek.type == TOK_MINUS || peek.type == TOK_SLASH) {
+                lexer_next(l); /* consume operator */
+                struct token operand = lexer_next(l); /* consume operand */
+                col_end = operand.value.data + operand.value.len;
+                continue;
+            }
+            /* skip optional column alias: AS alias */
             if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "AS")) {
                 lexer_next(l); /* consume AS */
                 lexer_next(l); /* consume alias name */
@@ -994,12 +1100,28 @@ static int parse_select(struct lexer *l, struct query *out)
             peek = lexer_next(l);
             if (peek.type == TOK_COMMA) {
                 tok = lexer_next(l);
-                if (tok.type != TOK_IDENTIFIER) {
-                    fprintf(stderr, "parse error: expected column name after ','\n");
+                if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
+                    /* CASE ... END */
+                    if (sv_eq_ignorecase_cstr(tok.value, "CASE")) {
+                        int depth = 1;
+                        col_end = tok.value.data + tok.value.len;
+                        while (depth > 0) {
+                            struct token ct = lexer_next(l);
+                            if (ct.type == TOK_EOF) break;
+                            if (ct.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(ct.value, "CASE")) depth++;
+                            if (ct.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(ct.value, "END")) depth--;
+                            col_end = ct.value.data + ct.value.len;
+                        }
+                    } else {
+                        last = consume_identifier(l, tok);
+                        col_end = last.data + last.len;
+                    }
+                } else if (tok.type == TOK_NUMBER) {
+                    col_end = tok.value.data + tok.value.len;
+                } else {
+                    fprintf(stderr, "parse error: expected column name or expression after ','\n");
                     return -1;
                 }
-                last = consume_identifier(l, tok);
-                col_end = last.data + last.len;
             } else {
                 if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "FROM")) {
                     out->columns = sv_from(col_start, (size_t)(col_end - col_start));
@@ -1392,6 +1514,9 @@ static int parse_create(struct lexer *l, struct query *out)
             fprintf(stderr, "parse error: expected column name\n");
             return -1;
         }
+        // TODO: MEMORY LEAK: col_name (and enum_type_name below) are heap-allocated via
+        // sv_to_cstr/strdup and stored in out->create_columns. No caller ever frees these
+        // strings after the query is executed. A query_free() function is needed.
         char *col_name = sv_to_cstr(tok.value);
 
         /* column type — keyword (INT/FLOAT/TEXT) or identifier (enum type name) */
@@ -1535,6 +1660,9 @@ static int parse_update(struct lexer *l, struct query *out)
         }
 
         tok = lexer_next(l);
+        // TODO: MEMORY LEAK: parse_literal_value may heap-allocate sc.value.value.as_text
+        // (via sv_to_cstr for string literals). These are stored in out->set_clauses but
+        // no caller ever frees them. A query_free() function is needed.
         sc.value = parse_literal_value(tok);
         da_push(&out->set_clauses, sc);
 

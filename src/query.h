@@ -77,6 +77,8 @@ struct condition {
     struct cell value;
     /* for CMP_IN / CMP_NOT_IN: list of values */
     DYNAMIC_ARRAY(struct cell) in_values;
+    /* for CMP_IN subquery: raw SQL text to be resolved before execution */
+    char *subquery_sql;
     /* for CMP_BETWEEN: low and high */
     struct cell between_high;
     /* for COND_AND / COND_OR */
@@ -152,5 +154,6 @@ struct query {
 };
 
 int query_exec(struct table *t, struct query *q, struct rows *result);
+void query_free(struct query *q);
 
 #endif

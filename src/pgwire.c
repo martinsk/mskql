@@ -86,6 +86,9 @@ static void msgbuf_ensure(struct msgbuf *m, size_t extra)
     if (m->len + extra > m->cap) {
         size_t newcap = m->cap ? m->cap * 2 : 256;
         while (newcap < m->len + extra) newcap *= 2;
+        // TODO: CRASH RISK: realloc return value is not checked for NULL. If allocation
+        // fails, m->data is set to NULL, losing the original pointer (leak) and causing
+        // a NULL dereference in the subsequent memcpy in msgbuf_push.
         m->data = realloc(m->data, newcap);
         m->cap  = newcap;
     }
@@ -361,6 +364,7 @@ static int handle_query(int fd, struct database *db, const char *sql)
 
     struct query q = {0};
     if (query_parse(sql, &q) != 0) {
+        query_free(&q);
         send_error(fd, "ERROR", "42601", "syntax error or unsupported statement");
         send_ready_for_query(fd, 'I');
         return 0;
@@ -372,6 +376,7 @@ static int handle_query(int fd, struct database *db, const char *sql)
     if (rc != 0) {
         send_error(fd, "ERROR", "42000", "query execution failed");
         rows_free(&result);
+        query_free(&q);
         send_ready_for_query(fd, 'I');
         return 0;
     }
@@ -430,6 +435,7 @@ static int handle_query(int fd, struct database *db, const char *sql)
 
     send_command_complete(fd, tag);
     rows_free(&result);
+    query_free(&q);
     send_ready_for_query(fd, 'I');
     return 0;
 }
