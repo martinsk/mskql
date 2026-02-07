@@ -505,9 +505,13 @@ parse_in_list:
             if (tok.type == TOK_RPAREN) break;
             if (tok.type != TOK_COMMA) {
                 fprintf(stderr, "parse error: expected ',' or ')' in IN list\n");
-                // TODO: MEMORY LEAK: On this error path, c->in_values cells that contain
-                // heap-allocated as_text strings (from parse_literal_value) are not freed
-                // before freeing c. Should iterate in_values, free text cells, then da_free.
+                for (size_t iv = 0; iv < c->in_values.count; iv++) {
+                    if ((c->in_values.items[iv].type == COLUMN_TYPE_TEXT ||
+                         c->in_values.items[iv].type == COLUMN_TYPE_ENUM) &&
+                        c->in_values.items[iv].value.as_text)
+                        free(c->in_values.items[iv].value.as_text);
+                }
+                da_free(&c->in_values);
                 free(c); return NULL;
             }
         }

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -589,18 +590,23 @@ int pgwire_init(struct pgwire_server *srv, struct database *db, int port)
     return 0;
 }
 
+extern volatile sig_atomic_t g_running;
+
 int pgwire_run(struct pgwire_server *srv)
 {
     printf("[pgwire] listening on port %d\n", srv->port);
     printf("[pgwire] connect with: psql -h 127.0.0.1 -p %d\n", srv->port);
 
-    for (;;) {
+    while (g_running) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(srv->listen_fd,
                                (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (!g_running) break;
+                continue;
+            }
             perror("accept");
             return -1;
         }

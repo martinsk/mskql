@@ -1,9 +1,24 @@
 #include <stdio.h>
+#include <signal.h>
 #include "database.h"
 #include "pgwire.h"
 
+static volatile sig_atomic_t g_running = 1;
+
+static void handle_signal(int sig)
+{
+    (void)sig;
+    g_running = 0;
+}
+
 int main(void)
 {
+    struct sigaction sa = {0};
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
     struct database db = {0};
     db_init(&db, "mskql");
 
@@ -13,10 +28,6 @@ int main(void)
         return 1;
     }
 
-    // TODO: UNREACHABLE CLEANUP: pgwire_run() contains an infinite accept() loop that
-    // never returns (no signal handling). The pgwire_stop() and db_free() calls below
-    // are dead code. A signal handler (e.g. for SIGINT/SIGTERM) should be installed to
-    // break the loop and allow graceful shutdown with proper resource cleanup.
     pgwire_run(&srv);
 
     pgwire_stop(&srv);
