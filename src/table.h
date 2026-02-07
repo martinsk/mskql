@@ -1,0 +1,20 @@
+#ifndef TABLE_H
+#define TABLE_H
+
+#include "dynamic_array.h"
+#include "column.h"
+#include "row.h"
+#include "index.h"
+
+struct table {
+    char *name;
+    DYNAMIC_ARRAY(struct column) columns;
+    DYNAMIC_ARRAY(struct row) rows;
+    DYNAMIC_ARRAY(struct index) indexes;
+};
+
+void table_init(struct table *t, const char *name);
+void table_add_column(struct table *t, struct column *col);
+void table_free(struct table *t);
+
+#endif
