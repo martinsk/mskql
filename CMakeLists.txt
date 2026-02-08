@@ -60,7 +60,7 @@ if(BUILD_BENCHMARKS)
     FetchContent_Declare(
         benchmark
         GIT_REPOSITORY https://github.com/CodSpeedHQ/benchmark.git
-        GIT_TAG v1.9.1
+        GIT_TAG main
     )
     
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "Disable benchmark tests")
