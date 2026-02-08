@@ -72,6 +72,10 @@ static int is_keyword(sv word)
         "PRIMARY", "KEY", "DEFAULT", "CHECK", "UNIQUE",
         "ALTER", "ADD", "RENAME", "COLUMN", "TO",
         "BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION",
+        "INNER", "CROSS", "NATURAL", "USING",
+        "UNION", "INTERSECT", "EXCEPT", "ALL",
+        "WITH", "RECURSIVE", "EXISTS",
+        "CONFLICT", "DO", "NOTHING",
         NULL
     };
     for (int i = 0; keywords[i]; i++) {
@@ -422,6 +426,8 @@ static struct cell parse_literal_value(struct token tok)
             c.value.as_int = sv_atoi(tok.value);
         }
     } else if (tok.type == TOK_STRING) {
+        // TODO: sv_to_cstr heap-allocates; for short-lived comparisons in WHERE
+        // conditions this could use a stack buffer or sv-aware cell type
         c.type = COLUMN_TYPE_TEXT;
         c.value.as_text = sv_to_cstr(tok.value);
     } else if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "NULL")) {
@@ -444,9 +450,47 @@ static struct condition *parse_single_cond(struct lexer *l)
 {
     struct token tok = lexer_peek(l);
 
-    /* NOT expr */
+    /* EXISTS (SELECT ...) */
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "EXISTS")) {
+        lexer_next(l); /* consume EXISTS */
+        struct token lp = lexer_next(l);
+        if (lp.type != TOK_LPAREN) {
+            fprintf(stderr, "parse error: expected '(' after EXISTS\n");
+            return NULL;
+        }
+        struct token peek_sel = lexer_peek(l);
+        const char *sq_start = peek_sel.value.data;
+        int depth = 1;
+        while (depth > 0) {
+            struct token t = lexer_next(l);
+            if (t.type == TOK_LPAREN) depth++;
+            else if (t.type == TOK_RPAREN) depth--;
+            else if (t.type == TOK_EOF) {
+                fprintf(stderr, "parse error: unterminated EXISTS subquery\n");
+                return NULL;
+            }
+        }
+        const char *sq_end = l->input + l->pos - 1; /* before closing ')' */
+        struct condition *c = calloc(1, sizeof(*c));
+        c->type = COND_COMPARE;
+        c->op = CMP_EXISTS;
+        size_t sql_len = (size_t)(sq_end - sq_start);
+        c->subquery_sql = malloc(sql_len + 1);
+        memcpy(c->subquery_sql, sq_start, sql_len);
+        c->subquery_sql[sql_len] = '\0';
+        return c;
+    }
+
+    /* NOT expr / NOT EXISTS */
     if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "NOT")) {
         lexer_next(l); /* consume NOT */
+        struct token next_peek = lexer_peek(l);
+        if (next_peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(next_peek.value, "EXISTS")) {
+            struct condition *inner = parse_single_cond(l);
+            if (!inner) return NULL;
+            inner->op = CMP_NOT_EXISTS;
+            return inner;
+        }
         struct condition *inner = parse_single_cond(l);
         if (!inner) return NULL;
         struct condition *node = calloc(1, sizeof(*node));
@@ -1271,24 +1315,55 @@ parse_table_name:
         struct token pa = lexer_peek(l);
         if (pa.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(pa.value, "AS")) {
             lexer_next(l); /* consume AS */
-            lexer_next(l); /* consume alias name */
+            tok = lexer_next(l); /* consume alias name */
+            out->table_alias = tok.value;
         } else if (pa.type == TOK_IDENTIFIER) {
             /* bare alias — but only if it's not a keyword we expect next */
-            /* skip: it could be confused with WHERE, JOIN, ORDER, etc. */
+            if (!sv_eq_ignorecase_cstr(pa.value, "WHERE") &&
+                !sv_eq_ignorecase_cstr(pa.value, "ORDER") &&
+                !sv_eq_ignorecase_cstr(pa.value, "GROUP") &&
+                !sv_eq_ignorecase_cstr(pa.value, "LIMIT") &&
+                !sv_eq_ignorecase_cstr(pa.value, "JOIN") &&
+                !sv_eq_ignorecase_cstr(pa.value, "LEFT") &&
+                !sv_eq_ignorecase_cstr(pa.value, "RIGHT") &&
+                !sv_eq_ignorecase_cstr(pa.value, "FULL") &&
+                !sv_eq_ignorecase_cstr(pa.value, "INNER") &&
+                !sv_eq_ignorecase_cstr(pa.value, "CROSS") &&
+                !sv_eq_ignorecase_cstr(pa.value, "NATURAL") &&
+                !sv_eq_ignorecase_cstr(pa.value, "ON") &&
+                !sv_eq_ignorecase_cstr(pa.value, "UNION") &&
+                !sv_eq_ignorecase_cstr(pa.value, "INTERSECT") &&
+                !sv_eq_ignorecase_cstr(pa.value, "EXCEPT")) {
+                tok = lexer_next(l);
+                out->table_alias = tok.value;
+            }
         }
     }
 
-    /* optional: one or more [LEFT|RIGHT|FULL] [OUTER] JOIN table ON cond */
+    /* optional: one or more [INNER|LEFT|RIGHT|FULL|CROSS|NATURAL] [OUTER] JOIN table ... */
     da_init(&out->joins);
     for (;;) {
         struct token peek = lexer_peek(l);
         int jtype = 0; /* 0=INNER */
+        int is_natural = 0;
+
+        /* NATURAL prefix */
+        if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "NATURAL")) {
+            is_natural = 1;
+            lexer_next(l);
+            peek = lexer_peek(l);
+        }
+
         if (peek.type == TOK_KEYWORD && (sv_eq_ignorecase_cstr(peek.value, "LEFT") ||
                                           sv_eq_ignorecase_cstr(peek.value, "RIGHT") ||
-                                          sv_eq_ignorecase_cstr(peek.value, "FULL"))) {
+                                          sv_eq_ignorecase_cstr(peek.value, "FULL") ||
+                                          sv_eq_ignorecase_cstr(peek.value, "INNER") ||
+                                          sv_eq_ignorecase_cstr(peek.value, "CROSS"))) {
             if (sv_eq_ignorecase_cstr(peek.value, "LEFT"))  jtype = 1;
             if (sv_eq_ignorecase_cstr(peek.value, "RIGHT")) jtype = 2;
             if (sv_eq_ignorecase_cstr(peek.value, "FULL"))  jtype = 3;
+            if (sv_eq_ignorecase_cstr(peek.value, "CROSS")) jtype = 4;
+            /* INNER leaves jtype = 0 */
             lexer_next(l);
             peek = lexer_peek(l);
             if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "OUTER")) {
@@ -1302,6 +1377,7 @@ parse_table_name:
 
         struct join_info ji = {0};
         ji.join_type = jtype;
+        ji.is_natural = is_natural;
 
         tok = lexer_next(l);
         if (tok.type != TOK_IDENTIFIER && tok.type != TOK_STRING) {
@@ -1310,27 +1386,71 @@ parse_table_name:
         }
         ji.join_table = tok.value;
 
-        /* ON */
-        tok = lexer_next(l);
-        if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "ON")) {
-            fprintf(stderr, "parse error: expected ON after JOIN table\n");
-            return -1;
+        /* optional alias */
+        peek = lexer_peek(l);
+        if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "AS")) {
+            lexer_next(l); /* consume AS */
+            tok = lexer_next(l);
+            ji.join_alias = tok.value;
+        } else if (peek.type == TOK_IDENTIFIER) {
+            /* bare alias — but only if not a keyword we expect next */
+            if (!sv_eq_ignorecase_cstr(peek.value, "ON") &&
+                !sv_eq_ignorecase_cstr(peek.value, "USING") &&
+                !sv_eq_ignorecase_cstr(peek.value, "WHERE") &&
+                !sv_eq_ignorecase_cstr(peek.value, "ORDER") &&
+                !sv_eq_ignorecase_cstr(peek.value, "GROUP") &&
+                !sv_eq_ignorecase_cstr(peek.value, "LIMIT")) {
+                tok = lexer_next(l);
+                ji.join_alias = tok.value;
+            }
         }
 
-        /* left: table.col */
-        tok = lexer_next(l);
-        ji.join_left_col = consume_identifier(l, tok);
+        if (jtype == 4 && !is_natural) {
+            /* CROSS JOIN — no ON/USING clause */
+        } else if (is_natural) {
+            /* NATURAL JOIN — no ON/USING clause, resolved at execution time */
+        } else {
+            /* ON or USING */
+            peek = lexer_peek(l);
+            if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "USING")) {
+                lexer_next(l); /* consume USING */
+                tok = lexer_next(l); /* ( */
+                if (tok.type != TOK_LPAREN) {
+                    fprintf(stderr, "parse error: expected '(' after USING\n");
+                    return -1;
+                }
+                tok = lexer_next(l);
+                ji.has_using = 1;
+                ji.using_col = tok.value;
+                tok = lexer_next(l); /* ) */
+                if (tok.type != TOK_RPAREN) {
+                    fprintf(stderr, "parse error: expected ')' after USING column\n");
+                    return -1;
+                }
+            } else {
+                /* ON */
+                tok = lexer_next(l);
+                if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "ON")) {
+                    fprintf(stderr, "parse error: expected ON after JOIN table\n");
+                    return -1;
+                }
 
-        /* = */
-        tok = lexer_next(l);
-        if (tok.type != TOK_EQUALS) {
-            fprintf(stderr, "parse error: expected '=' in ON clause\n");
-            return -1;
+                /* left: table.col */
+                tok = lexer_next(l);
+                ji.join_left_col = consume_identifier(l, tok);
+
+                /* = */
+                tok = lexer_next(l);
+                if (tok.type != TOK_EQUALS) {
+                    fprintf(stderr, "parse error: expected '=' in ON clause\n");
+                    return -1;
+                }
+
+                /* right: table.col */
+                tok = lexer_next(l);
+                ji.join_right_col = consume_identifier(l, tok);
+            }
         }
-
-        /* right: table.col */
-        tok = lexer_next(l);
-        ji.join_right_col = consume_identifier(l, tok);
 
         da_push(&out->joins, ji);
     }
@@ -1353,8 +1473,70 @@ parse_table_name:
         }
     }
 
-    /* optional: ORDER BY / LIMIT / OFFSET */
+    /* optional: GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET */
     parse_order_limit(l, out);
+
+    /* optional: UNION / INTERSECT / EXCEPT */
+    {
+        struct token peek = lexer_peek(l);
+        if (peek.type == TOK_KEYWORD &&
+            (sv_eq_ignorecase_cstr(peek.value, "UNION") ||
+             sv_eq_ignorecase_cstr(peek.value, "INTERSECT") ||
+             sv_eq_ignorecase_cstr(peek.value, "EXCEPT"))) {
+            if (sv_eq_ignorecase_cstr(peek.value, "UNION"))     out->set_op = 0;
+            if (sv_eq_ignorecase_cstr(peek.value, "INTERSECT")) out->set_op = 1;
+            if (sv_eq_ignorecase_cstr(peek.value, "EXCEPT"))    out->set_op = 2;
+            out->has_set_op = 1;
+            lexer_next(l); /* consume UNION/INTERSECT/EXCEPT */
+            peek = lexer_peek(l);
+            if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "ALL")) {
+                out->set_all = 1;
+                lexer_next(l);
+            }
+            /* capture rest of input as the RHS SQL */
+            while (l->pos < strlen(l->input) && (l->input[l->pos] == ' ' || l->input[l->pos] == '\t'))
+                l->pos++;
+            const char *rhs_start = l->input + l->pos;
+            size_t rhs_len = strlen(l->input) - l->pos;
+            /* trim trailing semicolons and whitespace */
+            while (rhs_len > 0 && (rhs_start[rhs_len-1] == ';' || rhs_start[rhs_len-1] == ' '
+                                    || rhs_start[rhs_len-1] == '\n'))
+                rhs_len--;
+            /* find trailing ORDER BY (not inside parens) to apply to combined result */
+            int paren_depth = 0;
+            size_t last_order = (size_t)-1;
+            for (size_t i = 0; i + 7 < rhs_len; i++) {
+                if (rhs_start[i] == '(') paren_depth++;
+                else if (rhs_start[i] == ')') paren_depth--;
+                else if (paren_depth == 0 &&
+                         (rhs_start[i] == 'O' || rhs_start[i] == 'o') &&
+                         (rhs_start[i+1] == 'R' || rhs_start[i+1] == 'r') &&
+                         (rhs_start[i+2] == 'D' || rhs_start[i+2] == 'd') &&
+                         (rhs_start[i+3] == 'E' || rhs_start[i+3] == 'e') &&
+                         (rhs_start[i+4] == 'R' || rhs_start[i+4] == 'r') &&
+                         rhs_start[i+5] == ' ' &&
+                         (rhs_start[i+6] == 'B' || rhs_start[i+6] == 'b') &&
+                         (rhs_start[i+7] == 'Y' || rhs_start[i+7] == 'y')) {
+                    last_order = i;
+                }
+            }
+            if (last_order != (size_t)-1) {
+                /* parse the ORDER BY for the combined result */
+                const char *ob_str = rhs_start + last_order;
+                size_t ob_len = rhs_len - last_order;
+                /* store the ORDER BY text for the combined result */
+                out->set_order_by = malloc(ob_len + 1);
+                memcpy(out->set_order_by, ob_str, ob_len);
+                out->set_order_by[ob_len] = '\0';
+                rhs_len = last_order;
+                /* trim whitespace before ORDER BY */
+                while (rhs_len > 0 && rhs_start[rhs_len-1] == ' ') rhs_len--;
+            }
+            out->set_rhs_sql = malloc(rhs_len + 1);
+            memcpy(out->set_rhs_sql, rhs_start, rhs_len);
+            out->set_rhs_sql[rhs_len] = '\0';
+        }
+    }
 
     return 0;
 }
@@ -1392,6 +1574,8 @@ static int parse_value_tuple(struct lexer *l, struct row *r)
                 }
             }
         } else if (tok.type == TOK_STRING) {
+            // TODO: sv_to_cstr heap-allocates per string value in every INSERT row;
+            // for bulk inserts this is many small allocations that could be batched
             c.type = COLUMN_TYPE_TEXT;
             c.value.as_text = sv_to_cstr(tok.value);
         } else if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "NULL")) {
@@ -1452,8 +1636,22 @@ static int parse_insert(struct lexer *l, struct query *out)
         }
         tok = lexer_next(l);
     }
+    /* INSERT ... SELECT ... */
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "SELECT")) {
+        /* capture everything from SELECT to end as insert_select_sql */
+        const char *sel_start = tok.value.data;
+        size_t sel_len = strlen(sel_start);
+        while (sel_len > 0 && (sel_start[sel_len-1] == ';' || sel_start[sel_len-1] == ' '
+                                || sel_start[sel_len-1] == '\n'))
+            sel_len--;
+        out->insert_select_sql = malloc(sel_len + 1);
+        memcpy(out->insert_select_sql, sel_start, sel_len);
+        out->insert_select_sql[sel_len] = '\0';
+        return 0;
+    }
+
     if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "VALUES")) {
-        fprintf(stderr, "parse error: expected VALUES\n");
+        fprintf(stderr, "parse error: expected VALUES or SELECT\n");
         return -1;
     }
 
@@ -1477,8 +1675,31 @@ static int parse_insert(struct lexer *l, struct query *out)
         out->insert_row = &out->insert_rows.items[0];
     }
 
-    /* optional RETURNING col, col, ... */
+    /* optional ON CONFLICT ... DO NOTHING */
     struct token peek = lexer_peek(l);
+    if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "ON")) {
+        lexer_next(l); /* consume ON */
+        tok = lexer_next(l); /* CONFLICT */
+        if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "CONFLICT")) {
+            out->has_on_conflict = 1;
+            peek = lexer_peek(l);
+            /* optional (column) */
+            if (peek.type == TOK_LPAREN) {
+                lexer_next(l); /* ( */
+                tok = lexer_next(l);
+                out->conflict_column = tok.value;
+                lexer_next(l); /* ) */
+            }
+            tok = lexer_next(l); /* DO */
+            tok = lexer_next(l); /* NOTHING */
+            if (sv_eq_ignorecase_cstr(tok.value, "NOTHING")) {
+                out->on_conflict_do_nothing = 1;
+            }
+        }
+        peek = lexer_peek(l);
+    }
+
+    /* optional RETURNING col, col, ... */
     if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "RETURNING")) {
         lexer_next(l); /* consume RETURNING */
         tok = lexer_next(l);
@@ -1831,6 +2052,26 @@ static int parse_delete(struct lexer *l, struct query *out)
         if (parse_where_clause(l, out) != 0) return -1;
     }
 
+    /* optional RETURNING */
+    peek = lexer_peek(l);
+    if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "RETURNING")) {
+        lexer_next(l);
+        out->has_returning = 1;
+        tok = lexer_next(l);
+        if (tok.type == TOK_STAR) {
+            out->returning_columns = tok.value;
+        } else {
+            const char *start = tok.value.data;
+            const char *end = tok.value.data + tok.value.len;
+            for (;;) {
+                struct token p = lexer_peek(l);
+                if (p.type == TOK_COMMA) { lexer_next(l); tok = lexer_next(l); end = tok.value.data + tok.value.len; }
+                else break;
+            }
+            out->returning_columns = sv_from(start, (size_t)(end - start));
+        }
+    }
+
     return 0;
 }
 
@@ -1879,11 +2120,55 @@ static int parse_update(struct lexer *l, struct query *out)
         lexer_next(l); /* consume comma */
     }
 
+    /* optional FROM table */
+    {
+        struct token peek2 = lexer_peek(l);
+        if (peek2.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek2.value, "FROM")) {
+            lexer_next(l); /* consume FROM */
+            tok = lexer_next(l);
+            out->has_update_from = 1;
+            out->update_from_table = tok.value;
+        }
+    }
+
     /* optional WHERE */
-    struct token peek = lexer_peek(l);
-    if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "WHERE")) {
-        lexer_next(l);
-        if (parse_where_clause(l, out) != 0) return -1;
+    {
+        struct token peek2 = lexer_peek(l);
+        if (peek2.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek2.value, "WHERE")) {
+            lexer_next(l);
+            if (out->has_update_from) {
+                /* UPDATE ... FROM ... WHERE t1.col = t2.col — parse as join condition */
+                tok = lexer_next(l);
+                out->update_from_join_left = consume_identifier(l, tok);
+                tok = lexer_next(l); /* = */
+                tok = lexer_next(l);
+                out->update_from_join_right = consume_identifier(l, tok);
+            } else {
+                if (parse_where_clause(l, out) != 0) return -1;
+            }
+        }
+    }
+
+    /* optional RETURNING */
+    {
+        struct token peek2 = lexer_peek(l);
+        if (peek2.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek2.value, "RETURNING")) {
+            lexer_next(l);
+            out->has_returning = 1;
+            tok = lexer_next(l);
+            if (tok.type == TOK_STAR) {
+                out->returning_columns = tok.value;
+            } else {
+                const char *start = tok.value.data;
+                const char *end = tok.value.data + tok.value.len;
+                for (;;) {
+                    struct token p = lexer_peek(l);
+                    if (p.type == TOK_COMMA) { lexer_next(l); tok = lexer_next(l); end = tok.value.data + tok.value.len; }
+                    else break;
+                }
+                out->returning_columns = sv_from(start, (size_t)(end - start));
+            }
+        }
     }
 
     return 0;
@@ -2001,6 +2286,52 @@ int query_parse(const char *sql, struct query *out)
     if (tok.type != TOK_KEYWORD) {
         fprintf(stderr, "parse error: expected SQL keyword, got '" SV_FMT "'\n", SV_ARG(tok.value));
         return -1;
+    }
+
+    /* WITH name AS (...) SELECT ... (CTE) */
+    if (sv_eq_ignorecase_cstr(tok.value, "WITH")) {
+        tok = lexer_next(&l);
+        if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
+            fprintf(stderr, "parse error: expected CTE name after WITH\n");
+            return -1;
+        }
+        size_t name_len = tok.value.len;
+        out->cte_name = malloc(name_len + 1);
+        memcpy(out->cte_name, tok.value.data, name_len);
+        out->cte_name[name_len] = '\0';
+
+        tok = lexer_next(&l); /* AS */
+        tok = lexer_next(&l); /* ( */
+        if (tok.type != TOK_LPAREN) {
+            fprintf(stderr, "parse error: expected '(' after AS in CTE\n");
+            return -1;
+        }
+        const char *cte_start = l.input + l.pos;
+        int depth = 1;
+        while (depth > 0) {
+            tok = lexer_next(&l);
+            if (tok.type == TOK_LPAREN) depth++;
+            else if (tok.type == TOK_RPAREN) depth--;
+            else if (tok.type == TOK_EOF) {
+                fprintf(stderr, "parse error: unterminated CTE\n");
+                return -1;
+            }
+        }
+        const char *cte_end = tok.value.data; /* points at ')' */
+        size_t cte_len = (size_t)(cte_end - cte_start);
+        while (cte_len > 0 && (cte_start[cte_len-1] == ' ' || cte_start[cte_len-1] == '\n'))
+            cte_len--;
+        out->cte_sql = malloc(cte_len + 1);
+        memcpy(out->cte_sql, cte_start, cte_len);
+        out->cte_sql[cte_len] = '\0';
+
+        /* now parse the main SELECT */
+        tok = lexer_next(&l);
+        if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "SELECT")) {
+            fprintf(stderr, "parse error: expected SELECT after CTE\n");
+            return -1;
+        }
+        return parse_select(&l, out);
     }
 
     if (sv_eq_ignorecase_cstr(tok.value, "CREATE"))

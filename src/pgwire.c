@@ -136,71 +136,54 @@ static int msg_send(int fd, char type, struct msgbuf *body)
     return 0;
 }
 
-/* ---- protocol messages ---- */
+/* ---- protocol messages (all share a caller-owned msgbuf, reset before use) ---- */
 
-static int send_auth_ok(int fd)
+static int send_auth_ok(int fd, struct msgbuf *m)
 {
-    struct msgbuf m;
-    msgbuf_init(&m);
-    msgbuf_push_u32(&m, 0); /* AuthenticationOk */
-    int rc = msg_send(fd, 'R', &m);
-    msgbuf_free(&m);
-    return rc;
+    m->len = 0;
+    msgbuf_push_u32(m, 0); /* AuthenticationOk */
+    return msg_send(fd, 'R', m);
 }
 
-static int send_parameter_status(int fd, const char *name, const char *value)
+static int send_parameter_status(int fd, struct msgbuf *m,
+                                 const char *name, const char *value)
 {
-    struct msgbuf m;
-    msgbuf_init(&m);
-    msgbuf_push_cstr(&m, name);
-    msgbuf_push_cstr(&m, value);
-    int rc = msg_send(fd, 'S', &m);
-    msgbuf_free(&m);
-    return rc;
+    m->len = 0;
+    msgbuf_push_cstr(m, name);
+    msgbuf_push_cstr(m, value);
+    return msg_send(fd, 'S', m);
 }
 
-static int send_ready_for_query(int fd, char status)
+static int send_ready_for_query(int fd, struct msgbuf *m, char status)
 {
-    struct msgbuf m;
-    msgbuf_init(&m);
-    msgbuf_push_byte(&m, (uint8_t)status);
-    int rc = msg_send(fd, 'Z', &m);
-    msgbuf_free(&m);
-    return rc;
+    m->len = 0;
+    msgbuf_push_byte(m, (uint8_t)status);
+    return msg_send(fd, 'Z', m);
 }
 
-static int send_error(int fd, const char *severity, const char *code,
-                      const char *message)
+static int send_error(int fd, struct msgbuf *m, const char *severity,
+                      const char *code, const char *message)
 {
-    struct msgbuf m;
-    msgbuf_init(&m);
-    msgbuf_push_byte(&m, 'S'); msgbuf_push_cstr(&m, severity);
-    msgbuf_push_byte(&m, 'V'); msgbuf_push_cstr(&m, severity);
-    msgbuf_push_byte(&m, 'C'); msgbuf_push_cstr(&m, code);
-    msgbuf_push_byte(&m, 'M'); msgbuf_push_cstr(&m, message);
-    msgbuf_push_byte(&m, 0);   /* terminator */
-    int rc = msg_send(fd, 'E', &m);
-    msgbuf_free(&m);
-    return rc;
+    m->len = 0;
+    msgbuf_push_byte(m, 'S'); msgbuf_push_cstr(m, severity);
+    msgbuf_push_byte(m, 'V'); msgbuf_push_cstr(m, severity);
+    msgbuf_push_byte(m, 'C'); msgbuf_push_cstr(m, code);
+    msgbuf_push_byte(m, 'M'); msgbuf_push_cstr(m, message);
+    msgbuf_push_byte(m, 0);   /* terminator */
+    return msg_send(fd, 'E', m);
 }
 
-static int send_command_complete(int fd, const char *tag)
+static int send_command_complete(int fd, struct msgbuf *m, const char *tag)
 {
-    struct msgbuf m;
-    msgbuf_init(&m);
-    msgbuf_push_cstr(&m, tag);
-    int rc = msg_send(fd, 'C', &m);
-    msgbuf_free(&m);
-    return rc;
+    m->len = 0;
+    msgbuf_push_cstr(m, tag);
+    return msg_send(fd, 'C', m);
 }
 
-static int send_empty_query(int fd)
+static int send_empty_query(int fd, struct msgbuf *m)
 {
-    struct msgbuf m;
-    msgbuf_init(&m);
-    int rc = msg_send(fd, 'I', &m);
-    msgbuf_free(&m);
-    return rc;
+    m->len = 0;
+    return msg_send(fd, 'I', m);
 }
 
 /* map our column types to PG OIDs */
@@ -380,33 +363,34 @@ static int send_data_rows(int fd, struct rows *result)
 
 /* ---- handle a single query string (may contain one statement) ---- */
 
-static int handle_query(int fd, struct database *db, const char *sql)
+static int handle_query(int fd, struct database *db, const char *sql,
+                        struct msgbuf *m)
 {
     /* skip empty / whitespace-only queries */
     const char *p = sql;
     while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
     if (*p == '\0') {
-        send_empty_query(fd);
-        send_ready_for_query(fd, 'I');
+        send_empty_query(fd, m);
+        send_ready_for_query(fd, m, 'I');
         return 0;
     }
 
     struct query q = {0};
     if (query_parse(sql, &q) != 0) {
         query_free(&q);
-        send_error(fd, "ERROR", "42601", "syntax error or unsupported statement");
-        send_ready_for_query(fd, 'I');
+        send_error(fd, m, "ERROR", "42601", "syntax error or unsupported statement");
+        send_ready_for_query(fd, m, 'I');
         return 0;
     }
 
     struct rows result = {0};
     int rc = db_exec(db, &q, &result);
 
-    if (rc != 0) {
-        send_error(fd, "ERROR", "42000", "query execution failed");
+    if (rc < 0) {
+        send_error(fd, m, "ERROR", "42000", "query execution failed");
         rows_free(&result);
         query_free(&q);
-        send_ready_for_query(fd, 'I');
+        send_ready_for_query(fd, m, 'I');
         return 0;
     }
 
@@ -431,21 +415,36 @@ static int handle_query(int fd, struct database *db, const char *sql)
                 send_row_description(fd, db, &q, &result);
                 send_data_rows(fd, &result);
             }
-            snprintf(tag, sizeof(tag), "INSERT 0 %zu",
-                     q.insert_rows.count);
+            {
+                size_t ins_count = q.insert_rows.count;
+                if (rc > 0) ins_count = (size_t)rc; /* INSERT...SELECT */
+                snprintf(tag, sizeof(tag), "INSERT 0 %zu", ins_count);
+            }
             break;
         case QUERY_TYPE_DELETE: {
-            size_t del_count = 0;
-            if (result.count > 0 && result.data[0].cells.count > 0)
-                del_count = (size_t)result.data[0].cells.items[0].value.as_int;
-            snprintf(tag, sizeof(tag), "DELETE %zu", del_count);
+            if (q.has_returning && result.count > 0) {
+                send_row_description(fd, db, &q, &result);
+                send_data_rows(fd, &result);
+                snprintf(tag, sizeof(tag), "DELETE %zu", result.count);
+            } else {
+                size_t del_count = 0;
+                if (result.count > 0 && result.data[0].cells.count > 0)
+                    del_count = (size_t)result.data[0].cells.items[0].value.as_int;
+                snprintf(tag, sizeof(tag), "DELETE %zu", del_count);
+            }
             break;
         }
         case QUERY_TYPE_UPDATE: {
-            size_t upd_count = 0;
-            if (result.count > 0 && result.data[0].cells.count > 0)
-                upd_count = (size_t)result.data[0].cells.items[0].value.as_int;
-            snprintf(tag, sizeof(tag), "UPDATE %zu", upd_count);
+            if (q.has_returning && result.count > 0) {
+                send_row_description(fd, db, &q, &result);
+                send_data_rows(fd, &result);
+                snprintf(tag, sizeof(tag), "UPDATE %zu", result.count);
+            } else {
+                size_t upd_count = 0;
+                if (result.count > 0 && result.data[0].cells.count > 0)
+                    upd_count = (size_t)result.data[0].cells.items[0].value.as_int;
+                snprintf(tag, sizeof(tag), "UPDATE %zu", upd_count);
+            }
             break;
         }
         case QUERY_TYPE_CREATE_INDEX:
@@ -474,10 +473,10 @@ static int handle_query(int fd, struct database *db, const char *sql)
             break;
     }
 
-    send_command_complete(fd, tag);
+    send_command_complete(fd, m, tag);
     rows_free(&result);
     query_free(&q);
-    send_ready_for_query(fd, 'I');
+    send_ready_for_query(fd, m, 'I');
     return 0;
 }
 
@@ -485,6 +484,9 @@ static int handle_query(int fd, struct database *db, const char *sql)
 
 static void handle_client(int client_fd, struct database *db)
 {
+    /* single msgbuf reused for all protocol messages on this connection */
+    struct msgbuf conn_buf;
+    msgbuf_init(&conn_buf);
 
     /* read startup message: int32 length, int32 protocol version, then params */
     uint8_t lenbuf[4];
@@ -505,13 +507,14 @@ static void handle_client(int client_fd, struct database *db)
     if (version == 80877103) {
         uint8_t n = 'N';
         send_all(client_fd, &n, 1);
-        free(startup);
 
-        /* client will retry with a normal startup */
-        if (read_all(client_fd, lenbuf, 4) != 0) goto done;
+        /* client will retry with a normal startup — reuse buffer */
+        if (read_all(client_fd, lenbuf, 4) != 0) { free(startup); goto done; }
         startup_len = read_u32(lenbuf);
-        if (startup_len < 8 || startup_len > 65536) goto done;
-        startup = malloc(startup_len);
+        if (startup_len < 8 || startup_len > 65536) { free(startup); goto done; }
+        void *tmp = realloc(startup, startup_len);
+        if (!tmp) { free(startup); goto done; }
+        startup = tmp;
         put_u32(startup, startup_len);
         if (read_all(client_fd, startup + 4, startup_len - 4) != 0) {
             free(startup);
@@ -532,26 +535,24 @@ static void handle_client(int client_fd, struct database *db)
     }
 
     /* send AuthenticationOk */
-    send_auth_ok(client_fd);
+    send_auth_ok(client_fd, &conn_buf);
 
     /* send some parameter status messages that clients expect */
-    send_parameter_status(client_fd, "server_version", "15.0");
-    send_parameter_status(client_fd, "server_encoding", "UTF8");
-    send_parameter_status(client_fd, "client_encoding", "UTF8");
-    send_parameter_status(client_fd, "DateStyle", "ISO, MDY");
-    send_parameter_status(client_fd, "integer_datetimes", "on");
+    send_parameter_status(client_fd, &conn_buf, "server_version", "15.0");
+    send_parameter_status(client_fd, &conn_buf, "server_encoding", "UTF8");
+    send_parameter_status(client_fd, &conn_buf, "client_encoding", "UTF8");
+    send_parameter_status(client_fd, &conn_buf, "DateStyle", "ISO, MDY");
+    send_parameter_status(client_fd, &conn_buf, "integer_datetimes", "on");
 
     /* BackendKeyData (fake) */
     {
-        struct msgbuf m;
-        msgbuf_init(&m);
-        msgbuf_push_u32(&m, (uint32_t)getpid());
-        msgbuf_push_u32(&m, 0); /* secret key */
-        msg_send(client_fd, 'K', &m);
-        msgbuf_free(&m);
+        conn_buf.len = 0;
+        msgbuf_push_u32(&conn_buf, (uint32_t)getpid());
+        msgbuf_push_u32(&conn_buf, 0); /* secret key */
+        msg_send(client_fd, 'K', &conn_buf);
     }
 
-    send_ready_for_query(client_fd, 'I');
+    send_ready_for_query(client_fd, &conn_buf, 'I');
 
     /* main message loop */
     for (;;) {
@@ -577,7 +578,7 @@ static void handle_client(int client_fd, struct database *db)
         switch (msg_type) {
             case 'Q': /* Simple Query */
                 if (body) {
-                    handle_query(client_fd, db, body);
+                    handle_query(client_fd, db, body, &conn_buf);
                 }
                 break;
             case 'X': /* Terminate */
@@ -592,6 +593,7 @@ static void handle_client(int client_fd, struct database *db)
     }
 
 done:
+    msgbuf_free(&conn_buf);
     close(client_fd);
 }
 

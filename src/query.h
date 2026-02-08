@@ -62,7 +62,9 @@ enum cmp_op {
     CMP_LIKE,
     CMP_ILIKE,
     CMP_IS_DISTINCT,
-    CMP_IS_NOT_DISTINCT
+    CMP_IS_NOT_DISTINCT,
+    CMP_EXISTS,
+    CMP_NOT_EXISTS
 };
 
 enum cond_type {
@@ -122,10 +124,14 @@ enum alter_action {
 };
 
 struct join_info {
-    int join_type; /* 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL */
+    int join_type; /* 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL, 4=CROSS */
     sv join_table;
+    sv join_alias;
     sv join_left_col;
     sv join_right_col;
+    int has_using;
+    sv using_col;
+    int is_natural;
 };
 
 struct order_by_item {
@@ -138,6 +144,7 @@ struct query {
     int has_distinct;
     sv columns;
     sv table;
+    sv table_alias;
     struct row *insert_row;
     DYNAMIC_ARRAY(struct row) insert_rows;
     sv returning_columns;
@@ -176,6 +183,28 @@ struct query {
     sv alter_column;
     sv alter_new_name;
     struct column alter_new_col;
+    /* set operations: UNION / INTERSECT / EXCEPT */
+    int has_set_op;
+    int set_op;       /* 0=UNION, 1=INTERSECT, 2=EXCEPT */
+    int set_all;      /* UNION ALL etc. */
+    char *set_rhs_sql; /* right-hand SELECT as raw SQL */
+    char *set_order_by; /* ORDER BY clause for combined set result */
+    /* CTE support */
+    char *cte_name;
+    char *cte_sql;
+    /* INSERT ... SELECT */
+    char *insert_select_sql;
+    /* ON CONFLICT */
+    int has_on_conflict;
+    int on_conflict_do_nothing;
+    sv conflict_column;
+    /* RETURNING on UPDATE/DELETE */
+    int has_returning;
+    /* UPDATE ... FROM */
+    int has_update_from;
+    sv update_from_table;
+    sv update_from_join_left;
+    sv update_from_join_right;
 };
 
 int query_exec(struct table *t, struct query *q, struct rows *result);

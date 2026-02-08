@@ -60,8 +60,7 @@ static struct btree_node *node_alloc(int is_leaf)
 static void cell_dup(struct cell *dst, const struct cell *src)
 {
     dst->type = src->type;
-    if ((src->type == COLUMN_TYPE_TEXT || src->type == COLUMN_TYPE_ENUM)
-        && src->value.as_text)
+    if (column_type_is_text(src->type) && src->value.as_text)
         dst->value.as_text = strdup(src->value.as_text);
     else
         dst->value = src->value;
@@ -69,8 +68,7 @@ static void cell_dup(struct cell *dst, const struct cell *src)
 
 static void entry_free(struct btree_entry *e)
 {
-    if ((e->key.type == COLUMN_TYPE_TEXT || e->key.type == COLUMN_TYPE_ENUM)
-        && e->key.value.as_text)
+    if (column_type_is_text(e->key.type) && e->key.value.as_text)
         free(e->key.value.as_text);
     da_free(&e->row_ids);
 }

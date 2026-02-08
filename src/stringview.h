@@ -24,6 +24,11 @@ static inline sv sv_from(const char *data, size_t len)
     return (sv){ .data = data, .len = len };
 }
 
+static inline sv sv_from_cstr(const char *cstr)
+{
+    return (sv){ .data = cstr, .len = cstr ? strlen(cstr) : 0 };
+}
+
 static inline bool sv_eq(sv a, sv b)
 {
     if (a.len != b.len) return false;

@@ -8,19 +8,70 @@ mskql is a from-scratch SQL database that speaks the PostgreSQL wire protocol. Y
 
 ## Features
 
-- **PostgreSQL wire protocol** — connect on port 5433 with `psql` or any Postgres-compatible client
-- **DDL** — `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE TYPE`, `DROP TYPE`
-- **DML** — `INSERT` (single and multi-row), `SELECT`, `UPDATE`, `DELETE`
-- **Data types** — `INT`, `BIGINT`, `FLOAT`, `NUMERIC`, `TEXT`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `UUID`, and user-defined `ENUM` types
-- **Filtering** — `WHERE` with `AND`/`OR`/`NOT`, `BETWEEN`, `IN`, `LIKE`, `ILIKE`, `IS NULL`, `IS DISTINCT FROM`, and subqueries
-- **Joins** — `INNER`, `LEFT`, `RIGHT`, and `FULL OUTER JOIN`
-- **Aggregation** — `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` with `GROUP BY` and `HAVING`
-- **Window functions** — `ROW_NUMBER()`, `RANK()`, `SUM()`, `COUNT()`, `AVG()` with `OVER (PARTITION BY … ORDER BY …)`
-- **Expressions** — arithmetic (`+`, `-`, `*`), `CASE WHEN … THEN … ELSE … END`, `COALESCE`
-- **Result control** — `DISTINCT`, `ORDER BY` (multi-column, `ASC`/`DESC`), `LIMIT`, `OFFSET`, column aliases
-- **Constraints** — `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `DEFAULT` values
-- **Indexing** — B-tree-style indexes for accelerated lookups
+### Protocol
+- **PostgreSQL wire protocol** — connect on port 5433 with `psql` or any Postgres-compatible client (SSL negotiation handled)
+
+### DDL
+- **Tables** — `CREATE TABLE`, `DROP TABLE`
+- **Indexes** — `CREATE INDEX`, `DROP INDEX` (B-tree-style for accelerated lookups)
+- **Types** — `CREATE TYPE … AS ENUM (…)`, `DROP TYPE`
+- **ALTER TABLE** — `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `ALTER COLUMN TYPE`
+
+### DML
+- **INSERT** — single-row, multi-row, and `INSERT … SELECT`
+- **SELECT** — with `*`, column lists, aliases, and expressions
+- **UPDATE** — including `UPDATE … FROM` for join-based updates
+- **DELETE** — with `WHERE` filtering
 - **`RETURNING`** — get back rows affected by `INSERT`, `UPDATE`, or `DELETE`
+- **`ON CONFLICT DO NOTHING`** — upsert-style conflict handling
+
+### Data Types
+`INT`, `BIGINT`, `FLOAT`, `NUMERIC`/`DECIMAL`, `TEXT`, `VARCHAR(n)`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `UUID`, `SERIAL`, and user-defined `ENUM` types
+
+### Filtering & Conditions
+- `WHERE` with `AND`/`OR`/`NOT` and parenthesized grouping
+- `BETWEEN`, `IN` (value lists and subqueries), `LIKE`, `ILIKE`
+- `IS NULL`, `IS NOT NULL`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`
+- Comparison operators: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`
+
+### Joins
+- `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`
+- `NATURAL JOIN` and `JOIN … USING (col)`
+- Multi-table joins
+
+### Aggregation
+- Functions: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
+- `GROUP BY` (single and multi-column)
+- `HAVING` for post-aggregation filtering
+
+### Window Functions
+- `ROW_NUMBER()`, `RANK()`, `SUM()`, `COUNT()`, `AVG()`
+- `OVER (PARTITION BY … ORDER BY …)`
+
+### Set Operations
+- `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
+- `ORDER BY` on combined results
+
+### Common Table Expressions
+- `WITH name AS (SELECT …) SELECT …`
+
+### Expressions
+- Arithmetic: `+`, `-`, `*`
+- `CASE WHEN … THEN … ELSE … END`
+- `COALESCE(…)`
+
+### Result Control
+- `DISTINCT`
+- `ORDER BY` (multi-column, individual `ASC`/`DESC` per column)
+- `LIMIT` and `OFFSET`
+
+### Constraints
+- `NOT NULL`, `UNIQUE`, `PRIMARY KEY`
+- `DEFAULT` values
+- `CHECK` (parsed)
+
+### Transactions
+- `BEGIN`, `COMMIT`, `ROLLBACK` with snapshot-based rollback
 
 ## Getting started
 
@@ -62,7 +113,7 @@ SELECT * FROM users;
 make test
 ```
 
-This builds the project, starts a fresh server instance for each test case, and validates output against expected results using `psql`.
+This builds the project, starts a fresh server instance for each test case, and validates output against expected results using `psql`. The suite currently contains **160 test cases**.
 
 ## How this project was built
 

@@ -11,6 +11,14 @@ void table_init(struct table *t, const char *name)
     da_init(&t->indexes);
 }
 
+void table_init_own(struct table *t, char *name)
+{
+    t->name = name;
+    da_init(&t->columns);
+    da_init(&t->rows);
+    da_init(&t->indexes);
+}
+
 void table_add_column(struct table *t, struct column *col)
 {
     struct column c = {

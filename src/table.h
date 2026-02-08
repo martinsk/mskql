@@ -16,6 +16,7 @@ struct table {
 };
 
 void table_init(struct table *t, const char *name);
+void table_init_own(struct table *t, char *name); /* takes ownership of name */
 void table_add_column(struct table *t, struct column *col);
 void table_free(struct table *t);
 void table_deep_copy(struct table *dst, const struct table *src);

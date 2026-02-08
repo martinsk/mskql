@@ -125,6 +125,12 @@ void query_free(struct query *q)
         free_cell_text(q->alter_new_col.default_value);
         free(q->alter_new_col.default_value);
     }
+
+    free(q->set_rhs_sql);
+    free(q->set_order_by);
+    free(q->cte_name);
+    free(q->cte_sql);
+    free(q->insert_select_sql);
 }
 
 static int cell_cmp(const struct cell *a, const struct cell *b)
@@ -191,6 +197,11 @@ int eval_condition(struct condition *cond, struct row *row,
         case COND_NOT:
             return !eval_condition(cond->left, row, t);
         case COND_COMPARE: {
+            /* EXISTS / NOT EXISTS — no column reference needed */
+            if (cond->op == CMP_EXISTS)
+                return cond->value.value.as_int != 0;
+            if (cond->op == CMP_NOT_EXISTS)
+                return cond->value.value.as_int == 0;
             int col_idx = find_col_idx(t, cond->column);
             if (col_idx < 0) return 0;
             struct cell *c = &row->cells.items[col_idx];
@@ -257,6 +268,8 @@ int eval_condition(struct condition *cond, struct row *row,
                 case CMP_ILIKE:
                 case CMP_IS_DISTINCT:
                 case CMP_IS_NOT_DISTINCT:
+                case CMP_EXISTS:
+                case CMP_NOT_EXISTS:
                     return 0;
             }
         }
@@ -306,6 +319,8 @@ static int sv_starts_with_ci(sv s, const char *prefix)
     return 1;
 }
 
+// TODO: eval_coalesce does manual comma-splitting and type detection on raw sv;
+// could reuse the lexer for tokenization and parse_literal_value for type inference
 /* evaluate COALESCE(arg1, arg2, ...) — returns first non-NULL argument */
 static struct cell eval_coalesce(sv expr, struct table *t, struct row *src)
 {
@@ -388,6 +403,8 @@ static struct cell eval_coalesce(sv expr, struct table *t, struct row *src)
     return null_cell;
 }
 
+// TODO: eval_case_when does manual keyword scanning with strncasecmp on raw sv;
+// could reuse the lexer and condition parser for more robust and maintainable parsing
 /* evaluate CASE WHEN cond THEN val [WHEN cond THEN val]* [ELSE val] END */
 static struct cell eval_case_when(sv expr, struct table *t, struct row *src)
 {
@@ -688,8 +705,7 @@ static void emit_row(struct table *t, struct query *q, struct row *src,
         for (size_t j = 0; j < src->cells.count; j++) {
             struct cell c = src->cells.items[j];
             struct cell copy = { .type = c.type, .is_null = c.is_null };
-            if ((c.type == COLUMN_TYPE_TEXT || c.type == COLUMN_TYPE_ENUM)
-                && c.value.as_text)
+            if (column_type_is_text(c.type) && c.value.as_text)
                 copy.value.as_text = strdup(c.value.as_text);
             else
                 copy.value = c.value;
@@ -835,11 +851,14 @@ static int query_aggregate(struct table *t, struct query *q, struct rows *result
         }
     }
 
-    /* accumulate */
-    double *sums = calloc(q->aggregates.count, sizeof(double));
-    double *mins = malloc(q->aggregates.count * sizeof(double));
-    double *maxs = malloc(q->aggregates.count * sizeof(double));
-    int *minmax_init = calloc(q->aggregates.count, sizeof(int));
+    /* accumulate — single allocation for all aggregate arrays */
+    size_t _nagg = q->aggregates.count;
+    size_t _agg_alloc = _nagg * (3 * sizeof(double) + sizeof(int));
+    char *_agg_buf = calloc(1, _agg_alloc ? _agg_alloc : 1);
+    double *sums = (double *)_agg_buf;
+    double *mins = sums + _nagg;
+    double *maxs = mins + _nagg;
+    int *minmax_init = (int *)(maxs + _nagg);
     size_t row_count = 0;
 
     for (size_t i = 0; i < t->rows.count; i++) {
@@ -909,10 +928,7 @@ static int query_aggregate(struct table *t, struct query *q, struct rows *result
     }
     rows_push(result, dst);
 
-    free(sums);
-    free(mins);
-    free(maxs);
-    free(minmax_init);
+    free(_agg_buf);
     free(agg_col);
     return 0;
 }
@@ -921,6 +937,11 @@ static void copy_cell_into(struct cell *dst, const struct cell *src);
 
 static int find_col_idx(struct table *t, sv name)
 {
+    /* first try exact match (handles qualified column names like "prices.id") */
+    for (size_t j = 0; j < t->columns.count; j++) {
+        if (sv_eq_cstr(name, t->columns.items[j].name))
+            return (int)j;
+    }
     /* strip table prefix if present (e.g. t1.id -> id) */
     sv col = name;
     for (size_t k = 0; k < name.len; k++) {
@@ -935,6 +956,17 @@ static int find_col_idx(struct table *t, sv name)
     }
     return -1;
 }
+
+/* qsort context for multi-column ORDER BY (single-threaded, so static is fine) */
+struct sort_ctx {
+    int *cols;
+    int *descs;
+    size_t ncols;
+    struct rows *rows;     /* for sorting rows directly */
+    struct table *table;   /* for sorting indices into table rows */
+    size_t *indices;       /* index array (when sorting indices) */
+};
+static struct sort_ctx _sort_ctx;
 
 static int cell_compare(const struct cell *a, const struct cell *b)
 {
@@ -973,6 +1005,38 @@ static int cell_compare(const struct cell *a, const struct cell *b)
     return 0;
 }
 
+/* qsort comparator: compare two struct row* by multi-column ORDER BY */
+static int cmp_rows_multi(const void *a, const void *b)
+{
+    const struct row *ra = (const struct row *)a;
+    const struct row *rb = (const struct row *)b;
+    for (size_t k = 0; k < _sort_ctx.ncols; k++) {
+        int ci = _sort_ctx.cols[k];
+        if (ci < 0) continue;
+        int cmp = cell_compare(&ra->cells.items[ci], &rb->cells.items[ci]);
+        if (_sort_ctx.descs[k]) cmp = -cmp;
+        if (cmp != 0) return cmp;
+    }
+    return 0;
+}
+
+/* qsort comparator: compare two size_t indices into _sort_ctx.table->rows */
+static int cmp_indices_multi(const void *a, const void *b)
+{
+    size_t ia = *(const size_t *)a;
+    size_t ib = *(const size_t *)b;
+    struct table *t = _sort_ctx.table;
+    for (size_t k = 0; k < _sort_ctx.ncols; k++) {
+        int ci = _sort_ctx.cols[k];
+        if (ci < 0) continue;
+        int cmp = cell_compare(&t->rows.items[ia].cells.items[ci],
+                               &t->rows.items[ib].cells.items[ci]);
+        if (_sort_ctx.descs[k]) cmp = -cmp;
+        if (cmp != 0) return cmp;
+    }
+    return 0;
+}
+
 static double cell_to_double(const struct cell *c)
 {
     switch (c->type) {
@@ -1005,11 +1069,12 @@ static int query_window(struct table *t, struct query *q, struct rows *result)
     size_t nrows = t->rows.count;
     size_t nexprs = q->select_exprs.count;
 
-    /* resolve column indices for plain columns and window args */
-    int *col_idx = calloc(nexprs, sizeof(int));
-    int *part_idx = calloc(nexprs, sizeof(int));
-    int *ord_idx = calloc(nexprs, sizeof(int));
-    int *arg_idx = calloc(nexprs, sizeof(int));
+    /* resolve column indices for plain columns and window args — single allocation */
+    int *_win_buf = calloc(4 * nexprs + 1, sizeof(int));
+    int *col_idx = _win_buf;
+    int *part_idx = _win_buf + nexprs;
+    int *ord_idx = _win_buf + 2 * nexprs;
+    int *arg_idx = _win_buf + 3 * nexprs;
 
     for (size_t e = 0; e < nexprs; e++) {
         struct select_expr *se = &q->select_exprs.items[e];
@@ -1022,7 +1087,7 @@ static int query_window(struct table *t, struct query *q, struct rows *result)
             col_idx[e] = find_col_idx(t, se->column);
             if (col_idx[e] < 0) {
                 fprintf(stderr, "column '" SV_FMT "' not found\n", SV_ARG(se->column));
-                free(col_idx); free(part_idx); free(ord_idx); free(arg_idx);
+                free(_win_buf);
                 return -1;
             }
         } else {
@@ -1031,7 +1096,7 @@ static int query_window(struct table *t, struct query *q, struct rows *result)
                 if (part_idx[e] < 0) {
                     fprintf(stderr, "partition column '" SV_FMT "' not found\n",
                             SV_ARG(se->win.partition_col));
-                    free(col_idx); free(part_idx); free(ord_idx); free(arg_idx);
+                    free(_win_buf);
                     return -1;
                 }
             }
@@ -1040,7 +1105,7 @@ static int query_window(struct table *t, struct query *q, struct rows *result)
                 if (ord_idx[e] < 0) {
                     fprintf(stderr, "order column '" SV_FMT "' not found\n",
                             SV_ARG(se->win.order_col));
-                    free(col_idx); free(part_idx); free(ord_idx); free(arg_idx);
+                    free(_win_buf);
                     return -1;
                 }
             }
@@ -1049,7 +1114,7 @@ static int query_window(struct table *t, struct query *q, struct rows *result)
                 if (arg_idx[e] < 0) {
                     fprintf(stderr, "window arg column '" SV_FMT "' not found\n",
                             SV_ARG(se->win.arg_column));
-                    free(col_idx); free(part_idx); free(ord_idx); free(arg_idx);
+                    free(_win_buf);
                     return -1;
                 }
             }
@@ -1183,10 +1248,7 @@ static int query_window(struct table *t, struct query *q, struct rows *result)
 
     da_free(&match_idx);
     free(sorted);
-    free(col_idx);
-    free(part_idx);
-    free(ord_idx);
-    free(arg_idx);
+    free(_win_buf);
     return 0;
 }
 
@@ -1280,6 +1342,54 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
     double *gmaxs = agg_n > 0 ? malloc(agg_n * sizeof(double)) : NULL;
     int *gminmax_init = agg_n > 0 ? malloc(agg_n * sizeof(int)) : NULL;
 
+    /* resolve aggregate column indices once */
+    int *gagg_cols = agg_n > 0 ? malloc(agg_n * sizeof(int)) : NULL;
+    for (size_t a = 0; a < agg_n; a++) {
+        if (sv_eq_cstr(q->aggregates.items[a].column, "*"))
+            gagg_cols[a] = -1;
+        else
+            gagg_cols[a] = find_col_idx(t, q->aggregates.items[a].column);
+    }
+
+    /* build HAVING tmp_t once (columns don't change between groups) */
+    struct table having_t = {0};
+    int has_having_t = 0;
+    if (q->has_having && q->having_cond) {
+        has_having_t = 1;
+        da_init(&having_t.columns);
+        da_init(&having_t.rows);
+        da_init(&having_t.indexes);
+        for (size_t k = 0; k < ngrp; k++) {
+            struct column col_grp = { .name = t->columns.items[grp_cols[k]].name,
+                                      .type = t->columns.items[grp_cols[k]].type,
+                                      .enum_type_name = NULL };
+            da_push(&having_t.columns, col_grp);
+        }
+        for (size_t a = 0; a < q->aggregates.count; a++) {
+            const char *agg_name = "?";
+            switch (q->aggregates.items[a].func) {
+                case AGG_SUM:   agg_name = "sum";   break;
+                case AGG_COUNT: agg_name = "count"; break;
+                case AGG_AVG:   agg_name = "avg";   break;
+                case AGG_MIN:   agg_name = "min";   break;
+                case AGG_MAX:   agg_name = "max";   break;
+                case AGG_NONE: break;
+            }
+            int ac_idx = gagg_cols[a];
+            enum column_type ctype = (ac_idx >= 0 &&
+                t->columns.items[ac_idx].type == COLUMN_TYPE_FLOAT)
+                ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
+            if (q->aggregates.items[a].func == AGG_AVG)
+                ctype = COLUMN_TYPE_FLOAT;
+            if (q->aggregates.items[a].func == AGG_COUNT)
+                ctype = COLUMN_TYPE_INT;
+            struct column col_a = { .name = (char *)agg_name,
+                                    .type = ctype,
+                                    .enum_type_name = NULL };
+            da_push(&having_t.columns, col_a);
+        }
+    }
+
     /* for each group, compute aggregates */
     for (size_t g = 0; g < group_starts.count; g++) {
         size_t first_ri = matching.items[group_starts.items[g]];
@@ -1304,9 +1414,9 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
             if (!eq) continue;
             grp_count++;
             for (size_t a = 0; a < q->aggregates.count; a++) {
-                if (sv_eq_cstr(q->aggregates.items[a].column, "*")) continue;
-                int ac = find_col_idx(t, q->aggregates.items[a].column);
-                if (ac >= 0) {
+                int ac = gagg_cols[a];
+                if (ac < 0) continue;
+                {
                     double v = cell_to_double(&t->rows.items[ri].cells.items[ac]);
                     sums[a] += v;
                     if (!gminmax_init[a] || v < gmins[a]) gmins[a] = v;
@@ -1330,7 +1440,7 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
         /* add aggregate values */
         for (size_t a = 0; a < q->aggregates.count; a++) {
             struct cell c = {0};
-            int ac_idx = find_col_idx(t, q->aggregates.items[a].column);
+            int ac_idx = gagg_cols[a];
             int col_is_float = (ac_idx >= 0 &&
                                 t->columns.items[ac_idx].type == COLUMN_TYPE_FLOAT);
             switch (q->aggregates.items[a].func) {
@@ -1369,40 +1479,8 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
             da_push(&dst.cells, c);
         }
         /* HAVING filter */
-        if (q->has_having && q->having_cond) {
-            struct table tmp_t = {0};
-            da_init(&tmp_t.columns);
-            da_init(&tmp_t.rows);
-            da_init(&tmp_t.indexes);
-
-            /* group columns */
-            for (size_t k = 0; k < ngrp; k++) {
-                struct column col_grp = { .name = t->columns.items[grp_cols[k]].name,
-                                          .type = t->columns.items[grp_cols[k]].type,
-                                          .enum_type_name = NULL };
-                da_push(&tmp_t.columns, col_grp);
-            }
-
-            /* aggregate columns named by function */
-            for (size_t a = 0; a < q->aggregates.count; a++) {
-                const char *agg_name = "?";
-                switch (q->aggregates.items[a].func) {
-                    case AGG_SUM:   agg_name = "sum";   break;
-                    case AGG_COUNT: agg_name = "count"; break;
-                    case AGG_AVG:   agg_name = "avg";   break;
-                    case AGG_MIN:   agg_name = "min";   break;
-                    case AGG_MAX:   agg_name = "max";   break;
-                    case AGG_NONE: break;
-                }
-                struct column col_a = { .name = (char *)agg_name,
-                                        .type = dst.cells.items[ngrp + a].type,
-                                        .enum_type_name = NULL };
-                da_push(&tmp_t.columns, col_a);
-            }
-
-            int passes = eval_condition(q->having_cond, &dst, &tmp_t);
-            da_free(&tmp_t.columns);
-
+        if (has_having_t) {
+            int passes = eval_condition(q->having_cond, &dst, &having_t);
             if (!passes) {
                 row_free(&dst);
                 continue;
@@ -1418,6 +1496,8 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
     free(gmins);
     free(gmaxs);
     free(gminmax_init);
+    free(gagg_cols);
+    if (has_having_t) da_free(&having_t.columns);
 
     /* ORDER BY on grouped results (multi-column) */
     if (q->has_order_by && q->order_by_items.count > 0 && result->count > 1) {
@@ -1429,22 +1509,8 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
                                              q->order_by_items.items[k].column);
             ord_descs[k] = q->order_by_items.items[k].desc;
         }
-        for (size_t i = 0; i < result->count; i++) {
-            for (size_t j = i + 1; j < result->count; j++) {
-                int cmp = 0;
-                for (size_t k = 0; k < nord && cmp == 0; k++) {
-                    if (ord_res[k] < 0) continue;
-                    cmp = cell_compare(&result->data[i].cells.items[ord_res[k]],
-                                       &result->data[j].cells.items[ord_res[k]]);
-                    if (ord_descs[k]) cmp = -cmp;
-                }
-                if (cmp > 0) {
-                    struct row swap = result->data[i];
-                    result->data[i] = result->data[j];
-                    result->data[j] = swap;
-                }
-            }
-        }
+        _sort_ctx = (struct sort_ctx){ .cols = ord_res, .descs = ord_descs, .ncols = nord };
+        qsort(result->data, result->count, sizeof(struct row), cmp_rows_multi);
     }
 
     /* LIMIT / OFFSET on grouped results */
@@ -1541,23 +1607,9 @@ static int query_select(struct table *t, struct query *q, struct rows *result)
             ord_cols[k] = find_col_idx(t, q->order_by_items.items[k].column);
             ord_descs[k] = q->order_by_items.items[k].desc;
         }
-        for (size_t i = 0; i < match_idx.count; i++) {
-            for (size_t j = i + 1; j < match_idx.count; j++) {
-                int cmp = 0;
-                for (size_t k = 0; k < nord && cmp == 0; k++) {
-                    if (ord_cols[k] < 0) continue;
-                    struct cell *a = &t->rows.items[match_idx.items[i]].cells.items[ord_cols[k]];
-                    struct cell *b = &t->rows.items[match_idx.items[j]].cells.items[ord_cols[k]];
-                    cmp = cell_compare(a, b);
-                    if (ord_descs[k]) cmp = -cmp;
-                }
-                if (cmp > 0) {
-                    size_t swap = match_idx.items[i];
-                    match_idx.items[i] = match_idx.items[j];
-                    match_idx.items[j] = swap;
-                }
-            }
-        }
+        _sort_ctx = (struct sort_ctx){ .cols = ord_cols, .descs = ord_descs,
+                                       .ncols = nord, .table = t };
+        qsort(match_idx.items, match_idx.count, sizeof(size_t), cmp_indices_multi);
     }
 
     /* project into result rows */
@@ -1567,6 +1619,8 @@ static int query_select(struct table *t, struct query *q, struct rows *result)
     }
     da_free(&match_idx);
 
+    // TODO: DISTINCT dedup is O(n^2); could sort rows first then deduplicate
+    // in a single linear pass for O(n log n) performance
     /* DISTINCT: deduplicate before LIMIT (SQL semantics) */
     if (q->has_distinct && tmp.count > 1) {
         struct rows deduped = {0};
@@ -1637,10 +1691,41 @@ static void rebuild_indexes(struct table *t)
 
 static int query_delete(struct table *t, struct query *q, struct rows *result)
 {
-    (void)result;
+    int has_returning = (q->has_returning && q->returning_columns.len > 0);
+    int return_all = has_returning && sv_eq_cstr(q->returning_columns, "*");
     size_t deleted = 0;
     for (size_t i = 0; i < t->rows.count; ) {
         if (row_matches(t, q, &t->rows.items[i])) {
+            /* capture row for RETURNING before freeing */
+            if (has_returning && result) {
+                struct row ret = {0};
+                da_init(&ret.cells);
+                if (return_all) {
+                    for (size_t c = 0; c < t->rows.items[i].cells.count; c++) {
+                        struct cell cp;
+                        copy_cell_into(&cp, &t->rows.items[i].cells.items[c]);
+                        da_push(&ret.cells, cp);
+                    }
+                } else {
+                    sv cols = q->returning_columns;
+                    while (cols.len > 0) {
+                        size_t end = 0;
+                        while (end < cols.len && cols.data[end] != ',') end++;
+                        sv one = sv_trim(sv_from(cols.data, end));
+                        for (size_t j = 0; j < t->columns.count; j++) {
+                            if (sv_eq_cstr(one, t->columns.items[j].name)) {
+                                struct cell cp;
+                                copy_cell_into(&cp, &t->rows.items[i].cells.items[j]);
+                                da_push(&ret.cells, cp);
+                                break;
+                            }
+                        }
+                        if (end < cols.len) end++;
+                        cols = sv_from(cols.data + end, cols.len - end);
+                    }
+                }
+                rows_push(result, ret);
+            }
             row_free(&t->rows.items[i]);
             for (size_t j = i; j + 1 < t->rows.count; j++)
                 t->rows.items[j] = t->rows.items[j + 1];
@@ -1654,8 +1739,8 @@ static int query_delete(struct table *t, struct query *q, struct rows *result)
     if (deleted > 0 && t->indexes.count > 0)
         rebuild_indexes(t);
 
-    /* store deleted count for command tag */
-    if (result) {
+    /* store deleted count for command tag (only if not RETURNING) */
+    if (!has_returning && result) {
         struct row r = {0};
         da_init(&r.cells);
         struct cell c = { .type = COLUMN_TYPE_INT };
@@ -1668,7 +1753,8 @@ static int query_delete(struct table *t, struct query *q, struct rows *result)
 
 static int query_update(struct table *t, struct query *q, struct rows *result)
 {
-    (void)result;
+    int has_returning = (q->has_returning && q->returning_columns.len > 0);
+    int return_all = has_returning && sv_eq_cstr(q->returning_columns, "*");
     size_t updated = 0;
     for (size_t i = 0; i < t->rows.count; i++) {
         if (!row_matches(t, q, &t->rows.items[i]))
@@ -1684,12 +1770,42 @@ static int query_update(struct table *t, struct query *q, struct rows *result)
             /* copy new value */
             copy_cell_into(dst, &q->set_clauses.items[s].value);
         }
+        /* capture row for RETURNING after SET */
+        if (has_returning && result) {
+            struct row ret = {0};
+            da_init(&ret.cells);
+            if (return_all) {
+                for (size_t c = 0; c < t->rows.items[i].cells.count; c++) {
+                    struct cell cp;
+                    copy_cell_into(&cp, &t->rows.items[i].cells.items[c]);
+                    da_push(&ret.cells, cp);
+                }
+            } else {
+                sv cols = q->returning_columns;
+                while (cols.len > 0) {
+                    size_t end = 0;
+                    while (end < cols.len && cols.data[end] != ',') end++;
+                    sv one = sv_trim(sv_from(cols.data, end));
+                    for (size_t j = 0; j < t->columns.count; j++) {
+                        if (sv_eq_cstr(one, t->columns.items[j].name)) {
+                            struct cell cp;
+                            copy_cell_into(&cp, &t->rows.items[i].cells.items[j]);
+                            da_push(&ret.cells, cp);
+                            break;
+                        }
+                    }
+                    if (end < cols.len) end++;
+                    cols = sv_from(cols.data + end, cols.len - end);
+                }
+            }
+            rows_push(result, ret);
+        }
     }
     /* rebuild indexes after cell mutation */
     if (updated > 0 && t->indexes.count > 0)
         rebuild_indexes(t);
 
-    if (result) {
+    if (!has_returning && result) {
         struct row r = {0};
         da_init(&r.cells);
         struct cell c = { .type = COLUMN_TYPE_INT };

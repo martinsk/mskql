@@ -1,4 +1,5 @@
 #include "row.h"
+#include "column.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -17,8 +18,7 @@ void row_free(struct row *row)
 {
     for (size_t i = 0; i < row->cells.count; i++) {
         struct cell *c = &row->cells.items[i];
-        if ((c->type == COLUMN_TYPE_TEXT || c->type == COLUMN_TYPE_ENUM)
-            && c->value.as_text) {
+        if (column_type_is_text(c->type) && c->value.as_text) {
             free(c->value.as_text);
         }
     }
