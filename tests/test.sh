@@ -19,7 +19,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TESTCASE_DIR="$(cd "$SCRIPT_DIR/../testcases" && pwd)"
+TESTCASE_DIR="$(cd "$SCRIPT_DIR/cases" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PORT=5433
 PSQL="psql -h 127.0.0.1 -p $PORT -U test -d mskql --no-psqlrc -tA"
 PASS=0
@@ -27,7 +28,7 @@ FAIL=0
 SERVER_PID=""
 
 start_server() {
-    "$SCRIPT_DIR/mskql" &
+    "$PROJECT_DIR/build/mskql" &
     SERVER_PID=$!
     # wait until the server is accepting connections
     for i in $(seq 1 20); do
@@ -188,7 +189,7 @@ run_testcase() {
 }
 
 # ---- build ----
-BUILD_OUT=$(cd "$SCRIPT_DIR" && make clean && make 2>&1)
+BUILD_OUT=$(cd "$PROJECT_DIR/src" && make clean && make 2>&1)
 if [ $? -ne 0 ]; then
     echo "BUILD FAILED:"
     echo "$BUILD_OUT"

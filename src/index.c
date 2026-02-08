@@ -183,6 +183,14 @@ void index_init(struct index *idx, const char *name, const char *col_name, int c
     idx->root = node_alloc(1);
 }
 
+void index_init_sv(struct index *idx, sv name, sv col_name, int col_idx)
+{
+    idx->name = sv_to_cstr(name);
+    idx->column_name = sv_to_cstr(col_name);
+    idx->column_idx = col_idx;
+    idx->root = node_alloc(1);
+}
+
 void index_insert(struct index *idx, const struct cell *key, size_t row_id)
 {
     if (idx->root->count == BTREE_ORDER - 1) {
@@ -207,6 +215,12 @@ int index_lookup(struct index *idx, const struct cell *key,
     *out_ids = e->row_ids.items;
     *out_count = e->row_ids.count;
     return 0;
+}
+
+void index_reset(struct index *idx)
+{
+    node_free(idx->root);
+    idx->root = node_alloc(1);
 }
 
 void index_free(struct index *idx)

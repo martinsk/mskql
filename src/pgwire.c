@@ -215,23 +215,41 @@ static uint32_t column_type_to_oid(enum column_type t)
     return 25;
 }
 
-/* format a cell value as text */
-static char *cell_to_text(const struct cell *c)
+/* push a cell value directly into a msgbuf as a pgwire text field (len + data) */
+static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c)
 {
-    if (c->is_null) return NULL;
+    if (c->is_null) {
+        msgbuf_push_u32(m, (uint32_t)-1);
+        return;
+    }
     char buf[64];
+    const char *txt;
+    size_t len;
     switch (c->type) {
         case COLUMN_TYPE_INT:
-            snprintf(buf, sizeof(buf), "%d", c->value.as_int);
-            return strdup(buf);
+            len = (size_t)snprintf(buf, sizeof(buf), "%d", c->value.as_int);
+            txt = buf;
+            break;
         case COLUMN_TYPE_FLOAT:
-            snprintf(buf, sizeof(buf), "%g", c->value.as_float);
-            return strdup(buf);
+            len = (size_t)snprintf(buf, sizeof(buf), "%g", c->value.as_float);
+            txt = buf;
+            break;
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
-            return c->value.as_text ? strdup(c->value.as_text) : NULL;
+            if (!c->value.as_text) {
+                msgbuf_push_u32(m, (uint32_t)-1);
+                return;
+            }
+            txt = c->value.as_text;
+            len = strlen(txt);
+            break;
+        default:
+            txt = "";
+            len = 0;
+            break;
     }
-    return strdup("");
+    msgbuf_push_u32(m, (uint32_t)len);
+    msgbuf_push(m, txt, len);
 }
 
 /* ---- query result sending ---- */
@@ -293,7 +311,9 @@ static int send_row_description(int fd, struct database *db, struct query *q,
                 case AGG_SUM:   colname = "sum";   break;
                 case AGG_COUNT: colname = "count"; break;
                 case AGG_AVG:   colname = "avg";   break;
-                default:        colname = "?";     break;
+                case AGG_MIN:   colname = "min";   break;
+                case AGG_MAX:   colname = "max";   break;
+                case AGG_NONE:  colname = "?";     break;
             }
             if (result->count > 0)
                 type_oid = column_type_to_oid(result->data[0].cells.items[i].type);
@@ -320,32 +340,24 @@ static int send_row_description(int fd, struct database *db, struct query *q,
 
 static int send_data_rows(int fd, struct rows *result)
 {
+    struct msgbuf m;
+    msgbuf_init(&m);
+
     for (size_t i = 0; i < result->count; i++) {
         struct row *r = &result->data[i];
-        struct msgbuf m;
-        msgbuf_init(&m);
+        m.len = 0; /* reset buffer, reuse backing memory */
 
         msgbuf_push_u16(&m, (uint16_t)r->cells.count);
 
-        for (size_t j = 0; j < r->cells.count; j++) {
-            char *txt = cell_to_text(&r->cells.items[j]);
-            if (txt == NULL) {
-                /* SQL NULL: length = -1, no data */
-                msgbuf_push_u32(&m, (uint32_t)-1);
-            } else {
-                uint32_t len = (uint32_t)strlen(txt);
-                msgbuf_push_u32(&m, len);
-                msgbuf_push(&m, txt, len);
-                free(txt);
-            }
-        }
+        for (size_t j = 0; j < r->cells.count; j++)
+            msgbuf_push_cell(&m, &r->cells.items[j]);
 
         if (msg_send(fd, 'D', &m) != 0) {
             msgbuf_free(&m);
             return -1;
         }
-        msgbuf_free(&m);
     }
+    msgbuf_free(&m);
     return 0;
 }
 

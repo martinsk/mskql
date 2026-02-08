@@ -385,7 +385,22 @@ static enum cmp_op cmp_from_token(enum token_type t)
         case TOK_GREATER:    return CMP_GT;
         case TOK_LESS_EQ:    return CMP_LE;
         case TOK_GREATER_EQ: return CMP_GE;
-        default:             return CMP_EQ;
+        case TOK_KEYWORD:
+        case TOK_IDENTIFIER:
+        case TOK_STRING:
+        case TOK_STAR:
+        case TOK_COMMA:
+        case TOK_SEMICOLON:
+        case TOK_NUMBER:
+        case TOK_LPAREN:
+        case TOK_RPAREN:
+        case TOK_DOT:
+        case TOK_PLUS:
+        case TOK_SLASH:
+        case TOK_MINUS:
+        case TOK_EOF:
+        case TOK_UNKNOWN:
+            return CMP_EQ;
     }
 }
 
@@ -393,15 +408,13 @@ static struct cell parse_literal_value(struct token tok)
 {
     struct cell c = {0};
     if (tok.type == TOK_NUMBER) {
-        char *tmp = sv_to_cstr(tok.value);
-        if (strchr(tmp, '.')) {
+        if (sv_contains_char(tok.value, '.')) {
             c.type = COLUMN_TYPE_FLOAT;
-            c.value.as_float = atof(tmp);
+            c.value.as_float = sv_atof(tok.value);
         } else {
             c.type = COLUMN_TYPE_INT;
-            c.value.as_int = atoi(tmp);
+            c.value.as_int = sv_atoi(tok.value);
         }
-        free(tmp);
     } else if (tok.type == TOK_STRING) {
         c.type = COLUMN_TYPE_TEXT;
         c.value.as_text = sv_to_cstr(tok.value);
@@ -668,9 +681,7 @@ static void parse_order_limit(struct lexer *l, struct query *out)
         struct token n = lexer_next(l);
         if (n.type == TOK_NUMBER) {
             out->has_limit = 1;
-            char *tmp = sv_to_cstr(n.value);
-            out->limit_count = atoi(tmp);
-            free(tmp);
+            out->limit_count = sv_atoi(n.value);
         }
         peek = lexer_peek(l);
     }
@@ -681,9 +692,7 @@ static void parse_order_limit(struct lexer *l, struct query *out)
         struct token n = lexer_next(l);
         if (n.type == TOK_NUMBER) {
             out->has_offset = 1;
-            char *tmp = sv_to_cstr(n.value);
-            out->offset_count = atoi(tmp);
-            free(tmp);
+            out->offset_count = sv_atoi(n.value);
         }
     }
 }
@@ -1017,17 +1026,12 @@ static int parse_select(struct lexer *l, struct query *out)
     } else if (tok.type == TOK_NUMBER || tok.type == TOK_STRING) {
         /* SELECT <literal> — no FROM needed */
         out->columns = tok.value;
-        // TODO: MEMORY LEAK: insert_row is heap-allocated here with calloc but is never
-        // freed by any caller. The cells within it (including strdup'd text values) also
-        // leak. A query_free() function should free this and its contents.
         out->insert_row = calloc(1, sizeof(struct row));
         da_init(&out->insert_row->cells);
         struct cell c = {0};
         if (tok.type == TOK_NUMBER) {
             c.type = COLUMN_TYPE_INT;
-            char *tmp = sv_to_cstr(tok.value);
-            c.value.as_int = atoi(tmp);
-            free(tmp);
+            c.value.as_int = sv_atoi(tok.value);
         } else {
             c.type = COLUMN_TYPE_TEXT;
             c.value.as_text = sv_to_cstr(tok.value);
@@ -1043,9 +1047,7 @@ static int parse_select(struct lexer *l, struct query *out)
                 struct cell c2 = {0};
                 if (tok.type == TOK_NUMBER) {
                     c2.type = COLUMN_TYPE_INT;
-                    char *tmp = sv_to_cstr(tok.value);
-                    c2.value.as_int = atoi(tmp);
-                    free(tmp);
+                    c2.value.as_int = sv_atoi(tok.value);
                 } else if (tok.type == TOK_STRING) {
                     c2.type = COLUMN_TYPE_TEXT;
                     c2.value.as_text = sv_to_cstr(tok.value);
@@ -1518,9 +1520,6 @@ static int parse_create(struct lexer *l, struct query *out)
             fprintf(stderr, "parse error: expected column name\n");
             return -1;
         }
-        // TODO: MEMORY LEAK: col_name (and enum_type_name below) are heap-allocated via
-        // sv_to_cstr/strdup and stored in out->create_columns. No caller ever frees these
-        // strings after the query is executed. A query_free() function is needed.
         char *col_name = sv_to_cstr(tok.value);
 
         /* column type — keyword (INT/FLOAT/TEXT) or identifier (enum type name) */
@@ -1664,9 +1663,6 @@ static int parse_update(struct lexer *l, struct query *out)
         }
 
         tok = lexer_next(l);
-        // TODO: MEMORY LEAK: parse_literal_value may heap-allocate sc.value.value.as_text
-        // (via sv_to_cstr for string literals). These are stored in out->set_clauses but
-        // no caller ever frees them. A query_free() function is needed.
         sc.value = parse_literal_value(tok);
         da_push(&out->set_clauses, sc);
 

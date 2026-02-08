@@ -7,6 +7,8 @@
 #include "index.h"
 
 struct table {
+    // TODO: STRINGVIEW OPPORTUNITY: name is strdup'd from sv-originated strings in most
+    // paths (db_exec CREATE TABLE). Could be sv if the schema had a persistent backing store.
     char *name;
     DYNAMIC_ARRAY(struct column) columns;
     DYNAMIC_ARRAY(struct row) rows;

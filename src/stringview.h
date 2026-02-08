@@ -92,4 +92,29 @@ static inline sv sv_chop_right(sv s, size_t n)
     return sv_from(s.data, s.len - n);
 }
 
+static inline int sv_atoi(sv s)
+{
+    char buf[64];
+    size_t n = s.len < sizeof(buf) - 1 ? s.len : sizeof(buf) - 1;
+    memcpy(buf, s.data, n);
+    buf[n] = '\0';
+    return atoi(buf);
+}
+
+static inline double sv_atof(sv s)
+{
+    char buf[64];
+    size_t n = s.len < sizeof(buf) - 1 ? s.len : sizeof(buf) - 1;
+    memcpy(buf, s.data, n);
+    buf[n] = '\0';
+    return atof(buf);
+}
+
+static inline bool sv_contains_char(sv s, char c)
+{
+    for (size_t i = 0; i < s.len; i++)
+        if (s.data[i] == c) return true;
+    return false;
+}
+
 #endif

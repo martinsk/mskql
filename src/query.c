@@ -71,25 +71,25 @@ void query_free(struct query *q)
     condition_free(q->having_cond);
     q->having_cond = NULL;
 
-    /* where_value (legacy single-condition path) */
-    free_cell_text(&q->where_value);
+    /* where_value is a shallow copy of where_cond->value — already freed above, do not double-free */
 
-    /* insert_row */
-    if (q->insert_row) {
+    /* insert_rows (multi-row INSERT) — also covers insert_row when it aliases into this array */
+    if (q->insert_rows.count > 0) {
+        for (size_t i = 0; i < q->insert_rows.count; i++) {
+            for (size_t j = 0; j < q->insert_rows.items[i].cells.count; j++)
+                free_cell_text(&q->insert_rows.items[i].cells.items[j]);
+            da_free(&q->insert_rows.items[i].cells);
+        }
+        da_free(&q->insert_rows);
+        q->insert_row = NULL; /* was alias into insert_rows */
+    } else if (q->insert_row) {
+        /* standalone calloc'd insert_row (e.g. SELECT <literal>) */
         for (size_t i = 0; i < q->insert_row->cells.count; i++)
             free_cell_text(&q->insert_row->cells.items[i]);
         da_free(&q->insert_row->cells);
         free(q->insert_row);
         q->insert_row = NULL;
     }
-
-    /* insert_rows (multi-row INSERT) */
-    for (size_t i = 0; i < q->insert_rows.count; i++) {
-        for (size_t j = 0; j < q->insert_rows.items[i].cells.count; j++)
-            free_cell_text(&q->insert_rows.items[i].cells.items[j]);
-        da_free(&q->insert_rows.items[i].cells);
-    }
-    da_free(&q->insert_rows);
 
     /* create_columns (strdup'd names) */
     for (size_t i = 0; i < q->create_columns.count; i++) {
@@ -202,7 +202,14 @@ int eval_condition(struct condition *cond, struct row *row,
                 case CMP_GT: return r > 0;
                 case CMP_LE: return r <= 0;
                 case CMP_GE: return r >= 0;
-                default: return 0;
+                case CMP_IS_NULL:
+                case CMP_IS_NOT_NULL:
+                case CMP_IN:
+                case CMP_NOT_IN:
+                case CMP_BETWEEN:
+                case CMP_LIKE:
+                case CMP_ILIKE:
+                    return 0;
             }
         }
     }
@@ -571,8 +578,15 @@ static struct cell eval_arith_expr(sv expr, struct table *t, struct row *src)
     for (size_t i = 0; i <= expr.len && nvals < 32; i++) {
         char c = (i < expr.len) ? expr.data[i] : '\0';
         int is_op = (c == '+' || c == '-' || c == '/' || c == '*');
-        /* '-' after another operator or at start is unary, not binary */
-        if (c == '-' && (nvals == 0 || (nvals == nops + 1 ? 0 : 1) == 0)) is_op = 0;
+        /* '-' is unary (not binary) only when no operand text precedes it */
+        if (c == '-' && is_op) {
+            /* check if there is any non-whitespace content since 'start' */
+            int has_operand = 0;
+            for (size_t k = start; k < i; k++) {
+                if (expr.data[k] != ' ' && expr.data[k] != '\t') { has_operand = 1; break; }
+            }
+            if (!has_operand) is_op = 0;
+        }
 
         if (is_op || i == expr.len) {
             sv operand = sv_from(expr.data + start, i - start);
@@ -825,7 +839,7 @@ static int query_aggregate(struct table *t, struct query *q, struct rows *result
                 }
                 break;
             }
-            default:
+            case AGG_NONE:
                 break;
         }
         da_push(&dst.cells, c);
@@ -886,7 +900,9 @@ static double cell_to_double(const struct cell *c)
     switch (c->type) {
         case COLUMN_TYPE_INT:   return (double)c->value.as_int;
         case COLUMN_TYPE_FLOAT: return c->value.as_float;
-        default: return 0.0;
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+            return 0.0;
     }
 }
 
@@ -1126,21 +1142,23 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
         if (!found) da_push(&group_starts, m);
     }
 
+    /* pre-allocate aggregate accumulators once, reuse across groups */
+    size_t agg_n = q->aggregates.count;
+    double *sums = agg_n > 0 ? malloc(agg_n * sizeof(double)) : NULL;
+    double *gmins = agg_n > 0 ? malloc(agg_n * sizeof(double)) : NULL;
+    double *gmaxs = agg_n > 0 ? malloc(agg_n * sizeof(double)) : NULL;
+    int *gminmax_init = agg_n > 0 ? malloc(agg_n * sizeof(int)) : NULL;
+
     /* for each group, compute aggregates */
     for (size_t g = 0; g < group_starts.count; g++) {
         size_t first_ri = matching.items[group_starts.items[g]];
         struct cell *group_key = &t->rows.items[first_ri].cells.items[grp_col];
 
-        /* count and accumulate for this group */
+        /* reset accumulators */
         size_t grp_count = 0;
-        double *sums = NULL;
-        double *gmins = NULL, *gmaxs = NULL;
-        int *gminmax_init = NULL;
-        if (q->aggregates.count > 0) {
-            sums = calloc(q->aggregates.count, sizeof(double));
-            gmins = malloc(q->aggregates.count * sizeof(double));
-            gmaxs = malloc(q->aggregates.count * sizeof(double));
-            gminmax_init = calloc(q->aggregates.count, sizeof(int));
+        if (agg_n > 0) {
+            memset(sums, 0, agg_n * sizeof(double));
+            memset(gminmax_init, 0, agg_n * sizeof(int));
         }
 
         for (size_t m = 0; m < matching.count; m++) {
@@ -1206,15 +1224,11 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
                     }
                     break;
                 }
-                default: break;
+                case AGG_NONE:
+                    break;
             }
             da_push(&dst.cells, c);
         }
-        free(sums);
-        free(gmins);
-        free(gmaxs);
-        free(gminmax_init);
-
         /* HAVING filter: evaluate against the result row using a temporary table */
         if (q->has_having && q->having_cond) {
             /* build a temp table with column names matching result columns */
@@ -1238,7 +1252,7 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
                     case AGG_AVG:   agg_name = "avg";   break;
                     case AGG_MIN:   agg_name = "min";   break;
                     case AGG_MAX:   agg_name = "max";   break;
-                    default: break;
+                    case AGG_NONE: break;
                 }
                 struct column col_a = { .name = (char *)agg_name,
                                         .type = dst.cells.items[1 + a].type,
@@ -1260,6 +1274,10 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
 
     da_free(&matching);
     da_free(&group_starts);
+    free(sums);
+    free(gmins);
+    free(gmaxs);
+    free(gminmax_init);
 
     /* ORDER BY on grouped results */
     if (q->has_order_by && result->count > 1) {
@@ -1276,7 +1294,7 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
                     case AGG_AVG:   agg_name = "avg";   break;
                     case AGG_MIN:   agg_name = "min";   break;
                     case AGG_MAX:   agg_name = "max";   break;
-                    default: break;
+                    case AGG_NONE: break;
                 }
                 if (sv_eq_cstr(q->order_by_col, agg_name)) {
                     ord_res = (int)(1 + a);
@@ -1409,6 +1427,32 @@ static int query_select(struct table *t, struct query *q, struct rows *result)
     }
     da_free(&match_idx);
 
+    /* DISTINCT: deduplicate before LIMIT (SQL semantics) */
+    if (q->has_distinct && tmp.count > 1) {
+        struct rows deduped = {0};
+        for (size_t i = 0; i < tmp.count; i++) {
+            int dup = 0;
+            for (size_t j = 0; j < deduped.count; j++) {
+                if (deduped.data[j].cells.count != tmp.data[i].cells.count) continue;
+                int eq = 1;
+                for (size_t k = 0; k < tmp.data[i].cells.count; k++) {
+                    if (cell_cmp(&tmp.data[i].cells.items[k],
+                                 &deduped.data[j].cells.items[k]) != 0) { eq = 0; break; }
+                }
+                if (eq) { dup = 1; break; }
+            }
+            if (!dup) {
+                rows_push(&deduped, tmp.data[i]);
+                tmp.data[i] = (struct row){0};
+            }
+        }
+        for (size_t i = 0; i < tmp.count; i++) {
+            if (tmp.data[i].cells.items) row_free(&tmp.data[i]);
+        }
+        free(tmp.data);
+        tmp = deduped;
+    }
+
     /* OFFSET / LIMIT */
     size_t start = 0;
     size_t end = tmp.count;
@@ -1434,29 +1478,6 @@ static int query_select(struct table *t, struct query *q, struct rows *result)
     }
     free(tmp.data);
 
-    /* DISTINCT: deduplicate result rows */
-    if (q->has_distinct && result->count > 1) {
-        struct rows deduped = {0};
-        for (size_t i = 0; i < result->count; i++) {
-            int dup = 0;
-            for (size_t j = 0; j < deduped.count; j++) {
-                if (deduped.data[j].cells.count != result->data[i].cells.count) continue;
-                int eq = 1;
-                for (size_t k = 0; k < result->data[i].cells.count; k++) {
-                    if (cell_cmp(&result->data[i].cells.items[k],
-                                 &deduped.data[j].cells.items[k]) != 0) { eq = 0; break; }
-                }
-                if (eq) { dup = 1; break; }
-            }
-            if (!dup) {
-                rows_push(&deduped, result->data[i]);
-                result->data[i] = (struct row){0};
-            }
-        }
-        rows_free(result);
-        *result = deduped;
-    }
-
     return 0;
 }
 
@@ -1464,15 +1485,8 @@ static void rebuild_indexes(struct table *t)
 {
     for (size_t idx = 0; idx < t->indexes.count; idx++) {
         struct index *ix = &t->indexes.items[idx];
-        /* save metadata */
-        char *name = strdup(ix->name);
-        char *col_name = strdup(ix->column_name);
         int col_idx = ix->column_idx;
-        /* free and reinit */
-        index_free(ix);
-        index_init(ix, name, col_name, col_idx);
-        free(name);
-        free(col_name);
+        index_reset(ix);
         /* re-insert all rows */
         for (size_t r = 0; r < t->rows.count; r++) {
             if ((size_t)col_idx < t->rows.items[r].cells.count)

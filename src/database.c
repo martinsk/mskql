@@ -21,6 +21,15 @@ struct enum_type *db_find_type(struct database *db, const char *name)
     return NULL;
 }
 
+static struct enum_type *db_find_type_sv(struct database *db, sv name)
+{
+    for (size_t i = 0; i < db->types.count; i++) {
+        if (sv_eq_cstr(name, db->types.items[i].name))
+            return &db->types.items[i];
+    }
+    return NULL;
+}
+
 int db_create_table(struct database *db, const char *name, struct column *cols)
 {
     struct table t;
@@ -65,6 +74,15 @@ static int find_column_index(struct table *t, const char *name)
 {
     for (size_t i = 0; i < t->columns.count; i++) {
         if (strcmp(t->columns.items[i].name, name) == 0)
+            return (int)i;
+    }
+    return -1;
+}
+
+static int find_column_index_sv(struct table *t, sv name)
+{
+    for (size_t i = 0; i < t->columns.count; i++) {
+        if (sv_eq_cstr(name, t->columns.items[i].name))
             return (int)i;
     }
     return -1;
@@ -317,21 +335,21 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
         merged_t = next_meta;
     }
 
-    /* WHERE filter */
+    /* WHERE filter — compact in-place */
     if (q->has_where && q->where_cond) {
-        struct rows filtered = {0};
+        size_t write = 0;
         for (size_t i = 0; i < merged.count; i++) {
             merged_t.rows.items = merged.data;
             merged_t.rows.count = merged.count;
             if (eval_condition(q->where_cond, &merged.data[i], &merged_t)) {
-                rows_push(&filtered, merged.data[i]);
-                merged.data[i] = (struct row){0};
+                if (write != i)
+                    merged.data[write] = merged.data[i];
+                write++;
             } else {
                 row_free(&merged.data[i]);
             }
         }
-        free(merged.data);
-        merged = filtered;
+        merged.count = write;
     }
 
     /* ORDER BY */
@@ -439,9 +457,6 @@ static void resolve_subqueries(struct database *db, struct condition *c)
     }
     if (c->type == COND_COMPARE && c->subquery_sql &&
         (c->op == CMP_IN || c->op == CMP_NOT_IN)) {
-        // TODO: MEMORY LEAK: The parsed subquery struct sq contains heap-allocated
-        // members that are never freed after use. A query_free() function should be
-        // called after db_exec completes.
         struct query sq = {0};
         if (query_parse(c->subquery_sql, &sq) == 0) {
             struct rows sq_result = {0};
@@ -502,14 +517,12 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             return -1;
         }
         case QUERY_TYPE_CREATE_TYPE: {
-            char *tname = sv_to_cstr(q->type_name);
-            if (db_find_type(db, tname)) {
-                fprintf(stderr, "type '%s' already exists\n", tname);
-                free(tname);
+            if (db_find_type_sv(db, q->type_name)) {
+                fprintf(stderr, "type '" SV_FMT "' already exists\n", SV_ARG(q->type_name));
                 return -1;
             }
             struct enum_type et;
-            et.name = tname;
+            et.name = sv_to_cstr(q->type_name);
             da_init(&et.values);
             for (size_t i = 0; i < q->enum_values.count; i++) {
                 da_push(&et.values, strdup(q->enum_values.items[i]));
@@ -518,19 +531,16 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             return 0;
         }
         case QUERY_TYPE_DROP_TYPE: {
-            char *tname = sv_to_cstr(q->type_name);
             for (size_t i = 0; i < db->types.count; i++) {
-                if (strcmp(db->types.items[i].name, tname) == 0) {
+                if (sv_eq_cstr(q->type_name, db->types.items[i].name)) {
                     enum_type_free(&db->types.items[i]);
                     for (size_t j = i; j + 1 < db->types.count; j++)
                         db->types.items[j] = db->types.items[j + 1];
                     db->types.count--;
-                    free(tname);
                     return 0;
                 }
             }
-            fprintf(stderr, "type '%s' not found\n", tname);
-            free(tname);
+            fprintf(stderr, "type '" SV_FMT "' not found\n", SV_ARG(q->type_name));
             return -1;
         }
         case QUERY_TYPE_CREATE_INDEX: {
@@ -539,17 +549,14 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(q->table));
                 return -1;
             }
-            char *col_name = sv_to_cstr(q->index_column);
-            int col_idx = find_column_index(t, col_name);
+            int col_idx = find_column_index_sv(t, q->index_column);
             if (col_idx < 0) {
-                fprintf(stderr, "column '%s' not found in table '" SV_FMT "'\n",
-                        col_name, SV_ARG(q->table));
-                free(col_name);
+                fprintf(stderr, "column '" SV_FMT "' not found in table '" SV_FMT "'\n",
+                        SV_ARG(q->index_column), SV_ARG(q->table));
                 return -1;
             }
-            char *idx_name = sv_to_cstr(q->index_name);
             struct index idx;
-            index_init(&idx, idx_name, col_name, col_idx);
+            index_init_sv(&idx, q->index_name, q->index_column, col_idx);
             /* backfill existing rows */
             for (size_t i = 0; i < t->rows.count; i++) {
                 if ((size_t)col_idx < t->rows.items[i].cells.count) {
@@ -557,28 +564,23 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 }
             }
             da_push(&t->indexes, idx);
-            free(idx_name);
-            free(col_name);
             return 0;
         }
         case QUERY_TYPE_DROP_INDEX: {
             /* search all tables for the named index */
-            char *idx_name = sv_to_cstr(q->index_name);
             for (size_t ti = 0; ti < db->tables.count; ti++) {
                 struct table *t = &db->tables.items[ti];
                 for (size_t ii = 0; ii < t->indexes.count; ii++) {
-                    if (strcmp(t->indexes.items[ii].name, idx_name) == 0) {
+                    if (sv_eq_cstr(q->index_name, t->indexes.items[ii].name)) {
                         index_free(&t->indexes.items[ii]);
                         for (size_t j = ii; j + 1 < t->indexes.count; j++)
                             t->indexes.items[j] = t->indexes.items[j + 1];
                         t->indexes.count--;
-                        free(idx_name);
                         return 0;
                     }
                 }
             }
-            fprintf(stderr, "index '%s' not found\n", idx_name);
-            free(idx_name);
+            fprintf(stderr, "index '" SV_FMT "' not found\n", SV_ARG(q->index_name));
             return -1;
         }
         case QUERY_TYPE_SELECT:
