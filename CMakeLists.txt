@@ -38,6 +38,8 @@ set(MSKQL_HEADERS
 # Create a library from the source files (excluding main.c)
 add_library(mskql_lib STATIC ${MSKQL_SOURCES} ${MSKQL_HEADERS})
 target_include_directories(mskql_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Ensure the library is compiled as C
+set_target_properties(mskql_lib PROPERTIES LINKER_LANGUAGE C)
 
 # Main executable
 add_executable(mskql src/main.c)
@@ -63,7 +65,7 @@ if(BUILD_BENCHMARKS)
         GIT_TAG main
     )
     
-    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "Disable benchmark tests")
+    set(BENCHMARK_ENABLE_TESTING OFF CACHEBOOL "Disable benchmark tests")
     set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "Disable gtest")
     
     FetchContent_MakeAvailable(benchmark)
@@ -84,6 +86,9 @@ if(BUILD_BENCHMARKS)
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
+    
+    # Allow implicit conversions for C/C++ interop
+    target_compile_options(mskql_benchmarks PRIVATE -Wno-error=conversion -fpermissive)
     
     # Set CodSpeed mode definition
     if(CODSPEED_MODE STREQUAL "simulation")
