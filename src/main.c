@@ -13,6 +13,8 @@ static void handle_signal(int sig)
 
 int main(void)
 {
+    signal(SIGPIPE, SIG_IGN);
+
     struct sigaction sa = {0};
     sa.sa_handler = handle_signal;
     sigemptyset(&sa.sa_mask);

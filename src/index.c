@@ -23,8 +23,23 @@ static int cell_compare(const struct cell *a, const struct cell *b)
             if (a->value.as_float < b->value.as_float) return -1;
             if (a->value.as_float > b->value.as_float) return  1;
             return 0;
+        case COLUMN_TYPE_BOOLEAN:
+            if (a->value.as_bool < b->value.as_bool) return -1;
+            if (a->value.as_bool > b->value.as_bool) return  1;
+            return 0;
+        case COLUMN_TYPE_BIGINT:
+            if (a->value.as_bigint < b->value.as_bigint) return -1;
+            if (a->value.as_bigint > b->value.as_bigint) return  1;
+            return 0;
+        case COLUMN_TYPE_NUMERIC:
+            if (a->value.as_numeric < b->value.as_numeric) return -1;
+            if (a->value.as_numeric > b->value.as_numeric) return  1;
+            return 0;
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_UUID:
             if (!a->value.as_text && !b->value.as_text) return 0;
             if (!a->value.as_text) return -1;
             if (!b->value.as_text) return  1;

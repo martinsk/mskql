@@ -9,6 +9,12 @@ union cell_value {
     int as_int;
     double as_float;
     char *as_text;
+    int as_bool;
+    long long as_bigint;
+    double as_numeric;
+    char *as_date;      /* "YYYY-MM-DD" */
+    char *as_timestamp; /* "YYYY-MM-DD HH:MM:SS" */
+    char *as_uuid;      /* "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" */
 };
 
 struct cell {

@@ -5,10 +5,17 @@
 #include "table.h"
 #include "query.h"
 
+struct db_snapshot {
+    DYNAMIC_ARRAY(struct table) tables;
+    DYNAMIC_ARRAY(struct enum_type) types;
+};
+
 struct database {
     char *name;
     DYNAMIC_ARRAY(struct table) tables;
     DYNAMIC_ARRAY(struct enum_type) types;
+    int in_transaction;
+    struct db_snapshot *snapshot;
 };
 
 void db_init(struct database *db, const char *name);

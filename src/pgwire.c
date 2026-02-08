@@ -207,10 +207,16 @@ static int send_empty_query(int fd)
 static uint32_t column_type_to_oid(enum column_type t)
 {
     switch (t) {
-        case COLUMN_TYPE_INT:   return 23;   /* int4 */
-        case COLUMN_TYPE_FLOAT: return 701;  /* float8 */
-        case COLUMN_TYPE_TEXT:  return 25;   /* text */
-        case COLUMN_TYPE_ENUM:  return 25;   /* text (enums sent as text) */
+        case COLUMN_TYPE_INT:       return 23;    /* int4 */
+        case COLUMN_TYPE_FLOAT:     return 701;   /* float8 */
+        case COLUMN_TYPE_TEXT:      return 25;    /* text */
+        case COLUMN_TYPE_ENUM:      return 25;    /* text (enums sent as text) */
+        case COLUMN_TYPE_BOOLEAN:   return 16;    /* bool */
+        case COLUMN_TYPE_BIGINT:    return 20;    /* int8 */
+        case COLUMN_TYPE_NUMERIC:   return 1700;  /* numeric */
+        case COLUMN_TYPE_DATE:      return 1082;  /* date */
+        case COLUMN_TYPE_TIMESTAMP: return 1114;  /* timestamp */
+        case COLUMN_TYPE_UUID:      return 2950;  /* uuid */
     }
     return 25;
 }
@@ -234,18 +240,29 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c)
             len = (size_t)snprintf(buf, sizeof(buf), "%g", c->value.as_float);
             txt = buf;
             break;
+        case COLUMN_TYPE_BOOLEAN:
+            len = (size_t)snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "t" : "f");
+            txt = buf;
+            break;
+        case COLUMN_TYPE_BIGINT:
+            len = (size_t)snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint);
+            txt = buf;
+            break;
+        case COLUMN_TYPE_NUMERIC:
+            len = (size_t)snprintf(buf, sizeof(buf), "%g", c->value.as_numeric);
+            txt = buf;
+            break;
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_UUID:
             if (!c->value.as_text) {
                 msgbuf_push_u32(m, (uint32_t)-1);
                 return;
             }
             txt = c->value.as_text;
             len = strlen(txt);
-            break;
-        default:
-            txt = "";
-            len = 0;
             break;
     }
     msgbuf_push_u32(m, (uint32_t)len);
@@ -442,6 +459,18 @@ static int handle_query(int fd, struct database *db, const char *sql)
             break;
         case QUERY_TYPE_DROP_TYPE:
             snprintf(tag, sizeof(tag), "DROP TYPE");
+            break;
+        case QUERY_TYPE_ALTER:
+            snprintf(tag, sizeof(tag), "ALTER TABLE");
+            break;
+        case QUERY_TYPE_BEGIN:
+            snprintf(tag, sizeof(tag), "BEGIN");
+            break;
+        case QUERY_TYPE_COMMIT:
+            snprintf(tag, sizeof(tag), "COMMIT");
+            break;
+        case QUERY_TYPE_ROLLBACK:
+            snprintf(tag, sizeof(tag), "ROLLBACK");
             break;
     }
 

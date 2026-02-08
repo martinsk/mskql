@@ -4,6 +4,7 @@
 #include "stringview.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void db_init(struct database *db, const char *name)
 {
@@ -106,12 +107,17 @@ static const char *extract_col_name(sv ref, char *buf, size_t bufsz)
     return buf;
 }
 
+static void free_cell_text_ext(struct cell *c)
+{
+    if (column_type_is_text(c->type) && c->value.as_text)
+        free(c->value.as_text);
+}
+
 static void copy_cell(struct cell *dst, const struct cell *src)
 {
     dst->type = src->type;
     dst->is_null = src->is_null;
-    if ((src->type == COLUMN_TYPE_TEXT || src->type == COLUMN_TYPE_ENUM)
-        && src->value.as_text) {
+    if (column_type_is_text(src->type) && src->value.as_text) {
         dst->value.as_text = strdup(src->value.as_text);
     } else {
         dst->value = src->value;
@@ -130,8 +136,23 @@ static int cell_compare_join(const struct cell *a, const struct cell *b)
             if (a->value.as_float < b->value.as_float) return -1;
             if (a->value.as_float > b->value.as_float) return  1;
             return 0;
+        case COLUMN_TYPE_BOOLEAN:
+            if (a->value.as_bool < b->value.as_bool) return -1;
+            if (a->value.as_bool > b->value.as_bool) return  1;
+            return 0;
+        case COLUMN_TYPE_BIGINT:
+            if (a->value.as_bigint < b->value.as_bigint) return -1;
+            if (a->value.as_bigint > b->value.as_bigint) return  1;
+            return 0;
+        case COLUMN_TYPE_NUMERIC:
+            if (a->value.as_numeric < b->value.as_numeric) return -1;
+            if (a->value.as_numeric > b->value.as_numeric) return  1;
+            return 0;
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_UUID:
             if (!a->value.as_text && !b->value.as_text) return 0;
             if (!a->value.as_text) return -1;
             if (!b->value.as_text) return  1;
@@ -151,10 +172,16 @@ static int cells_equal(const struct cell *a, const struct cell *b)
     }
     if (a->type != b->type) return 0;
     switch (a->type) {
-        case COLUMN_TYPE_INT:   return a->value.as_int == b->value.as_int;
-        case COLUMN_TYPE_FLOAT: return a->value.as_float == b->value.as_float;
+        case COLUMN_TYPE_INT:     return a->value.as_int == b->value.as_int;
+        case COLUMN_TYPE_FLOAT:   return a->value.as_float == b->value.as_float;
+        case COLUMN_TYPE_BOOLEAN: return a->value.as_bool == b->value.as_bool;
+        case COLUMN_TYPE_BIGINT:  return a->value.as_bigint == b->value.as_bigint;
+        case COLUMN_TYPE_NUMERIC: return a->value.as_numeric == b->value.as_numeric;
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_UUID:
             if (!a->value.as_text || !b->value.as_text) return a->value.as_text == b->value.as_text;
             return strcmp(a->value.as_text, b->value.as_text) == 0;
     }
@@ -352,27 +379,36 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
         merged.count = write;
     }
 
-    /* ORDER BY */
-    if (q->has_order_by && merged.count > 1) {
-        char obuf[256];
-        const char *ord_name = extract_col_name(q->order_by_col, obuf, sizeof(obuf));
-        int ord_col = -1;
-        for (size_t c = 0; c < merged_t.columns.count; c++) {
-            if (strcmp(merged_t.columns.items[c].name, ord_name) == 0) {
-                ord_col = (int)c; break;
+    /* ORDER BY (multi-column) */
+    if (q->has_order_by && q->order_by_items.count > 0 && merged.count > 1) {
+        int ord_cols[32];
+        int ord_descs[32];
+        size_t nord = q->order_by_items.count < 32 ? q->order_by_items.count : 32;
+        for (size_t k = 0; k < nord; k++) {
+            char obuf[256];
+            const char *ord_name = extract_col_name(q->order_by_items.items[k].column, obuf, sizeof(obuf));
+            ord_cols[k] = -1;
+            for (size_t c = 0; c < merged_t.columns.count; c++) {
+                if (strcmp(merged_t.columns.items[c].name, ord_name) == 0) {
+                    ord_cols[k] = (int)c; break;
+                }
             }
+            ord_descs[k] = q->order_by_items.items[k].desc;
         }
-        if (ord_col >= 0) {
-            for (size_t i = 0; i < merged.count; i++) {
-                for (size_t j = i + 1; j < merged.count; j++) {
-                    int cmp = cell_compare_join(
-                        &merged.data[i].cells.items[ord_col],
-                        &merged.data[j].cells.items[ord_col]);
-                    if (q->order_desc ? (cmp < 0) : (cmp > 0)) {
-                        struct row swap = merged.data[i];
-                        merged.data[i] = merged.data[j];
-                        merged.data[j] = swap;
-                    }
+        for (size_t i = 0; i < merged.count; i++) {
+            for (size_t j = i + 1; j < merged.count; j++) {
+                int cmp = 0;
+                for (size_t k = 0; k < nord && cmp == 0; k++) {
+                    if (ord_cols[k] < 0) continue;
+                    cmp = cell_compare_join(
+                        &merged.data[i].cells.items[ord_cols[k]],
+                        &merged.data[j].cells.items[ord_cols[k]]);
+                    if (ord_descs[k]) cmp = -cmp;
+                }
+                if (cmp > 0) {
+                    struct row swap = merged.data[i];
+                    merged.data[i] = merged.data[j];
+                    merged.data[j] = swap;
                 }
             }
         }
@@ -455,6 +491,10 @@ static void resolve_subqueries(struct database *db, struct condition *c)
         resolve_subqueries(db, c->right);
         return;
     }
+    if (c->type == COND_NOT) {
+        resolve_subqueries(db, c->left);
+        return;
+    }
     if (c->type == COND_COMPARE && c->subquery_sql &&
         (c->op == CMP_IN || c->op == CMP_NOT_IN)) {
         struct query sq = {0};
@@ -487,8 +527,90 @@ static void resolve_subqueries(struct database *db, struct condition *c)
     }
 }
 
+static void snapshot_free(struct db_snapshot *snap)
+{
+    for (size_t i = 0; i < snap->tables.count; i++)
+        table_free(&snap->tables.items[i]);
+    da_free(&snap->tables);
+    for (size_t i = 0; i < snap->types.count; i++)
+        enum_type_free(&snap->types.items[i]);
+    da_free(&snap->types);
+    free(snap);
+}
+
+static struct db_snapshot *snapshot_create(struct database *db)
+{
+    struct db_snapshot *snap = calloc(1, sizeof(*snap));
+    da_init(&snap->tables);
+    da_init(&snap->types);
+    for (size_t i = 0; i < db->tables.count; i++) {
+        struct table t;
+        table_deep_copy(&t, &db->tables.items[i]);
+        da_push(&snap->tables, t);
+    }
+    for (size_t i = 0; i < db->types.count; i++) {
+        struct enum_type et;
+        et.name = strdup(db->types.items[i].name);
+        da_init(&et.values);
+        for (size_t j = 0; j < db->types.items[i].values.count; j++)
+            da_push(&et.values, strdup(db->types.items[i].values.items[j]));
+        da_push(&snap->types, et);
+    }
+    return snap;
+}
+
+static void snapshot_restore(struct database *db, struct db_snapshot *snap)
+{
+    /* free current state */
+    for (size_t i = 0; i < db->tables.count; i++)
+        table_free(&db->tables.items[i]);
+    da_free(&db->tables);
+    for (size_t i = 0; i < db->types.count; i++)
+        enum_type_free(&db->types.items[i]);
+    da_free(&db->types);
+
+    /* move snapshot data into db (memcpy because DYNAMIC_ARRAY creates anonymous struct types) */
+    memcpy(&db->tables, &snap->tables, sizeof(db->tables));
+    memcpy(&db->types, &snap->types, sizeof(db->types));
+    /* zero out snap arrays so snapshot_free won't double-free */
+    memset(&snap->tables, 0, sizeof(snap->tables));
+    memset(&snap->types, 0, sizeof(snap->types));
+}
+
 int db_exec(struct database *db, struct query *q, struct rows *result)
 {
+    /* handle transaction statements first */
+    if (q->query_type == QUERY_TYPE_BEGIN) {
+        if (db->in_transaction) {
+            fprintf(stderr, "WARNING: already in a transaction\n");
+            return 0;
+        }
+        db->in_transaction = 1;
+        db->snapshot = snapshot_create(db);
+        return 0;
+    }
+    if (q->query_type == QUERY_TYPE_COMMIT) {
+        if (!db->in_transaction) {
+            fprintf(stderr, "WARNING: no transaction in progress\n");
+            return 0;
+        }
+        db->in_transaction = 0;
+        snapshot_free(db->snapshot);
+        db->snapshot = NULL;
+        return 0;
+    }
+    if (q->query_type == QUERY_TYPE_ROLLBACK) {
+        if (!db->in_transaction) {
+            fprintf(stderr, "WARNING: no transaction in progress\n");
+            return 0;
+        }
+        snapshot_restore(db, db->snapshot);
+        snapshot_free(db->snapshot);
+        db->snapshot = NULL;
+        db->in_transaction = 0;
+        return 0;
+    }
+
     switch (q->query_type) {
         case QUERY_TYPE_CREATE: {
             char *tname = sv_to_cstr(q->table);
@@ -595,7 +717,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     struct cell c = {0};
                     c.is_null = q->insert_row->cells.items[i].is_null;
                     c.type = q->insert_row->cells.items[i].type;
-                    if ((c.type == COLUMN_TYPE_TEXT || c.type == COLUMN_TYPE_ENUM)
+                    if (column_type_is_text(c.type)
                         && q->insert_row->cells.items[i].value.as_text)
                         c.value.as_text = strdup(q->insert_row->cells.items[i].value.as_text);
                     else
@@ -612,6 +734,81 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
         case QUERY_TYPE_DELETE:
         case QUERY_TYPE_UPDATE:
             return db_table_exec_query(db, q->table, q, result);
+        case QUERY_TYPE_ALTER: {
+            struct table *t = db_find_table_sv(db, q->table);
+            if (!t) {
+                fprintf(stderr, "alter error: table '" SV_FMT "' not found\n", SV_ARG(q->table));
+                return -1;
+            }
+            switch (q->alter_action) {
+                case ALTER_ADD_COLUMN: {
+                    table_add_column(t, &q->alter_new_col);
+                    /* pad existing rows with NULL for the new column */
+                    size_t new_idx = t->columns.count - 1;
+                    for (size_t i = 0; i < t->rows.count; i++) {
+                        struct cell null_cell = {0};
+                        null_cell.type = t->columns.items[new_idx].type;
+                        null_cell.is_null = 1;
+                        da_push(&t->rows.items[i].cells, null_cell);
+                    }
+                    return 0;
+                }
+                case ALTER_DROP_COLUMN: {
+                    int col_idx = find_column_index_sv(t, q->alter_column);
+                    if (col_idx < 0) {
+                        fprintf(stderr, "alter error: column '" SV_FMT "' not found\n", SV_ARG(q->alter_column));
+                        return -1;
+                    }
+                    /* remove column from schema */
+                    free(t->columns.items[col_idx].name);
+                    free(t->columns.items[col_idx].enum_type_name);
+                    if (t->columns.items[col_idx].default_value) {
+                        if (column_type_is_text(t->columns.items[col_idx].default_value->type)
+                            && t->columns.items[col_idx].default_value->value.as_text)
+                            free(t->columns.items[col_idx].default_value->value.as_text);
+                        free(t->columns.items[col_idx].default_value);
+                    }
+                    for (size_t j = (size_t)col_idx; j + 1 < t->columns.count; j++)
+                        t->columns.items[j] = t->columns.items[j + 1];
+                    t->columns.count--;
+                    /* remove cell from each row */
+                    for (size_t i = 0; i < t->rows.count; i++) {
+                        struct row *r = &t->rows.items[i];
+                        if ((size_t)col_idx < r->cells.count) {
+                            free_cell_text_ext(&r->cells.items[col_idx]);
+                            for (size_t j = (size_t)col_idx; j + 1 < r->cells.count; j++)
+                                r->cells.items[j] = r->cells.items[j + 1];
+                            r->cells.count--;
+                        }
+                    }
+                    return 0;
+                }
+                case ALTER_RENAME_COLUMN: {
+                    int col_idx = find_column_index_sv(t, q->alter_column);
+                    if (col_idx < 0) {
+                        fprintf(stderr, "alter error: column '" SV_FMT "' not found\n", SV_ARG(q->alter_column));
+                        return -1;
+                    }
+                    free(t->columns.items[col_idx].name);
+                    t->columns.items[col_idx].name = sv_to_cstr(q->alter_new_name);
+                    return 0;
+                }
+                case ALTER_COLUMN_TYPE: {
+                    int col_idx = find_column_index_sv(t, q->alter_column);
+                    if (col_idx < 0) {
+                        fprintf(stderr, "alter error: column '" SV_FMT "' not found\n", SV_ARG(q->alter_column));
+                        return -1;
+                    }
+                    t->columns.items[col_idx].type = q->alter_new_col.type;
+                    return 0;
+                }
+            }
+            return -1;
+        }
+        case QUERY_TYPE_BEGIN:
+        case QUERY_TYPE_COMMIT:
+        case QUERY_TYPE_ROLLBACK:
+            return 0; /* handled above */
     }
     return -1;
 }

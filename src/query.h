@@ -60,13 +60,16 @@ enum cmp_op {
     CMP_NOT_IN,
     CMP_BETWEEN,
     CMP_LIKE,
-    CMP_ILIKE
+    CMP_ILIKE,
+    CMP_IS_DISTINCT,
+    CMP_IS_NOT_DISTINCT
 };
 
 enum cond_type {
     COND_COMPARE,
     COND_AND,
-    COND_OR
+    COND_OR,
+    COND_NOT
 };
 
 struct condition {
@@ -104,7 +107,18 @@ enum query_type {
     QUERY_TYPE_CREATE_INDEX,
     QUERY_TYPE_DROP_INDEX,
     QUERY_TYPE_CREATE_TYPE,
-    QUERY_TYPE_DROP_TYPE
+    QUERY_TYPE_DROP_TYPE,
+    QUERY_TYPE_ALTER,
+    QUERY_TYPE_BEGIN,
+    QUERY_TYPE_COMMIT,
+    QUERY_TYPE_ROLLBACK
+};
+
+enum alter_action {
+    ALTER_ADD_COLUMN,
+    ALTER_DROP_COLUMN,
+    ALTER_RENAME_COLUMN,
+    ALTER_COLUMN_TYPE
 };
 
 struct join_info {
@@ -112,6 +126,11 @@ struct join_info {
     sv join_table;
     sv join_left_col;
     sv join_right_col;
+};
+
+struct order_by_item {
+    sv column;
+    int desc;
 };
 
 struct query {
@@ -136,11 +155,13 @@ struct query {
     DYNAMIC_ARRAY(struct set_clause) set_clauses;
     int has_group_by;
     sv group_by_col;
+    DYNAMIC_ARRAY(sv) group_by_cols;
     int has_having;
     struct condition *having_cond;
     int has_order_by;
     sv order_by_col;
     int order_desc;
+    DYNAMIC_ARRAY(struct order_by_item) order_by_items;
     int has_limit;
     int limit_count;
     int has_offset;
@@ -151,6 +172,10 @@ struct query {
     DYNAMIC_ARRAY(char *) enum_values;
     DYNAMIC_ARRAY(struct agg_expr) aggregates;
     DYNAMIC_ARRAY(struct select_expr) select_exprs;
+    enum alter_action alter_action;
+    sv alter_column;
+    sv alter_new_name;
+    struct column alter_new_col;
 };
 
 int query_exec(struct table *t, struct query *q, struct rows *result);
