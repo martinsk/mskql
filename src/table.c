@@ -1,5 +1,6 @@
 #include "table.h"
 #include "row.h"
+#include "stringview.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -92,6 +93,35 @@ void table_deep_copy(struct table *dst, const struct table *src)
     }
 
     /* skip indexes — they will be rebuilt if needed */
+}
+
+int table_find_column_sv(struct table *t, sv name)
+{
+    /* exact match first */
+    for (size_t i = 0; i < t->columns.count; i++) {
+        if (sv_eq_cstr(name, t->columns.items[i].name))
+            return (int)i;
+    }
+    /* strip "table." prefix and retry */
+    sv col = name;
+    for (size_t k = 0; k < name.len; k++) {
+        if (name.data[k] == '.') {
+            col = sv_from(name.data + k + 1, name.len - k - 1);
+            break;
+        }
+    }
+    if (col.data != name.data) {
+        for (size_t i = 0; i < t->columns.count; i++) {
+            if (sv_eq_cstr(col, t->columns.items[i].name))
+                return (int)i;
+        }
+    }
+    return -1;
+}
+
+int table_find_column(struct table *t, const char *name)
+{
+    return table_find_column_sv(t, sv_from(name, strlen(name)));
 }
 
 void table_free(struct table *t)

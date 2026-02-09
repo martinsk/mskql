@@ -9,4 +9,7 @@ clean:
 test: all
 	./tests/test.sh
 
-.PHONY: all clean test
+bench:
+	$(MAKE) -C src bench
+
+.PHONY: all clean test bench

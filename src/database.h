@@ -11,6 +11,8 @@ struct db_snapshot {
 };
 
 struct database {
+    // TODO: STRINGVIEW OPPORTUNITY: name is strdup'd from a string literal in main.c;
+    // could be sv if the caller guaranteed lifetime.
     char *name;
     DYNAMIC_ARRAY(struct table) tables;
     DYNAMIC_ARRAY(struct enum_type) types;

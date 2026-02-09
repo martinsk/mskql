@@ -607,6 +607,9 @@ parse_in_list:
                 /* tok is now the closing ')' */
                 const char *sq_end = tok.value.data; /* points at ')' */
                 size_t sq_len = (size_t)(sq_end - sq_start);
+                // TODO: OWNERSHIP VIOLATION (JPL): subquery_sql is malloc'd here in parser.c
+                // but freed by condition_free in query.c. Allocator and deallocator are in
+                // different files.
                 c->subquery_sql = malloc(sq_len + 1);
                 memcpy(c->subquery_sql, sq_start, sq_len);
                 c->subquery_sql[sq_len] = '\0';
@@ -1175,10 +1178,10 @@ static int parse_select(struct lexer *l, struct query *out)
     if (tok.type == TOK_STAR) {
         out->columns = tok.value;
     } else if (tok.type == TOK_NUMBER || tok.type == TOK_STRING) {
-        /* SELECT <literal> — no FROM needed */
+        /* SELECT <literal> — no FROM needed; store in insert_rows for uniform ownership */
         out->columns = tok.value;
-        out->insert_row = calloc(1, sizeof(struct row));
-        da_init(&out->insert_row->cells);
+        struct row lit_row = {0};
+        da_init(&lit_row.cells);
         struct cell c = {0};
         if (tok.type == TOK_NUMBER) {
             c.type = COLUMN_TYPE_INT;
@@ -1187,7 +1190,7 @@ static int parse_select(struct lexer *l, struct query *out)
             c.type = COLUMN_TYPE_TEXT;
             c.value.as_text = sv_to_cstr(tok.value);
         }
-        da_push(&out->insert_row->cells, c);
+        da_push(&lit_row.cells, c);
 
         /* check for more comma-separated literals */
         for (;;) {
@@ -1205,11 +1208,14 @@ static int parse_select(struct lexer *l, struct query *out)
                 } else {
                     break;
                 }
-                da_push(&out->insert_row->cells, c2);
+                da_push(&lit_row.cells, c2);
             } else {
                 break;
             }
         }
+        da_init(&out->insert_rows);
+        da_push(&out->insert_rows, lit_row);
+        out->insert_row = &out->insert_rows.items[0];
         return 0;
     } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
         const char *col_start = tok.value.data;
@@ -1502,23 +1508,32 @@ parse_table_name:
             while (rhs_len > 0 && (rhs_start[rhs_len-1] == ';' || rhs_start[rhs_len-1] == ' '
                                     || rhs_start[rhs_len-1] == '\n'))
                 rhs_len--;
-            /* find trailing ORDER BY (not inside parens) to apply to combined result */
-            int paren_depth = 0;
+            /* find trailing ORDER BY (not inside parens) using the lexer */
             size_t last_order = (size_t)-1;
-            for (size_t i = 0; i + 7 < rhs_len; i++) {
-                if (rhs_start[i] == '(') paren_depth++;
-                else if (rhs_start[i] == ')') paren_depth--;
-                else if (paren_depth == 0 &&
-                         (rhs_start[i] == 'O' || rhs_start[i] == 'o') &&
-                         (rhs_start[i+1] == 'R' || rhs_start[i+1] == 'r') &&
-                         (rhs_start[i+2] == 'D' || rhs_start[i+2] == 'd') &&
-                         (rhs_start[i+3] == 'E' || rhs_start[i+3] == 'e') &&
-                         (rhs_start[i+4] == 'R' || rhs_start[i+4] == 'r') &&
-                         rhs_start[i+5] == ' ' &&
-                         (rhs_start[i+6] == 'B' || rhs_start[i+6] == 'b') &&
-                         (rhs_start[i+7] == 'Y' || rhs_start[i+7] == 'y')) {
-                    last_order = i;
+            {
+                /* make a NUL-terminated copy for the temporary lexer */
+                char *tmp_sql = malloc(rhs_len + 1);
+                memcpy(tmp_sql, rhs_start, rhs_len);
+                tmp_sql[rhs_len] = '\0';
+                struct lexer tmp_l;
+                lexer_init(&tmp_l, tmp_sql);
+                int pd = 0;
+                for (;;) {
+                    size_t tok_pos = tmp_l.pos;
+                    struct token tk = lexer_next(&tmp_l);
+                    if (tk.type == TOK_EOF) break;
+                    if (tk.type == TOK_LPAREN) { pd++; continue; }
+                    if (tk.type == TOK_RPAREN) { pd--; continue; }
+                    if (pd == 0 && tk.type == TOK_KEYWORD &&
+                        sv_eq_ignorecase_cstr(tk.value, "ORDER")) {
+                        struct token nxt = lexer_peek(&tmp_l);
+                        if (nxt.type == TOK_KEYWORD &&
+                            sv_eq_ignorecase_cstr(nxt.value, "BY")) {
+                            last_order = tok_pos;
+                        }
+                    }
                 }
+                free(tmp_sql);
             }
             if (last_order != (size_t)-1) {
                 /* parse the ORDER BY for the combined result */
@@ -1600,6 +1615,33 @@ static int parse_value_tuple(struct lexer *l, struct row *r)
         }
     }
     return 0;
+}
+
+static void parse_returning_clause(struct lexer *l, struct query *out)
+{
+    struct token peek = lexer_peek(l);
+    if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "RETURNING")) {
+        lexer_next(l); /* consume RETURNING */
+        out->has_returning = 1;
+        struct token tok = lexer_next(l);
+        if (tok.type == TOK_STAR) {
+            out->returning_columns = tok.value;
+        } else {
+            const char *start = tok.value.data;
+            const char *end = tok.value.data + tok.value.len;
+            for (;;) {
+                struct token p = lexer_peek(l);
+                if (p.type == TOK_COMMA) {
+                    lexer_next(l);
+                    tok = lexer_next(l);
+                    end = tok.value.data + tok.value.len;
+                } else {
+                    break;
+                }
+            }
+            out->returning_columns = sv_from(start, (size_t)(end - start));
+        }
+    }
 }
 
 static int parse_insert(struct lexer *l, struct query *out)
@@ -1699,28 +1741,7 @@ static int parse_insert(struct lexer *l, struct query *out)
         peek = lexer_peek(l);
     }
 
-    /* optional RETURNING col, col, ... */
-    if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "RETURNING")) {
-        lexer_next(l); /* consume RETURNING */
-        tok = lexer_next(l);
-        if (tok.type == TOK_STAR) {
-            out->returning_columns = tok.value;
-        } else if (tok.type == TOK_IDENTIFIER) {
-            const char *start = tok.value.data;
-            const char *end = tok.value.data + tok.value.len;
-            for (;;) {
-                struct token p = lexer_peek(l);
-                if (p.type == TOK_COMMA) {
-                    lexer_next(l);
-                    tok = lexer_next(l);
-                    end = tok.value.data + tok.value.len;
-                } else {
-                    break;
-                }
-            }
-            out->returning_columns = sv_from(start, (size_t)(end - start));
-        }
-    }
+    parse_returning_clause(l, out);
 
     return 0;
 }
@@ -2052,25 +2073,7 @@ static int parse_delete(struct lexer *l, struct query *out)
         if (parse_where_clause(l, out) != 0) return -1;
     }
 
-    /* optional RETURNING */
-    peek = lexer_peek(l);
-    if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "RETURNING")) {
-        lexer_next(l);
-        out->has_returning = 1;
-        tok = lexer_next(l);
-        if (tok.type == TOK_STAR) {
-            out->returning_columns = tok.value;
-        } else {
-            const char *start = tok.value.data;
-            const char *end = tok.value.data + tok.value.len;
-            for (;;) {
-                struct token p = lexer_peek(l);
-                if (p.type == TOK_COMMA) { lexer_next(l); tok = lexer_next(l); end = tok.value.data + tok.value.len; }
-                else break;
-            }
-            out->returning_columns = sv_from(start, (size_t)(end - start));
-        }
-    }
+    parse_returning_clause(l, out);
 
     return 0;
 }
@@ -2149,27 +2152,7 @@ static int parse_update(struct lexer *l, struct query *out)
         }
     }
 
-    /* optional RETURNING */
-    {
-        struct token peek2 = lexer_peek(l);
-        if (peek2.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek2.value, "RETURNING")) {
-            lexer_next(l);
-            out->has_returning = 1;
-            tok = lexer_next(l);
-            if (tok.type == TOK_STAR) {
-                out->returning_columns = tok.value;
-            } else {
-                const char *start = tok.value.data;
-                const char *end = tok.value.data + tok.value.len;
-                for (;;) {
-                    struct token p = lexer_peek(l);
-                    if (p.type == TOK_COMMA) { lexer_next(l); tok = lexer_next(l); end = tok.value.data + tok.value.len; }
-                    else break;
-                }
-                out->returning_columns = sv_from(start, (size_t)(end - start));
-            }
-        }
-    }
+    parse_returning_clause(l, out);
 
     return 0;
 }

@@ -71,24 +71,11 @@ int db_table_exec_query(struct database *db, sv table_name,
     return query_exec(t, q, result);
 }
 
-static int find_column_index(struct table *t, const char *name)
-{
-    for (size_t i = 0; i < t->columns.count; i++) {
-        if (strcmp(t->columns.items[i].name, name) == 0)
-            return (int)i;
-    }
-    return -1;
-}
+/* find_column_index / find_column_index_sv → use shared table_find_column / table_find_column_sv from table.h */
 
-static int find_column_index_sv(struct table *t, sv name)
-{
-    for (size_t i = 0; i < t->columns.count; i++) {
-        if (sv_eq_cstr(name, t->columns.items[i].name))
-            return (int)i;
-    }
-    return -1;
-}
-
+// TODO: STRINGVIEW OPPORTUNITY: extract_col_name copies into a stack buffer then returns
+// const char*; callers could use an sv-returning variant to avoid the copy entirely,
+// since the result is only used for strcmp/find_column_index lookups
 /* extract the column part from "table.column" or just "column" */
 static const char *extract_col_name(sv ref, char *buf, size_t bufsz)
 {
@@ -107,59 +94,11 @@ static const char *extract_col_name(sv ref, char *buf, size_t bufsz)
     return buf;
 }
 
-static void free_cell_text_ext(struct cell *c)
-{
-    if (column_type_is_text(c->type) && c->value.as_text)
-        free(c->value.as_text);
-}
+/* free_cell_text_ext → use shared cell_free_text from row.h */
 
-static void copy_cell(struct cell *dst, const struct cell *src)
-{
-    dst->type = src->type;
-    dst->is_null = src->is_null;
-    if (column_type_is_text(src->type) && src->value.as_text) {
-        dst->value.as_text = strdup(src->value.as_text);
-    } else {
-        dst->value = src->value;
-    }
-}
+/* copy_cell → use shared cell_copy from row.h */
 
-static int cell_compare_join(const struct cell *a, const struct cell *b)
-{
-    if (a->type != b->type) return (int)a->type - (int)b->type;
-    switch (a->type) {
-        case COLUMN_TYPE_INT:
-            if (a->value.as_int < b->value.as_int) return -1;
-            if (a->value.as_int > b->value.as_int) return  1;
-            return 0;
-        case COLUMN_TYPE_FLOAT:
-            if (a->value.as_float < b->value.as_float) return -1;
-            if (a->value.as_float > b->value.as_float) return  1;
-            return 0;
-        case COLUMN_TYPE_BOOLEAN:
-            if (a->value.as_bool < b->value.as_bool) return -1;
-            if (a->value.as_bool > b->value.as_bool) return  1;
-            return 0;
-        case COLUMN_TYPE_BIGINT:
-            if (a->value.as_bigint < b->value.as_bigint) return -1;
-            if (a->value.as_bigint > b->value.as_bigint) return  1;
-            return 0;
-        case COLUMN_TYPE_NUMERIC:
-            if (a->value.as_numeric < b->value.as_numeric) return -1;
-            if (a->value.as_numeric > b->value.as_numeric) return  1;
-            return 0;
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_DATE:
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_UUID:
-            if (!a->value.as_text && !b->value.as_text) return 0;
-            if (!a->value.as_text) return -1;
-            if (!b->value.as_text) return  1;
-            return strcmp(a->value.as_text, b->value.as_text);
-    }
-    return 0;
-}
+/* cell_compare_join → use shared cell_compare from row.h */
 
 /* qsort context for multi-column ORDER BY (single-threaded, so static is fine) */
 struct join_sort_ctx {
@@ -176,39 +115,14 @@ static int cmp_rows_join(const void *a, const void *b)
     for (size_t k = 0; k < _jsort_ctx.ncols; k++) {
         int ci = _jsort_ctx.cols[k];
         if (ci < 0) continue;
-        int cmp = cell_compare_join(&ra->cells.items[ci], &rb->cells.items[ci]);
+        int cmp = cell_compare(&ra->cells.items[ci], &rb->cells.items[ci]);
         if (_jsort_ctx.descs[k]) cmp = -cmp;
         if (cmp != 0) return cmp;
     }
     return 0;
 }
 
-static int cells_equal(const struct cell *a, const struct cell *b)
-{
-    /* promote INT <-> FLOAT */
-    if ((a->type == COLUMN_TYPE_INT && b->type == COLUMN_TYPE_FLOAT) ||
-        (a->type == COLUMN_TYPE_FLOAT && b->type == COLUMN_TYPE_INT)) {
-        double da = (a->type == COLUMN_TYPE_FLOAT) ? a->value.as_float : (double)a->value.as_int;
-        double db = (b->type == COLUMN_TYPE_FLOAT) ? b->value.as_float : (double)b->value.as_int;
-        return da == db;
-    }
-    if (a->type != b->type) return 0;
-    switch (a->type) {
-        case COLUMN_TYPE_INT:     return a->value.as_int == b->value.as_int;
-        case COLUMN_TYPE_FLOAT:   return a->value.as_float == b->value.as_float;
-        case COLUMN_TYPE_BOOLEAN: return a->value.as_bool == b->value.as_bool;
-        case COLUMN_TYPE_BIGINT:  return a->value.as_bigint == b->value.as_bigint;
-        case COLUMN_TYPE_NUMERIC: return a->value.as_numeric == b->value.as_numeric;
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_DATE:
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_UUID:
-            if (!a->value.as_text || !b->value.as_text) return a->value.as_text == b->value.as_text;
-            return strcmp(a->value.as_text, b->value.as_text) == 0;
-    }
-    return 0;
-}
+/* cells_equal → use shared cell_equal from row.h */
 
 static void emit_merged_row(struct row *r1, size_t ncols1,
                             struct row *r2, size_t ncols2,
@@ -217,11 +131,11 @@ static void emit_merged_row(struct row *r1, size_t ncols1,
     struct row full = {0};
     da_init(&full.cells);
     for (size_t c = 0; c < ncols1; c++) {
-        struct cell cp; copy_cell(&cp, &r1->cells.items[c]);
+        struct cell cp; cell_copy(&cp, &r1->cells.items[c]);
         da_push(&full.cells, cp);
     }
     for (size_t c = 0; c < ncols2; c++) {
-        struct cell cp; copy_cell(&cp, &r2->cells.items[c]);
+        struct cell cp; cell_copy(&cp, &r2->cells.items[c]);
         da_push(&full.cells, cp);
     }
     rows_push(out, full);
@@ -233,7 +147,7 @@ static void emit_null_right(struct row *r1, size_t ncols1,
     struct row full = {0};
     da_init(&full.cells);
     for (size_t c = 0; c < ncols1; c++) {
-        struct cell cp; copy_cell(&cp, &r1->cells.items[c]);
+        struct cell cp; cell_copy(&cp, &r1->cells.items[c]);
         da_push(&full.cells, cp);
     }
     for (size_t c = 0; c < t2->columns.count; c++) {
@@ -253,12 +167,14 @@ static void emit_null_left(struct table *t1, struct row *r2,
         da_push(&full.cells, cp);
     }
     for (size_t c = 0; c < ncols2; c++) {
-        struct cell cp; copy_cell(&cp, &r2->cells.items[c]);
+        struct cell cp; cell_copy(&cp, &r2->cells.items[c]);
         da_push(&full.cells, cp);
     }
     rows_push(out, full);
 }
 
+// TODO: STRINGVIEW OPPORTUNITY: make_aliased_name heap-allocates "alias.col" strings
+// that are only used for column name lookups; could use a stack buffer or sv concatenation
 static char *make_aliased_name(const char *alias, const char *col_name)
 {
     if (!alias || !alias[0]) return strdup(col_name);
@@ -318,9 +234,9 @@ static int do_single_join(struct table *t1, const char *alias1,
     const char *left_col = extract_col_name(left_col_sv, buf, sizeof(buf));
     const char *right_col = extract_col_name(right_col_sv, buf2, sizeof(buf2));
 
-    int left_in_t1 = (find_column_index(t1, left_col) >= 0);
-    int t1_join_col = left_in_t1 ? find_column_index(t1, left_col) : find_column_index(t1, right_col);
-    int t2_join_col = left_in_t1 ? find_column_index(t2, right_col) : find_column_index(t2, left_col);
+    int left_in_t1 = (table_find_column(t1, left_col) >= 0);
+    int t1_join_col = left_in_t1 ? table_find_column(t1, left_col) : table_find_column(t1, right_col);
+    int t2_join_col = left_in_t1 ? table_find_column(t2, right_col) : table_find_column(t2, left_col);
 
     if (t1_join_col < 0 || t2_join_col < 0) {
         fprintf(stderr, "join error: could not resolve ON columns\n");
@@ -334,7 +250,7 @@ static int do_single_join(struct table *t1, const char *alias1,
         struct row *r1 = &t1->rows.items[i];
         for (size_t j = 0; j < t2->rows.count; j++) {
             struct row *r2 = &t2->rows.items[j];
-            if (!cells_equal(&r1->cells.items[t1_join_col], &r2->cells.items[t2_join_col]))
+            if (!cell_equal(&r1->cells.items[t1_join_col], &r2->cells.items[t2_join_col]))
                 continue;
             t1_matched[i] = 1;
             t2_matched[j] = 1;
@@ -550,7 +466,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
 
         if (select_all) {
             for (size_t c = 0; c < merged.data[i].cells.count; c++) {
-                struct cell cp; copy_cell(&cp, &merged.data[i].cells.items[c]);
+                struct cell cp; cell_copy(&cp, &merged.data[i].cells.items[c]);
                 da_push(&dst.cells, cp);
             }
         } else {
@@ -602,7 +518,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
                     }
                 }
                 if (idx >= 0) {
-                    struct cell cp; copy_cell(&cp, &merged.data[i].cells.items[idx]);
+                    struct cell cp; cell_copy(&cp, &merged.data[i].cells.items[idx]);
                     da_push(&dst.cells, cp);
                 }
 
@@ -827,7 +743,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(q->table));
                 return -1;
             }
-            int col_idx = find_column_index_sv(t, q->index_column);
+            int col_idx = table_find_column_sv(t, q->index_column);
             if (col_idx < 0) {
                 fprintf(stderr, "column '" SV_FMT "' not found in table '" SV_FMT "'\n",
                         SV_ARG(q->index_column), SV_ARG(q->table));
@@ -890,8 +806,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                             da_push(&ct.columns, col);
                         }
                     } else if (src_t) {
-                        // TODO: this manual sv tokenization duplicates what the lexer already does;
-                // could reuse the lexer to parse the column list instead
+                        // TODO: CONTAINER REUSE: this manual sv tokenization duplicates what the lexer
+                // already does; could reuse the lexer to parse the column list instead
                 /* parse the select column list to get names */
                         sv cols = cte_q.columns;
                         size_t ci = 0;
@@ -939,7 +855,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     da_init(&r.cells);
                     for (size_t c = 0; c < cte_rows.data[i].cells.count; c++) {
                         struct cell cp;
-                        copy_cell(&cp, &cte_rows.data[i].cells.items[c]);
+                        cell_copy(&cp, &cte_rows.data[i].cells.items[c]);
                         da_push(&r.cells, cp);
                     }
                     da_push(&ct.rows, r);
@@ -980,6 +896,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             }
 
             /* UNION / INTERSECT / EXCEPT */
+            // TODO: CONTAINER REUSE: the row-equality comparison loop (iterate cells,
+            // call cell_equal) is duplicated three times below for UNION, INTERSECT, and
+            // EXCEPT. Extract a rows_equal(row*, row*) helper into row.c.
             if (sel_rc == 0 && q->has_set_op && q->set_rhs_sql && result) {
                 struct query rhs_q = {0};
                 if (query_parse(q->set_rhs_sql, &rhs_q) == 0) {
@@ -994,13 +913,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                                     /* check for duplicates */
                                     int dup = 0;
                                     for (size_t j = 0; j < result->count; j++) {
-                                        if (result->data[j].cells.count != rhs_rows.data[i].cells.count) continue;
-                                        int eq = 1;
-                                        for (size_t c = 0; c < rhs_rows.data[i].cells.count; c++) {
-                                            if (!cells_equal(&result->data[j].cells.items[c],
-                                                             &rhs_rows.data[i].cells.items[c])) { eq = 0; break; }
-                                        }
-                                        if (eq) { dup = 1; break; }
+                                        if (row_equal(&result->data[j], &rhs_rows.data[i])) { dup = 1; break; }
                                     }
                                     if (dup) { row_free(&rhs_rows.data[i]); continue; }
                                 }
@@ -1014,13 +927,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                             for (size_t i = 0; i < result->count; i++) {
                                 int found = 0;
                                 for (size_t j = 0; j < rhs_rows.count; j++) {
-                                    if (result->data[i].cells.count != rhs_rows.data[j].cells.count) continue;
-                                    int eq = 1;
-                                    for (size_t c = 0; c < result->data[i].cells.count; c++) {
-                                        if (!cells_equal(&result->data[i].cells.items[c],
-                                                         &rhs_rows.data[j].cells.items[c])) { eq = 0; break; }
-                                    }
-                                    if (eq) { found = 1; break; }
+                                    if (row_equal(&result->data[i], &rhs_rows.data[j])) { found = 1; break; }
                                 }
                                 if (found) {
                                     if (w != i) result->data[w] = result->data[i];
@@ -1036,13 +943,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                             for (size_t i = 0; i < result->count; i++) {
                                 int found = 0;
                                 for (size_t j = 0; j < rhs_rows.count; j++) {
-                                    if (result->data[i].cells.count != rhs_rows.data[j].cells.count) continue;
-                                    int eq = 1;
-                                    for (size_t c = 0; c < result->data[i].cells.count; c++) {
-                                        if (!cells_equal(&result->data[i].cells.items[c],
-                                                         &rhs_rows.data[j].cells.items[c])) { eq = 0; break; }
-                                    }
-                                    if (eq) { found = 1; break; }
+                                    if (row_equal(&result->data[i], &rhs_rows.data[j])) { found = 1; break; }
                                 }
                                 if (!found) {
                                     if (w != i) result->data[w] = result->data[i];
@@ -1082,7 +983,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                             char obuf[256];
                             const char *ord_name = extract_col_name(
                                 ob_q.order_by_items.items[k].column, obuf, sizeof(obuf));
-                            ord_cols[k] = find_column_index(src_t, ord_name);
+                            ord_cols[k] = table_find_column(src_t, ord_name);
                         }
                     }
                     _jsort_ctx = (struct join_sort_ctx){ .cols = ord_cols, .descs = ord_descs, .ncols = nord };
@@ -1127,7 +1028,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     da_init(&r.cells);
                     for (size_t c = 0; c < sel_rows.data[i].cells.count; c++) {
                         struct cell cp;
-                        copy_cell(&cp, &sel_rows.data[i].cells.items[c]);
+                        cell_copy(&cp, &sel_rows.data[i].cells.items[c]);
                         da_push(&r.cells, cp);
                     }
                     da_push(&t->rows, r);
@@ -1144,7 +1045,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 if (t) {
                     int conflict_col = -1;
                     if (q->conflict_column.len > 0)
-                        conflict_col = find_column_index_sv(t, q->conflict_column);
+                        conflict_col = table_find_column_sv(t, q->conflict_column);
                     else {
                         /* find first UNIQUE or PRIMARY KEY column */
                         for (size_t c = 0; c < t->columns.count; c++) {
@@ -1161,7 +1062,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                             struct cell *new_cell = &q->insert_rows.items[ri].cells.items[conflict_col];
                             int conflict = 0;
                             for (size_t ei = 0; ei < t->rows.count; ei++) {
-                                if (cells_equal(new_cell, &t->rows.items[ei].cells.items[conflict_col])) {
+                                if (cell_equal(new_cell, &t->rows.items[ei].cells.items[conflict_col])) {
                                     conflict = 1;
                                     break;
                                 }
@@ -1210,10 +1111,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     char lbuf[256], rbuf[256];
                     const char *lcol = extract_col_name(q->update_from_join_left, lbuf, sizeof(lbuf));
                     const char *rcol = extract_col_name(q->update_from_join_right, rbuf, sizeof(rbuf));
-                    int l_in_t = find_column_index(t, lcol);
-                    int l_in_ft = find_column_index(ft, lcol);
-                    int r_in_t = find_column_index(t, rcol);
-                    int r_in_ft = find_column_index(ft, rcol);
+                    int l_in_t = table_find_column(t, lcol);
+                    int l_in_ft = table_find_column(ft, lcol);
+                    int r_in_t = table_find_column(t, rcol);
+                    int r_in_ft = table_find_column(ft, rcol);
                     if (l_in_t >= 0 && r_in_ft >= 0) {
                         t_join_col = l_in_t; ft_join_col = r_in_ft;
                     } else if (l_in_ft >= 0 && r_in_t >= 0) {
@@ -1225,7 +1126,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     int matched = 0;
                     for (size_t j = 0; j < ft->rows.count; j++) {
                         if (t_join_col >= 0 && ft_join_col >= 0) {
-                            if (cells_equal(&t->rows.items[i].cells.items[t_join_col],
+                            if (cell_equal(&t->rows.items[i].cells.items[t_join_col],
                                             &ft->rows.items[j].cells.items[ft_join_col])) {
                                 matched = 1;
                                 break;
@@ -1235,7 +1136,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     if (!matched) continue;
                     updated++;
                     for (size_t s = 0; s < q->set_clauses.count; s++) {
-                        int ci = find_column_index_sv(t, q->set_clauses.items[s].column);
+                        int ci = table_find_column_sv(t, q->set_clauses.items[s].column);
                         if (ci < 0) continue;
                         if (column_type_is_text(t->rows.items[i].cells.items[ci].type)
                             && t->rows.items[i].cells.items[ci].value.as_text)
@@ -1281,7 +1182,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     return 0;
                 }
                 case ALTER_DROP_COLUMN: {
-                    int col_idx = find_column_index_sv(t, q->alter_column);
+                    int col_idx = table_find_column_sv(t, q->alter_column);
                     if (col_idx < 0) {
                         fprintf(stderr, "alter error: column '" SV_FMT "' not found\n", SV_ARG(q->alter_column));
                         return -1;
@@ -1302,7 +1203,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     for (size_t i = 0; i < t->rows.count; i++) {
                         struct row *r = &t->rows.items[i];
                         if ((size_t)col_idx < r->cells.count) {
-                            free_cell_text_ext(&r->cells.items[col_idx]);
+                            cell_free_text(&r->cells.items[col_idx]);
                             for (size_t j = (size_t)col_idx; j + 1 < r->cells.count; j++)
                                 r->cells.items[j] = r->cells.items[j + 1];
                             r->cells.count--;
@@ -1311,7 +1212,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     return 0;
                 }
                 case ALTER_RENAME_COLUMN: {
-                    int col_idx = find_column_index_sv(t, q->alter_column);
+                    int col_idx = table_find_column_sv(t, q->alter_column);
                     if (col_idx < 0) {
                         fprintf(stderr, "alter error: column '" SV_FMT "' not found\n", SV_ARG(q->alter_column));
                         return -1;
@@ -1321,7 +1222,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     return 0;
                 }
                 case ALTER_COLUMN_TYPE: {
-                    int col_idx = find_column_index_sv(t, q->alter_column);
+                    int col_idx = table_find_column_sv(t, q->alter_column);
                     if (col_idx < 0) {
                         fprintf(stderr, "alter error: column '" SV_FMT "' not found\n", SV_ARG(q->alter_column));
                         return -1;

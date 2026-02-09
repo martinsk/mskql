@@ -145,7 +145,7 @@ struct query {
     sv columns;
     sv table;
     sv table_alias;
-    struct row *insert_row;
+    struct row *insert_row; /* always an alias into insert_rows (never independently owned) */
     DYNAMIC_ARRAY(struct row) insert_rows;
     sv returning_columns;
     DYNAMIC_ARRAY(struct column) create_columns;
@@ -187,6 +187,13 @@ struct query {
     int has_set_op;
     int set_op;       /* 0=UNION, 1=INTERSECT, 2=EXCEPT */
     int set_all;      /* UNION ALL etc. */
+    // TODO: OWNERSHIP VIOLATION (JPL): set_rhs_sql, set_order_by, cte_name, cte_sql,
+    // and insert_select_sql are all malloc'd in parser.c but freed in query_free (query.c).
+    // The allocator and deallocator live in different files. Consider moving the free logic
+    // into a parser_query_free helper in parser.c, or documenting the cross-file contract.
+    // TODO: STRINGVIEW OPPORTUNITY: these five char* fields hold substrings of the original
+    // SQL input; they could be sv references into the input string if the caller guaranteed
+    // its lifetime, avoiding the malloc+memcpy+free round-trip entirely.
     char *set_rhs_sql; /* right-hand SELECT as raw SQL */
     char *set_order_by; /* ORDER BY clause for combined set result */
     /* CTE support */

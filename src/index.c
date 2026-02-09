@@ -2,51 +2,7 @@
 #include <string.h>
 #include <stdio.h>
 
-static int cell_compare(const struct cell *a, const struct cell *b)
-{
-    /* promote INT <-> FLOAT for numeric comparison */
-    if ((a->type == COLUMN_TYPE_INT && b->type == COLUMN_TYPE_FLOAT) ||
-        (a->type == COLUMN_TYPE_FLOAT && b->type == COLUMN_TYPE_INT)) {
-        double da = (a->type == COLUMN_TYPE_FLOAT) ? a->value.as_float : (double)a->value.as_int;
-        double db = (b->type == COLUMN_TYPE_FLOAT) ? b->value.as_float : (double)b->value.as_int;
-        if (da < db) return -1;
-        if (da > db) return  1;
-        return 0;
-    }
-    if (a->type != b->type) return (int)a->type - (int)b->type;
-    switch (a->type) {
-        case COLUMN_TYPE_INT:
-            if (a->value.as_int < b->value.as_int) return -1;
-            if (a->value.as_int > b->value.as_int) return  1;
-            return 0;
-        case COLUMN_TYPE_FLOAT:
-            if (a->value.as_float < b->value.as_float) return -1;
-            if (a->value.as_float > b->value.as_float) return  1;
-            return 0;
-        case COLUMN_TYPE_BOOLEAN:
-            if (a->value.as_bool < b->value.as_bool) return -1;
-            if (a->value.as_bool > b->value.as_bool) return  1;
-            return 0;
-        case COLUMN_TYPE_BIGINT:
-            if (a->value.as_bigint < b->value.as_bigint) return -1;
-            if (a->value.as_bigint > b->value.as_bigint) return  1;
-            return 0;
-        case COLUMN_TYPE_NUMERIC:
-            if (a->value.as_numeric < b->value.as_numeric) return -1;
-            if (a->value.as_numeric > b->value.as_numeric) return  1;
-            return 0;
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_DATE:
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_UUID:
-            if (!a->value.as_text && !b->value.as_text) return 0;
-            if (!a->value.as_text) return -1;
-            if (!b->value.as_text) return  1;
-            return strcmp(a->value.as_text, b->value.as_text);
-    }
-    return 0;
-}
+/* cell_compare → now shared from row.h */
 
 static struct btree_node *node_alloc(int is_leaf)
 {
@@ -57,14 +13,7 @@ static struct btree_node *node_alloc(int is_leaf)
     return n;
 }
 
-static void cell_dup(struct cell *dst, const struct cell *src)
-{
-    dst->type = src->type;
-    if (column_type_is_text(src->type) && src->value.as_text)
-        dst->value.as_text = strdup(src->value.as_text);
-    else
-        dst->value = src->value;
-}
+/* cell_dup → use shared cell_copy from row.h */
 
 static void entry_free(struct btree_entry *e)
 {
@@ -126,7 +75,7 @@ static void insert_nonfull(struct btree_node *node, const struct cell *key, size
             node->entries[j] = node->entries[j - 1];
 
         memset(&node->entries[i], 0, sizeof(node->entries[i]));
-        cell_dup(&node->entries[i].key, key);
+        cell_copy(&node->entries[i].key, key);
         da_init(&node->entries[i].row_ids);
         da_push(&node->entries[i].row_ids, row_id);
         node->count++;

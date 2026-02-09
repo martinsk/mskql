@@ -21,4 +21,9 @@ void table_add_column(struct table *t, struct column *col);
 void table_free(struct table *t);
 void table_deep_copy(struct table *dst, const struct table *src);
 
+/* column lookup — exact match first, then strips "table." prefix and retries */
+#include "stringview.h"
+int table_find_column_sv(struct table *t, sv name);
+int table_find_column(struct table *t, const char *name);
+
 #endif
