@@ -150,85 +150,159 @@ struct order_by_item {
     int desc;
 };
 
-struct query {
-    enum query_type query_type;
-    int has_distinct;
-    sv columns;
+/* WHERE clause fields shared by SELECT, UPDATE, DELETE */
+struct where_clause {
+    int has_where;
+    sv where_column;
+    struct cell where_value;
+    struct condition *where_cond;
+};
+
+struct query_select {
     sv table;
     sv table_alias;
-    struct row *insert_row; /* always an alias into insert_rows (never independently owned) */
-    DYNAMIC_ARRAY(struct row) insert_rows;
-    sv returning_columns;
-    DYNAMIC_ARRAY(struct column) create_columns;
+    sv columns;
+    int has_distinct;
+    /* WHERE */
+    struct where_clause where;
+    /* JOIN */
     int has_join;
     int join_type; /* 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL */
     sv join_table;
     sv join_left_col;
     sv join_right_col;
     DYNAMIC_ARRAY(struct join_info) joins;
-    int has_where;
-    sv where_column;
-    struct cell where_value;
-    struct condition *where_cond;
-    DYNAMIC_ARRAY(struct set_clause) set_clauses;
+    /* GROUP BY */
     int has_group_by;
     sv group_by_col;
     DYNAMIC_ARRAY(sv) group_by_cols;
+    /* HAVING */
     int has_having;
     struct condition *having_cond;
+    /* ORDER BY */
     int has_order_by;
     sv order_by_col;
     int order_desc;
     DYNAMIC_ARRAY(struct order_by_item) order_by_items;
+    /* LIMIT / OFFSET */
     int has_limit;
     int limit_count;
     int has_offset;
     int offset_count;
-    sv index_name;
-    sv index_column;
-    sv type_name;
-    DYNAMIC_ARRAY(char *) enum_values;
+    /* aggregates & window functions */
     DYNAMIC_ARRAY(struct agg_expr) aggregates;
     DYNAMIC_ARRAY(struct select_expr) select_exprs;
-    enum alter_action alter_action;
-    sv alter_column;
-    sv alter_new_name;
-    struct column alter_new_col;
     /* set operations: UNION / INTERSECT / EXCEPT */
     int has_set_op;
     int set_op;       /* 0=UNION, 1=INTERSECT, 2=EXCEPT */
     int set_all;      /* UNION ALL etc. */
-    // TODO: OWNERSHIP VIOLATION (JPL): set_rhs_sql, set_order_by, cte_name, cte_sql,
-    // and insert_select_sql are all malloc'd in parser.c but freed in query_free (query.c).
-    // The allocator and deallocator live in different files. Consider moving the free logic
-    // into a parser_query_free helper in parser.c, or documenting the cross-file contract.
-    // TODO: STRINGVIEW OPPORTUNITY: these five char* fields hold substrings of the original
-    // SQL input; they could be sv references into the input string if the caller guaranteed
-    // its lifetime, avoiding the malloc+memcpy+free round-trip entirely.
-    char *set_rhs_sql; /* right-hand SELECT as raw SQL */
-    char *set_order_by; /* ORDER BY clause for combined set result */
+    char *set_rhs_sql;
+    char *set_order_by;
     /* CTE support (legacy single CTE) */
     char *cte_name;
     char *cte_sql;
     /* multiple / recursive CTEs */
     DYNAMIC_ARRAY(struct cte_def) ctes;
     int has_recursive_cte;
+    /* FROM subquery: SELECT * FROM (SELECT ...) AS alias */
+    char *from_subquery_sql;
+    sv from_subquery_alias;
+    /* literal SELECT (no table): reuse insert_row for literal values */
+    DYNAMIC_ARRAY(struct row) insert_rows;
+    struct row *insert_row;
+};
+
+struct query_insert {
+    sv table;
+    sv columns;
+    struct row *insert_row; /* alias into insert_rows (never independently owned) */
+    DYNAMIC_ARRAY(struct row) insert_rows;
+    /* RETURNING */
+    int has_returning;
+    sv returning_columns;
     /* INSERT ... SELECT */
     char *insert_select_sql;
     /* ON CONFLICT */
     int has_on_conflict;
     int on_conflict_do_nothing;
     sv conflict_column;
-    /* RETURNING on UPDATE/DELETE */
+};
+
+struct query_update {
+    sv table;
+    DYNAMIC_ARRAY(struct set_clause) set_clauses;
+    /* WHERE */
+    struct where_clause where;
+    /* RETURNING */
     int has_returning;
+    sv returning_columns;
     /* UPDATE ... FROM */
     int has_update_from;
     sv update_from_table;
     sv update_from_join_left;
     sv update_from_join_right;
-    /* FROM subquery: SELECT * FROM (SELECT ...) AS alias */
-    char *from_subquery_sql;
-    sv from_subquery_alias;
+};
+
+struct query_delete {
+    sv table;
+    /* WHERE */
+    struct where_clause where;
+    /* RETURNING */
+    int has_returning;
+    sv returning_columns;
+};
+
+struct query_create_table {
+    sv table;
+    DYNAMIC_ARRAY(struct column) create_columns;
+};
+
+struct query_drop_table {
+    sv table;
+};
+
+struct query_alter {
+    sv table;
+    enum alter_action alter_action;
+    sv alter_column;
+    sv alter_new_name;
+    struct column alter_new_col;
+};
+
+struct query_create_index {
+    sv table;
+    sv index_name;
+    sv index_column;
+};
+
+struct query_drop_index {
+    sv index_name;
+};
+
+struct query_create_type {
+    sv type_name;
+    DYNAMIC_ARRAY(char *) enum_values;
+};
+
+struct query_drop_type {
+    sv type_name;
+};
+
+struct query {
+    enum query_type query_type;
+    union {
+        struct query_select select;
+        struct query_insert insert;
+        struct query_update update;
+        struct query_delete del;
+        struct query_create_table create_table;
+        struct query_drop_table drop_table;
+        struct query_alter alter;
+        struct query_create_index create_index;
+        struct query_drop_index drop_index;
+        struct query_create_type create_type;
+        struct query_drop_type drop_type;
+    };
 };
 
 int query_exec(struct table *t, struct query *q, struct rows *result);

@@ -347,8 +347,8 @@ static int send_row_description(int fd, struct database *db, struct query *q,
     }
 
     /* try to get column metadata from the table */
-    if (q->table.len > 0) {
-        t = db_find_table_sv(db, q->table);
+    if (q->query_type == QUERY_TYPE_SELECT && q->select.table.len > 0) {
+        t = db_find_table_sv(db, q->select.table);
     }
 
     msgbuf_push_u16(&m, (uint16_t)ncols);
@@ -357,8 +357,8 @@ static int send_row_description(int fd, struct database *db, struct query *q,
         const char *colname = "?";
         uint32_t type_oid = 25; /* text */
 
-        if (q->select_exprs.count > 0 && (size_t)i < q->select_exprs.count) {
-            struct select_expr *se = &q->select_exprs.items[i];
+        if (q->select.select_exprs.count > 0 && (size_t)i < q->select.select_exprs.count) {
+            struct select_expr *se = &q->select.select_exprs.items[i];
             if (se->kind == SEL_COLUMN) {
                 /* try to get name from table */
                 int ci = -1;
@@ -384,8 +384,8 @@ static int send_row_description(int fd, struct database *db, struct query *q,
                 if (result->count > 0)
                     type_oid = column_type_to_oid(result->data[0].cells.items[i].type);
             }
-        } else if (q->aggregates.count > 0 && (size_t)i < q->aggregates.count) {
-            switch (q->aggregates.items[i].func) {
+        } else if (q->select.aggregates.count > 0 && (size_t)i < q->select.aggregates.count) {
+            switch (q->select.aggregates.items[i].func) {
                 case AGG_SUM:   colname = "sum";   break;
                 case AGG_COUNT: colname = "count"; break;
                 case AGG_AVG:   colname = "avg";   break;
@@ -494,13 +494,13 @@ static int handle_query(int fd, struct database *db, const char *sql,
                 send_data_rows(fd, &result);
             }
             {
-                size_t ins_count = q.insert_rows.count;
+                size_t ins_count = q.insert.insert_rows.count;
                 if (rc > 0) ins_count = (size_t)rc; /* INSERT...SELECT */
                 snprintf(tag, sizeof(tag), "INSERT 0 %zu", ins_count);
             }
             break;
         case QUERY_TYPE_DELETE: {
-            if (q.has_returning && result.count > 0) {
+            if (q.del.has_returning && result.count > 0) {
                 send_row_description(fd, db, &q, &result);
                 send_data_rows(fd, &result);
                 snprintf(tag, sizeof(tag), "DELETE %zu", result.count);
@@ -513,7 +513,7 @@ static int handle_query(int fd, struct database *db, const char *sql,
             break;
         }
         case QUERY_TYPE_UPDATE: {
-            if (q.has_returning && result.count > 0) {
+            if (q.update.has_returning && result.count > 0) {
                 send_row_description(fd, db, &q, &result);
                 send_data_rows(fd, &result);
                 snprintf(tag, sizeof(tag), "UPDATE %zu", result.count);
