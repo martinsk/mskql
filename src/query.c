@@ -1,5 +1,6 @@
 #include "query.h"
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>

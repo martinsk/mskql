@@ -1,5 +1,5 @@
 CC       = cc
-CFLAGS   = -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -g
+CFLAGS   = -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -g
 BUILDDIR = ../build
 SRCS     = main.c database.c table.c query.c row.c parser.c pgwire.c index.c column.c
 OBJS     = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
