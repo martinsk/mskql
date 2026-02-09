@@ -420,7 +420,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
                         if (cv->is_null) {
                             wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "NULL");
                         } else if (cv->type == COLUMN_TYPE_INT) {
-                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "%lld", cv->value.as_int);
+                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "%d", cv->value.as_int);
                         } else if (cv->type == COLUMN_TYPE_FLOAT) {
                             wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "%g", cv->value.as_float);
                         } else if (column_type_is_text(cv->type) && cv->value.as_text) {
@@ -443,7 +443,8 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
             if (!lat_cols_added && lat_rows.count > 0) {
                 /* infer column names from the lateral subquery's column list */
                 struct query lat_q = {0};
-                if (query_parse(ji->lateral_subquery_sql, &lat_q) == 0) {
+                int lat_parsed = (query_parse(ji->lateral_subquery_sql, &lat_q) == 0);
+                if (lat_parsed) {
                     /* parse the SELECT column list to get names */
                     sv cols = lat_q.select.columns;
                     size_t ci = 0;
@@ -485,8 +486,8 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
                         col.type = lat_rows.data[0].cells.items[ci].type;
                         da_push(&merged_t.columns, col);
                     }
-                    query_free(&lat_q);
                 }
+                query_free(&lat_q);
                 lat_cols_added = 1;
             }
 
@@ -1307,7 +1308,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             // EXCEPT. Extract a rows_equal(row*, row*) helper into row.c.
             if (sel_rc == 0 && s->has_set_op && s->set_rhs_sql && result) {
                 struct query rhs_q = {0};
-                if (query_parse(s->set_rhs_sql, &rhs_q) == 0) {
+                int rhs_parsed = (query_parse(s->set_rhs_sql, &rhs_q) == 0);
+                if (rhs_parsed) {
                     struct rows rhs_rows = {0};
                     if (db_exec(db, &rhs_q, &rhs_rows) == 0) {
                         if (s->set_op == 0) {
@@ -1319,7 +1321,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                                     /* check for duplicates */
                                     int dup = 0;
                                     for (size_t j = 0; j < result->count; j++) {
-                                        if (row_equal(&result->data[j], &rhs_rows.data[i])) { dup = 1; break; }
+                                        if (row_equal_nullsafe(&result->data[j], &rhs_rows.data[i])) { dup = 1; break; }
                                     }
                                     if (dup) { row_free(&rhs_rows.data[i]); continue; }
                                 }
@@ -1333,7 +1335,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                             for (size_t i = 0; i < result->count; i++) {
                                 int found = 0;
                                 for (size_t j = 0; j < rhs_rows.count; j++) {
-                                    if (row_equal(&result->data[i], &rhs_rows.data[j])) { found = 1; break; }
+                                    if (row_equal_nullsafe(&result->data[i], &rhs_rows.data[j])) { found = 1; break; }
                                 }
                                 if (found) {
                                     if (w != i) result->data[w] = result->data[i];
@@ -1349,7 +1351,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                             for (size_t i = 0; i < result->count; i++) {
                                 int found = 0;
                                 for (size_t j = 0; j < rhs_rows.count; j++) {
-                                    if (row_equal(&result->data[i], &rhs_rows.data[j])) { found = 1; break; }
+                                    if (row_equal_nullsafe(&result->data[i], &rhs_rows.data[j])) { found = 1; break; }
                                 }
                                 if (!found) {
                                     if (w != i) result->data[w] = result->data[i];
@@ -1364,8 +1366,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                             row_free(&rhs_rows.data[i]);
                         free(rhs_rows.data);
                     }
-                    query_free(&rhs_q);
                 }
+                query_free(&rhs_q);
             }
 
             /* ORDER BY on combined set operation result */
@@ -1420,7 +1422,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             /* INSERT ... SELECT */
             if (ins->insert_select_sql) {
                 struct query sel_q = {0};
-                if (query_parse(ins->insert_select_sql, &sel_q) != 0) return -1;
+                if (query_parse(ins->insert_select_sql, &sel_q) != 0) {
+                    query_free(&sel_q);
+                    return -1;
+                }
                 struct rows sel_rows = {0};
                 if (db_exec(db, &sel_q, &sel_rows) != 0) {
                     query_free(&sel_q);
@@ -1659,7 +1664,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
 int db_exec_sql(struct database *db, const char *sql, struct rows *result)
 {
     struct query q = {0};
-    if (query_parse(sql, &q) != 0) return -1;
+    if (query_parse(sql, &q) != 0) {
+        query_free(&q);
+        return -1;
+    }
     int rc = db_exec(db, &q, result);
     query_free(&q);
     return rc;

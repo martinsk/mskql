@@ -52,4 +52,6 @@ struct column {
     int is_primary_key;
 };
 
+void column_free(struct column *col);
+
 #endif

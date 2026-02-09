@@ -629,13 +629,6 @@ parse_in_list:
             if (tok.type == TOK_RPAREN) break;
             if (tok.type != TOK_COMMA) {
                 fprintf(stderr, "parse error: expected ',' or ')' in IN list\n");
-                for (size_t iv = 0; iv < c->in_values.count; iv++) {
-                    if ((c->in_values.items[iv].type == COLUMN_TYPE_TEXT ||
-                         c->in_values.items[iv].type == COLUMN_TYPE_ENUM) &&
-                        c->in_values.items[iv].value.as_text)
-                        free(c->in_values.items[iv].value.as_text);
-                }
-                da_free(&c->in_values);
                 condition_free(c); return NULL;
             }
         }
@@ -1398,13 +1391,9 @@ parse_table_name:
             s->table = tok.value;
         } else {
             fprintf(stderr, "parse error: expected AS alias after FROM subquery\n");
-            // TODO: MEMORY LEAK ON ERROR: from_subquery_sql was just malloc'd above.
-            // query_free will free it only if the caller calls query_free AND query_type
-            // is QUERY_TYPE_SELECT. pgwire.c does call query_free on parse failure, so
-            // this is safe there, but any caller that doesn't call query_free on error
-            // (e.g. the LATERAL path in exec_join that parses with query_parse then only
-            // calls query_free on success) would leak. Defensive: free here or ensure all
-            // callers always call query_free.
+            // NOTE: from_subquery_sql was just malloc'd above. Safe as long as the
+            // caller always calls query_free on failure (query_type is QUERY_TYPE_SELECT
+            // here, so query_select_free will free it). All current callers do this.
             return -1;
         }
     } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_STRING) {
@@ -1490,12 +1479,6 @@ parse_table_name:
             tok = lexer_next(l); /* should be ( */
             if (tok.type != TOK_LPAREN) {
                 fprintf(stderr, "parse error: expected '(' after LATERAL\n");
-                // TODO: MEMORY LEAK ON ERROR: any previously pushed join_info entries
-                // with lateral_subquery_sql will be freed by query_free (since
-                // query_type is already QUERY_TYPE_SELECT), but if this error fires
-                // after ji.lateral_subquery_sql was malloc'd below, that stack-local
-                // ji is lost. The same applies to the "unterminated LATERAL subquery"
-                // and "expected alias after LATERAL subquery" error paths below.
                 return -1;
             }
             const char *sq_start = l->input + l->pos;
@@ -1529,6 +1512,7 @@ parse_table_name:
                 ji.join_table = tok.value;
             } else {
                 fprintf(stderr, "parse error: expected alias after LATERAL subquery\n");
+                free(ji.lateral_subquery_sql);
                 return -1;
             }
         } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_STRING) {
@@ -2068,13 +2052,6 @@ static int parse_create(struct lexer *l, struct query *out)
         return -1;
     }
 
-    // TODO: MEMORY LEAK ON ERROR: if any error return -1 fires inside this loop
-    // after columns have been pushed into crt->create_columns, those columns (with
-    // malloc'd name, enum_type_name, and default_value) are leaked unless the caller
-    // calls query_free. query_type is QUERY_TYPE_CREATE so query_free will handle it,
-    // but only if the caller always calls query_free on failure. db_exec_sql and
-    // pgwire.c do, but materialize_subquery does NOT call query_free when query_parse
-    // fails (line 836).
     for (;;) {
         /* column name */
         tok = lexer_next(l);
@@ -2458,13 +2435,8 @@ int query_parse(const char *sql, struct query *out)
 
         da_init(&s->ctes);
 
-        // TODO: MEMORY LEAK ON ERROR: if any error return -1 fires below (e.g.
-        // "expected CTE name", "expected AS", "unterminated CTE", "expected SELECT"),
-        // previously parsed CTE entries in s->ctes (with malloc'd name and sql) are
-        // leaked. The caller does call query_free, but query_type is still 0
-        // (QUERY_TYPE_CREATE) from the memset, so query_free takes the wrong switch
-        // branch and never frees the CTE data. Should set out->query_type =
-        // QUERY_TYPE_SELECT before parsing CTEs, or free s->ctes in error paths.
+        /* set query_type early so query_free takes the SELECT branch on error */
+        out->query_type = QUERY_TYPE_SELECT;
 
         /* parse one or more CTE definitions: name AS (...) [, ...] */
         for (;;) {

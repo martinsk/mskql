@@ -121,7 +121,7 @@ int row_equal(const struct row *a, const struct row *b)
 {
     if (a->cells.count != b->cells.count) return 0;
     for (size_t i = 0; i < a->cells.count; i++) {
-        if (!cell_equal_nullsafe(&a->cells.items[i], &b->cells.items[i]))
+        if (!cell_equal(&a->cells.items[i], &b->cells.items[i]))
             return 0;
     }
     return 1;

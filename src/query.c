@@ -39,18 +39,13 @@ void condition_free(struct condition *c)
     } else if (c->type == COND_NOT) {
         condition_free(c->left);
     } else if (c->type == COND_COMPARE) {
-        if (column_type_is_text(c->value.type) && c->value.value.as_text)
-            free(c->value.value.as_text);
+        cell_free_text(&c->value);
         /* free IN / NOT IN value list */
-        for (size_t i = 0; i < c->in_values.count; i++) {
-            if (column_type_is_text(c->in_values.items[i].type) &&
-                c->in_values.items[i].value.as_text)
-                free(c->in_values.items[i].value.as_text);
-        }
+        for (size_t i = 0; i < c->in_values.count; i++)
+            cell_free_text(&c->in_values.items[i]);
         da_free(&c->in_values);
         /* free BETWEEN high value */
-        if (column_type_is_text(c->between_high.type) && c->between_high.value.as_text)
-            free(c->between_high.value.as_text);
+        cell_free_text(&c->between_high);
         /* free unresolved subquery SQL */
         free(c->subquery_sql);
         free(c->scalar_subquery_sql);
@@ -62,12 +57,6 @@ void condition_free(struct condition *c)
 
 static void where_clause_free(struct where_clause *w)
 {
-    // TODO: DANGLING POINTER RISK: where_value is documented as a shallow alias of
-    // where_cond->value, but resolve_subqueries (database.c) can overwrite cond->value
-    // with a strdup'd string (scalar subquery path). After condition_free frees that
-    // string, where_value.value.as_text becomes a dangling pointer. Any code that reads
-    // where_value after this point (e.g. index_lookup in query_select) would use-after-free.
-    // Should either clear where_value here or stop aliasing it.
     condition_free(w->where_cond);
     w->where_cond = NULL;
     /* where_value is a shallow copy of where_cond->value — already freed above;
@@ -75,93 +64,91 @@ static void where_clause_free(struct where_clause *w)
     memset(&w->where_value, 0, sizeof(w->where_value));
 }
 
+static void query_select_free(struct query_select *s)
+{
+    where_clause_free(&s->where);
+    condition_free(s->having_cond);
+    s->having_cond = NULL;
+    da_free(&s->aggregates);
+    da_free(&s->select_exprs);
+    for (size_t i = 0; i < s->joins.count; i++)
+        free(s->joins.items[i].lateral_subquery_sql);
+    da_free(&s->joins);
+    da_free(&s->order_by_items);
+    da_free(&s->group_by_cols);
+    free(s->set_rhs_sql);
+    free(s->set_order_by);
+    free(s->cte_name);
+    free(s->cte_sql);
+    free(s->from_subquery_sql);
+    for (size_t i = 0; i < s->ctes.count; i++) {
+        free(s->ctes.items[i].name);
+        free(s->ctes.items[i].sql);
+    }
+    da_free(&s->ctes);
+    for (size_t i = 0; i < s->insert_rows.count; i++) {
+        for (size_t j = 0; j < s->insert_rows.items[i].cells.count; j++)
+            cell_free_text(&s->insert_rows.items[i].cells.items[j]);
+        da_free(&s->insert_rows.items[i].cells);
+    }
+    da_free(&s->insert_rows);
+    s->insert_row = NULL;
+}
+
+static void query_insert_free(struct query_insert *ins)
+{
+    for (size_t i = 0; i < ins->insert_rows.count; i++) {
+        for (size_t j = 0; j < ins->insert_rows.items[i].cells.count; j++)
+            cell_free_text(&ins->insert_rows.items[i].cells.items[j]);
+        da_free(&ins->insert_rows.items[i].cells);
+    }
+    da_free(&ins->insert_rows);
+    ins->insert_row = NULL;
+    free(ins->insert_select_sql);
+}
+
+static void query_update_free(struct query_update *u)
+{
+    where_clause_free(&u->where);
+    for (size_t i = 0; i < u->set_clauses.count; i++)
+        cell_free_text(&u->set_clauses.items[i].value);
+    da_free(&u->set_clauses);
+}
+
+static void query_delete_free(struct query_delete *d)
+{
+    where_clause_free(&d->where);
+}
+
+static void query_create_table_free(struct query_create_table *ct)
+{
+    for (size_t i = 0; i < ct->create_columns.count; i++)
+        column_free(&ct->create_columns.items[i]);
+    da_free(&ct->create_columns);
+}
+
+static void query_alter_free(struct query_alter *a)
+{
+    column_free(&a->alter_new_col);
+}
+
+static void query_create_type_free(struct query_create_type *ct)
+{
+    for (size_t i = 0; i < ct->enum_values.count; i++)
+        free(ct->enum_values.items[i]);
+    da_free(&ct->enum_values);
+}
+
 void query_free(struct query *q)
 {
     switch (q->query_type) {
-    case QUERY_TYPE_SELECT: {
-        struct query_select *s = &q->select;
-        where_clause_free(&s->where);
-        condition_free(s->having_cond);
-        s->having_cond = NULL;
-        da_free(&s->aggregates);
-        da_free(&s->select_exprs);
-        for (size_t i = 0; i < s->joins.count; i++)
-            free(s->joins.items[i].lateral_subquery_sql);
-        da_free(&s->joins);
-        da_free(&s->order_by_items);
-        da_free(&s->group_by_cols);
-        free(s->set_rhs_sql);
-        free(s->set_order_by);
-        free(s->cte_name);
-        free(s->cte_sql);
-        free(s->from_subquery_sql);
-        for (size_t i = 0; i < s->ctes.count; i++) {
-            free(s->ctes.items[i].name);
-            free(s->ctes.items[i].sql);
-        }
-        da_free(&s->ctes);
-        for (size_t i = 0; i < s->insert_rows.count; i++) {
-            for (size_t j = 0; j < s->insert_rows.items[i].cells.count; j++)
-                cell_free_text(&s->insert_rows.items[i].cells.items[j]);
-            da_free(&s->insert_rows.items[i].cells);
-        }
-        da_free(&s->insert_rows);
-        s->insert_row = NULL;
-        break;
-    }
-    case QUERY_TYPE_INSERT: {
-        struct query_insert *ins = &q->insert;
-        for (size_t i = 0; i < ins->insert_rows.count; i++) {
-            for (size_t j = 0; j < ins->insert_rows.items[i].cells.count; j++)
-                cell_free_text(&ins->insert_rows.items[i].cells.items[j]);
-            da_free(&ins->insert_rows.items[i].cells);
-        }
-        da_free(&ins->insert_rows);
-        ins->insert_row = NULL;
-        free(ins->insert_select_sql);
-        break;
-    }
-    case QUERY_TYPE_UPDATE: {
-        struct query_update *u = &q->update;
-        where_clause_free(&u->where);
-        for (size_t i = 0; i < u->set_clauses.count; i++)
-            cell_free_text(&u->set_clauses.items[i].value);
-        da_free(&u->set_clauses);
-        break;
-    }
-    case QUERY_TYPE_DELETE: {
-        where_clause_free(&q->del.where);
-        break;
-    }
-    case QUERY_TYPE_CREATE: {
-        struct query_create_table *ct = &q->create_table;
-        for (size_t i = 0; i < ct->create_columns.count; i++) {
-            free(ct->create_columns.items[i].name);
-            free(ct->create_columns.items[i].enum_type_name);
-            if (ct->create_columns.items[i].default_value) {
-                cell_free_text(ct->create_columns.items[i].default_value);
-                free(ct->create_columns.items[i].default_value);
-            }
-        }
-        da_free(&ct->create_columns);
-        break;
-    }
-    case QUERY_TYPE_ALTER: {
-        struct query_alter *a = &q->alter;
-        free(a->alter_new_col.name);
-        free(a->alter_new_col.enum_type_name);
-        if (a->alter_new_col.default_value) {
-            cell_free_text(a->alter_new_col.default_value);
-            free(a->alter_new_col.default_value);
-        }
-        break;
-    }
-    case QUERY_TYPE_CREATE_TYPE: {
-        for (size_t i = 0; i < q->create_type.enum_values.count; i++)
-            free(q->create_type.enum_values.items[i]);
-        da_free(&q->create_type.enum_values);
-        break;
-    }
+    case QUERY_TYPE_SELECT:     query_select_free(&q->select);       break;
+    case QUERY_TYPE_INSERT:     query_insert_free(&q->insert);       break;
+    case QUERY_TYPE_UPDATE:     query_update_free(&q->update);       break;
+    case QUERY_TYPE_DELETE:     query_delete_free(&q->del);          break;
+    case QUERY_TYPE_CREATE:     query_create_table_free(&q->create_table); break;
+    case QUERY_TYPE_ALTER:      query_alter_free(&q->alter);         break;
+    case QUERY_TYPE_CREATE_TYPE: query_create_type_free(&q->create_type); break;
     case QUERY_TYPE_DROP:
     case QUERY_TYPE_DROP_INDEX:
     case QUERY_TYPE_DROP_TYPE:
@@ -774,9 +761,8 @@ static void emit_row(struct table *t, struct query_select *s, struct row *src,
     rows_push(result, dst);
 }
 
-static int query_aggregate(struct table *t, struct query *q, struct rows *result)
+static int query_aggregate(struct table *t, struct query_select *s, struct rows *result)
 {
-    struct query_select *s = &q->select;
     /* find WHERE column index if applicable (legacy path) */
     int where_col = -1;
     if (s->where.has_where && !s->where.where_cond) {
@@ -815,15 +801,16 @@ static int query_aggregate(struct table *t, struct query *q, struct rows *result
         }
     }
 
-    /* accumulate — single allocation for all aggregate arrays */
+    /* accumulate — single allocation for all aggregate arrays
+     * layout: double[3*N] | size_t[N] | int[N]  (descending alignment) */
     size_t _nagg = s->aggregates.count;
-    size_t _agg_alloc = _nagg * (3 * sizeof(double) + 2 * sizeof(size_t) + sizeof(int));
+    size_t _agg_alloc = _nagg * (3 * sizeof(double) + sizeof(size_t) + sizeof(int));
     char *_agg_buf = calloc(1, _agg_alloc ? _agg_alloc : 1);
     double *sums = (double *)_agg_buf;
     double *mins = sums + _nagg;
     double *maxs = mins + _nagg;
-    int *minmax_init = (int *)(maxs + _nagg);
-    size_t *nonnull_count = (size_t *)(minmax_init + _nagg);
+    size_t *nonnull_count = (size_t *)(maxs + _nagg);
+    int *minmax_init = (int *)(nonnull_count + _nagg);
     size_t row_count = 0;
 
     for (size_t i = 0; i < t->rows.count; i++) {
@@ -979,9 +966,8 @@ static int sort_entry_cmp(const void *a, const void *b)
     return cell_compare(sa->key, sb->key);
 }
 
-static int query_window(struct table *t, struct query *q, struct rows *result)
+static int query_window(struct table *t, struct query_select *s, struct rows *result)
 {
-    struct query_select *s = &q->select;
     size_t nrows = t->rows.count;
     size_t nexprs = s->select_exprs.count;
 
@@ -1194,9 +1180,8 @@ static int grp_find_result_col(struct table *t, int *grp_cols, size_t ngrp,
     return -1;
 }
 
-static int query_group_by(struct table *t, struct query *q, struct rows *result)
+static int query_group_by(struct table *t, struct query_select *s, struct rows *result)
 {
-    struct query_select *s = &q->select;
     /* resolve GROUP BY column indices */
     size_t ngrp = s->group_by_cols.count;
     if (ngrp == 0) ngrp = 1; /* backward compat: single group_by_col */
@@ -1259,13 +1244,14 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
     int *gminmax_init = NULL, *gagg_cols = NULL;
     size_t *gnonnull = NULL;
     if (agg_n > 0) {
-        _grp_buf = malloc(3 * agg_n * sizeof(double) + 2 * agg_n * sizeof(int) + agg_n * sizeof(size_t));
+        /* layout: double[3*N] | size_t[N] | int[2*N]  (descending alignment) */
+        _grp_buf = malloc(3 * agg_n * sizeof(double) + agg_n * sizeof(size_t) + 2 * agg_n * sizeof(int));
         sums          = (double *)_grp_buf;
         gmins         = sums + agg_n;
         gmaxs         = gmins + agg_n;
-        gminmax_init  = (int *)(gmaxs + agg_n);
+        gnonnull      = (size_t *)(gmaxs + agg_n);
+        gminmax_init  = (int *)(gnonnull + agg_n);
         gagg_cols     = gminmax_init + agg_n;
-        gnonnull      = (size_t *)(gagg_cols + agg_n);
     }
 
     /* resolve aggregate column indices once */
@@ -1427,7 +1413,7 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
     free(_grp_buf);
     if (has_having_t) {
         for (size_t i = 0; i < having_t.columns.count; i++)
-            free(having_t.columns.items[i].name);
+            column_free(&having_t.columns.items[i]);
         da_free(&having_t.columns);
     }
 
@@ -1482,20 +1468,19 @@ static int row_matches(struct table *t, struct where_clause *w, struct row *row)
     return cell_equal(&row->cells.items[where_col], &w->where_value);
 }
 
-static int query_select(struct table *t, struct query *q, struct rows *result)
+static int query_select_exec(struct table *t, struct query_select *s, struct rows *result)
 {
-    struct query_select *s = &q->select;
     /* dispatch to window path if select_exprs are present */
     if (s->select_exprs.count > 0)
-        return query_window(t, q, result);
+        return query_window(t, s, result);
 
     /* dispatch to GROUP BY path */
     if (s->has_group_by)
-        return query_group_by(t, q, result);
+        return query_group_by(t, s, result);
 
     /* dispatch to aggregate path if aggregates are present */
     if (s->aggregates.count > 0)
-        return query_aggregate(t, q, result);
+        return query_aggregate(t, s, result);
 
     int select_all = sv_eq_cstr(s->columns, "*");
 
@@ -1509,7 +1494,7 @@ static int query_select(struct table *t, struct query *q, struct rows *result)
                            t->columns.items[where_col].name) == 0) {
                     size_t *ids = NULL;
                     size_t id_count = 0;
-                    index_lookup(&t->indexes.items[idx], &s->where.where_value,
+                    index_lookup(&t->indexes.items[idx], &s->where.where_cond->value,
                                  &ids, &id_count);
                     for (size_t k = 0; k < id_count; k++) {
                         if (ids[k] < t->rows.count)
@@ -1567,7 +1552,7 @@ static int query_select(struct table *t, struct query *q, struct rows *result)
         for (size_t i = 0; i < tmp.count; i++) {
             int dup = 0;
             for (size_t j = 0; j < deduped.count; j++) {
-                if (row_equal(&tmp.data[i], &deduped.data[j])) { dup = 1; break; }
+                if (row_equal_nullsafe(&tmp.data[i], &deduped.data[j])) { dup = 1; break; }
             }
             if (!dup) {
                 rows_push(&deduped, tmp.data[i]);
@@ -1656,9 +1641,8 @@ static void emit_returning_row(struct table *t, struct row *src,
     rows_push(result, ret);
 }
 
-static int query_delete(struct table *t, struct query *q, struct rows *result)
+static int query_delete_exec(struct table *t, struct query_delete *d, struct rows *result)
 {
-    struct query_delete *d = &q->del;
     int has_ret = (d->has_returning && d->returning_columns.len > 0);
     int return_all = has_ret && sv_eq_cstr(d->returning_columns, "*");
     size_t deleted = 0;
@@ -1692,9 +1676,8 @@ static int query_delete(struct table *t, struct query *q, struct rows *result)
     return 0;
 }
 
-static int query_update(struct table *t, struct query *q, struct rows *result)
+static int query_update_exec(struct table *t, struct query_update *u, struct rows *result)
 {
-    struct query_update *u = &q->update;
     int has_ret = (u->has_returning && u->returning_columns.len > 0);
     int return_all = has_ret && sv_eq_cstr(u->returning_columns, "*");
     size_t updated = 0;
@@ -1733,9 +1716,8 @@ static int query_update(struct table *t, struct query *q, struct rows *result)
 
 /* copy_cell_into → use shared cell_copy from row.h */
 
-static int query_insert(struct table *t, struct query *q, struct rows *result)
+static int query_insert_exec(struct table *t, struct query_insert *ins, struct rows *result)
 {
-    struct query_insert *ins = &q->insert;
     int has_returning = (ins->returning_columns.len > 0);
     int return_all = has_returning && sv_eq_cstr(ins->returning_columns, "*");
 
@@ -1828,13 +1810,13 @@ int query_exec(struct table *t, struct query *q, struct rows *result)
         case QUERY_TYPE_ROLLBACK:
             return -1;
         case QUERY_TYPE_SELECT:
-            return query_select(t, q, result);
+            return query_select_exec(t, &q->select, result);
         case QUERY_TYPE_INSERT:
-            return query_insert(t, q, result);
+            return query_insert_exec(t, &q->insert, result);
         case QUERY_TYPE_DELETE:
-            return query_delete(t, q, result);
+            return query_delete_exec(t, &q->del, result);
         case QUERY_TYPE_UPDATE:
-            return query_update(t, q, result);
+            return query_update_exec(t, &q->update, result);
     }
     return -1;
 }
