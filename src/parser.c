@@ -941,6 +941,15 @@ static int parse_agg_list(struct lexer *l, struct query *out, struct token first
         fprintf(stderr, "parse error: expected ')' after aggregate column\n");
         return -1;
     }
+    /* store optional AS alias */
+    {
+        struct token pa = lexer_peek(l);
+        if (pa.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(pa.value, "AS")) {
+            lexer_next(l); /* AS */
+            struct token alias_tok = lexer_next(l); /* alias */
+            agg.alias = alias_tok.value;
+        }
+    }
     da_push(&out->aggregates, agg);
 
     /* check for more comma-separated aggregates */
@@ -975,6 +984,15 @@ static int parse_agg_list(struct lexer *l, struct query *out, struct token first
         if (tok.type != TOK_RPAREN) {
             fprintf(stderr, "parse error: expected ')' after aggregate column\n");
             return -1;
+        }
+        /* store optional AS alias */
+        {
+            struct token pa = lexer_peek(l);
+            if (pa.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(pa.value, "AS")) {
+                lexer_next(l); /* AS */
+                struct token alias_tok = lexer_next(l); /* alias */
+                a2.alias = alias_tok.value;
+            }
         }
         da_push(&out->aggregates, a2);
     }
@@ -1155,6 +1173,13 @@ static int parse_select(struct lexer *l, struct query *out)
                     if (tok.type == TOK_KEYWORD && is_agg_keyword(tok.value)) {
                         struct agg_expr agg;
                         if (parse_single_agg(l, tok.value, &agg) != 0) return -1;
+                        /* store optional AS alias */
+                        struct token pa = lexer_peek(l);
+                        if (pa.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(pa.value, "AS")) {
+                            lexer_next(l); /* AS */
+                            struct token alias_tok = lexer_next(l); /* alias */
+                            agg.alias = alias_tok.value;
+                        }
                         da_push(&out->aggregates, agg);
                     } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
                         sv id = consume_identifier(l, tok);
@@ -1255,10 +1280,12 @@ static int parse_select(struct lexer *l, struct query *out)
                 col_end = operand.value.data + operand.value.len;
                 continue;
             }
-            /* skip optional column alias: AS alias */
+            /* skip optional column alias: AS alias — include in col_end so
+             * resolve_alias_to_column can find it in the raw columns text */
             if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "AS")) {
                 lexer_next(l); /* consume AS */
-                lexer_next(l); /* consume alias name */
+                struct token alias_tok = lexer_next(l); /* consume alias name */
+                col_end = alias_tok.value.data + alias_tok.value.len;
             }
             peek = lexer_next(l);
             if (peek.type == TOK_COMMA) {

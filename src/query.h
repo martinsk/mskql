@@ -17,6 +17,7 @@ enum agg_func {
 struct agg_expr {
     enum agg_func func;
     sv column;
+    sv alias; /* optional AS alias name */
 };
 
 enum win_func {

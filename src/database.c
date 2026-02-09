@@ -811,7 +811,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 /* parse the select column list to get names */
                         sv cols = cte_q.columns;
                         size_t ci = 0;
-                        while (cols.len > 0 && ci < (cte_rows.count > 0 ? cte_rows.data[0].cells.count : 0)) {
+                        size_t ncells = cte_rows.count > 0 ? cte_rows.data[0].cells.count : 0;
+                        while (cols.len > 0 && ci < ncells) {
                             /* skip whitespace */
                             while (cols.len > 0 && (cols.data[0] == ' ' || cols.data[0] == '\t'))
                                 { cols.data++; cols.len--; }
@@ -822,20 +823,47 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                             /* trim trailing whitespace */
                             while (col_sv.len > 0 && (col_sv.data[col_sv.len-1] == ' ' || col_sv.data[col_sv.len-1] == '\t'))
                                 col_sv.len--;
+                            /* check for AS alias — use alias as column name */
+                            sv col_name = col_sv;
+                            for (size_t k = 0; k + 2 < col_sv.len; k++) {
+                                if ((col_sv.data[k] == ' ' || col_sv.data[k] == '\t') &&
+                                    (col_sv.data[k+1] == 'A' || col_sv.data[k+1] == 'a') &&
+                                    (col_sv.data[k+2] == 'S' || col_sv.data[k+2] == 's') &&
+                                    (k + 3 >= col_sv.len || col_sv.data[k+3] == ' ' || col_sv.data[k+3] == '\t')) {
+                                    /* found AS — use the part after AS as name */
+                                    size_t alias_start = k + 3;
+                                    while (alias_start < col_sv.len && (col_sv.data[alias_start] == ' ' || col_sv.data[alias_start] == '\t'))
+                                        alias_start++;
+                                    col_name = sv_from(col_sv.data + alias_start, col_sv.len - alias_start);
+                                    break;
+                                }
+                            }
                             /* strip table prefix (e.g. "t.col" -> "col") */
-                            for (size_t k = 0; k < col_sv.len; k++) {
-                                if (col_sv.data[k] == '.') {
-                                    col_sv = sv_from(col_sv.data + k + 1, col_sv.len - k - 1);
+                            for (size_t k = 0; k < col_name.len; k++) {
+                                if (col_name.data[k] == '.') {
+                                    col_name = sv_from(col_name.data + k + 1, col_name.len - k - 1);
                                     break;
                                 }
                             }
                             struct column col = {0};
-                            col.name = sv_to_cstr(col_sv);
+                            col.name = sv_to_cstr(col_name);
                             col.type = cte_rows.data[0].cells.items[ci].type;
                             da_push(&ct.columns, col);
                             ci++;
                             if (end < cols.len) { cols.data += end + 1; cols.len -= end + 1; }
                             else break;
+                        }
+                        /* add columns for aggregate results not covered by the column list */
+                        for (size_t a = 0; a < cte_q.aggregates.count && ci < ncells; a++, ci++) {
+                            struct column col = {0};
+                            /* use alias if available, otherwise aggregate column name */
+                            if (cte_q.aggregates.items[a].alias.len > 0) {
+                                col.name = sv_to_cstr(cte_q.aggregates.items[a].alias);
+                            } else {
+                                col.name = sv_to_cstr(cte_q.aggregates.items[a].column);
+                            }
+                            col.type = cte_rows.data[0].cells.items[ci].type;
+                            da_push(&ct.columns, col);
                         }
                     }
                 }
@@ -984,6 +1012,11 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                             const char *ord_name = extract_col_name(
                                 ob_q.order_by_items.items[k].column, obuf, sizeof(obuf));
                             ord_cols[k] = table_find_column(src_t, ord_name);
+                            /* if not found, try resolving as a SELECT alias */
+                            if (ord_cols[k] < 0 && q->columns.len > 0) {
+                                ord_cols[k] = resolve_alias_to_column(src_t, q->columns,
+                                    ob_q.order_by_items.items[k].column);
+                            }
                         }
                     }
                     _jsort_ctx = (struct join_sort_ctx){ .cols = ord_cols, .descs = ord_descs, .ncols = nord };

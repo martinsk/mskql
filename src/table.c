@@ -124,6 +124,32 @@ int table_find_column(struct table *t, const char *name)
     return table_find_column_sv(t, sv_from(name, strlen(name)));
 }
 
+int resolve_alias_to_column(struct table *t, sv columns, sv alias)
+{
+    const char *p = columns.data;
+    const char *end = columns.data + columns.len;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n')) p++;
+        const char *col_start = p;
+        while (p < end && *p != ' ' && *p != ',' && *p != '\t' && *p != '\n') p++;
+        sv col_name = sv_from(col_start, (size_t)(p - col_start));
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        if (p + 2 < end && (p[0] == 'A' || p[0] == 'a') &&
+            (p[1] == 'S' || p[1] == 's') && (p[2] == ' ' || p[2] == '\t')) {
+            p += 2;
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+            const char *alias_start = p;
+            while (p < end && *p != ' ' && *p != ',' && *p != '\t' && *p != '\n' && *p != ';') p++;
+            sv alias_name = sv_from(alias_start, (size_t)(p - alias_start));
+            if (sv_eq_ignorecase(alias, alias_name))
+                return table_find_column_sv(t, col_name);
+        }
+        while (p < end && *p != ',') p++;
+        if (p < end) p++;
+    }
+    return -1;
+}
+
 void table_free(struct table *t)
 {
     free(t->name);

@@ -1474,6 +1474,11 @@ static int query_select(struct table *t, struct query *q, struct rows *result)
         size_t nord = q->order_by_items.count < 32 ? q->order_by_items.count : 32;
         for (size_t k = 0; k < nord; k++) {
             ord_cols[k] = table_find_column_sv(t, q->order_by_items.items[k].column);
+            /* if not found, try resolving as a SELECT alias */
+            if (ord_cols[k] < 0 && q->columns.len > 0) {
+                ord_cols[k] = resolve_alias_to_column(t, q->columns,
+                                                       q->order_by_items.items[k].column);
+            }
             ord_descs[k] = q->order_by_items.items[k].desc;
         }
         _sort_ctx = (struct sort_ctx){ .cols = ord_cols, .descs = ord_descs,

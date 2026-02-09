@@ -26,4 +26,8 @@ void table_deep_copy(struct table *dst, const struct table *src);
 int table_find_column_sv(struct table *t, sv name);
 int table_find_column(struct table *t, const char *name);
 
+/* resolve an ORDER BY name that might be a SELECT alias (e.g. "price AS cost")
+ * by scanning the raw column-list text for "col AS alias" patterns */
+int resolve_alias_to_column(struct table *t, sv columns, sv alias);
+
 #endif
