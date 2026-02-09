@@ -9,7 +9,11 @@ clean:
 test: all
 	./tests/test.sh
 
+test-concurrent: all
+	$(MAKE) -C tests/cases/concurrent
+	./build/test_concurrent
+
 bench:
 	$(MAKE) -C src bench
 
-.PHONY: all clean test bench
+.PHONY: all clean test test-concurrent bench

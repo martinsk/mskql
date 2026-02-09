@@ -8,6 +8,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include <poll.h>
+#include <fcntl.h>
 
 /* ---- helpers: write big-endian integers ---- */
 
@@ -40,19 +42,12 @@ static int send_all(int fd, const void *buf, size_t len)
     const uint8_t *p = buf;
     while (len > 0) {
         ssize_t n = write(fd, p, len);
-        if (n <= 0) return -1;
-        p   += n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static int read_all(int fd, void *buf, size_t len)
-{
-    uint8_t *p = buf;
-    while (len > 0) {
-        ssize_t n = read(fd, p, len);
-        if (n <= 0) return -1;
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0) return -1;
         p   += n;
         len -= (size_t)n;
     }
@@ -252,6 +247,89 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c)
     msgbuf_push(m, txt, len);
 }
 
+/* ---- per-client state for poll()-based multiplexing ---- */
+
+#define MAX_CLIENTS 64
+
+enum client_phase {
+    PHASE_STARTUP,      /* waiting for startup message (possibly after SSL) */
+    PHASE_SSL_RETRY,    /* sent 'N' for SSLRequest, waiting for real startup */
+    PHASE_QUERY_LOOP,   /* authenticated, processing queries */
+};
+
+struct client_state {
+    int fd;
+    enum client_phase phase;
+    struct msgbuf send_buf;     /* reusable send buffer */
+    uint8_t *recv_buf;          /* partial read accumulator */
+    size_t recv_len;
+    size_t recv_cap;
+};
+
+static void client_init(struct client_state *c, int fd)
+{
+    c->fd = fd;
+    c->phase = PHASE_STARTUP;
+    msgbuf_init(&c->send_buf);
+    c->recv_buf = NULL;
+    c->recv_len = 0;
+    c->recv_cap = 0;
+}
+
+static void client_free(struct client_state *c)
+{
+    if (c->fd >= 0) close(c->fd);
+    c->fd = -1;
+    msgbuf_free(&c->send_buf);
+    free(c->recv_buf);
+    c->recv_buf = NULL;
+    c->recv_len = 0;
+    c->recv_cap = 0;
+}
+
+/* rollback any open transaction when a client disconnects, then free */
+static void client_disconnect(struct client_state *c, struct database *db)
+{
+    if (db->in_transaction) {
+        struct query q = {0};
+        q.query_type = QUERY_TYPE_ROLLBACK;
+        struct rows r = {0};
+        db_exec(db, &q, &r);
+        rows_free(&r);
+    }
+    client_free(c);
+}
+
+static void client_recv_ensure(struct client_state *c, size_t extra)
+{
+    if (c->recv_len + extra > c->recv_cap) {
+        size_t newcap = c->recv_cap ? c->recv_cap * 2 : 4096;
+        while (newcap < c->recv_len + extra) newcap *= 2;
+        void *tmp = realloc(c->recv_buf, newcap);
+        if (!tmp) { fprintf(stderr, "client_recv_ensure: OOM\n"); abort(); }
+        c->recv_buf = tmp;
+        c->recv_cap = newcap;
+    }
+}
+
+/* consume n bytes from the front of the recv buffer */
+static void client_recv_consume(struct client_state *c, size_t n)
+{
+    if (n >= c->recv_len) {
+        c->recv_len = 0;
+    } else {
+        memmove(c->recv_buf, c->recv_buf + n, c->recv_len - n);
+        c->recv_len -= n;
+    }
+}
+
+static int set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 /* ---- query result sending ---- */
 
 static int send_row_description(int fd, struct database *db, struct query *q,
@@ -371,7 +449,7 @@ static int handle_query(int fd, struct database *db, const char *sql,
     while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
     if (*p == '\0') {
         send_empty_query(fd, m);
-        send_ready_for_query(fd, m, 'I');
+        send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
         return 0;
     }
 
@@ -379,7 +457,7 @@ static int handle_query(int fd, struct database *db, const char *sql,
     if (query_parse(sql, &q) != 0) {
         query_free(&q);
         send_error(fd, m, "ERROR", "42601", "syntax error or unsupported statement");
-        send_ready_for_query(fd, m, 'I');
+        send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
         return 0;
     }
 
@@ -390,7 +468,7 @@ static int handle_query(int fd, struct database *db, const char *sql,
         send_error(fd, m, "ERROR", "42000", "query execution failed");
         rows_free(&result);
         query_free(&q);
-        send_ready_for_query(fd, m, 'I');
+        send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
         return 0;
     }
 
@@ -476,125 +554,104 @@ static int handle_query(int fd, struct database *db, const char *sql,
     send_command_complete(fd, m, tag);
     rows_free(&result);
     query_free(&q);
-    send_ready_for_query(fd, m, 'I');
+    send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
     return 0;
 }
 
-/* ---- handle a single client connection ---- */
+/* ---- startup handshake (non-blocking, returns 0=ok, -1=disconnect, 1=need more data) ---- */
 
-static void handle_client(int client_fd, struct database *db)
+static int complete_auth(struct client_state *c)
 {
-    /* single msgbuf reused for all protocol messages on this connection */
-    struct msgbuf conn_buf;
-    msgbuf_init(&conn_buf);
+    send_auth_ok(c->fd, &c->send_buf);
+    send_parameter_status(c->fd, &c->send_buf, "server_version", "15.0");
+    send_parameter_status(c->fd, &c->send_buf, "server_encoding", "UTF8");
+    send_parameter_status(c->fd, &c->send_buf, "client_encoding", "UTF8");
+    send_parameter_status(c->fd, &c->send_buf, "DateStyle", "ISO, MDY");
+    send_parameter_status(c->fd, &c->send_buf, "integer_datetimes", "on");
 
-    /* read startup message: int32 length, int32 protocol version, then params */
-    uint8_t lenbuf[4];
-    if (read_all(client_fd, lenbuf, 4) != 0) goto done;
-    uint32_t startup_len = read_u32(lenbuf);
-    if (startup_len < 8 || startup_len > 65536) goto done;
+    /* BackendKeyData (fake) */
+    c->send_buf.len = 0;
+    msgbuf_push_u32(&c->send_buf, (uint32_t)getpid());
+    msgbuf_push_u32(&c->send_buf, 0);
+    msg_send(c->fd, 'K', &c->send_buf);
 
-    uint8_t *startup = malloc(startup_len);
-    put_u32(startup, startup_len);
-    if (read_all(client_fd, startup + 4, startup_len - 4) != 0) {
-        free(startup);
-        goto done;
-    }
+    send_ready_for_query(c->fd, &c->send_buf, 'I');
+    c->phase = PHASE_QUERY_LOOP;
+    return 0;
+}
 
-    uint32_t version = read_u32(startup + 4);
+static int process_startup(struct client_state *c)
+{
+    /* startup messages have no type byte — just int32 length + int32 version + params */
+    /* need at least 4 bytes for the length */
+    if (c->recv_len < 4) return 1;
+    uint32_t startup_len = read_u32(c->recv_buf);
+    if (startup_len < 8 || startup_len > 65536) return -1;
+    if (c->recv_len < startup_len) return 1; /* need more data */
 
-    /* handle SSLRequest (code 80877103) — decline with 'N' */
+    uint32_t version = read_u32(c->recv_buf + 4);
+
+    /* SSLRequest (code 80877103) — decline with 'N', wait for real startup */
     if (version == 80877103) {
         uint8_t n = 'N';
-        send_all(client_fd, &n, 1);
-
-        /* client will retry with a normal startup — reuse buffer */
-        if (read_all(client_fd, lenbuf, 4) != 0) { free(startup); goto done; }
-        startup_len = read_u32(lenbuf);
-        if (startup_len < 8 || startup_len > 65536) { free(startup); goto done; }
-        void *tmp = realloc(startup, startup_len);
-        if (!tmp) { free(startup); goto done; }
-        startup = tmp;
-        put_u32(startup, startup_len);
-        if (read_all(client_fd, startup + 4, startup_len - 4) != 0) {
-            free(startup);
-            goto done;
-        }
-        version = read_u32(startup + 4);
+        if (send_all(c->fd, &n, 1) != 0) return -1;
+        client_recv_consume(c, startup_len);
+        c->phase = PHASE_SSL_RETRY;
+        return 0;
     }
-
-    free(startup);
 
     /* expect protocol 3.0 */
     uint16_t major = (version >> 16) & 0xffff;
-    uint16_t minor = version & 0xffff;
     if (major != 3) {
-        fprintf(stderr, "[pgwire] unsupported protocol version %d.%d\n",
-                major, minor);
-        goto done;
+        fprintf(stderr, "[pgwire] unsupported protocol version %u.%u\n",
+                major, version & 0xffff);
+        return -1;
     }
 
-    /* send AuthenticationOk */
-    send_auth_ok(client_fd, &conn_buf);
+    client_recv_consume(c, startup_len);
+    return complete_auth(c);
+}
 
-    /* send some parameter status messages that clients expect */
-    send_parameter_status(client_fd, &conn_buf, "server_version", "15.0");
-    send_parameter_status(client_fd, &conn_buf, "server_encoding", "UTF8");
-    send_parameter_status(client_fd, &conn_buf, "client_encoding", "UTF8");
-    send_parameter_status(client_fd, &conn_buf, "DateStyle", "ISO, MDY");
-    send_parameter_status(client_fd, &conn_buf, "integer_datetimes", "on");
+/* ---- process buffered query-loop messages (returns 0=ok, -1=disconnect) ---- */
 
-    /* BackendKeyData (fake) */
-    {
-        conn_buf.len = 0;
-        msgbuf_push_u32(&conn_buf, (uint32_t)getpid());
-        msgbuf_push_u32(&conn_buf, 0); /* secret key */
-        msg_send(client_fd, 'K', &conn_buf);
-    }
-
-    send_ready_for_query(client_fd, &conn_buf, 'I');
-
-    /* main message loop */
+static int process_messages(struct client_state *c, struct database *db)
+{
     for (;;) {
-        uint8_t msg_type;
-        if (read_all(client_fd, &msg_type, 1) != 0) break;
-
-        uint8_t len_buf[4];
-        if (read_all(client_fd, len_buf, 4) != 0) break;
-        uint32_t msg_len = read_u32(len_buf);
-        if (msg_len < 4) break;
+        /* need at least 5 bytes: 1 type + 4 length */
+        if (c->recv_len < 5) return 0;
+        uint8_t msg_type = c->recv_buf[0];
+        uint32_t msg_len = read_u32(c->recv_buf + 1);
+        if (msg_len < 4) return -1;
+        if (msg_len > 16 * 1024 * 1024) return -1; /* reject messages > 16 MB */
+        size_t total = 1 + msg_len; /* type byte + length-inclusive body */
+        if (c->recv_len < total) return 0; /* need more data */
 
         uint32_t body_len = msg_len - 4;
-        char *body = NULL;
-        if (body_len > 0) {
-            body = malloc(body_len + 1);
-            if (read_all(client_fd, body, body_len) != 0) {
-                free(body);
-                break;
-            }
-            body[body_len] = '\0';
-        }
 
         switch (msg_type) {
-            case 'Q': /* Simple Query */
-                if (body) {
-                    handle_query(client_fd, db, body, &conn_buf);
+            case 'Q': { /* Simple Query */
+                if (body_len > 0) {
+                    /* NUL-terminate the SQL in-place (safe — we own the buffer) */
+                    c->recv_buf[1 + msg_len] = '\0'; /* just past the message */
+                    /* but actually the body starts at offset 5 */
+                    char *sql = (char *)(c->recv_buf + 5);
+                    /* ensure NUL termination within the body */
+                    char saved = sql[body_len];
+                    sql[body_len] = '\0';
+                    handle_query(c->fd, db, sql, &c->send_buf);
+                    sql[body_len] = saved;
                 }
                 break;
+            }
             case 'X': /* Terminate */
-                free(body);
-                goto done;
+                return -1;
             default:
                 /* ignore unknown messages */
                 break;
         }
 
-        free(body);
+        client_recv_consume(c, total);
     }
-
-done:
-    msgbuf_free(&conn_buf);
-    close(client_fd);
 }
 
 /* ---- public API ---- */
@@ -624,7 +681,7 @@ int pgwire_init(struct pgwire_server *srv, struct database *db, int port)
         return -1;
     }
 
-    if (listen(srv->listen_fd, 8) < 0) {
+    if (listen(srv->listen_fd, 128) < 0) {
         perror("listen");
         close(srv->listen_fd);
         return -1;
@@ -635,26 +692,148 @@ int pgwire_init(struct pgwire_server *srv, struct database *db, int port)
 
 extern volatile sig_atomic_t g_running;
 
+/* self-pipe for waking poll() from signal handler */
+static int g_wakeup_pipe[2] = {-1, -1};
+
+void pgwire_signal_wakeup(void)
+{
+    if (g_wakeup_pipe[1] >= 0) {
+        char c = 1;
+        (void)write(g_wakeup_pipe[1], &c, 1);
+    }
+}
+
 int pgwire_run(struct pgwire_server *srv)
 {
     printf("[pgwire] listening on port %d\n", srv->port);
     printf("[pgwire] connect with: psql -h 127.0.0.1 -p %d\n", srv->port);
 
+    /* set up self-pipe for signal wakeup */
+    if (pipe(g_wakeup_pipe) != 0) { perror("pipe"); return -1; }
+    set_nonblocking(g_wakeup_pipe[0]);
+    set_nonblocking(g_wakeup_pipe[1]);
+
+    /* fds layout: [0]=wakeup pipe read, [1]=listen, [2..]=clients */
+    struct pollfd fds[2 + MAX_CLIENTS];
+    struct client_state clients[MAX_CLIENTS];
+    int nclients = 0;
+
+    set_nonblocking(srv->listen_fd);
+    fds[0].fd = g_wakeup_pipe[0];
+    fds[0].events = POLLIN;
+    fds[1].fd = srv->listen_fd;
+    fds[1].events = POLLIN;
+
     while (g_running) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(srv->listen_fd,
-                               (struct sockaddr *)&client_addr, &client_len);
-        if (client_fd < 0) {
-            if (errno == EINTR) {
-                if (!g_running) break;
+        /* build pollfd array: [0]=wakeup, [1]=listen, [2..nclients+1]=clients */
+        for (int i = 0; i < nclients; i++) {
+            fds[2 + i].fd = clients[i].fd;
+            fds[2 + i].events = POLLIN;
+            fds[2 + i].revents = 0;
+        }
+        fds[0].revents = 0;
+        fds[1].revents = 0;
+
+        int nready = poll(fds, (nfds_t)(2 + nclients), -1 /* block until event */);
+        if (nready < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+        if (nready == 0) continue; /* timeout, check g_running */
+
+        /* drain wakeup pipe if signalled */
+        if (fds[0].revents & POLLIN) {
+            char buf[64];
+            while (read(g_wakeup_pipe[0], buf, sizeof(buf)) > 0) {}
+            if (!g_running) break;
+        }
+
+        /* check listen socket for new connections */
+        if (fds[1].revents & POLLIN) {
+            for (;;) {
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(srv->listen_fd,
+                                       (struct sockaddr *)&client_addr, &client_len);
+                if (client_fd < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (errno == EINTR) break;
+                    perror("accept");
+                    break;
+                }
+                if (nclients >= MAX_CLIENTS) {
+                    fprintf(stderr, "[pgwire] max clients reached, rejecting\n");
+                    close(client_fd);
+                    continue;
+                }
+                set_nonblocking(client_fd);
+                client_init(&clients[nclients], client_fd);
+                nclients++;
+            }
+        }
+
+        /* process each client */
+        for (int i = 0; i < nclients; i++) {
+            if (!(fds[2 + i].revents & (POLLIN | POLLHUP | POLLERR)))
+                continue;
+
+            /* read available data */
+            client_recv_ensure(&clients[i], 4096);
+            ssize_t n = read(clients[i].fd,
+                             clients[i].recv_buf + clients[i].recv_len,
+                             clients[i].recv_cap - clients[i].recv_len);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                    continue; /* no data yet, not an error */
+                /* real error — disconnect */
+                client_disconnect(&clients[i], srv->db);
+                clients[i] = clients[nclients - 1];
+                nclients--;
+                i--;
                 continue;
             }
-            perror("accept");
-            return -1;
+            if (n == 0) {
+                /* EOF — client disconnected */
+                client_disconnect(&clients[i], srv->db);
+                clients[i] = clients[nclients - 1];
+                nclients--;
+                i--;
+                continue;
+            }
+            clients[i].recv_len += (size_t)n;
+
+            /* process buffered data based on phase */
+            int rc;
+            switch (clients[i].phase) {
+                case PHASE_STARTUP:
+                case PHASE_SSL_RETRY:
+                    rc = process_startup(&clients[i]);
+                    break;
+                case PHASE_QUERY_LOOP:
+                    rc = process_messages(&clients[i], srv->db);
+                    break;
+                default:
+                    rc = -1;
+                    break;
+            }
+
+            if (rc < 0) {
+                client_disconnect(&clients[i], srv->db);
+                clients[i] = clients[nclients - 1];
+                nclients--;
+                i--;
+            }
         }
-        handle_client(client_fd, srv->db);
     }
+
+    /* clean up all remaining clients */
+    for (int i = 0; i < nclients; i++)
+        client_disconnect(&clients[i], srv->db);
+
+    /* close wakeup pipe */
+    close(g_wakeup_pipe[0]); g_wakeup_pipe[0] = -1;
+    close(g_wakeup_pipe[1]); g_wakeup_pipe[1] = -1;
 
     return 0;
 }

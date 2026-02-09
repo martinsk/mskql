@@ -44,8 +44,8 @@ start_server() {
 }
 
 stop_server() {
-    if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
-        kill "$SERVER_PID" 2>/dev/null
+    if [ -n "$SERVER_PID" ]; then
+        kill -TERM "$SERVER_PID" 2>/dev/null
         wait "$SERVER_PID" 2>/dev/null || true
     fi
     SERVER_PID=""
@@ -58,6 +58,12 @@ trap cleanup EXIT
 
 run_sql() {
     $PSQL -c "$1" 2>&1
+}
+
+# Run multiple SQL statements in a single psql session (piped via stdin).
+# This keeps transactions alive across statements.
+run_sql_session() {
+    echo "$1" | $PSQL 2>&1
 }
 
 # Parse a testcase file into variables:
@@ -124,31 +130,40 @@ run_testcase() {
     # start a fresh server for each test
     start_server
 
-    # run setup SQL (one statement at a time)
+    # run setup SQL — use a single session if it contains transaction statements
+    # (BEGIN), otherwise run one statement at a time for reliability
     if [ -n "$TC_SETUP" ]; then
-        while IFS= read -r stmt; do
-            stmt="$(echo "$stmt" | sed 's/;$//')"
-            [ -z "$stmt" ] && continue
-            run_sql "$stmt" >/dev/null 2>&1
-        done <<< "$TC_SETUP"
+        if echo "$TC_SETUP" | grep -qiE '^BEGIN'; then
+            run_sql_session "$TC_SETUP" >/dev/null 2>&1
+        else
+            while IFS= read -r stmt; do
+                stmt="$(echo "$stmt" | sed 's/;$//')"
+                [ -z "$stmt" ] && continue
+                run_sql "$stmt" >/dev/null 2>&1
+            done <<< "$TC_SETUP"
+        fi
     fi
 
-    # run input SQL and capture output
+    # run input SQL — use a single session if it contains transaction statements,
+    # otherwise run one statement at a time (preserves per-statement output capture)
     local actual="" status=0
     if [ -n "$TC_INPUT" ]; then
-        # combine multi-line input, run each statement separated by ;
-        local combined=""
-        while IFS= read -r stmt; do
-            stmt="$(echo "$stmt" | sed 's/;$//')"
-            [ -z "$stmt" ] && continue
-            local out
-            out=$(run_sql "$stmt" 2>&1) || status=$?
-            if [ -n "$out" ]; then
-                if [ -n "$combined" ]; then combined="$combined"$'\n'"$out"
-                else combined="$out"; fi
-            fi
-        done <<< "$TC_INPUT"
-        actual="$combined"
+        if echo "$TC_INPUT" | grep -qiE '^BEGIN|^COMMIT|^ROLLBACK'; then
+            actual=$(run_sql_session "$TC_INPUT") || status=$?
+        else
+            local combined=""
+            while IFS= read -r stmt; do
+                stmt="$(echo "$stmt" | sed 's/;$//')"
+                [ -z "$stmt" ] && continue
+                local out
+                out=$(run_sql "$stmt" 2>&1) || status=$?
+                if [ -n "$out" ]; then
+                    if [ -n "$combined" ]; then combined="$combined"$'\n'"$out"
+                    else combined="$out"; fi
+                fi
+            done <<< "$TC_INPUT"
+            actual="$combined"
+        fi
     fi
 
     stop_server
@@ -189,8 +204,7 @@ run_testcase() {
 }
 
 # ---- build ----
-BUILD_OUT=$(cd "$PROJECT_DIR/src" && make clean && make 2>&1)
-if [ $? -ne 0 ]; then
+if ! BUILD_OUT=$(cd "$PROJECT_DIR/src" && make clean && make 2>&1); then
     echo "BUILD FAILED:"
     echo "$BUILD_OUT"
     exit 1

@@ -9,6 +9,7 @@ static void handle_signal(int sig)
 {
     (void)sig;
     g_running = 0;
+    pgwire_signal_wakeup();
 }
 
 int main(void)

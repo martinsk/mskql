@@ -12,5 +12,6 @@ struct pgwire_server {
 int  pgwire_init(struct pgwire_server *srv, struct database *db, int port);
 int  pgwire_run(struct pgwire_server *srv);
 void pgwire_stop(struct pgwire_server *srv);
+void pgwire_signal_wakeup(void);
 
 #endif
