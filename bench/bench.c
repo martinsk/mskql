@@ -356,7 +356,7 @@ static double bench_index_lookup(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Benchmark: transaction (BEGIN / INSERT / ROLLBACK)                 */
+/*  Benchmark: transaction (BEGIN / INSERT / COMMIT)                   */
 /* ------------------------------------------------------------------ */
 
 static double bench_transaction(void)
@@ -371,17 +371,17 @@ static double bench_transaction(void)
         exec(&db, sql);
     }
 
-    const int N = 200;
+    const int N = 100;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         exec(&db, "BEGIN");
-        for (int j = 0; j < 100; j++) {
+        for (int j = 0; j < 50; j++) {
             char sql[128];
             snprintf(sql, sizeof(sql),
-                     "INSERT INTO t VALUES (%d, %d)", 1000 + j, j);
+                     "INSERT INTO t VALUES (%d, %d)", 10000 + i * 50 + j, j);
             exec(&db, sql);
         }
-        exec(&db, "ROLLBACK");
+        exec(&db, "COMMIT");
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
