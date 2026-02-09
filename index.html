@@ -3,62 +3,380 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>mskql — Benchmarks</title>
+    <title>mskql</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0d1117;
-            color: #c9d1d9;
-            display: flex;
-            justify-content: center;
-            padding: 2rem;
+            max-width: 720px;
+            margin: 40px auto;
+            padding: 0 20px;
+            font-family: "Times New Roman", Times, serif;
+            font-size: 14px;
+            line-height: 1.5;
+            color: #111;
+            background: #fff;
         }
-        .container { max-width: 720px; width: 100%; }
-        h1 { color: #58a6ff; margin-bottom: 0.25rem; font-size: 1.8rem; }
-        .subtitle { color: #8b949e; margin-bottom: 2rem; }
-        a { color: #58a6ff; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        .card {
-            background: #161b22;
-            border: 1px solid #30363d;
-            border-radius: 6px;
-            padding: 1.5rem;
-            margin-bottom: 1rem;
+        h1.title {
+            text-align: center;
+            font-size: 24px;
+            margin-bottom: 2px;
         }
-        .card h2 { font-size: 1.1rem; color: #f0f6fc; margin-bottom: 0.5rem; }
-        .card p { color: #8b949e; line-height: 1.6; }
+        p.authors {
+            text-align: center;
+            font-size: 13px;
+            color: #444;
+            margin-bottom: 24px;
+        }
+        hr { border: none; border-top: 1px solid #000; margin: 20px 0; }
+        h2 { font-size: 16px; margin: 24px 0 6px 0; }
+        h3 { font-size: 14px; margin: 16px 0 4px 0; }
+        p, li { margin-bottom: 6px; }
+        ul, ol { padding-left: 24px; }
+        a { color: #111; }
         code {
-            background: #1c2128;
-            padding: 0.15em 0.4em;
-            border-radius: 3px;
-            font-size: 0.9em;
+            font-family: "Courier New", Courier, monospace;
+            font-size: 13px;
+            background: #f4f4f4;
+            padding: 1px 4px;
+        }
+        pre {
+            background: #f4f4f4;
+            border: 1px solid #ddd;
+            padding: 10px 12px;
+            overflow-x: auto;
+            font-size: 13px;
+            line-height: 1.4;
+            margin: 8px 0 12px 0;
+        }
+        pre code { background: none; padding: 0; }
+        table {
+            border-collapse: collapse;
+            margin: 8px 0 12px 0;
+            font-size: 13px;
+        }
+        th, td {
+            border: 1px solid #999;
+            padding: 4px 10px;
+            text-align: left;
+        }
+        th { background: #f4f4f4; font-weight: bold; }
+        .abstract {
+            margin: 0 30px 16px 30px;
+            font-size: 13px;
+        }
+        .abstract strong { font-size: 14px; }
+        .toc { margin: 0 0 8px 0; }
+        .toc a { text-decoration: none; }
+        .toc a:hover { text-decoration: underline; }
+        .toc ol { padding-left: 20px; }
+        .toc li { margin-bottom: 2px; font-size: 13px; }
+        .bench-link {
+            display: inline-block;
+            margin: 8px 0;
+            font-size: 13px;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>mskql</h1>
-        <p class="subtitle">Benchmark results &amp; performance tracking</p>
 
-        <div class="card">
-            <h2>Benchmark Charts</h2>
-            <p>
-                View the historical benchmark charts at
-                <a href="dev/bench/index.html">dev/bench/</a>.
-            </p>
-            <p style="margin-top: 0.5rem;">
-                Charts are updated automatically on every push to <code>main</code>
-                via <a href="https://github.com/martinsk/mskql">GitHub Actions</a>.
-            </p>
-        </div>
+<h1 class="title">mskql</h1>
+<p class="authors">
+    A Lightweight, In-Memory SQL Database Engine Written in C
+    <br>
+    <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
+</p>
 
-        <div class="card">
-            <h2>Source</h2>
-            <p>
-                <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-            </p>
-        </div>
-    </div>
+<hr>
+
+<div class="abstract">
+    <strong>Abstract.</strong>
+    mskql is a from-scratch SQL database that speaks the PostgreSQL wire protocol.
+    You connect to it with any standard PostgreSQL client&mdash;<code>psql</code>, any GUI, or any
+    language driver&mdash;and run SQL against fast, in-memory tables.
+    The implementation is roughly 8,200 lines of C11 with zero external dependencies,
+    validated by a suite of 241 automated test cases.
+    No configuration files. No third-party libraries. Build and go.
+</div>
+
+<hr>
+
+<div class="toc">
+    <strong>Contents</strong>
+    <ol>
+        <li><a href="#motivation">Motivation</a></li>
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#supported-sql">Supported SQL</a></li>
+        <li><a href="#data-types">Data Types</a></li>
+        <li><a href="#getting-started">Getting Started</a></li>
+        <li><a href="#testing">Testing</a></li>
+        <li><a href="#benchmarks">Benchmarks</a></li>
+        <li><a href="#construction">How This Project Was Built</a></li>
+        <li><a href="#source-layout">Source Layout</a></li>
+    </ol>
+</div>
+
+<hr>
+
+<h2 id="motivation">1&ensp;Motivation</h2>
+
+<p>
+    Most embeddable databases either expose a custom API or implement a subset of SQL
+    behind a proprietary protocol. mskql takes a different approach: it implements the
+    PostgreSQL wire protocol (v3) directly, so any tool that can talk to Postgres can talk
+    to mskql without modification. The goal is a minimal, understandable, single-binary
+    database useful for prototyping, testing, and education.
+</p>
+
+<h2 id="architecture">2&ensp;Architecture</h2>
+
+<p>
+    The system is structured as a pipeline of four stages:
+</p>
+
+<ol>
+    <li><strong>Wire protocol server</strong> (<code>pgwire.c</code>) &mdash;
+        accepts TCP connections on port 5433, handles SSL negotiation, parses
+        PostgreSQL startup and query messages, and serializes result rows back
+        to the client.</li>
+    <li><strong>SQL parser</strong> (<code>parser.c</code>) &mdash;
+        a hand-written recursive-descent parser that produces a typed
+        <code>struct query</code> AST. No lexer generator or parser generator is used.</li>
+    <li><strong>Query executor</strong> (<code>query.c</code>, <code>database.c</code>) &mdash;
+        walks the AST and executes it against the in-memory table structures.
+        Handles joins, aggregation, window functions, set operations, CTEs,
+        subqueries, and transactions.</li>
+    <li><strong>Storage layer</strong> (<code>table.c</code>, <code>row.c</code>,
+        <code>column.c</code>, <code>index.c</code>) &mdash;
+        tables are arrays of rows; each row is an array of cells. B-tree-style
+        indexes accelerate equality lookups. Transactions use full-table
+        snapshot-and-restore for rollback.</li>
+</ol>
+
+<p>
+    All memory is managed explicitly. A generic dynamic-array macro
+    (<code>dynamic_array.h</code>) and zero-copy string views
+    (<code>stringview.h</code>) are the only internal abstractions.
+</p>
+
+<h2 id="supported-sql">3&ensp;Supported SQL</h2>
+
+<h3>3.1&ensp;DDL</h3>
+<ul>
+    <li><code>CREATE TABLE</code>, <code>DROP TABLE</code></li>
+    <li><code>CREATE INDEX</code>, <code>DROP INDEX</code> (B-tree-style)</li>
+    <li><code>CREATE TYPE &hellip; AS ENUM (&hellip;)</code>, <code>DROP TYPE</code></li>
+    <li><code>ALTER TABLE</code> &mdash; <code>ADD COLUMN</code>, <code>DROP COLUMN</code>,
+        <code>RENAME COLUMN</code>, <code>ALTER COLUMN TYPE</code></li>
+</ul>
+
+<h3>3.2&ensp;DML</h3>
+<ul>
+    <li><code>INSERT</code> &mdash; single-row, multi-row, and <code>INSERT &hellip; SELECT</code></li>
+    <li><code>SELECT</code> &mdash; <code>*</code>, column lists, aliases, expressions</li>
+    <li><code>UPDATE</code> &mdash; including <code>UPDATE &hellip; FROM</code> for join-based updates</li>
+    <li><code>DELETE</code> &mdash; with <code>WHERE</code> filtering</li>
+    <li><code>RETURNING</code> clause on <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code></li>
+    <li><code>ON CONFLICT DO NOTHING</code></li>
+</ul>
+
+<h3>3.3&ensp;Filtering &amp; Conditions</h3>
+<ul>
+    <li><code>WHERE</code> with <code>AND</code>/<code>OR</code>/<code>NOT</code> and parenthesized grouping</li>
+    <li><code>BETWEEN</code>, <code>IN</code> (value lists and subqueries), <code>LIKE</code>, <code>ILIKE</code></li>
+    <li><code>IS NULL</code>, <code>IS NOT NULL</code>, <code>IS DISTINCT FROM</code>, <code>IS NOT DISTINCT FROM</code></li>
+    <li>Comparison operators: <code>=</code>, <code>!=</code>, <code>&lt;&gt;</code>,
+        <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code></li>
+</ul>
+
+<h3>3.4&ensp;Joins</h3>
+<ul>
+    <li><code>INNER JOIN</code>, <code>LEFT JOIN</code>, <code>RIGHT JOIN</code>,
+        <code>FULL OUTER JOIN</code>, <code>CROSS JOIN</code></li>
+    <li><code>NATURAL JOIN</code> and <code>JOIN &hellip; USING (col)</code></li>
+    <li>Multi-table joins</li>
+</ul>
+
+<h3>3.5&ensp;Aggregation</h3>
+<ul>
+    <li>Functions: <code>COUNT</code>, <code>SUM</code>, <code>AVG</code>,
+        <code>MIN</code>, <code>MAX</code></li>
+    <li><code>GROUP BY</code> (single and multi-column)</li>
+    <li><code>HAVING</code> for post-aggregation filtering</li>
+</ul>
+
+<h3>3.6&ensp;Window Functions</h3>
+<ul>
+    <li><code>ROW_NUMBER()</code>, <code>RANK()</code>, <code>SUM()</code>,
+        <code>COUNT()</code>, <code>AVG()</code></li>
+    <li><code>OVER (PARTITION BY &hellip; ORDER BY &hellip;)</code></li>
+</ul>
+
+<h3>3.7&ensp;Set Operations</h3>
+<ul>
+    <li><code>UNION</code>, <code>UNION ALL</code>, <code>INTERSECT</code>, <code>EXCEPT</code></li>
+</ul>
+
+<h3>3.8&ensp;Common Table Expressions</h3>
+<ul>
+    <li><code>WITH name AS (SELECT &hellip;) SELECT &hellip;</code></li>
+</ul>
+
+<h3>3.9&ensp;Expressions</h3>
+<ul>
+    <li>Arithmetic: <code>+</code>, <code>-</code>, <code>*</code></li>
+    <li><code>CASE WHEN &hellip; THEN &hellip; ELSE &hellip; END</code></li>
+    <li><code>COALESCE(&hellip;)</code></li>
+</ul>
+
+<h3>3.10&ensp;Result Control</h3>
+<ul>
+    <li><code>DISTINCT</code></li>
+    <li><code>ORDER BY</code> (multi-column, individual <code>ASC</code>/<code>DESC</code>)</li>
+    <li><code>LIMIT</code> and <code>OFFSET</code></li>
+</ul>
+
+<h3>3.11&ensp;Constraints</h3>
+<ul>
+    <li><code>NOT NULL</code>, <code>UNIQUE</code>, <code>PRIMARY KEY</code></li>
+    <li><code>DEFAULT</code> values</li>
+    <li><code>CHECK</code> (parsed)</li>
+</ul>
+
+<h3>3.12&ensp;Transactions</h3>
+<ul>
+    <li><code>BEGIN</code>, <code>COMMIT</code>, <code>ROLLBACK</code> with snapshot-based rollback</li>
+</ul>
+
+<h2 id="data-types">4&ensp;Data Types</h2>
+
+<table>
+    <tr>
+        <th>Type</th>
+        <th>Description</th>
+    </tr>
+    <tr><td><code>INT</code></td><td>32-bit signed integer</td></tr>
+    <tr><td><code>BIGINT</code></td><td>64-bit signed integer</td></tr>
+    <tr><td><code>FLOAT</code></td><td>Double-precision floating point</td></tr>
+    <tr><td><code>NUMERIC</code>/<code>DECIMAL</code></td><td>Decimal number</td></tr>
+    <tr><td><code>TEXT</code></td><td>Variable-length string</td></tr>
+    <tr><td><code>VARCHAR(n)</code></td><td>Length-bounded string</td></tr>
+    <tr><td><code>BOOLEAN</code></td><td><code>TRUE</code>/<code>FALSE</code></td></tr>
+    <tr><td><code>DATE</code></td><td>Calendar date</td></tr>
+    <tr><td><code>TIMESTAMP</code></td><td>Date and time</td></tr>
+    <tr><td><code>UUID</code></td><td>128-bit universally unique identifier</td></tr>
+    <tr><td><code>SERIAL</code></td><td>Auto-incrementing integer</td></tr>
+    <tr><td><code>ENUM</code></td><td>User-defined enumeration type</td></tr>
+</table>
+
+<h2 id="getting-started">5&ensp;Getting Started</h2>
+
+<h3>5.1&ensp;Prerequisites</h3>
+<p>
+    A C11 compiler (<code>cc</code>, <code>gcc</code>, or <code>clang</code>) and
+    <code>make</code>. Nothing else.
+</p>
+
+<h3>5.2&ensp;Build</h3>
+<pre><code>make</code></pre>
+<p>The binary is placed at <code>build/mskql</code>.</p>
+
+<h3>5.3&ensp;Run</h3>
+<pre><code>./build/mskql</code></pre>
+<p>
+    The server starts listening on <strong>port 5433</strong>. Connect with any
+    PostgreSQL client:
+</p>
+<pre><code>psql -h 127.0.0.1 -p 5433 -U test -d mskql</code></pre>
+
+<h3>5.4&ensp;Example Session</h3>
+<pre><code>CREATE TABLE users (
+    id    INT PRIMARY KEY,
+    name  TEXT NOT NULL,
+    email TEXT UNIQUE
+);
+
+INSERT INTO users (id, name, email)
+VALUES (1, 'Alice', 'alice@example.com');
+
+SELECT * FROM users;</code></pre>
+
+<h2 id="testing">6&ensp;Testing</h2>
+
+<p>
+    The project includes 241 SQL test cases covering DDL, DML, joins, aggregation,
+    window functions, set operations, CTEs, transactions, NULL handling, type coercion,
+    constraint enforcement, and various edge cases.
+</p>
+
+<pre><code>make test</code></pre>
+
+<p>
+    Each test case starts a fresh server instance, sends SQL via <code>psql</code>,
+    and validates the output against expected results.
+</p>
+
+<h2 id="benchmarks">7&ensp;Benchmarks</h2>
+
+<p>
+    A micro-benchmark suite measures wall-clock time for core operations:
+    bulk insert, full-table scan, filtered select, aggregation, ordering,
+    joins, update, delete, parsing, index lookup, and transactions.
+    Results are tracked over time via CI.
+</p>
+
+<p class="bench-link">
+    &#8594;&ensp;<a href="dev/bench/index.html"><strong>View historical benchmark charts</strong></a>
+</p>
+
+<h2 id="construction">8&ensp;How This Project Was Built</h2>
+
+<p>
+    mskql was written entirely by AI through an adversarial collaboration between
+    two agents:
+</p>
+
+<ol>
+    <li><strong>The Writer</strong> &mdash; designed the architecture, wrote all production
+        code, and resolved every failing test.</li>
+    <li><strong>The Challenger</strong> &mdash; read the source code, identified edge cases,
+        gaps, and potential bugs, then authored targeted test cases designed to break
+        the implementation.</li>
+</ol>
+
+<p>
+    The two agents worked in iterative rounds. The Challenger would study the current
+    codebase and produce <code>.sql</code> test files exercising corner cases&mdash;empty
+    tables, NULL handling, multi-column ordering, stale index entries after deletes,
+    and more. The Writer would then run the new tests, diagnose failures, and ship fixes.
+    This back-and-forth continued until the full suite passed cleanly.
+</p>
+
+<p>
+    No human wrote any of the C code or SQL test cases. The adversarial loop drove the
+    implementation toward correctness the same way a rigorous code-review culture does
+    on a human team&mdash;except both sides were machines.
+</p>
+
+<h2 id="source-layout">9&ensp;Source Layout</h2>
+
+<table>
+    <tr><th>File</th><th>Lines</th><th>Role</th></tr>
+    <tr><td><code>parser.c</code></td><td>2,537</td><td>Recursive-descent SQL parser</td></tr>
+    <tr><td><code>query.c</code></td><td>1,822</td><td>Query planning and execution</td></tr>
+    <tr><td><code>database.c</code></td><td>1,691</td><td>Database-level operations, transactions</td></tr>
+    <tr><td><code>pgwire.c</code></td><td>847</td><td>PostgreSQL wire protocol server</td></tr>
+    <tr><td><code>table.c</code></td><td>177</td><td>Table storage</td></tr>
+    <tr><td><code>row.c</code></td><td>171</td><td>Row and cell representation</td></tr>
+    <tr><td><code>index.c</code></td><td>194</td><td>B-tree-style index management</td></tr>
+    <tr><td><code>column.c</code></td><td>31</td><td>Column types, enums, constraints</td></tr>
+    <tr><td><code>main.c</code></td><td>40</td><td>Entry point, signal handling</td></tr>
+    <tr><td colspan="2"><strong>~8,200 total</strong></td><td>(including headers)</td></tr>
+</table>
+
+<hr>
+
+<p style="text-align:center; font-size: 12px; color: #666; margin-top: 20px;">
+    <a href="https://github.com/martinsk/mskql" style="color:#666;">Source on GitHub</a>
+</p>
+
 </body>
 </html>
