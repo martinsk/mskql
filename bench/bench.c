@@ -3,10 +3,14 @@
  *
  * Builds as a standalone executable that links against the library .o files
  * (everything except main.o).  Each benchmark function sets up a fresh
- * database, runs a workload, and prints wall-clock elapsed time.
+ * database, runs a workload, and returns wall-clock elapsed time in ms.
  *
- * Usage:  ./build/mskql_bench              (run all benchmarks)
- *         ./build/mskql_bench <name>       (run only the named benchmark)
+ * When --json <file> is passed, writes results in the
+ * "customSmallerIsBetter" format for github-action-benchmark.
+ *
+ * Usage:  ./build/mskql_bench                          (run all, console)
+ *         ./build/mskql_bench --json results.json      (run all + JSON)
+ *         ./build/mskql_bench <name>                   (single benchmark)
  */
 
 #include <stdio.h>
@@ -28,15 +32,6 @@ static double now_sec(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-#define BENCH_START  double _t0 = now_sec()
-#define BENCH_END(label, iters)                                         \
-    do {                                                                \
-        double _elapsed = now_sec() - _t0;                              \
-        printf("%-40s  %8d iters  %9.3f ms  (%7.1f ops/s)\n",          \
-               (label), (int)(iters), _elapsed * 1e3,                   \
-               (double)(iters) / _elapsed);                             \
-    } while (0)
-
 /* ------------------------------------------------------------------ */
 /*  Helper: execute SQL, discard result, abort on error                */
 /* ------------------------------------------------------------------ */
@@ -55,7 +50,7 @@ static void exec(struct database *db, const char *sql)
 /*  Benchmark: bulk INSERT                                             */
 /* ------------------------------------------------------------------ */
 
-static void bench_insert_bulk(void)
+static double bench_insert_bulk(void)
 {
     struct database db;
     db_init(&db, "bench");
@@ -63,23 +58,24 @@ static void bench_insert_bulk(void)
 
     const int N = 10000;
     char sql[256];
-    BENCH_START;
+    double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         snprintf(sql, sizeof(sql),
                  "INSERT INTO t VALUES (%d, 'user_%d', %d.%d)",
                  i, i, i % 100, i % 10);
         exec(&db, sql);
     }
-    BENCH_END("insert_bulk (10k rows)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
 
     db_free(&db);
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark: SELECT full scan                                        */
 /* ------------------------------------------------------------------ */
 
-static void bench_select_full_scan(void)
+static double bench_select_full_scan(void)
 {
     struct database db;
     db_init(&db, "bench");
@@ -93,22 +89,23 @@ static void bench_select_full_scan(void)
     }
 
     const int N = 200;
-    BENCH_START;
+    double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         struct rows r = {0};
         db_exec_sql(&db, "SELECT * FROM t", &r);
         rows_free(&r);
     }
-    BENCH_END("select_full_scan (5k rows x200)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
 
     db_free(&db);
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark: SELECT with WHERE filter                                */
 /* ------------------------------------------------------------------ */
 
-static void bench_select_where(void)
+static double bench_select_where(void)
 {
     struct database db;
     db_init(&db, "bench");
@@ -123,22 +120,23 @@ static void bench_select_where(void)
     }
 
     const int N = 500;
-    BENCH_START;
+    double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         struct rows r = {0};
         db_exec_sql(&db, "SELECT * FROM t WHERE amount > 2500", &r);
         rows_free(&r);
     }
-    BENCH_END("select_where (5k rows x500)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
 
     db_free(&db);
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark: aggregate (SUM + GROUP BY)                              */
 /* ------------------------------------------------------------------ */
 
-static void bench_aggregate(void)
+static double bench_aggregate(void)
 {
     struct database db;
     db_init(&db, "bench");
@@ -154,23 +152,24 @@ static void bench_aggregate(void)
     }
 
     const int N = 500;
-    BENCH_START;
+    double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         struct rows r = {0};
         db_exec_sql(&db,
             "SELECT region, SUM(amount) FROM sales GROUP BY region", &r);
         rows_free(&r);
     }
-    BENCH_END("aggregate_group_by (5k rows x500)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
 
     db_free(&db);
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark: ORDER BY                                                */
 /* ------------------------------------------------------------------ */
 
-static void bench_order_by(void)
+static double bench_order_by(void)
 {
     struct database db;
     db_init(&db, "bench");
@@ -184,22 +183,23 @@ static void bench_order_by(void)
     }
 
     const int N = 200;
-    BENCH_START;
+    double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         struct rows r = {0};
         db_exec_sql(&db, "SELECT * FROM t ORDER BY val DESC", &r);
         rows_free(&r);
     }
-    BENCH_END("order_by (5k rows x200)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
 
     db_free(&db);
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark: JOIN                                                    */
 /* ------------------------------------------------------------------ */
 
-static void bench_join(void)
+static double bench_join(void)
 {
     struct database db;
     db_init(&db, "bench");
@@ -221,7 +221,7 @@ static void bench_join(void)
     }
 
     const int N = 50;
-    BENCH_START;
+    double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         struct rows r = {0};
         db_exec_sql(&db,
@@ -229,16 +229,17 @@ static void bench_join(void)
             "JOIN orders ON users.id = orders.user_id", &r);
         rows_free(&r);
     }
-    BENCH_END("join (500x2000 rows x50)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
 
     db_free(&db);
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark: UPDATE                                                  */
 /* ------------------------------------------------------------------ */
 
-static void bench_update(void)
+static double bench_update(void)
 {
     struct database db;
     db_init(&db, "bench");
@@ -251,30 +252,29 @@ static void bench_update(void)
     }
 
     const int N = 200;
-    BENCH_START;
+    double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         exec(&db, "UPDATE t SET val = 0 WHERE id < 1000");
     }
-    BENCH_END("update_where (5k rows x200)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
 
     db_free(&db);
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark: DELETE                                                   */
 /* ------------------------------------------------------------------ */
 
-static void bench_delete(void)
+static double bench_delete(void)
 {
     struct database db;
     db_init(&db, "bench");
     exec(&db, "CREATE TABLE t (id INT, val INT)");
 
-    /* insert, delete half, re-insert — measures delete performance */
     const int N = 50;
-    BENCH_START;
+    double t0 = now_sec();
     for (int iter = 0; iter < N; iter++) {
-        /* fresh table each iteration */
         exec(&db, "DROP TABLE t");
         exec(&db, "CREATE TABLE t (id INT, val INT)");
         for (int i = 0; i < 2000; i++) {
@@ -284,16 +284,17 @@ static void bench_delete(void)
         }
         exec(&db, "DELETE FROM t WHERE id >= 1000");
     }
-    BENCH_END("delete_where (2k rows x50)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
 
     db_free(&db);
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark: parser throughput                                       */
 /* ------------------------------------------------------------------ */
 
-static void bench_parser(void)
+static double bench_parser(void)
 {
     const char *queries[] = {
         "SELECT * FROM t",
@@ -308,20 +309,21 @@ static void bench_parser(void)
     int nq = (int)(sizeof(queries) / sizeof(queries[0]));
 
     const int N = 50000;
-    BENCH_START;
+    double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         struct query q = {0};
         if (query_parse(queries[i % nq], &q) == 0)
             query_free(&q);
     }
-    BENCH_END("parser (50k parses)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark: index lookup                                            */
 /* ------------------------------------------------------------------ */
 
-static void bench_index_lookup(void)
+static double bench_index_lookup(void)
 {
     struct database db;
     db_init(&db, "bench");
@@ -337,7 +339,7 @@ static void bench_index_lookup(void)
 
     const int N = 2000;
     char sql[128];
-    BENCH_START;
+    double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         struct rows r = {0};
         snprintf(sql, sizeof(sql),
@@ -345,16 +347,17 @@ static void bench_index_lookup(void)
         db_exec_sql(&db, sql, &r);
         rows_free(&r);
     }
-    BENCH_END("index_lookup (10k rows x2000)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
 
     db_free(&db);
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark: transaction (BEGIN / INSERT / ROLLBACK)                 */
 /* ------------------------------------------------------------------ */
 
-static void bench_transaction(void)
+static double bench_transaction(void)
 {
     struct database db;
     db_init(&db, "bench");
@@ -367,7 +370,7 @@ static void bench_transaction(void)
     }
 
     const int N = 200;
-    BENCH_START;
+    double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         exec(&db, "BEGIN");
         for (int j = 0; j < 100; j++) {
@@ -378,9 +381,10 @@ static void bench_transaction(void)
         }
         exec(&db, "ROLLBACK");
     }
-    BENCH_END("transaction_rollback (1k base x200)", N);
+    double elapsed_ms = (now_sec() - t0) * 1e3;
 
     db_free(&db);
+    return elapsed_ms;
 }
 
 /* ------------------------------------------------------------------ */
@@ -389,7 +393,7 @@ static void bench_transaction(void)
 
 struct bench_entry {
     const char *name;
-    void (*fn)(void);
+    double (*fn)(void);
 };
 
 static struct bench_entry benchmarks[] = {
@@ -408,19 +412,52 @@ static struct bench_entry benchmarks[] = {
 
 static int nbench = (int)(sizeof(benchmarks) / sizeof(benchmarks[0]));
 
+struct bench_result {
+    const char *name;
+    double ms;
+};
+
+static void write_json(const char *path, struct bench_result *results, int n)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) { perror(path); return; }
+    fprintf(f, "[\n");
+    for (int i = 0; i < n; i++) {
+        fprintf(f, "  { \"name\": \"%s\", \"unit\": \"ms\", \"value\": %.3f }",
+                results[i].name, results[i].ms);
+        fprintf(f, "%s\n", i + 1 < n ? "," : "");
+    }
+    fprintf(f, "]\n");
+    fclose(f);
+    printf("wrote %s\n", path);
+}
+
 int main(int argc, char **argv)
 {
-    const char *filter = argc > 1 ? argv[1] : NULL;
+    const char *filter = NULL;
+    const char *json_path = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--json") == 0 && i + 1 < argc) {
+            json_path = argv[++i];
+        } else {
+            filter = argv[i];
+        }
+    }
 
     printf("mskql benchmarks\n");
     printf("=========================================="
            "======================================\n");
 
+    struct bench_result results[32];
     int ran = 0;
     for (int i = 0; i < nbench; i++) {
         if (filter && strcmp(filter, benchmarks[i].name) != 0)
             continue;
-        benchmarks[i].fn();
+        double ms = benchmarks[i].fn();
+        printf("%-40s  %9.3f ms\n", benchmarks[i].name, ms);
+        results[ran].name = benchmarks[i].name;
+        results[ran].ms = ms;
         ran++;
     }
 
@@ -436,5 +473,9 @@ int main(int argc, char **argv)
     printf("=========================================="
            "======================================\n");
     printf("done (%d benchmarks)\n", ran);
+
+    if (json_path)
+        write_json(json_path, results, ran);
+
     return 0;
 }

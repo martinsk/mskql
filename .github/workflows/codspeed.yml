@@ -1,4 +1,4 @@
-name: CodSpeed Benchmarks
+name: Benchmarks
 
 on:
   push:
@@ -9,8 +9,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  id-token: write
+  contents: write
+  deployments: write
 
 jobs:
   benchmarks:
@@ -18,17 +18,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake
-
       - name: Build benchmarks
-        run: |
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCODSPEED_MODE=simulation ..
-          make -j$(nproc)
+        run: make bench
 
-      - name: Run benchmarks with CodSpeed
-        uses: CodSpeedHQ/action@v4
+      - name: Run benchmarks
+        run: ./build/mskql_bench --json bench_results.json
+
+      - name: Store benchmark results
+        uses: benchmark-action/github-action-benchmark@v1
         with:
-          mode: simulation
-          run: ./build/mskql_benchmarks
+          tool: customSmallerIsBetter
+          output-file-path: bench_results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: "130%"
+          comment-on-alert: true
+          fail-on-alert: false
+          benchmark-data-dir-path: dev/bench
