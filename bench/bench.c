@@ -39,11 +39,13 @@ static double now_sec(void)
 static void exec(struct database *db, const char *sql)
 {
     struct rows r = {0};
-    if (db_exec_sql(db, sql, &r) != 0) {
-        fprintf(stderr, "FATAL: %s\n", sql);
+    int rc = db_exec_sql(db, sql, &r);
+    rows_free(&r);
+    if (rc != 0) {
+        fprintf(stderr, "FATAL (rc=%d): %s\n", rc, sql);
+        fflush(stderr);
         exit(1);
     }
-    rows_free(&r);
 }
 
 /* ------------------------------------------------------------------ */
@@ -454,8 +456,11 @@ int main(int argc, char **argv)
     for (int i = 0; i < nbench; i++) {
         if (filter && strcmp(filter, benchmarks[i].name) != 0)
             continue;
+        printf("  running %-30s ...", benchmarks[i].name);
+        fflush(stdout);
         double ms = benchmarks[i].fn();
-        printf("%-40s  %9.3f ms\n", benchmarks[i].name, ms);
+        printf("  %9.3f ms\n", ms);
+        fflush(stdout);
         results[ran].name = benchmarks[i].name;
         results[ran].ms = ms;
         ran++;
