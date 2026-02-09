@@ -71,7 +71,7 @@ static inline sv sv_trim(sv s)
 
 static inline char *sv_to_cstr(sv s)
 {
-    char *buf = malloc(s.len + 1);
+    char *buf = (char *)malloc(s.len + 1);
     if (buf) {
         memcpy(buf, s.data, s.len);
         buf[s.len] = '\0';
