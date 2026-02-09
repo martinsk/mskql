@@ -207,6 +207,16 @@
         }
         footer.site-footer a { font-size: 0.85rem; }
 
+        /* ── Diagram ─────────────────────────────────────────── */
+        .diagram {
+            margin: 2rem auto;
+            text-align: center;
+        }
+        .diagram svg {
+            max-width: 100%;
+            height: auto;
+        }
+
         /* ── Responsive: collapse sidenotes on narrow screens ── */
         @media (max-width: 1100px) {
             body { width: 80%; }
@@ -278,24 +288,40 @@
     The system is structured as a pipeline of four stages:
 </p>
 
-<ol>
-    <li><strong>Wire protocol server</strong> (<code>pgwire.c</code>)&mdash;accepts
-        TCP connections, handles SSL negotiation, parses PostgreSQL startup and query
-        messages, and serializes result rows back to the client.</li>
-    <li><strong>SQL parser</strong> (<code>parser.c</code>)&mdash;a hand-written
-        recursive-descent parser that produces a typed <code>struct&nbsp;query</code>
-        AST. No lexer generator or parser generator is used.<span class="sidenote">At
-        2,537 lines the parser is the largest single file. It handles the full grammar
-        including CTEs, window functions, and set operations.</span></li>
-    <li><strong>Query executor</strong> (<code>query.c</code>,
-        <code>database.c</code>)&mdash;walks the AST and executes it against the
-        in-memory table structures. Handles joins, aggregation, window functions,
-        set operations, CTEs, subqueries, and transactions.</li>
-    <li><strong>Storage layer</strong> (<code>table.c</code>, <code>row.c</code>,
-        <code>column.c</code>, <code>index.c</code>)&mdash;tables are arrays of rows;
-        each row is an array of typed cells. B-tree-style indexes accelerate equality
-        lookups. Transactions use full-table snapshot-and-restore for rollback.</li>
-</ol>
+<table>
+    <thead>
+        <tr><th>Stage</th><th>Source</th><th>Description</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Wire protocol</strong></td>
+            <td><code>pgwire.c</code></td>
+            <td>Accepts TCP connections on port&nbsp;5433, handles SSL negotiation,
+                parses PostgreSQL startup/query messages, serializes result rows</td>
+        </tr>
+        <tr>
+            <td><strong>SQL parser</strong></td>
+            <td><code>parser.c</code></td>
+            <td>Hand-written recursive-descent parser producing a typed
+                <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
+                2,537 lines the parser is the largest single file. It handles the full
+                grammar including CTEs, window functions, and set operations.</span></td>
+        </tr>
+        <tr>
+            <td><strong>Query executor</strong></td>
+            <td><code>query.c</code>, <code>database.c</code></td>
+            <td>Walks the AST and executes against in-memory tables. Handles joins,
+                aggregation, window functions, set operations, CTEs, subqueries,
+                transactions</td>
+        </tr>
+        <tr>
+            <td><strong>Storage</strong></td>
+            <td><code>table.c</code>, <code>row.c</code>, <code>index.c</code></td>
+            <td>Tables are arrays of rows; rows are arrays of typed cells. B-tree indexes
+                for equality lookups. Snapshot-and-restore for transaction rollback</td>
+        </tr>
+    </tbody>
+</table>
 
 <p>
     All memory is managed explicitly. A generic dynamic-array macro
@@ -309,72 +335,86 @@
 
 <h2 id="supported-sql">3. Supported SQL</h2>
 
-<h3>3.1&ensp;DDL</h3>
-<ul>
-    <li><code>CREATE TABLE</code>, <code>DROP TABLE</code></li>
-    <li><code>CREATE INDEX</code>, <code>DROP INDEX</code>&ensp;(B-tree-style)</li>
-    <li><code>CREATE TYPE &hellip; AS ENUM (&hellip;)</code>, <code>DROP TYPE</code></li>
-    <li><code>ALTER TABLE</code>&mdash;<code>ADD COLUMN</code>, <code>DROP COLUMN</code>,
-        <code>RENAME COLUMN</code>, <code>ALTER COLUMN TYPE</code></li>
-</ul>
-
-<h3>3.2&ensp;DML</h3>
-<ul>
-    <li><code>INSERT</code>&mdash;single-row, multi-row, and <code>INSERT &hellip; SELECT</code></li>
-    <li><code>SELECT</code>&mdash;<code>*</code>, column lists, aliases, expressions</li>
-    <li><code>UPDATE</code>&mdash;including <code>UPDATE &hellip; FROM</code> for join-based updates</li>
-    <li><code>DELETE</code> with <code>WHERE</code> filtering</li>
-    <li><code>RETURNING</code> clause on <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code></li>
-    <li><code>ON CONFLICT DO NOTHING</code></li>
-</ul>
-
-<h3>3.3&ensp;Filtering &amp; Conditions</h3>
-<ul>
-    <li><code>WHERE</code> with <code>AND</code>/<code>OR</code>/<code>NOT</code> and parenthesized grouping</li>
-    <li><code>BETWEEN</code>, <code>IN</code> (value lists and subqueries), <code>LIKE</code>, <code>ILIKE</code></li>
-    <li><code>IS NULL</code>, <code>IS NOT NULL</code>, <code>IS DISTINCT FROM</code>, <code>IS NOT DISTINCT FROM</code></li>
-    <li>Comparison: <code>=</code> <code>!=</code> <code>&lt;&gt;</code>
-        <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code></li>
-</ul>
-
-<h3>3.4&ensp;Joins</h3>
-<ul>
-    <li><code>INNER JOIN</code>, <code>LEFT JOIN</code>, <code>RIGHT JOIN</code>,
-        <code>FULL OUTER JOIN</code>, <code>CROSS JOIN</code></li>
-    <li><code>NATURAL JOIN</code> and <code>JOIN &hellip; USING (col)</code></li>
-    <li>Multi-table joins</li>
-</ul>
-
-<h3>3.5&ensp;Aggregation &amp; Window Functions</h3>
-<ul>
-    <li><code>COUNT</code>, <code>SUM</code>, <code>AVG</code>,
-        <code>MIN</code>, <code>MAX</code></li>
-    <li><code>GROUP BY</code> (single and multi-column), <code>HAVING</code></li>
-    <li><code>ROW_NUMBER()</code>, <code>RANK()</code> over
-        <code>PARTITION BY &hellip; ORDER BY &hellip;</code></li>
-</ul>
-
-<h3>3.6&ensp;Set Operations &amp; CTEs</h3>
-<ul>
-    <li><code>UNION</code>, <code>UNION ALL</code>, <code>INTERSECT</code>, <code>EXCEPT</code></li>
-    <li><code>WITH name AS (SELECT &hellip;) SELECT &hellip;</code></li>
-</ul>
-
-<h3>3.7&ensp;Expressions &amp; Result Control</h3>
-<ul>
-    <li>Arithmetic: <code>+</code>, <code>-</code>, <code>*</code></li>
-    <li><code>CASE WHEN &hellip; THEN &hellip; ELSE &hellip; END</code>,
-        <code>COALESCE(&hellip;)</code></li>
-    <li><code>DISTINCT</code>, <code>ORDER BY</code> (multi-column, per-column
-        <code>ASC</code>/<code>DESC</code>), <code>LIMIT</code>, <code>OFFSET</code></li>
-</ul>
-
-<h3>3.8&ensp;Constraints &amp; Transactions</h3>
-<ul>
-    <li><code>NOT NULL</code>, <code>UNIQUE</code>, <code>PRIMARY KEY</code>,
-        <code>DEFAULT</code>, <code>CHECK</code></li>
-    <li><code>BEGIN</code>, <code>COMMIT</code>, <code>ROLLBACK</code>&ensp;(snapshot-based)</li>
-</ul>
+<table>
+    <thead>
+        <tr><th>Category</th><th>Supported</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>DDL</strong></td>
+            <td><code>CREATE TABLE</code>, <code>DROP TABLE</code>,
+                <code>CREATE INDEX</code>, <code>DROP INDEX</code>,
+                <code>CREATE TYPE &hellip; AS ENUM</code>, <code>DROP TYPE</code>,
+                <code>ALTER TABLE</code> (<code>ADD</code>/<code>DROP</code>/<code>RENAME COLUMN</code>,
+                <code>ALTER COLUMN TYPE</code>)</td>
+        </tr>
+        <tr>
+            <td><strong>DML</strong></td>
+            <td><code>INSERT</code> (single, multi-row, <code>INSERT&hellip;SELECT</code>),
+                <code>SELECT</code>, <code>UPDATE</code> (incl. <code>UPDATE&hellip;FROM</code>),
+                <code>DELETE</code>,
+                <code>RETURNING</code>, <code>ON CONFLICT DO NOTHING</code></td>
+        </tr>
+        <tr>
+            <td><strong>Filtering</strong></td>
+            <td><code>WHERE</code> with <code>AND</code>/<code>OR</code>/<code>NOT</code>,
+                <code>BETWEEN</code>, <code>IN</code> (values &amp; subqueries),
+                <code>LIKE</code>, <code>ILIKE</code>,
+                <code>IS [NOT] NULL</code>, <code>IS [NOT] DISTINCT FROM</code>,
+                <code>=</code> <code>!=</code> <code>&lt;&gt;</code>
+                <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code></td>
+        </tr>
+        <tr>
+            <td><strong>Joins</strong></td>
+            <td><code>INNER</code>, <code>LEFT</code>, <code>RIGHT</code>,
+                <code>FULL OUTER</code>, <code>CROSS</code>,
+                <code>NATURAL</code>, <code>USING</code>, multi-table</td>
+        </tr>
+        <tr>
+            <td><strong>Aggregation</strong></td>
+            <td><code>COUNT</code>, <code>SUM</code>, <code>AVG</code>,
+                <code>MIN</code>, <code>MAX</code>,
+                <code>GROUP BY</code> (multi-column), <code>HAVING</code></td>
+        </tr>
+        <tr>
+            <td><strong>Window functions</strong></td>
+            <td><code>ROW_NUMBER()</code>, <code>RANK()</code>,
+                <code>SUM()</code>, <code>COUNT()</code>, <code>AVG()</code>
+                over <code>PARTITION BY &hellip; ORDER BY &hellip;</code></td>
+        </tr>
+        <tr>
+            <td><strong>Set operations</strong></td>
+            <td><code>UNION</code>, <code>UNION ALL</code>,
+                <code>INTERSECT</code>, <code>EXCEPT</code></td>
+        </tr>
+        <tr>
+            <td><strong>CTEs</strong></td>
+            <td><code>WITH name AS (SELECT &hellip;) SELECT &hellip;</code></td>
+        </tr>
+        <tr>
+            <td><strong>Expressions</strong></td>
+            <td><code>+</code> <code>-</code> <code>*</code>,
+                <code>CASE WHEN&hellip;THEN&hellip;ELSE&hellip;END</code>,
+                <code>COALESCE()</code></td>
+        </tr>
+        <tr>
+            <td><strong>Result control</strong></td>
+            <td><code>DISTINCT</code>,
+                <code>ORDER BY</code> (multi-column, per-column <code>ASC</code>/<code>DESC</code>),
+                <code>LIMIT</code>, <code>OFFSET</code></td>
+        </tr>
+        <tr>
+            <td><strong>Constraints</strong></td>
+            <td><code>NOT NULL</code>, <code>UNIQUE</code>, <code>PRIMARY KEY</code>,
+                <code>DEFAULT</code>, <code>CHECK</code></td>
+        </tr>
+        <tr>
+            <td><strong>Transactions</strong></td>
+            <td><code>BEGIN</code>, <code>COMMIT</code>, <code>ROLLBACK</code>
+                (snapshot-based)</td>
+        </tr>
+    </tbody>
+</table>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--  4. Data Types                                              -->
@@ -470,54 +510,66 @@ SELECT * FROM users;</code></pre>
 
 <p>
     mskql was written entirely by AI through an adversarial collaboration between
-    two agents:
+    two agents. No human wrote any of the C code or SQL test cases.<span class="sidenote">The
+    adversarial loop drove the implementation toward correctness the same way a rigorous
+    code-review culture does on a human team&mdash;except both sides were machines.</span>
 </p>
 
-<ol>
-    <li><strong>The Writer</strong>&mdash;designed the architecture, wrote all production
-        code, and resolved every failing test.</li>
-    <li><strong>The Challenger</strong>&mdash;read the source code, identified edge cases,
-        gaps, and potential bugs, then authored targeted test cases designed to break
-        the implementation.</li>
-</ol>
+<div class="diagram">
+<svg viewBox="0 0 620 340" xmlns="http://www.w3.org/2000/svg" font-family="'EB Garamond', Georgia, serif">
+  <!-- Background -->
+  <rect width="620" height="340" fill="#fffff8"/>
+
+  <!-- Writer box -->
+  <rect x="40" y="40" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
+  <text x="140" y="72" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Writer</text>
+  <text x="140" y="96" text-anchor="middle" font-size="12" fill="#555">Designs architecture</text>
+  <text x="140" y="114" text-anchor="middle" font-size="12" fill="#555">Writes code &amp; fixes bugs</text>
+
+  <!-- Challenger box -->
+  <rect x="380" y="40" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
+  <text x="480" y="72" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Challenger</text>
+  <text x="480" y="96" text-anchor="middle" font-size="12" fill="#555">Reads source code</text>
+  <text x="480" y="114" text-anchor="middle" font-size="12" fill="#555">Writes adversarial tests</text>
+
+  <!-- Arrow: Writer -> Challenger (top) -->
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#a00"/>
+    </marker>
+  </defs>
+  <path d="M240,70 C310,70 310,70 380,70" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <text x="310" y="62" text-anchor="middle" font-size="11" fill="#a00" font-style="italic">production code</text>
+
+  <!-- Arrow: Challenger -> Writer (bottom) -->
+  <path d="M380,120 C310,120 310,120 240,120" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <text x="310" y="136" text-anchor="middle" font-size="11" fill="#a00" font-style="italic">.sql test cases</text>
+
+  <!-- Cycle arrow down from both -->
+  <path d="M140,140 L140,190 C140,210 140,210 200,210 L310,210" stroke="#ccc" stroke-width="1.2" fill="none" stroke-dasharray="4,3"/>
+  <path d="M480,140 L480,190 C480,210 480,210 420,210 L310,210" stroke="#ccc" stroke-width="1.2" fill="none" stroke-dasharray="4,3"/>
+
+  <!-- Iteration circle -->
+  <circle cx="310" cy="210" r="22" fill="#fff" stroke="#a00" stroke-width="1.5"/>
+  <text x="310" y="206" text-anchor="middle" font-size="10" fill="#a00" font-weight="600">iterate</text>
+  <text x="310" y="218" text-anchor="middle" font-size="10" fill="#a00" font-weight="600">rounds</text>
+
+  <!-- Arrow down to result -->
+  <line x1="310" y1="232" x2="310" y2="270" stroke="#a00" stroke-width="1.5" marker-end="url(#ah)"/>
+
+  <!-- Result box -->
+  <rect x="180" y="275" width="260" height="48" rx="6" fill="#a00" stroke="none"/>
+  <text x="310" y="296" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">241 tests pass</text>
+  <text x="310" y="314" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.8)">~8,200 lines of C &middot; zero human code</text>
+</svg>
+</div>
 
 <p>
     The two agents worked in iterative rounds. The Challenger would study the current
     codebase and produce <code>.sql</code> test files exercising corner
     cases&mdash;empty tables, NULL handling, multi-column ordering, stale index entries
     after deletes, and more. The Writer would then run the new tests, diagnose failures,
-    and ship fixes. This continued until the full suite passed
-    cleanly.<span class="sidenote">No human wrote any of the C code or SQL test cases.
-    The adversarial loop drove the implementation toward correctness the same way a
-    rigorous code-review culture does on a human team&mdash;except both sides were
-    machines.</span>
-</p>
-
-<!-- ═══════════════════════════════════════════════════════════ -->
-<!--  9. Source Layout                                           -->
-<!-- ═══════════════════════════════════════════════════════════ -->
-
-<h2 id="source-layout">9. Source Layout</h2>
-
-<table>
-    <thead>
-        <tr><th>File</th><th>Lines</th><th>Role</th></tr>
-    </thead>
-    <tbody>
-        <tr><td><code>parser.c</code></td><td>2,537</td><td>Recursive-descent SQL parser</td></tr>
-        <tr><td><code>query.c</code></td><td>1,822</td><td>Query planning and execution</td></tr>
-        <tr><td><code>database.c</code></td><td>1,691</td><td>Database-level operations, transactions</td></tr>
-        <tr><td><code>pgwire.c</code></td><td>847</td><td>PostgreSQL wire protocol server</td></tr>
-        <tr><td><code>index.c</code></td><td>194</td><td>B-tree-style index management</td></tr>
-        <tr><td><code>table.c</code></td><td>177</td><td>Table storage</td></tr>
-        <tr><td><code>row.c</code></td><td>171</td><td>Row and cell representation</td></tr>
-        <tr><td><code>column.c</code></td><td>31</td><td>Column types, enums, constraints</td></tr>
-        <tr><td><code>main.c</code></td><td>40</td><td>Entry point, signal handling</td></tr>
-    </tbody>
-</table>
-
-<p style="font-size: 0.95rem; color: var(--fg-dim);">
-    Total: approximately 8,200 lines including headers.
+    and ship fixes. This continued until the full suite passed cleanly.
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
