@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql — Benchmarks</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            display: flex;
+            justify-content: center;
+            padding: 2rem;
+        }
+        .container { max-width: 720px; width: 100%; }
+        h1 { color: #58a6ff; margin-bottom: 0.25rem; font-size: 1.8rem; }
+        .subtitle { color: #8b949e; margin-bottom: 2rem; }
+        a { color: #58a6ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .card h2 { font-size: 1.1rem; color: #f0f6fc; margin-bottom: 0.5rem; }
+        .card p { color: #8b949e; line-height: 1.6; }
+        code {
+            background: #1c2128;
+            padding: 0.15em 0.4em;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>mskql</h1>
+        <p class="subtitle">Benchmark results &amp; performance tracking</p>
+
+        <div class="card">
+            <h2>Benchmark Charts</h2>
+            <p>
+                View the historical benchmark charts at
+                <a href="dev/bench/index.html">dev/bench/</a>.
+            </p>
+            <p style="margin-top: 0.5rem;">
+                Charts are updated automatically on every push to <code>main</code>
+                via <a href="https://github.com/martinsk/mskql">GitHub Actions</a>.
+            </p>
+        </div>
+
+        <div class="card">
+            <h2>Source</h2>
+            <p>
+                <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
+            </p>
+        </div>
+    </div>
+</body>
+</html>
