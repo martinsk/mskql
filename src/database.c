@@ -13,6 +13,8 @@ void db_init(struct database *db, const char *name)
     db->name = strdup(name);
     da_init(&db->tables);
     da_init(&db->types);
+    db->in_transaction = 0;
+    db->snapshot = NULL;
 }
 
 struct enum_type *db_find_type(struct database *db, const char *name)
@@ -1675,6 +1677,8 @@ int db_exec_sql(struct database *db, const char *sql, struct rows *result)
 
 void db_free(struct database *db)
 {
+    if (db->snapshot)
+        snapshot_free(db->snapshot);
     free(db->name);
     for (size_t i = 0; i < db->tables.count; i++) {
         table_free(&db->tables.items[i]);
