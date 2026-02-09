@@ -7,7 +7,7 @@ INSERT INTO "t2" (id, name) VALUES (2, 'bob'), (3, 'charlie');
 -- input:
 SELECT val, name FROM t1 FULL OUTER JOIN t2 ON t1.id = t2.id ORDER BY val;
 -- expected output:
-|charlie
 10|
 20|bob
+|charlie
 -- expected status: 0

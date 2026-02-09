@@ -40,10 +40,12 @@ void row_free(struct row *row);
 /* shared cell helpers — single canonical implementations */
 int  cell_compare(const struct cell *a, const struct cell *b);
 int  cell_equal(const struct cell *a, const struct cell *b);
+int  cell_equal_nullsafe(const struct cell *a, const struct cell *b);
 void cell_copy(struct cell *dst, const struct cell *src);
 void cell_free_text(struct cell *c);
 
 /* row-level equality (same cell count and all cells equal) */
 int  row_equal(const struct row *a, const struct row *b);
+int  row_equal_nullsafe(const struct row *a, const struct row *b);
 
 #endif

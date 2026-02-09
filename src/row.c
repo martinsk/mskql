@@ -25,6 +25,12 @@ void cell_copy(struct cell *dst, const struct cell *src)
 
 int cell_compare(const struct cell *a, const struct cell *b)
 {
+    /* NULL handling: NULLs sort after all non-NULL values */
+    int a_null = a->is_null || (column_type_is_text(a->type) && !a->value.as_text);
+    int b_null = b->is_null || (column_type_is_text(b->type) && !b->value.as_text);
+    if (a_null && b_null) return 0;
+    if (a_null) return 1;  /* NULL sorts last */
+    if (b_null) return -1;
     /* promote INT <-> FLOAT for numeric comparison */
     if ((a->type == COLUMN_TYPE_INT && b->type == COLUMN_TYPE_FLOAT) ||
         (a->type == COLUMN_TYPE_FLOAT && b->type == COLUMN_TYPE_INT)) {
@@ -71,6 +77,10 @@ int cell_compare(const struct cell *a, const struct cell *b)
 
 int cell_equal(const struct cell *a, const struct cell *b)
 {
+    /* SQL standard: NULL is never equal to anything, including NULL */
+    int a_null = a->is_null || (column_type_is_text(a->type) && !a->value.as_text);
+    int b_null = b->is_null || (column_type_is_text(b->type) && !b->value.as_text);
+    if (a_null || b_null) return 0;
     /* promote INT <-> FLOAT */
     if ((a->type == COLUMN_TYPE_INT && b->type == COLUMN_TYPE_FLOAT) ||
         (a->type == COLUMN_TYPE_FLOAT && b->type == COLUMN_TYPE_INT)) {
@@ -96,11 +106,32 @@ int cell_equal(const struct cell *a, const struct cell *b)
     return 0;
 }
 
+int cell_equal_nullsafe(const struct cell *a, const struct cell *b)
+{
+    /* NULL-safe: two NULLs are considered equal */
+    int a_null = a->is_null || (column_type_is_text(a->type) && !a->value.as_text);
+    int b_null = b->is_null || (column_type_is_text(b->type) && !b->value.as_text);
+    if (a_null && b_null) return 1;
+    if (a_null || b_null) return 0;
+    /* delegate to regular equality for non-NULL values */
+    return cell_equal(a, b);
+}
+
 int row_equal(const struct row *a, const struct row *b)
 {
     if (a->cells.count != b->cells.count) return 0;
     for (size_t i = 0; i < a->cells.count; i++) {
-        if (!cell_equal(&a->cells.items[i], &b->cells.items[i]))
+        if (!cell_equal_nullsafe(&a->cells.items[i], &b->cells.items[i]))
+            return 0;
+    }
+    return 1;
+}
+
+int row_equal_nullsafe(const struct row *a, const struct row *b)
+{
+    if (a->cells.count != b->cells.count) return 0;
+    for (size_t i = 0; i < a->cells.count; i++) {
+        if (!cell_equal_nullsafe(&a->cells.items[i], &b->cells.items[i]))
             return 0;
     }
     return 1;

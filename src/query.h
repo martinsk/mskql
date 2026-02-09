@@ -132,6 +132,7 @@ struct join_info {
     sv join_alias;
     sv join_left_col;
     sv join_right_col;
+    enum cmp_op join_op; /* comparison operator in ON clause (default CMP_EQ) */
     int has_using;
     sv using_col;
     int is_natural;

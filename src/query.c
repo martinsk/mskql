@@ -245,6 +245,9 @@ int eval_condition(struct condition *cond, struct row *row,
                 return like_match(cond->value.value.as_text, c->value.as_text,
                                   cond->op == CMP_ILIKE);
             }
+            /* SQL three-valued logic: any comparison with NULL → UNKNOWN (false) */
+            if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
+                return 0;
             int r = cell_compare(c, &cond->value);
             if (r == -2) return 0;
             switch (cond->op) {
@@ -814,12 +817,13 @@ static int query_aggregate(struct table *t, struct query *q, struct rows *result
 
     /* accumulate — single allocation for all aggregate arrays */
     size_t _nagg = s->aggregates.count;
-    size_t _agg_alloc = _nagg * (3 * sizeof(double) + sizeof(int));
+    size_t _agg_alloc = _nagg * (3 * sizeof(double) + 2 * sizeof(size_t) + sizeof(int));
     char *_agg_buf = calloc(1, _agg_alloc ? _agg_alloc : 1);
     double *sums = (double *)_agg_buf;
     double *mins = sums + _nagg;
     double *maxs = mins + _nagg;
     int *minmax_init = (int *)(maxs + _nagg);
+    size_t *nonnull_count = (size_t *)(minmax_init + _nagg);
     size_t row_count = 0;
 
     for (size_t i = 0; i < t->rows.count; i++) {
@@ -837,6 +841,10 @@ static int query_aggregate(struct table *t, struct query *q, struct rows *result
         for (size_t a = 0; a < s->aggregates.count; a++) {
             if (agg_col[a] < 0) continue;
             struct cell *c = &t->rows.items[i].cells.items[agg_col[a]];
+            /* skip NULL values (SQL standard) */
+            if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
+                continue;
+            nonnull_count[a]++;
             double v = cell_to_double(c);
             sums[a] += v;
             if (!minmax_init[a] || v < mins[a]) mins[a] = v;
@@ -855,7 +863,8 @@ static int query_aggregate(struct table *t, struct query *q, struct rows *result
         switch (s->aggregates.items[a].func) {
             case AGG_COUNT:
                 c.type = COLUMN_TYPE_INT;
-                c.value.as_int = (int)row_count;
+                /* COUNT(*) counts all rows; COUNT(col) counts non-NULL */
+                c.value.as_int = (agg_col[a] < 0) ? (int)row_count : (int)nonnull_count[a];
                 break;
             case AGG_SUM:
                 if (col_is_float) {
@@ -868,7 +877,7 @@ static int query_aggregate(struct table *t, struct query *q, struct rows *result
                 break;
             case AGG_AVG:
                 c.type = COLUMN_TYPE_FLOAT;
-                c.value.as_float = row_count > 0 ? sums[a] / (double)row_count : 0.0;
+                c.value.as_float = nonnull_count[a] > 0 ? sums[a] / (double)nonnull_count[a] : 0.0;
                 break;
             case AGG_MIN:
             case AGG_MAX: {
@@ -1084,7 +1093,7 @@ static int query_window(struct table *t, struct query *q, struct rows *result)
 
                     /* check partition match */
                     if (se->win.has_partition && part_idx[e] >= 0) {
-                        if (!cell_equal(&src->cells.items[part_idx[e]],
+                        if (!cell_equal_nullsafe(&src->cells.items[part_idx[e]],
                                         &peer->cells.items[part_idx[e]]))
                             continue;
                     }
@@ -1115,7 +1124,7 @@ static int query_window(struct table *t, struct query *q, struct rows *result)
                             for (size_t rj = 0; rj < nmatch; rj++) {
                                 size_t j = sorted[rj].idx;
                                 if (se->win.has_partition && part_idx[e] >= 0) {
-                                    if (!cell_equal(&src->cells.items[part_idx[e]],
+                                    if (!cell_equal_nullsafe(&src->cells.items[part_idx[e]],
                                                     &t->rows.items[j].cells.items[part_idx[e]]))
                                         continue;
                                 }
@@ -1233,7 +1242,7 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
             size_t gi = matching.items[group_starts.items[g]];
             int eq = 1;
             for (size_t k = 0; k < ngrp; k++) {
-                if (!cell_equal(&t->rows.items[ri].cells.items[grp_cols[k]],
+                if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
                                 &t->rows.items[gi].cells.items[grp_cols[k]])) {
                     eq = 0; break;
                 }
@@ -1248,13 +1257,15 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
     void *_grp_buf = NULL;
     double *sums = NULL, *gmins = NULL, *gmaxs = NULL;
     int *gminmax_init = NULL, *gagg_cols = NULL;
+    size_t *gnonnull = NULL;
     if (agg_n > 0) {
-        _grp_buf = malloc(3 * agg_n * sizeof(double) + 2 * agg_n * sizeof(int));
+        _grp_buf = malloc(3 * agg_n * sizeof(double) + 2 * agg_n * sizeof(int) + agg_n * sizeof(size_t));
         sums          = (double *)_grp_buf;
         gmins         = sums + agg_n;
         gmaxs         = gmins + agg_n;
         gminmax_init  = (int *)(gmaxs + agg_n);
         gagg_cols     = gminmax_init + agg_n;
+        gnonnull      = (size_t *)(gagg_cols + agg_n);
     }
 
     /* resolve aggregate column indices once */
@@ -1313,6 +1324,7 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
         if (agg_n > 0) {
             memset(sums, 0, agg_n * sizeof(double));
             memset(gminmax_init, 0, agg_n * sizeof(int));
+            memset(gnonnull, 0, agg_n * sizeof(size_t));
         }
 
         for (size_t m = 0; m < matching.count; m++) {
@@ -1320,7 +1332,7 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
             /* check if this row belongs to the current group */
             int eq = 1;
             for (size_t k = 0; k < ngrp; k++) {
-                if (!cell_equal(&t->rows.items[ri].cells.items[grp_cols[k]],
+                if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
                                 &t->rows.items[first_ri].cells.items[grp_cols[k]])) {
                     eq = 0; break;
                 }
@@ -1330,8 +1342,13 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
             for (size_t a = 0; a < s->aggregates.count; a++) {
                 int ac = gagg_cols[a];
                 if (ac < 0) continue;
+                struct cell *gc = &t->rows.items[ri].cells.items[ac];
+                /* skip NULL values (SQL standard) */
+                if (gc->is_null || (column_type_is_text(gc->type) && !gc->value.as_text))
+                    continue;
+                gnonnull[a]++;
                 {
-                    double v = cell_to_double(&t->rows.items[ri].cells.items[ac]);
+                    double v = cell_to_double(gc);
                     sums[a] += v;
                     if (!gminmax_init[a] || v < gmins[a]) gmins[a] = v;
                     if (!gminmax_init[a] || v > gmaxs[a]) gmaxs[a] = v;
@@ -1360,7 +1377,8 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
             switch (s->aggregates.items[a].func) {
                 case AGG_COUNT:
                     c.type = COLUMN_TYPE_INT;
-                    c.value.as_int = (int)grp_count;
+                    /* COUNT(*) counts all rows; COUNT(col) counts non-NULL */
+                    c.value.as_int = (gagg_cols[a] < 0) ? (int)grp_count : (int)gnonnull[a];
                     break;
                 case AGG_SUM:
                     if (col_is_float) {
@@ -1373,7 +1391,7 @@ static int query_group_by(struct table *t, struct query *q, struct rows *result)
                     break;
                 case AGG_AVG:
                     c.type = COLUMN_TYPE_FLOAT;
-                    c.value.as_float = grp_count > 0 ? sums[a] / (double)grp_count : 0.0;
+                    c.value.as_float = gnonnull[a] > 0 ? sums[a] / (double)gnonnull[a] : 0.0;
                     break;
                 case AGG_MIN:
                 case AGG_MAX: {
@@ -1761,6 +1779,9 @@ static int query_insert(struct table *t, struct query *q, struct rows *result)
         for (size_t i = 0; i < t->columns.count && i < copy.cells.count; i++) {
             if (t->columns.items[i].is_unique) {
                 struct cell *new_c = &copy.cells.items[i];
+                /* SQL standard: NULLs are not considered duplicates */
+                if (new_c->is_null || (column_type_is_text(new_c->type) && !new_c->value.as_text))
+                    continue;
                 for (size_t ri = 0; ri < t->rows.count; ri++) {
                     struct cell *existing = &t->rows.items[ri].cells.items[i];
                     if (cell_compare(new_c, existing) == 0) {

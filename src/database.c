@@ -211,9 +211,38 @@ static void build_merged_columns_ex(struct table *t1, const char *alias1,
 }
 
 /* perform a single join between two table descriptors, producing merged rows and columns */
+static int join_cmp_match(const struct cell *a, const struct cell *b, enum cmp_op op)
+{
+    if (op == CMP_EQ) return cell_equal(a, b);
+    int r = cell_compare(a, b);
+    if (r == -2) return 0;
+    switch (op) {
+        case CMP_NE: return r != 0;
+        case CMP_LT: return r < 0;
+        case CMP_GT: return r > 0;
+        case CMP_LE: return r <= 0;
+        case CMP_GE: return r >= 0;
+        case CMP_EQ:
+        case CMP_IS_NULL:
+        case CMP_IS_NOT_NULL:
+        case CMP_IN:
+        case CMP_NOT_IN:
+        case CMP_BETWEEN:
+        case CMP_LIKE:
+        case CMP_ILIKE:
+        case CMP_IS_DISTINCT:
+        case CMP_IS_NOT_DISTINCT:
+        case CMP_EXISTS:
+        case CMP_NOT_EXISTS:
+            return r == 0;
+    }
+    return 0;
+}
+
 static int do_single_join(struct table *t1, const char *alias1,
                           struct table *t2, const char *alias2,
                           sv left_col_sv, sv right_col_sv, int join_type,
+                          enum cmp_op join_op,
                           struct rows *out_rows,
                           struct table *out_meta)
 {
@@ -252,7 +281,7 @@ static int do_single_join(struct table *t1, const char *alias1,
         struct row *r1 = &t1->rows.items[i];
         for (size_t j = 0; j < t2->rows.count; j++) {
             struct row *r2 = &t2->rows.items[j];
-            if (!cell_equal(&r1->cells.items[t1_join_col], &r2->cells.items[t2_join_col]))
+            if (!join_cmp_match(&r1->cells.items[t1_join_col], &r2->cells.items[t2_join_col], join_op))
                 continue;
             t1_matched[i] = 1;
             t2_matched[j] = 1;
@@ -495,7 +524,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
             snprintf(t2_alias_buf, sizeof(t2_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
         const char *a2 = t2_alias_buf[0] ? t2_alias_buf : NULL;
         if (do_single_join(t1, a1, t2, a2, ji->join_left_col, ji->join_right_col, ji->join_type,
-                           &merged, &merged_t) != 0) {
+                           ji->join_op, &merged, &merged_t) != 0) {
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
             return -1;
@@ -530,7 +559,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
             snprintf(jn_alias_buf, sizeof(jn_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
         if (do_single_join(&merged_t, NULL, tn, jn_alias_buf[0] ? jn_alias_buf : NULL,
                            ji->join_left_col, ji->join_right_col, ji->join_type,
-                           &next_merged, &next_meta) != 0) {
+                           ji->join_op, &next_merged, &next_meta) != 0) {
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
             return -1;

@@ -1599,12 +1599,13 @@ parse_table_name:
                 tok = lexer_next(l);
                 ji.join_left_col = consume_identifier(l, tok);
 
-                /* = */
+                /* comparison operator */
                 tok = lexer_next(l);
-                if (tok.type != TOK_EQUALS) {
-                    fprintf(stderr, "parse error: expected '=' in ON clause\n");
+                if (!is_cmp_token(tok.type)) {
+                    fprintf(stderr, "parse error: expected comparison operator in ON clause\n");
                     return -1;
                 }
+                ji.join_op = cmp_from_token(tok.type);
 
                 /* right: table.col */
                 tok = lexer_next(l);
