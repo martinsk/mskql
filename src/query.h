@@ -85,6 +85,8 @@ struct condition {
     DYNAMIC_ARRAY(struct cell) in_values;
     /* for CMP_IN subquery: raw SQL text to be resolved before execution */
     char *subquery_sql;
+    /* for scalar subquery comparison: WHERE x > (SELECT ...) */
+    char *scalar_subquery_sql;
     /* for CMP_BETWEEN: low and high */
     struct cell between_high;
     /* for COND_AND / COND_OR */
@@ -133,6 +135,14 @@ struct join_info {
     int has_using;
     sv using_col;
     int is_natural;
+    int is_lateral;
+    char *lateral_subquery_sql; /* for LATERAL (SELECT ...) */
+};
+
+struct cte_def {
+    char *name;
+    char *sql;
+    int is_recursive;
 };
 
 struct order_by_item {
@@ -197,9 +207,12 @@ struct query {
     // its lifetime, avoiding the malloc+memcpy+free round-trip entirely.
     char *set_rhs_sql; /* right-hand SELECT as raw SQL */
     char *set_order_by; /* ORDER BY clause for combined set result */
-    /* CTE support */
+    /* CTE support (legacy single CTE) */
     char *cte_name;
     char *cte_sql;
+    /* multiple / recursive CTEs */
+    DYNAMIC_ARRAY(struct cte_def) ctes;
+    int has_recursive_cte;
     /* INSERT ... SELECT */
     char *insert_select_sql;
     /* ON CONFLICT */
@@ -213,6 +226,9 @@ struct query {
     sv update_from_table;
     sv update_from_join_left;
     sv update_from_join_right;
+    /* FROM subquery: SELECT * FROM (SELECT ...) AS alias */
+    char *from_subquery_sql;
+    sv from_subquery_alias;
 };
 
 int query_exec(struct table *t, struct query *q, struct rows *result);

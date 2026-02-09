@@ -53,6 +53,7 @@ void condition_free(struct condition *c)
             free(c->between_high.value.as_text);
         /* free unresolved subquery SQL */
         free(c->subquery_sql);
+        free(c->scalar_subquery_sql);
     }
     free(c);
 }
@@ -119,6 +120,19 @@ void query_free(struct query *q)
     free(q->cte_name);
     free(q->cte_sql);
     free(q->insert_select_sql);
+    free(q->from_subquery_sql);
+
+    /* multiple CTEs */
+    for (size_t i = 0; i < q->ctes.count; i++) {
+        free(q->ctes.items[i].name);
+        free(q->ctes.items[i].sql);
+    }
+    da_free(&q->ctes);
+
+    /* lateral subquery SQL in joins */
+    for (size_t i = 0; i < q->joins.count; i++) {
+        free(q->joins.items[i].lateral_subquery_sql);
+    }
 }
 
 /* cell_cmp → use shared cell_compare from row.h (returns -2 for incompatible types) */

@@ -3,6 +3,8 @@
 #include "query.h"
 #include "stringview.h"
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -334,20 +336,161 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
 
     /* first join */
     struct join_info *ji = &q->joins.items[0];
-    struct table *t2 = db_find_table_sv(db, ji->join_table);
-    if (!t2) { fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(ji->join_table)); return -1; }
-    resolve_join_cols(ji, t1, t2);
-    /* convert aliases to C strings for merged column naming */
     char t1_alias_buf[128] = {0};
     if (q->table_alias.len > 0)
         snprintf(t1_alias_buf, sizeof(t1_alias_buf), "%.*s", (int)q->table_alias.len, q->table_alias.data);
-    char t2_alias_buf[128] = {0};
-    if (ji->join_alias.len > 0)
-        snprintf(t2_alias_buf, sizeof(t2_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
     const char *a1 = t1_alias_buf[0] ? t1_alias_buf : NULL;
-    const char *a2 = t2_alias_buf[0] ? t2_alias_buf : NULL;
-    if (do_single_join(t1, a1, t2, a2, ji->join_left_col, ji->join_right_col, ji->join_type,
-                       &merged, &merged_t) != 0) return -1;
+
+    if (ji->is_lateral && ji->lateral_subquery_sql) {
+        /* LATERAL JOIN: for each row of t1, execute the subquery and cross-join */
+        /* build merged column metadata: t1 columns + lateral result columns */
+        for (size_t c = 0; c < t1->columns.count; c++) {
+            struct column col = {0};
+            if (a1) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s.%s", a1, t1->columns.items[c].name);
+                col.name = strdup(buf);
+            } else {
+                col.name = strdup(t1->columns.items[c].name);
+            }
+            col.type = t1->columns.items[c].type;
+            da_push(&merged_t.columns, col);
+        }
+        int lat_cols_added = 0;
+        char lat_alias_buf[128] = {0};
+        if (ji->join_alias.len > 0)
+            snprintf(lat_alias_buf, sizeof(lat_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
+
+        for (size_t ri = 0; ri < t1->rows.count; ri++) {
+            /* Build a rewritten SQL where outer_table.col references are
+             * replaced with literal values from the current outer row */
+            const char *outer_prefix = a1 ? a1 : t1->name;
+            size_t pfx_len = strlen(outer_prefix);
+            char rewritten[4096];
+            const char *src = ji->lateral_subquery_sql;
+            size_t wp = 0;
+            while (*src && wp < sizeof(rewritten) - 128) {
+                /* check for outer_prefix.col_name */
+                if (strncasecmp(src, outer_prefix, pfx_len) == 0 && src[pfx_len] == '.') {
+                    const char *col_start = src + pfx_len + 1;
+                    const char *col_end = col_start;
+                    while (*col_end && (isalnum((unsigned char)*col_end) || *col_end == '_')) col_end++;
+                    size_t col_len = (size_t)(col_end - col_start);
+                    /* find column index in t1 */
+                    int ci = -1;
+                    for (size_t c = 0; c < t1->columns.count; c++) {
+                        if (strlen(t1->columns.items[c].name) == col_len &&
+                            strncasecmp(t1->columns.items[c].name, col_start, col_len) == 0) {
+                            ci = (int)c;
+                            break;
+                        }
+                    }
+                    if (ci >= 0 && ci < (int)t1->rows.items[ri].cells.count) {
+                        struct cell *cv = &t1->rows.items[ri].cells.items[ci];
+                        if (cv->is_null) {
+                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "NULL");
+                        } else if (cv->type == COLUMN_TYPE_INT) {
+                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "%lld", cv->value.as_int);
+                        } else if (cv->type == COLUMN_TYPE_FLOAT) {
+                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "%g", cv->value.as_float);
+                        } else if (column_type_is_text(cv->type) && cv->value.as_text) {
+                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "'%s'", cv->value.as_text);
+                        } else {
+                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "NULL");
+                        }
+                        src = col_end;
+                        continue;
+                    }
+                }
+                rewritten[wp++] = *src++;
+            }
+            rewritten[wp] = '\0';
+
+            struct rows lat_rows = {0};
+            db_exec_sql(db, rewritten, &lat_rows);
+
+            /* add lateral result columns on first iteration */
+            if (!lat_cols_added && lat_rows.count > 0) {
+                /* infer column names from the lateral subquery's column list */
+                struct query lat_q = {0};
+                if (query_parse(ji->lateral_subquery_sql, &lat_q) == 0) {
+                    /* parse the SELECT column list to get names */
+                    sv cols = lat_q.columns;
+                    size_t ci = 0;
+                    while (cols.len > 0 && ci < lat_rows.data[0].cells.count) {
+                        while (cols.len > 0 && (cols.data[0] == ' ' || cols.data[0] == '\t'))
+                            { cols.data++; cols.len--; }
+                        size_t end = 0;
+                        while (end < cols.len && cols.data[end] != ',') end++;
+                        sv col_sv = sv_from(cols.data, end);
+                        while (col_sv.len > 0 && (col_sv.data[col_sv.len-1] == ' ' || col_sv.data[col_sv.len-1] == '\t'))
+                            col_sv.len--;
+                        /* strip table prefix */
+                        sv col_name = col_sv;
+                        for (size_t k = 0; k < col_name.len; k++) {
+                            if (col_name.data[k] == '.') {
+                                col_name = sv_from(col_name.data + k + 1, col_name.len - k - 1);
+                                break;
+                            }
+                        }
+                        struct column col = {0};
+                        char buf[256];
+                        if (lat_alias_buf[0])
+                            snprintf(buf, sizeof(buf), "%s.%.*s", lat_alias_buf, (int)col_name.len, col_name.data);
+                        else
+                            snprintf(buf, sizeof(buf), "%.*s", (int)col_name.len, col_name.data);
+                        col.name = strdup(buf);
+                        col.type = lat_rows.data[0].cells.items[ci].type;
+                        da_push(&merged_t.columns, col);
+                        ci++;
+                        if (end < cols.len) { cols.data += end + 1; cols.len -= end + 1; }
+                        else break;
+                    }
+                    /* fallback for remaining columns */
+                    for (; ci < lat_rows.data[0].cells.count; ci++) {
+                        struct column col = {0};
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "col%zu", ci + 1);
+                        col.name = strdup(buf);
+                        col.type = lat_rows.data[0].cells.items[ci].type;
+                        da_push(&merged_t.columns, col);
+                    }
+                    query_free(&lat_q);
+                }
+                lat_cols_added = 1;
+            }
+
+            /* cross-join: each lateral row with the current t1 row */
+            for (size_t li = 0; li < lat_rows.count; li++) {
+                struct row dst = {0};
+                da_init(&dst.cells);
+                for (size_t c = 0; c < t1->rows.items[ri].cells.count; c++) {
+                    struct cell cp;
+                    cell_copy(&cp, &t1->rows.items[ri].cells.items[c]);
+                    da_push(&dst.cells, cp);
+                }
+                for (size_t c = 0; c < lat_rows.data[li].cells.count; c++) {
+                    struct cell cp;
+                    cell_copy(&cp, &lat_rows.data[li].cells.items[c]);
+                    da_push(&dst.cells, cp);
+                }
+                rows_push(&merged, dst);
+            }
+            for (size_t li = 0; li < lat_rows.count; li++)
+                row_free(&lat_rows.data[li]);
+            free(lat_rows.data);
+        }
+    } else {
+        struct table *t2 = db_find_table_sv(db, ji->join_table);
+        if (!t2) { fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(ji->join_table)); return -1; }
+        resolve_join_cols(ji, t1, t2);
+        char t2_alias_buf[128] = {0};
+        if (ji->join_alias.len > 0)
+            snprintf(t2_alias_buf, sizeof(t2_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
+        const char *a2 = t2_alias_buf[0] ? t2_alias_buf : NULL;
+        if (do_single_join(t1, a1, t2, a2, ji->join_left_col, ji->join_right_col, ji->join_type,
+                           &merged, &merged_t) != 0) return -1;
+    }
 
     /* subsequent joins: build a temp table from merged results, join with next */
     for (size_t jn = 1; jn < q->joins.count; jn++) {
@@ -598,6 +741,30 @@ static void resolve_subqueries(struct database *db, struct condition *c)
         free(c->subquery_sql);
         c->subquery_sql = NULL;
     }
+    /* scalar subquery: WHERE col > (SELECT ...) */
+    if (c->type == COND_COMPARE && c->scalar_subquery_sql) {
+        struct query sq = {0};
+        if (query_parse(c->scalar_subquery_sql, &sq) == 0) {
+            struct rows sq_result = {0};
+            if (db_exec(db, &sq, &sq_result) == 0) {
+                if (sq_result.count > 0 && sq_result.data[0].cells.count > 0) {
+                    struct cell *src = &sq_result.data[0].cells.items[0];
+                    c->value.type = src->type;
+                    c->value.is_null = src->is_null;
+                    if (column_type_is_text(src->type) && src->value.as_text)
+                        c->value.value.as_text = strdup(src->value.as_text);
+                    else
+                        c->value.value = src->value;
+                }
+                for (size_t i = 0; i < sq_result.count; i++)
+                    row_free(&sq_result.data[i]);
+                free(sq_result.data);
+            }
+            query_free(&sq);
+        }
+        free(c->scalar_subquery_sql);
+        c->scalar_subquery_sql = NULL;
+    }
 }
 
 static void snapshot_free(struct db_snapshot *snap)
@@ -648,6 +815,129 @@ static void snapshot_restore(struct database *db, struct db_snapshot *snap)
     /* zero out snap arrays so snapshot_free won't double-free */
     memset(&snap->tables, 0, sizeof(snap->tables));
     memset(&snap->types, 0, sizeof(snap->types));
+}
+
+/* Materialize a subquery into a temporary table added to db->tables.
+ * Returns a pointer to the new table, or NULL on failure.
+ * The caller is responsible for removing the table when done. */
+static struct table *materialize_subquery(struct database *db, const char *sql,
+                                          const char *table_name)
+{
+    struct query sq = {0};
+    if (query_parse(sql, &sq) != 0) return NULL;
+    struct rows sq_rows = {0};
+    if (db_exec(db, &sq, &sq_rows) != 0) {
+        query_free(&sq);
+        return NULL;
+    }
+    struct table ct = {0};
+    ct.name = strdup(table_name);
+    da_init(&ct.columns);
+    da_init(&ct.rows);
+    da_init(&ct.indexes);
+    /* infer column names */
+    if (sq.query_type == QUERY_TYPE_SELECT && sq_rows.count > 0) {
+        size_t ncells = sq_rows.data[0].cells.count;
+        struct table *src_t = db_find_table_sv(db, sq.table);
+        if (src_t && sv_eq_cstr(sq.columns, "*")) {
+            for (size_t c = 0; c < src_t->columns.count; c++) {
+                struct column col = {0};
+                col.name = strdup(src_t->columns.items[c].name);
+                col.type = src_t->columns.items[c].type;
+                da_push(&ct.columns, col);
+            }
+        } else if (src_t) {
+            sv cols = sq.columns;
+            size_t ci = 0;
+            while (cols.len > 0 && ci < ncells) {
+                while (cols.len > 0 && (cols.data[0] == ' ' || cols.data[0] == '\t'))
+                    { cols.data++; cols.len--; }
+                size_t end = 0;
+                while (end < cols.len && cols.data[end] != ',') end++;
+                sv col_sv = sv_from(cols.data, end);
+                while (col_sv.len > 0 && (col_sv.data[col_sv.len-1] == ' ' || col_sv.data[col_sv.len-1] == '\t'))
+                    col_sv.len--;
+                sv col_name = col_sv;
+                for (size_t k = 0; k + 2 < col_sv.len; k++) {
+                    if ((col_sv.data[k] == ' ' || col_sv.data[k] == '\t') &&
+                        (col_sv.data[k+1] == 'A' || col_sv.data[k+1] == 'a') &&
+                        (col_sv.data[k+2] == 'S' || col_sv.data[k+2] == 's') &&
+                        (k + 3 >= col_sv.len || col_sv.data[k+3] == ' ' || col_sv.data[k+3] == '\t')) {
+                        size_t alias_start = k + 3;
+                        while (alias_start < col_sv.len && (col_sv.data[alias_start] == ' ' || col_sv.data[alias_start] == '\t'))
+                            alias_start++;
+                        col_name = sv_from(col_sv.data + alias_start, col_sv.len - alias_start);
+                        break;
+                    }
+                }
+                for (size_t k = 0; k < col_name.len; k++) {
+                    if (col_name.data[k] == '.') {
+                        col_name = sv_from(col_name.data + k + 1, col_name.len - k - 1);
+                        break;
+                    }
+                }
+                struct column col = {0};
+                col.name = sv_to_cstr(col_name);
+                col.type = sq_rows.data[0].cells.items[ci].type;
+                da_push(&ct.columns, col);
+                ci++;
+                if (end < cols.len) { cols.data += end + 1; cols.len -= end + 1; }
+                else break;
+            }
+            for (size_t a = 0; a < sq.aggregates.count && ci < ncells; a++, ci++) {
+                struct column col = {0};
+                if (sq.aggregates.items[a].alias.len > 0)
+                    col.name = sv_to_cstr(sq.aggregates.items[a].alias);
+                else
+                    col.name = sv_to_cstr(sq.aggregates.items[a].column);
+                col.type = sq_rows.data[0].cells.items[ci].type;
+                da_push(&ct.columns, col);
+            }
+        }
+        /* fallback */
+        if (ct.columns.count == 0) {
+            for (size_t c = 0; c < ncells; c++) {
+                struct column col = {0};
+                char buf[32];
+                snprintf(buf, sizeof(buf), "column%zu", c + 1);
+                col.name = strdup(buf);
+                col.type = sq_rows.data[0].cells.items[c].type;
+                da_push(&ct.columns, col);
+            }
+        }
+    }
+    /* copy rows */
+    for (size_t i = 0; i < sq_rows.count; i++) {
+        struct row r = {0};
+        da_init(&r.cells);
+        for (size_t c = 0; c < sq_rows.data[i].cells.count; c++) {
+            struct cell cp;
+            cell_copy(&cp, &sq_rows.data[i].cells.items[c]);
+            da_push(&r.cells, cp);
+        }
+        da_push(&ct.rows, r);
+    }
+    for (size_t i = 0; i < sq_rows.count; i++)
+        row_free(&sq_rows.data[i]);
+    free(sq_rows.data);
+    query_free(&sq);
+    da_push(&db->tables, ct);
+    return &db->tables.items[db->tables.count - 1];
+}
+
+/* Remove a temporary table from the database by pointer */
+static void remove_temp_table(struct database *db, struct table *t)
+{
+    if (!t) return;
+    for (size_t i = 0; i < db->tables.count; i++) {
+        if (&db->tables.items[i] == t) {
+            table_free(&db->tables.items[i]);
+            for (size_t j = i; j + 1 < db->tables.count; j++)
+                db->tables.items[j] = db->tables.items[j + 1];
+            db->tables.count--;
+            return;
+        }
+    }
 }
 
 int db_exec(struct database *db, struct query *q, struct rows *result)
@@ -778,122 +1068,151 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             return -1;
         }
         case QUERY_TYPE_SELECT: {
-            /* CTE: create a temporary table from the CTE query */
-            struct table *cte_table = NULL;
-            if (q->cte_name && q->cte_sql) {
-                struct query cte_q = {0};
-                if (query_parse(q->cte_sql, &cte_q) != 0) return -1;
-                struct rows cte_rows = {0};
-                if (db_exec(db, &cte_q, &cte_rows) != 0) {
-                    query_free(&cte_q);
-                    return -1;
-                }
-                /* create a temp table with the CTE name */
-                struct table ct = {0};
-                ct.name = strdup(q->cte_name);
-                da_init(&ct.columns);
-                da_init(&ct.rows);
-                da_init(&ct.indexes);
-                /* infer column names from the CTE query's column list and source table */
-                if (cte_q.query_type == QUERY_TYPE_SELECT) {
-                    struct table *src_t = db_find_table_sv(db, cte_q.table);
-                    if (src_t && sv_eq_cstr(cte_q.columns, "*")) {
-                        /* SELECT * — copy all column names from source table */
-                        for (size_t c = 0; c < src_t->columns.count; c++) {
-                            struct column col = {0};
-                            col.name = strdup(src_t->columns.items[c].name);
-                            col.type = src_t->columns.items[c].type;
-                            da_push(&ct.columns, col);
-                        }
-                    } else if (src_t) {
-                        // TODO: CONTAINER REUSE: this manual sv tokenization duplicates what the lexer
-                // already does; could reuse the lexer to parse the column list instead
-                /* parse the select column list to get names */
-                        sv cols = cte_q.columns;
-                        size_t ci = 0;
-                        size_t ncells = cte_rows.count > 0 ? cte_rows.data[0].cells.count : 0;
-                        while (cols.len > 0 && ci < ncells) {
-                            /* skip whitespace */
-                            while (cols.len > 0 && (cols.data[0] == ' ' || cols.data[0] == '\t'))
-                                { cols.data++; cols.len--; }
-                            /* find end of this column name (comma or end) */
-                            size_t end = 0;
-                            while (end < cols.len && cols.data[end] != ',') end++;
-                            sv col_sv = sv_from(cols.data, end);
-                            /* trim trailing whitespace */
-                            while (col_sv.len > 0 && (col_sv.data[col_sv.len-1] == ' ' || col_sv.data[col_sv.len-1] == '\t'))
-                                col_sv.len--;
-                            /* check for AS alias — use alias as column name */
-                            sv col_name = col_sv;
-                            for (size_t k = 0; k + 2 < col_sv.len; k++) {
-                                if ((col_sv.data[k] == ' ' || col_sv.data[k] == '\t') &&
-                                    (col_sv.data[k+1] == 'A' || col_sv.data[k+1] == 'a') &&
-                                    (col_sv.data[k+2] == 'S' || col_sv.data[k+2] == 's') &&
-                                    (k + 3 >= col_sv.len || col_sv.data[k+3] == ' ' || col_sv.data[k+3] == '\t')) {
-                                    /* found AS — use the part after AS as name */
-                                    size_t alias_start = k + 3;
-                                    while (alias_start < col_sv.len && (col_sv.data[alias_start] == ' ' || col_sv.data[alias_start] == '\t'))
-                                        alias_start++;
-                                    col_name = sv_from(col_sv.data + alias_start, col_sv.len - alias_start);
+            /* CTE: create temporary tables from CTE definitions */
+            struct table *cte_temps[32] = {0};
+            size_t n_cte_temps = 0;
+
+            /* multiple CTEs (new path) */
+            if (q->ctes.count > 0) {
+                for (size_t ci = 0; ci < q->ctes.count && n_cte_temps < 32; ci++) {
+                    struct cte_def *cd = &q->ctes.items[ci];
+                    if (cd->is_recursive) {
+                        /* Recursive CTE: the SQL should be "base UNION ALL recursive"
+                         * We execute the base case, create the temp table, then
+                         * repeatedly execute the recursive part until no new rows. */
+                        /* find UNION ALL separator */
+                        const char *union_pos = NULL;
+                        const char *p = cd->sql;
+                        int depth = 0;
+                        while (*p) {
+                            if (*p == '(') depth++;
+                            else if (*p == ')') depth--;
+                            else if (depth == 0 && (p[0] == 'U' || p[0] == 'u')) {
+                                if (strncasecmp(p, "UNION", 5) == 0 &&
+                                    (p[5] == ' ' || p[5] == '\t' || p[5] == '\n')) {
+                                    union_pos = p;
                                     break;
                                 }
                             }
-                            /* strip table prefix (e.g. "t.col" -> "col") */
-                            for (size_t k = 0; k < col_name.len; k++) {
-                                if (col_name.data[k] == '.') {
-                                    col_name = sv_from(col_name.data + k + 1, col_name.len - k - 1);
-                                    break;
+                            p++;
+                        }
+                        if (!union_pos) {
+                            /* no UNION — just materialize normally */
+                            cte_temps[n_cte_temps] = materialize_subquery(db, cd->sql, cd->name);
+                            n_cte_temps++;
+                            continue;
+                        }
+                        /* extract base SQL (before UNION) */
+                        size_t base_len = (size_t)(union_pos - cd->sql);
+                        char *base_sql = malloc(base_len + 1);
+                        memcpy(base_sql, cd->sql, base_len);
+                        base_sql[base_len] = '\0';
+                        /* skip "UNION ALL " */
+                        const char *rec_start = union_pos + 5;
+                        while (*rec_start == ' ' || *rec_start == '\t' || *rec_start == '\n') rec_start++;
+                        if (strncasecmp(rec_start, "ALL", 3) == 0) {
+                            rec_start += 3;
+                            while (*rec_start == ' ' || *rec_start == '\t' || *rec_start == '\n') rec_start++;
+                        }
+                        char *rec_sql = strdup(rec_start);
+
+                        /* execute base case */
+                        struct table *ct = materialize_subquery(db, base_sql, cd->name);
+                        free(base_sql);
+                        if (!ct) { free(rec_sql); continue; }
+                        cte_temps[n_cte_temps++] = ct;
+
+                        /* Collect all rows in an accumulator; the CTE table acts as
+                         * the "working table" containing only the newest rows so the
+                         * recursive query doesn't re-process old rows. */
+                        /* save base rows into accumulator */
+                        struct rows accum = {0};
+                        for (size_t ri = 0; ri < ct->rows.count; ri++) {
+                            struct row r = {0};
+                            da_init(&r.cells);
+                            for (size_t c = 0; c < ct->rows.items[ri].cells.count; c++) {
+                                struct cell cp;
+                                cell_copy(&cp, &ct->rows.items[ri].cells.items[c]);
+                                da_push(&r.cells, cp);
+                            }
+                            rows_push(&accum, r);
+                        }
+
+                        for (int iter = 0; iter < 1000; iter++) {
+                            /* ct currently holds only the working set (new rows) */
+                            ct = db_find_table(db, cd->name);
+                            if (!ct) break;
+                            struct rows rec_rows = {0};
+                            if (db_exec_sql(db, rec_sql, &rec_rows) != 0) break;
+                            if (rec_rows.count == 0) { free(rec_rows.data); break; }
+
+                            /* replace CTE table rows with only the new rows */
+                            for (size_t ri = 0; ri < ct->rows.count; ri++)
+                                row_free(&ct->rows.items[ri]);
+                            ct->rows.count = 0;
+
+                            for (size_t ri = 0; ri < rec_rows.count; ri++) {
+                                /* add to accumulator */
+                                struct row ar = {0};
+                                da_init(&ar.cells);
+                                for (size_t c = 0; c < rec_rows.data[ri].cells.count; c++) {
+                                    struct cell cp;
+                                    cell_copy(&cp, &rec_rows.data[ri].cells.items[c]);
+                                    da_push(&ar.cells, cp);
                                 }
+                                rows_push(&accum, ar);
+                                /* add to working table */
+                                struct row wr = {0};
+                                da_init(&wr.cells);
+                                for (size_t c = 0; c < rec_rows.data[ri].cells.count; c++) {
+                                    struct cell cp;
+                                    cell_copy(&cp, &rec_rows.data[ri].cells.items[c]);
+                                    da_push(&wr.cells, cp);
+                                }
+                                da_push(&ct->rows, wr);
                             }
-                            struct column col = {0};
-                            col.name = sv_to_cstr(col_name);
-                            col.type = cte_rows.data[0].cells.items[ci].type;
-                            da_push(&ct.columns, col);
-                            ci++;
-                            if (end < cols.len) { cols.data += end + 1; cols.len -= end + 1; }
-                            else break;
+                            for (size_t ri = 0; ri < rec_rows.count; ri++)
+                                row_free(&rec_rows.data[ri]);
+                            free(rec_rows.data);
                         }
-                        /* add columns for aggregate results not covered by the column list */
-                        for (size_t a = 0; a < cte_q.aggregates.count && ci < ncells; a++, ci++) {
-                            struct column col = {0};
-                            /* use alias if available, otherwise aggregate column name */
-                            if (cte_q.aggregates.items[a].alias.len > 0) {
-                                col.name = sv_to_cstr(cte_q.aggregates.items[a].alias);
-                            } else {
-                                col.name = sv_to_cstr(cte_q.aggregates.items[a].column);
-                            }
-                            col.type = cte_rows.data[0].cells.items[ci].type;
-                            da_push(&ct.columns, col);
+
+                        /* replace CTE table rows with the full accumulator */
+                        ct = db_find_table(db, cd->name);
+                        if (ct) {
+                            for (size_t ri = 0; ri < ct->rows.count; ri++)
+                                row_free(&ct->rows.items[ri]);
+                            ct->rows.count = 0;
+                            for (size_t ri = 0; ri < accum.count; ri++)
+                                da_push(&ct->rows, accum.data[ri]);
+                            free(accum.data);
+                        } else {
+                            for (size_t ri = 0; ri < accum.count; ri++)
+                                row_free(&accum.data[ri]);
+                            free(accum.data);
                         }
+                        free(rec_sql);
+                    } else {
+                        cte_temps[n_cte_temps] = materialize_subquery(db, cd->sql, cd->name);
+                        n_cte_temps++;
                     }
                 }
-                /* fallback: if no columns were resolved, use "?" */
-                if (ct.columns.count == 0 && cte_rows.count > 0) {
-                    for (size_t c = 0; c < cte_rows.data[0].cells.count; c++) {
-                        struct column col = {0};
-                        char buf[32];
-                        snprintf(buf, sizeof(buf), "column%zu", c + 1);
-                        col.name = strdup(buf);
-                        col.type = cte_rows.data[0].cells.items[c].type;
-                        da_push(&ct.columns, col);
-                    }
+            } else if (q->cte_name && q->cte_sql) {
+                /* legacy single CTE */
+                cte_temps[0] = materialize_subquery(db, q->cte_sql, q->cte_name);
+                n_cte_temps = 1;
+            }
+
+            /* FROM subquery: create temp table */
+            struct table *from_sub_table = NULL;
+            if (q->from_subquery_sql) {
+                char alias_buf[256];
+                if (q->from_subquery_alias.len > 0) {
+                    snprintf(alias_buf, sizeof(alias_buf), "%.*s",
+                             (int)q->from_subquery_alias.len, q->from_subquery_alias.data);
+                } else {
+                    snprintf(alias_buf, sizeof(alias_buf), "_from_sub");
                 }
-                for (size_t i = 0; i < cte_rows.count; i++) {
-                    struct row r = {0};
-                    da_init(&r.cells);
-                    for (size_t c = 0; c < cte_rows.data[i].cells.count; c++) {
-                        struct cell cp;
-                        cell_copy(&cp, &cte_rows.data[i].cells.items[c]);
-                        da_push(&r.cells, cp);
-                    }
-                    da_push(&ct.rows, r);
-                }
-                for (size_t i = 0; i < cte_rows.count; i++)
-                    row_free(&cte_rows.data[i]);
-                free(cte_rows.data);
-                query_free(&cte_q);
-                da_push(&db->tables, ct);
-                cte_table = &db->tables.items[db->tables.count - 1];
+                from_sub_table = materialize_subquery(db, q->from_subquery_sql, alias_buf);
             }
 
             /* resolve any IN (SELECT ...) / EXISTS subqueries */
@@ -1025,14 +1344,14 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 query_free(&ob_q);
             }
 
-            /* clean up CTE temp table */
-            if (cte_table) {
-                table_free(cte_table);
-                /* remove from tables array */
-                size_t idx = db->tables.count - 1;
-                for (size_t j = idx; j + 1 < db->tables.count; j++)
-                    db->tables.items[j] = db->tables.items[j + 1];
-                db->tables.count--;
+            /* clean up FROM subquery temp table */
+            if (from_sub_table)
+                remove_temp_table(db, from_sub_table);
+
+            /* clean up CTE temp tables (reverse order to keep indices valid) */
+            for (size_t ci = n_cte_temps; ci > 0; ci--) {
+                if (cte_temps[ci - 1])
+                    remove_temp_table(db, cte_temps[ci - 1]);
             }
 
             return sel_rc;
