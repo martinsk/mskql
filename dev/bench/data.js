@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770755166990,
+  "lastUpdate": 1770760548348,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -394,6 +394,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 29.931,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "47aab95bde02c0cb9c7edf89b5782ff4bc0ed3eb",
+          "message": "add DISTINCT support for aggregate functions, fix correlated EXISTS/NOT EXISTS evaluation, and enable UPDATE...FROM with expression evaluation against merged row context\n\nImplement DISTINCT keyword parsing in aggregate functions (COUNT/SUM/AVG/MIN/MAX) by adding has_distinct flag to agg_expr. Move EXISTS/NOT EXISTS evaluation from resolve_subqueries to eval_condition to support correlated subqueries that reference outer table columns via per-row SQL template substitution with literal value injection",
+          "timestamp": "2026-02-10T13:55:29-08:00",
+          "tree_id": "8e1ec8a881a5eb2688afd89f226f68ec64867c0e",
+          "url": "https://github.com/martinsk/mskql/commit/47aab95bde02c0cb9c7edf89b5782ff4bc0ed3eb"
+        },
+        "date": 1770760547324,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 26.412,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 161.639,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 286.312,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 463.384,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 331.867,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 701.112,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 60.1,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 285.398,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 447.502,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 11.149,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 32.976,
             "unit": "ms"
           }
         ]
