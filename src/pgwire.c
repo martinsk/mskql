@@ -264,6 +264,7 @@ struct client_state {
     uint8_t *recv_buf;          /* partial read accumulator */
     size_t recv_len;
     size_t recv_cap;
+    struct query_arena arena;   /* connection-scoped arena, reset per request */
 };
 
 static void client_init(struct client_state *c, int fd)
@@ -274,6 +275,7 @@ static void client_init(struct client_state *c, int fd)
     c->recv_buf = NULL;
     c->recv_len = 0;
     c->recv_cap = 0;
+    query_arena_init(&c->arena);
 }
 
 static void client_free(struct client_state *c)
@@ -285,6 +287,7 @@ static void client_free(struct client_state *c)
     c->recv_buf = NULL;
     c->recv_len = 0;
     c->recv_cap = 0;
+    query_arena_destroy(&c->arena);
 }
 
 /* rollback any open transaction when a client disconnects, then free */
@@ -442,7 +445,7 @@ static int send_data_rows(int fd, struct rows *result)
 /* ---- handle a single query string (may contain one statement) ---- */
 
 static int handle_query(int fd, struct database *db, const char *sql,
-                        struct msgbuf *m)
+                        struct msgbuf *m, struct query_arena *conn_arena)
 {
     /* skip empty / whitespace-only queries */
     const char *p = sql;
@@ -454,20 +457,19 @@ static int handle_query(int fd, struct database *db, const char *sql,
     }
 
     struct query q = {0};
-    if (query_parse(sql, &q) != 0) {
-        query_free(&q);
+    if (query_parse_into(sql, &q, conn_arena) != 0) {
+        /* arena is reset on next request — no query_free needed */
         send_error(fd, m, "ERROR", "42601", "syntax error or unsupported statement");
         send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
         return 0;
     }
 
-    struct rows result = {0};
-    int rc = db_exec(db, &q, &result);
+    struct rows *result = &conn_arena->result;
+    int rc = db_exec(db, &q, result);
 
     if (rc < 0) {
         send_error(fd, m, "ERROR", "42000", "query execution failed");
-        rows_free(&result);
-        query_free(&q);
+        arena_free_result_rows(conn_arena);
         send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
         return 0;
     }
@@ -483,15 +485,15 @@ static int handle_query(int fd, struct database *db, const char *sql,
             break;
         case QUERY_TYPE_SELECT:
             /* send RowDescription + DataRows */
-            send_row_description(fd, db, &q, &result);
-            send_data_rows(fd, &result);
-            snprintf(tag, sizeof(tag), "SELECT %zu", result.count);
+            send_row_description(fd, db, &q, result);
+            send_data_rows(fd, result);
+            snprintf(tag, sizeof(tag), "SELECT %zu", result->count);
             break;
         case QUERY_TYPE_INSERT:
-            if (result.count > 0) {
+            if (result->count > 0) {
                 /* RETURNING — send rows */
-                send_row_description(fd, db, &q, &result);
-                send_data_rows(fd, &result);
+                send_row_description(fd, db, &q, result);
+                send_data_rows(fd, result);
             }
             {
                 size_t ins_count = q.insert.insert_rows_count;
@@ -500,27 +502,27 @@ static int handle_query(int fd, struct database *db, const char *sql,
             }
             break;
         case QUERY_TYPE_DELETE: {
-            if (q.del.has_returning && result.count > 0) {
-                send_row_description(fd, db, &q, &result);
-                send_data_rows(fd, &result);
-                snprintf(tag, sizeof(tag), "DELETE %zu", result.count);
+            if (q.del.has_returning && result->count > 0) {
+                send_row_description(fd, db, &q, result);
+                send_data_rows(fd, result);
+                snprintf(tag, sizeof(tag), "DELETE %zu", result->count);
             } else {
                 size_t del_count = 0;
-                if (result.count > 0 && result.data[0].cells.count > 0)
-                    del_count = (size_t)result.data[0].cells.items[0].value.as_int;
+                if (result->count > 0 && result->data[0].cells.count > 0)
+                    del_count = (size_t)result->data[0].cells.items[0].value.as_int;
                 snprintf(tag, sizeof(tag), "DELETE %zu", del_count);
             }
             break;
         }
         case QUERY_TYPE_UPDATE: {
-            if (q.update.has_returning && result.count > 0) {
-                send_row_description(fd, db, &q, &result);
-                send_data_rows(fd, &result);
-                snprintf(tag, sizeof(tag), "UPDATE %zu", result.count);
+            if (q.update.has_returning && result->count > 0) {
+                send_row_description(fd, db, &q, result);
+                send_data_rows(fd, result);
+                snprintf(tag, sizeof(tag), "UPDATE %zu", result->count);
             } else {
                 size_t upd_count = 0;
-                if (result.count > 0 && result.data[0].cells.count > 0)
-                    upd_count = (size_t)result.data[0].cells.items[0].value.as_int;
+                if (result->count > 0 && result->data[0].cells.count > 0)
+                    upd_count = (size_t)result->data[0].cells.items[0].value.as_int;
                 snprintf(tag, sizeof(tag), "UPDATE %zu", upd_count);
             }
             break;
@@ -552,8 +554,8 @@ static int handle_query(int fd, struct database *db, const char *sql,
     }
 
     send_command_complete(fd, m, tag);
-    rows_free(&result);
-    query_free(&q);
+    arena_free_result_rows(conn_arena);
+    /* no query_free — arena is connection-scoped, reset on next request */
     send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
     return 0;
 }
@@ -638,7 +640,7 @@ static int process_messages(struct client_state *c, struct database *db)
                     /* ensure NUL termination within the body */
                     char saved = sql[body_len];
                     sql[body_len] = '\0';
-                    handle_query(c->fd, db, sql, &c->send_buf);
+                    handle_query(c->fd, db, sql, &c->send_buf, &c->arena);
                     sql[body_len] = saved;
                 }
                 break;

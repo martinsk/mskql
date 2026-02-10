@@ -89,48 +89,79 @@ static inline uint32_t arena_push_agg(struct query_arena *a, struct agg_expr ae)
     return (uint32_t)(a->aggregates.count - 1);
 }
 
-/* destroy the arena: free all owned strings, text cells, rows, columns, then arrays */
-static inline void query_arena_destroy(struct query_arena *a)
+/* Free column default_value structs (calloc'd).
+ * The text inside default_value cells is in the bump slab — do NOT free it. */
+static inline void arena_free_column_defaults(struct query_arena *a)
 {
-    /* free owned strings */
-    for (size_t i = 0; i < a->strings.count; i++)
-        free(a->strings.items[i]);
-    da_free(&a->strings);
-
-    /* free text in literal cells */
-    for (size_t i = 0; i < a->cells.count; i++)
-        cell_free_text(&a->cells.items[i]);
-    da_free(&a->cells);
-
-    /* free text in expr literals */
-    for (size_t i = 0; i < a->exprs.count; i++) {
-        if (a->exprs.items[i].type == EXPR_LITERAL) {
-            cell_free_text(&a->exprs.items[i].literal);
+    for (size_t i = 0; i < a->columns.count; i++) {
+        if (a->columns.items[i].default_value) {
+            free(a->columns.items[i].default_value);
+            a->columns.items[i].default_value = NULL;
         }
     }
-    da_free(&a->exprs);
+}
 
-    /* free text in condition values */
-    for (size_t i = 0; i < a->conditions.count; i++) {
-        cell_free_text(&a->conditions.items[i].value);
-        cell_free_text(&a->conditions.items[i].between_high);
-    }
-    da_free(&a->conditions);
+/* Free execution-time result rows (cells may contain malloc'd text). */
+static inline void arena_free_result_rows(struct query_arena *a)
+{
+    for (size_t i = 0; i < a->result.count; i++)
+        row_free(&a->result.data[i]);
+    a->result.count = 0;
+    /* keep data/capacity for reuse */
+}
 
-    /* free rows (each row has its own cells dynamic array) */
-    for (size_t i = 0; i < a->rows.count; i++) {
-        for (size_t j = 0; j < a->rows.items[i].cells.count; j++)
-            cell_free_text(&a->rows.items[i].cells.items[j]);
+/* Free per-row cells arrays in arena.rows (INSERT tuples).
+ * The cell text is in the bump slab, but each row's cells.items is da_push'd. */
+static inline void arena_free_row_cell_arrays(struct query_arena *a)
+{
+    for (size_t i = 0; i < a->rows.count; i++)
         da_free(&a->rows.items[i].cells);
-    }
+}
+
+/* Reset the arena: set all counts to 0, reset bump slabs.
+ * Keeps all backing memory allocated for reuse.
+ * Strings, cell text in exprs/conditions/cells are in the bump slab
+ * and don't need individual freeing. */
+static inline void query_arena_reset(struct query_arena *a)
+{
+    arena_free_column_defaults(a);
+    arena_free_result_rows(a);
+    arena_free_row_cell_arrays(a);
+
+    da_reset(&a->exprs);
+    da_reset(&a->conditions);
+    da_reset(&a->cells);
+    da_reset(&a->strings);
+    da_reset(&a->branches);
+    da_reset(&a->joins);
+    da_reset(&a->ctes);
+    da_reset(&a->set_clauses);
+    da_reset(&a->order_items);
+    da_reset(&a->select_cols);
+    da_reset(&a->select_exprs);
+    da_reset(&a->aggregates);
+    da_reset(&a->rows);
+    da_reset(&a->svs);
+    da_reset(&a->columns);
+    da_reset(&a->arg_indices);
+    bump_reset(&a->bump);
+    bump_reset(&a->scratch);
+}
+
+/* destroy the arena: free all backing memory.
+ * Strings and cell text live in the bump slab — no per-item free needed.
+ * Column default_value and row cell arrays still need individual cleanup. */
+static inline void query_arena_destroy(struct query_arena *a)
+{
+    arena_free_column_defaults(a);
+    arena_free_row_cell_arrays(a);
+
+    da_free(&a->strings);
+    da_free(&a->cells);
+    da_free(&a->exprs);
+    da_free(&a->conditions);
     da_free(&a->rows);
-
-    /* free columns (name, enum_type_name, default_value) */
-    for (size_t i = 0; i < a->columns.count; i++)
-        column_free(&a->columns.items[i]);
     da_free(&a->columns);
-
-    /* free remaining flat arrays */
     da_free(&a->branches);
     da_free(&a->joins);
     da_free(&a->ctes);
@@ -141,6 +172,16 @@ static inline void query_arena_destroy(struct query_arena *a)
     da_free(&a->aggregates);
     da_free(&a->svs);
     da_free(&a->arg_indices);
+    bump_destroy(&a->bump);
+    bump_destroy(&a->scratch);
+
+    /* free result rows */
+    for (size_t i = 0; i < a->result.count; i++)
+        row_free(&a->result.data[i]);
+    free(a->result.data);
+    a->result.data = NULL;
+    a->result.count = 0;
+    a->result.capacity = 0;
 }
 
 #endif

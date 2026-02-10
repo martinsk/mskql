@@ -249,7 +249,8 @@ static int do_single_join(struct table *t1, const char *alias1,
                           sv left_col_sv, sv right_col_sv, int join_type,
                           enum cmp_op join_op,
                           struct rows *out_rows,
-                          struct table *out_meta)
+                          struct table *out_meta,
+                          struct query_arena *arena, uint32_t join_on_cond)
 {
     size_t ncols1 = t1->columns.count;
     size_t ncols2 = t2->columns.count;
@@ -266,31 +267,59 @@ static int do_single_join(struct table *t1, const char *alias1,
         return 0;
     }
 
-    char buf[256], buf2[256];
-    const char *left_col = extract_col_name(left_col_sv, buf, sizeof(buf));
-    const char *right_col = extract_col_name(right_col_sv, buf2, sizeof(buf2));
-
-    int left_in_t1 = (table_find_column(t1, left_col) >= 0);
-    int t1_join_col = left_in_t1 ? table_find_column(t1, left_col) : table_find_column(t1, right_col);
-    int t2_join_col = left_in_t1 ? table_find_column(t2, right_col) : table_find_column(t2, left_col);
-
-    if (t1_join_col < 0 || t2_join_col < 0) {
-        fprintf(stderr, "join error: could not resolve ON columns\n");
-        return -1;
-    }
+    /* build merged column metadata first (needed for condition evaluation) */
+    build_merged_columns_ex(t1, alias1, t2, alias2, out_meta);
 
     int *t1_matched = calloc(t1->rows.count, sizeof(int));
     int *t2_matched = calloc(t2->rows.count, sizeof(int));
 
-    for (size_t i = 0; i < t1->rows.count; i++) {
-        struct row *r1 = &t1->rows.items[i];
-        for (size_t j = 0; j < t2->rows.count; j++) {
-            struct row *r2 = &t2->rows.items[j];
-            if (!join_cmp_match(&r1->cells.items[t1_join_col], &r2->cells.items[t2_join_col], join_op))
-                continue;
-            t1_matched[i] = 1;
-            t2_matched[j] = 1;
-            emit_merged_row(r1, ncols1, r2, ncols2, out_rows);
+    if (join_on_cond != IDX_NONE && arena) {
+        /* use full condition tree for matching */
+        for (size_t i = 0; i < t1->rows.count; i++) {
+            struct row *r1 = &t1->rows.items[i];
+            for (size_t j = 0; j < t2->rows.count; j++) {
+                struct row *r2 = &t2->rows.items[j];
+                /* build temporary merged row for eval_condition */
+                struct row tmp = {0};
+                da_init(&tmp.cells);
+                for (size_t c = 0; c < ncols1; c++)
+                    da_push(&tmp.cells, r1->cells.items[c]);
+                for (size_t c = 0; c < ncols2; c++)
+                    da_push(&tmp.cells, r2->cells.items[c]);
+                int match = eval_condition(join_on_cond, arena, &tmp, out_meta, NULL);
+                da_free(&tmp.cells);
+                if (!match) continue;
+                t1_matched[i] = 1;
+                t2_matched[j] = 1;
+                emit_merged_row(r1, ncols1, r2, ncols2, out_rows);
+            }
+        }
+    } else {
+        char buf[256], buf2[256];
+        const char *left_col = extract_col_name(left_col_sv, buf, sizeof(buf));
+        const char *right_col = extract_col_name(right_col_sv, buf2, sizeof(buf2));
+
+        int left_in_t1 = (table_find_column(t1, left_col) >= 0);
+        int t1_join_col = left_in_t1 ? table_find_column(t1, left_col) : table_find_column(t1, right_col);
+        int t2_join_col = left_in_t1 ? table_find_column(t2, right_col) : table_find_column(t2, left_col);
+
+        if (t1_join_col < 0 || t2_join_col < 0) {
+            fprintf(stderr, "join error: could not resolve ON columns\n");
+            free(t1_matched);
+            free(t2_matched);
+            return -1;
+        }
+
+        for (size_t i = 0; i < t1->rows.count; i++) {
+            struct row *r1 = &t1->rows.items[i];
+            for (size_t j = 0; j < t2->rows.count; j++) {
+                struct row *r2 = &t2->rows.items[j];
+                if (!join_cmp_match(&r1->cells.items[t1_join_col], &r2->cells.items[t2_join_col], join_op))
+                    continue;
+                t1_matched[i] = 1;
+                t2_matched[j] = 1;
+                emit_merged_row(r1, ncols1, r2, ncols2, out_rows);
+            }
         }
     }
 
@@ -312,7 +341,6 @@ static int do_single_join(struct table *t1, const char *alias1,
 
     free(t1_matched);
     free(t2_matched);
-    build_merged_columns_ex(t1, alias1, t2, alias2, out_meta);
     return 0;
 }
 
@@ -536,7 +564,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
         if (!a1) a1 = t1->name;
         if (!a2) a2 = t2->name;
         if (do_single_join(t1, a1, t2, a2, ji->join_left_col, ji->join_right_col, ji->join_type,
-                           ji->join_op, &merged, &merged_t) != 0) {
+                           ji->join_op, &merged, &merged_t, a, ji->join_on_cond) != 0) {
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
             return -1;
@@ -571,7 +599,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
             snprintf(jn_alias_buf, sizeof(jn_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
         if (do_single_join(&merged_t, NULL, tn, jn_alias_buf[0] ? jn_alias_buf : NULL,
                            ji->join_left_col, ji->join_right_col, ji->join_type,
-                           ji->join_op, &next_merged, &next_meta) != 0) {
+                           ji->join_op, &next_merged, &next_meta, a, ji->join_on_cond) != 0) {
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
             return -1;
@@ -1498,6 +1526,71 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 free(sel_rows.data);
                 query_free(&sel_q);
                 return cnt;
+            }
+            /* ON CONFLICT DO UPDATE — update conflicting rows with SET clauses */
+            if (ins->has_on_conflict && ins->on_conflict_do_update) {
+                uint32_t orig_count = ins->insert_rows_count;
+                struct table *t = db_find_table_sv(db, ins->table);
+                if (t) {
+                    int conflict_col = -1;
+                    if (ins->conflict_column.len > 0)
+                        conflict_col = table_find_column_sv(t, ins->conflict_column);
+                    else {
+                        for (size_t c = 0; c < t->columns.count; c++) {
+                            if (t->columns.items[c].is_unique || t->columns.items[c].is_primary_key) {
+                                conflict_col = (int)c;
+                                break;
+                            }
+                        }
+                    }
+                    if (conflict_col >= 0) {
+                        struct row *ir_items = &q->arena.rows.items[ins->insert_rows_start];
+                        uint32_t ir_count = ins->insert_rows_count;
+                        for (uint32_t ri = 0; ri < ir_count; ) {
+                            struct cell *new_cell = &ir_items[ri].cells.items[conflict_col];
+                            int conflict = 0;
+                            size_t conflict_row = 0;
+                            for (size_t ei = 0; ei < t->rows.count; ei++) {
+                                if (cell_equal(new_cell, &t->rows.items[ei].cells.items[conflict_col])) {
+                                    conflict = 1;
+                                    conflict_row = ei;
+                                    break;
+                                }
+                            }
+                            if (conflict) {
+                                /* apply SET clauses to the existing row */
+                                for (uint32_t sc = 0; sc < ins->conflict_set_count; sc++) {
+                                    struct set_clause *scp = &q->arena.set_clauses.items[ins->conflict_set_start + sc];
+                                    int ci = table_find_column_sv(t, scp->column);
+                                    if (ci < 0) continue;
+                                    struct cell val;
+                                    if (scp->expr_idx != IDX_NONE)
+                                        val = eval_expr(scp->expr_idx, &q->arena, t, &t->rows.items[conflict_row], db);
+                                    else
+                                        cell_copy(&val, &scp->value);
+                                    struct cell *dst = &t->rows.items[conflict_row].cells.items[ci];
+                                    if (column_type_is_text(dst->type) && dst->value.as_text)
+                                        free(dst->value.as_text);
+                                    *dst = val;
+                                }
+                                /* remove this insert row — it was handled as update */
+                                row_free(&ir_items[ri]);
+                                for (uint32_t j = ri; j + 1 < ir_count; j++)
+                                    ir_items[j] = ir_items[j + 1];
+                                ir_count--;
+                                ins->insert_rows_count = ir_count;
+                                memset(&ir_items[ir_count], 0, sizeof(ir_items[ir_count]));
+                            } else {
+                                ri++;
+                            }
+                        }
+                    }
+                }
+                if (ins->insert_rows_count == 0) {
+                    ins->insert_rows_count = orig_count;
+                    return 0;
+                }
+                ins->insert_rows_count = orig_count;
             }
             /* ON CONFLICT DO NOTHING — check for duplicate before insert */
             if (ins->has_on_conflict && ins->on_conflict_do_nothing) {

@@ -94,6 +94,7 @@ struct condition {
     sv column;
     enum cmp_op op;
     struct cell value;
+    sv rhs_column;               /* if set, RHS is a column ref (JOIN ON) */
     uint32_t lhs_expr;           /* index into arena.exprs, or IDX_NONE */
     /* for CMP_IN / CMP_NOT_IN: range in arena.cells */
     uint32_t in_values_start;    /* index into arena.cells */
@@ -260,6 +261,7 @@ struct join_info {
     int is_natural;
     int is_lateral;
     uint32_t lateral_subquery_sql; /* index into arena.strings, or IDX_NONE */
+    uint32_t join_on_cond; /* full ON condition tree, or IDX_NONE */
 };
 
 struct cte_def {
@@ -320,6 +322,7 @@ struct query_select {
     /* aggregates & window functions */
     uint32_t aggregates_start; /* index into arena.aggregates (consecutive) */
     uint32_t aggregates_count;
+    int agg_before_cols; /* 1 if aggregates listed before plain columns in SELECT */
     uint32_t select_exprs_start; /* index into arena.select_exprs (consecutive) */
     uint32_t select_exprs_count;
     /* set operations: UNION / INTERSECT / EXCEPT */
@@ -357,6 +360,10 @@ struct query_insert {
     int has_on_conflict;
     int on_conflict_do_nothing;
     sv conflict_column;
+    /* ON CONFLICT DO UPDATE SET */
+    int on_conflict_do_update;
+    uint32_t conflict_set_start; /* index into arena.set_clauses (consecutive) */
+    uint32_t conflict_set_count;
 };
 
 struct query_update {

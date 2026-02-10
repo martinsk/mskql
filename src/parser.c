@@ -744,7 +744,7 @@ static uint32_t parse_expr_atom(struct lexer *l, struct query_arena *a)
         lexer_next(l);
         uint32_t ei = expr_alloc(a, EXPR_LITERAL);
         EXPR(a, ei).literal.type = COLUMN_TYPE_TEXT;
-        EXPR(a, ei).literal.value.as_text = sv_to_cstr(tok.value);
+        EXPR(a, ei).literal.value.as_text = bump_strndup(&a->bump, tok.value.data, tok.value.len);
         return ei;
     }
 
@@ -861,7 +861,7 @@ static uint32_t parse_expr(struct lexer *l, struct query_arena *a)
     return left;
 }
 
-static struct cell parse_literal_value(struct token tok)
+static struct cell parse_literal_value_arena(struct token tok, struct query_arena *a)
 {
     struct cell c = {0};
     if (tok.type == TOK_NUMBER) {
@@ -873,10 +873,8 @@ static struct cell parse_literal_value(struct token tok)
             c.value.as_int = sv_atoi(tok.value);
         }
     } else if (tok.type == TOK_STRING) {
-        // TODO: sv_to_cstr heap-allocates; for short-lived comparisons in WHERE
-        // conditions this could use a stack buffer or sv-aware cell type
         c.type = COLUMN_TYPE_TEXT;
-        c.value.as_text = sv_to_cstr(tok.value);
+        c.value.as_text = bump_strndup(&a->bump, tok.value.data, tok.value.len);
     } else if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "NULL")) {
         c.type = COLUMN_TYPE_TEXT;
         c.value.as_text = NULL;
@@ -1043,7 +1041,7 @@ static uint32_t parse_single_cond(struct lexer *l, struct query_arena *a)
                 }
                 for (int vi = 0; vi < COND(a, ci).multi_tuple_width; vi++) {
                     struct token vt = lexer_next(l);
-                    struct cell v = parse_literal_value(vt);
+                    struct cell v = parse_literal_value_arena(vt, a);
                     arena_push_cell(a, v);
                     mv_count++;
                     if (vi < COND(a, ci).multi_tuple_width - 1) {
@@ -1107,6 +1105,32 @@ static uint32_t parse_single_cond(struct lexer *l, struct query_arena *a)
 
     struct token op_tok;
 
+    /* check if LHS is an aggregate call in HAVING (e.g. COUNT(*) > 1) */
+    if (is_agg_keyword(tok.value)) {
+        struct token peek_lp = lexer_peek(l);
+        if (peek_lp.type == TOK_LPAREN) {
+            /* consume the aggregate call: FUNC( ... ) */
+            lexer_next(l); /* ( */
+            int depth = 1;
+            while (depth > 0) {
+                struct token t = lexer_next(l);
+                if (t.type == TOK_LPAREN) depth++;
+                else if (t.type == TOK_RPAREN) depth--;
+                else if (t.type == TOK_EOF) break;
+            }
+            /* use the lowercase function name as the virtual column name */
+            const char *agg_name = "?";
+            if (sv_eq_ignorecase_cstr(tok.value, "COUNT")) agg_name = "count";
+            else if (sv_eq_ignorecase_cstr(tok.value, "SUM")) agg_name = "sum";
+            else if (sv_eq_ignorecase_cstr(tok.value, "AVG")) agg_name = "avg";
+            else if (sv_eq_ignorecase_cstr(tok.value, "MIN")) agg_name = "min";
+            else if (sv_eq_ignorecase_cstr(tok.value, "MAX")) agg_name = "max";
+            COND(a, ci).column = sv_from(agg_name, strlen(agg_name));
+            op_tok = lexer_next(l);
+            goto parse_operator;
+        }
+    }
+
     /* check if LHS is a function call (e.g. COALESCE(val, 0) > 5) */
     if (is_expr_func_keyword(tok.value)) {
         struct token peek_lp = lexer_peek(l);
@@ -1138,7 +1162,7 @@ parse_operator:
                 }
                 COND(a, ci).op = CMP_IS_NOT_DISTINCT;
                 struct token val_tok = lexer_next(l);
-                COND(a, ci).value = parse_literal_value(val_tok);
+                COND(a, ci).value = parse_literal_value_arena(val_tok, a);
                 return ci;
             }
             next = lexer_next(l);
@@ -1155,7 +1179,7 @@ parse_operator:
             }
             COND(a, ci).op = CMP_IS_DISTINCT;
             struct token val_tok = lexer_next(l);
-            COND(a, ci).value = parse_literal_value(val_tok);
+            COND(a, ci).value = parse_literal_value_arena(val_tok, a);
             return ci;
         } else if (next.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(next.value, "NULL")) {
             COND(a, ci).op = CMP_IS_NULL;
@@ -1219,7 +1243,7 @@ parse_in_list:
         uint32_t iv_count = 0;
         for (;;) {
             tok = lexer_next(l);
-            struct cell v = parse_literal_value(tok);
+            struct cell v = parse_literal_value_arena(tok, a);
             arena_push_cell(a, v);
             iv_count++;
             tok = lexer_next(l);
@@ -1238,14 +1262,14 @@ parse_in_list:
     if (op_tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(op_tok.value, "BETWEEN")) {
         COND(a, ci).op = CMP_BETWEEN;
         tok = lexer_next(l);
-        COND(a, ci).value = parse_literal_value(tok);
+        COND(a, ci).value = parse_literal_value_arena(tok, a);
         tok = lexer_next(l); /* AND */
         if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "AND")) {
             fprintf(stderr, "parse error: expected AND in BETWEEN\n");
             return IDX_NONE;
         }
         tok = lexer_next(l);
-        COND(a, ci).between_high = parse_literal_value(tok);
+        COND(a, ci).between_high = parse_literal_value_arena(tok, a);
         return ci;
     }
 
@@ -1253,13 +1277,13 @@ parse_in_list:
     if (op_tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(op_tok.value, "LIKE")) {
         COND(a, ci).op = CMP_LIKE;
         tok = lexer_next(l);
-        COND(a, ci).value = parse_literal_value(tok);
+        COND(a, ci).value = parse_literal_value_arena(tok, a);
         return ci;
     }
     if (op_tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(op_tok.value, "ILIKE")) {
         COND(a, ci).op = CMP_ILIKE;
         tok = lexer_next(l);
-        COND(a, ci).value = parse_literal_value(tok);
+        COND(a, ci).value = parse_literal_value_arena(tok, a);
         return ci;
     }
 
@@ -1304,7 +1328,7 @@ parse_in_list:
                     if (rp.type == TOK_RPAREN) break;
                     continue;
                 }
-                struct cell v = parse_literal_value(vt);
+                struct cell v = parse_literal_value_arena(vt, a);
                 arena_push_cell(a, v);
                 av_count++;
                 struct token sep = lexer_peek(l);
@@ -1347,7 +1371,20 @@ parse_in_list:
     }
 
     tok = lexer_next(l);
-    COND(a, ci).value = parse_literal_value(tok);
+    if (tok.type == TOK_IDENTIFIER || (tok.type == TOK_KEYWORD &&
+        !sv_eq_ignorecase_cstr(tok.value, "NULL") &&
+        !sv_eq_ignorecase_cstr(tok.value, "TRUE") &&
+        !sv_eq_ignorecase_cstr(tok.value, "FALSE"))) {
+        /* check if next token is a dot (qualified column ref like t2.col) or
+         * if this looks like a column reference rather than a literal */
+        struct token peek_dot = lexer_peek(l);
+        if (peek_dot.type == TOK_DOT || tok.type == TOK_IDENTIFIER) {
+            /* store as RHS column reference for column-to-column comparison */
+            COND(a, ci).rhs_column = consume_identifier(l, tok);
+            return ci;
+        }
+    }
+    COND(a, ci).value = parse_literal_value_arena(tok, a);
     return ci;
 }
 
@@ -1647,55 +1684,45 @@ static int parse_agg_list(struct lexer *l, struct query_arena *a, struct query_s
     arena_push_agg(a, agg);
     agg_count++;
 
-    /* check for more comma-separated aggregates */
+    /* check for more comma-separated aggregates or plain columns */
+    const char *col_start = NULL;
+    const char *col_end = NULL;
     for (;;) {
         struct token peek = lexer_peek(l);
         if (peek.type != TOK_COMMA) break;
         lexer_next(l); /* consume comma */
 
         tok = lexer_next(l);
-        if (tok.type != TOK_KEYWORD || !is_agg_keyword(tok.value)) {
-            fprintf(stderr, "parse error: expected aggregate function after ','\n");
-            return -1;
-        }
-        struct agg_expr a2;
-        memset(&a2, 0, sizeof(a2));
-        a2.func = agg_from_keyword(tok.value);
-
-        tok = lexer_next(l);
-        if (tok.type != TOK_LPAREN) {
-            fprintf(stderr, "parse error: expected '(' after aggregate function\n");
-            return -1;
-        }
-        tok = lexer_next(l);
-        if (tok.type == TOK_STAR) {
-            a2.column = tok.value;
-        } else if (tok.type == TOK_IDENTIFIER) {
-            a2.column = tok.value;
-        } else {
-            fprintf(stderr, "parse error: expected column name or * in aggregate\n");
-            return -1;
-        }
-        tok = lexer_next(l);
-        if (tok.type != TOK_RPAREN) {
-            fprintf(stderr, "parse error: expected ')' after aggregate column\n");
-            return -1;
-        }
-        /* store optional AS alias */
-        {
-            struct token pa = lexer_peek(l);
-            if (pa.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(pa.value, "AS")) {
-                lexer_next(l); /* AS */
-                struct token alias_tok = lexer_next(l); /* alias */
-                a2.alias = alias_tok.value;
+        if (tok.type == TOK_KEYWORD && is_agg_keyword(tok.value)) {
+            struct agg_expr a2;
+            memset(&a2, 0, sizeof(a2));
+            if (parse_single_agg(l, tok.value, &a2) != 0) return -1;
+            /* store optional AS alias */
+            {
+                struct token pa = lexer_peek(l);
+                if (pa.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(pa.value, "AS")) {
+                    lexer_next(l); /* AS */
+                    struct token alias_tok = lexer_next(l); /* alias */
+                    a2.alias = alias_tok.value;
+                }
             }
+            arena_push_agg(a, a2);
+            agg_count++;
+        } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
+            sv id = consume_identifier(l, tok);
+            if (!col_start) col_start = id.data;
+            col_end = id.data + id.len;
+        } else {
+            fprintf(stderr, "parse error: expected aggregate or column after ','\n");
+            return -1;
         }
-        arena_push_agg(a, a2);
-        agg_count++;
     }
+    if (col_start)
+        s->columns = sv_from(col_start, (size_t)(col_end - col_start));
 
     s->aggregates_start = agg_start;
     s->aggregates_count = agg_count;
+    if (col_start) s->agg_before_cols = 1;
     return 0;
 }
 
@@ -2100,6 +2127,8 @@ parse_table_name:
         struct join_info ji = {0};
         ji.join_type = jtype;
         ji.is_natural = is_natural;
+        ji.join_on_cond = IDX_NONE;
+        ji.lateral_subquery_sql = IDX_NONE;
 
         /* check for LATERAL (SELECT ...) */
         tok = lexer_next(l);
@@ -2205,21 +2234,29 @@ parse_table_name:
                     return -1;
                 }
 
-                /* left: table.col */
-                tok = lexer_next(l);
-                ji.join_left_col = consume_identifier(l, tok);
-
-                /* comparison operator */
-                tok = lexer_next(l);
-                if (!is_cmp_token(tok.type)) {
-                    fprintf(stderr, "parse error: expected comparison operator in ON clause\n");
+                /* parse full ON condition tree (supports AND/OR/compound) */
+                ji.join_on_cond = parse_or_cond(l, a);
+                if (ji.join_on_cond == IDX_NONE) {
+                    fprintf(stderr, "parse error: invalid ON condition\n");
                     return -1;
                 }
-                ji.join_op = cmp_from_token(tok.type);
 
-                /* right: table.col */
-                tok = lexer_next(l);
-                ji.join_right_col = consume_identifier(l, tok);
+                /* backward compat: populate legacy fields from first simple condition */
+                struct condition *jc = &COND(a, ji.join_on_cond);
+                if (jc->type == COND_COMPARE) {
+                    ji.join_left_col = jc->column;
+                    ji.join_op = jc->op;
+                    /* extract RHS column name from value if it's text, or from the condition */
+                    if (jc->value.type == COLUMN_TYPE_TEXT && jc->value.value.as_text)
+                        ji.join_right_col = sv_from(jc->value.value.as_text, strlen(jc->value.value.as_text));
+                } else if (jc->type == COND_AND) {
+                    /* first child of AND */
+                    struct condition *first = &COND(a, jc->left);
+                    if (first->type == COND_COMPARE) {
+                        ji.join_left_col = first->column;
+                        ji.join_op = first->op;
+                    }
+                }
             }
         }
 
@@ -2504,9 +2541,34 @@ static int parse_insert(struct lexer *l, struct query *out)
                 lexer_next(l); /* ) */
             }
             tok = lexer_next(l); /* DO */
-            tok = lexer_next(l); /* NOTHING */
+            tok = lexer_next(l); /* NOTHING or UPDATE */
             if (sv_eq_ignorecase_cstr(tok.value, "NOTHING")) {
                 ins->on_conflict_do_nothing = 1;
+            } else if (sv_eq_ignorecase_cstr(tok.value, "UPDATE")) {
+                ins->on_conflict_do_update = 1;
+                tok = lexer_next(l); /* SET */
+                struct query_arena *ca = &out->arena;
+                uint32_t sc_start = (uint32_t)ca->set_clauses.count;
+                uint32_t sc_count = 0;
+                for (;;) {
+                    tok = lexer_next(l); /* column name */
+                    struct set_clause sc = {0};
+                    sc.column = tok.value;
+                    sc.expr_idx = IDX_NONE;
+                    tok = lexer_next(l); /* = */
+                    sc.expr_idx = parse_expr(l, ca);
+                    if (sc.expr_idx == IDX_NONE) {
+                        fprintf(stderr, "parse error: expected expression in ON CONFLICT SET\n");
+                        return -1;
+                    }
+                    arena_push_set_clause(ca, sc);
+                    sc_count++;
+                    peek = lexer_peek(l);
+                    if (peek.type != TOK_COMMA) break;
+                    lexer_next(l); /* consume comma */
+                }
+                ins->conflict_set_start = sc_start;
+                ins->conflict_set_count = sc_count;
             }
         }
         peek = lexer_peek(l);
@@ -2693,13 +2755,12 @@ static int parse_create(struct lexer *l, struct query *out)
             fprintf(stderr, "parse error: expected column name\n");
             return -1;
         }
-        char *col_name = sv_to_cstr(tok.value);
+        char *col_name = bump_strndup(&out->arena.bump, tok.value.data, tok.value.len);
 
         /* column type — keyword (INT/FLOAT/TEXT) or identifier (enum type name) */
         tok = lexer_next(l);
         if (tok.type != TOK_KEYWORD && tok.type != TOK_IDENTIFIER) {
             fprintf(stderr, "parse error: expected column type\n");
-            free(col_name);
             return -1;
         }
         struct column col = {
@@ -2708,7 +2769,7 @@ static int parse_create(struct lexer *l, struct query *out)
             .enum_type_name = NULL
         };
         if (col.type == COLUMN_TYPE_ENUM) {
-            col.enum_type_name = sv_to_cstr(tok.value);
+            col.enum_type_name = bump_strndup(&out->arena.bump, tok.value.data, tok.value.len);
         }
         /* skip optional (n) or (p,s) after type name (e.g. VARCHAR(255), NUMERIC(10,2)) */
         {
@@ -2736,7 +2797,7 @@ static int parse_create(struct lexer *l, struct query *out)
                 struct token val_tok = lexer_next(l);
                 col.has_default = 1;
                 col.default_value = calloc(1, sizeof(struct cell));
-                *col.default_value = parse_literal_value(val_tok);
+                *col.default_value = parse_literal_value_arena(val_tok, &out->arena);
             } else if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "UNIQUE")) {
                 lexer_next(l);
                 col.is_unique = 1;
@@ -3054,11 +3115,27 @@ static int parse_alter(struct lexer *l, struct query *out)
     return -1;
 }
 
+static int query_parse_internal(const char *sql, struct query *out);
+
 int query_parse(const char *sql, struct query *out)
 {
     memset(out, 0, sizeof(*out));
     query_arena_init(&out->arena);
+    return query_parse_internal(sql, out);
+}
 
+int query_parse_into(const char *sql, struct query *out, struct query_arena *arena)
+{
+    memset(out, 0, sizeof(*out));
+    query_arena_reset(arena);
+    out->arena = *arena;  /* shallow copy — pointers transfer */
+    int rc = query_parse_internal(sql, out);
+    *arena = out->arena;  /* copy back any capacity growth */
+    return rc;
+}
+
+static int query_parse_internal(const char *sql, struct query *out)
+{
     struct lexer l;
     lexer_init(&l, sql);
 

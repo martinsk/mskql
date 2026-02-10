@@ -9,6 +9,76 @@
 
 #define IDX_NONE ((uint32_t)0xFFFFFFFF)
 
+/* Bump allocator: a single contiguous slab that grows as needed.
+ * On reset, just set used=0 — no per-allocation free. */
+struct bump_alloc {
+    char  *buf;
+    size_t used;
+    size_t capacity;
+};
+
+static inline void bump_init(struct bump_alloc *b)
+{
+    b->buf = NULL;
+    b->used = 0;
+    b->capacity = 0;
+}
+
+static inline void bump_reset(struct bump_alloc *b)
+{
+    b->used = 0; /* keep buf and capacity */
+}
+
+static inline void bump_destroy(struct bump_alloc *b)
+{
+    free(b->buf);
+    b->buf = NULL;
+    b->used = 0;
+    b->capacity = 0;
+}
+
+/* Allocate n bytes from the bump slab (8-byte aligned). */
+static inline void *bump_alloc(struct bump_alloc *b, size_t n)
+{
+    /* align to 8 bytes */
+    size_t aligned = (n + 7) & ~(size_t)7;
+    if (b->used + aligned > b->capacity) {
+        size_t newcap = b->capacity == 0 ? 4096 : b->capacity * 2;
+        while (newcap < b->used + aligned) newcap *= 2;
+        void *tmp = realloc(b->buf, newcap);
+        if (!tmp) { fprintf(stderr, "bump_alloc: OOM\n"); abort(); }
+        b->buf = tmp;
+        b->capacity = newcap;
+    }
+    void *ptr = b->buf + b->used;
+    b->used += aligned;
+    return ptr;
+}
+
+/* Allocate n zero-initialized bytes from the bump slab. */
+static inline void *bump_calloc(struct bump_alloc *b, size_t count, size_t size)
+{
+    size_t total = count * size;
+    void *ptr = bump_alloc(b, total);
+    memset(ptr, 0, total);
+    return ptr;
+}
+
+/* Copy a string of known length into the bump slab, NUL-terminated. */
+static inline char *bump_strndup(struct bump_alloc *b, const char *s, size_t len)
+{
+    char *dst = (char *)bump_alloc(b, len + 1);
+    memcpy(dst, s, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+/* Copy a NUL-terminated string into the bump slab. */
+static inline char *bump_strdup(struct bump_alloc *b, const char *s)
+{
+    return bump_strndup(b, s, strlen(s));
+}
+
 /* forward declarations — full definitions in query.h */
 struct expr;
 struct condition;
@@ -23,12 +93,14 @@ struct cte_def;
 
 /* Pool-based arena: each parsed type gets its own flat dynamic array.
  * Structures reference items by uint32_t index instead of pointers.
- * Freeing the entire query is a single query_arena_destroy() call. */
+ * Freeing the entire query is a single query_arena_destroy() call.
+ * For connection-scoped reuse, query_arena_reset() sets counts to 0
+ * but keeps all backing memory allocated. */
 struct query_arena {
     DYNAMIC_ARRAY(struct expr)             exprs;
     DYNAMIC_ARRAY(struct condition)        conditions;
     DYNAMIC_ARRAY(struct cell)             cells;       /* literal values, IN lists, etc. */
-    DYNAMIC_ARRAY(char *)                  strings;     /* owned NUL-terminated strings */
+    DYNAMIC_ARRAY(char *)                  strings;     /* pointers into bump slab */
     DYNAMIC_ARRAY(struct case_when_branch) branches;
     DYNAMIC_ARRAY(struct join_info)        joins;
     DYNAMIC_ARRAY(struct cte_def)          ctes;
@@ -41,6 +113,12 @@ struct query_arena {
     DYNAMIC_ARRAY(sv)                      svs;         /* sv values (multi_columns, group_by) */
     DYNAMIC_ARRAY(struct column)           columns;     /* CREATE TABLE columns */
     DYNAMIC_ARRAY(uint32_t)                arg_indices; /* func call arg expr indices */
+    /* bump slab for strings, scratch buffers, result row cells */
+    struct bump_alloc bump;
+    /* result rows: bump-allocated cells, reset with arena */
+    struct rows result;
+    /* scratch area for temporary per-query allocations */
+    struct bump_alloc scratch;
 };
 
 static inline void query_arena_init(struct query_arena *a)
@@ -61,6 +139,11 @@ static inline void query_arena_init(struct query_arena *a)
     da_init(&a->svs);
     da_init(&a->columns);
     da_init(&a->arg_indices);
+    bump_init(&a->bump);
+    a->result.data = NULL;
+    a->result.count = 0;
+    a->result.capacity = 0;
+    bump_init(&a->scratch);
 }
 
 /* helpers that only need cell / char* / sv / row / column (complete here) */
@@ -73,16 +156,18 @@ static inline uint32_t arena_push_cell(struct query_arena *a, struct cell c)
 
 static inline uint32_t arena_store_string(struct query_arena *a, const char *s, size_t len)
 {
-    char *copy = malloc(len + 1);
-    memcpy(copy, s, len);
-    copy[len] = '\0';
+    char *copy = bump_strndup(&a->bump, s, len);
     da_push(&a->strings, copy);
     return (uint32_t)(a->strings.count - 1);
 }
 
+/* Transfer ownership of a malloc'd string into the bump slab.
+ * The original pointer is freed after copying. */
 static inline uint32_t arena_own_string(struct query_arena *a, char *s)
 {
-    da_push(&a->strings, s);
+    char *copy = bump_strdup(&a->bump, s);
+    free(s);
+    da_push(&a->strings, copy);
     return (uint32_t)(a->strings.count - 1);
 }
 

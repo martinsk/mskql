@@ -29,6 +29,9 @@
 #define da_free(da) \
     do { free((da)->items); (da)->items = NULL; (da)->count = 0; (da)->capacity = 0; } while (0)
 
+#define da_reset(da) \
+    do { (da)->count = 0; } while (0)
+
 #define da_get(da, index) ((da)->items[(index)])
 
 #endif
