@@ -72,7 +72,7 @@ int db_table_exec_query(struct database *db, sv table_name,
         fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(table_name));
         return -1;
     }
-    return query_exec(t, q, result);
+    return query_exec(t, q, result, db);
 }
 
 /* find_column_index / find_column_index_sv → use shared table_find_column / table_find_column_sv from table.h */
@@ -526,6 +526,9 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
         if (ji->join_alias.len > 0)
             snprintf(t2_alias_buf, sizeof(t2_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
         const char *a2 = t2_alias_buf[0] ? t2_alias_buf : NULL;
+        /* use table names as fallback aliases to disambiguate columns */
+        if (!a1) a1 = t1->name;
+        if (!a2) a2 = t2->name;
         if (do_single_join(t1, a1, t2, a2, ji->join_left_col, ji->join_right_col, ji->join_type,
                            ji->join_op, &merged, &merged_t) != 0) {
             free_merged_rows(&merged);

@@ -116,6 +116,16 @@ int table_find_column_sv(struct table *t, sv name)
                 return (int)i;
         }
     }
+    /* try matching bare name against suffix of "table.col" stored names */
+    for (size_t i = 0; i < t->columns.count; i++) {
+        const char *cname = t->columns.items[i].name;
+        const char *dot = strchr(cname, '.');
+        if (dot) {
+            const char *suffix = dot + 1;
+            if (sv_eq_cstr(name, suffix))
+                return (int)i;
+        }
+    }
     return -1;
 }
 

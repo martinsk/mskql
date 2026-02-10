@@ -6,6 +6,6 @@ INSERT INTO t1 (id, dept, salary) VALUES (1, 'eng', 100), (2, 'sales', 200), (3,
 SELECT id, dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) FROM t1 ORDER BY id;
 -- expected output:
 1|eng|1
-3|hr|1
 2|sales|1
+3|hr|1
 -- expected status: 0

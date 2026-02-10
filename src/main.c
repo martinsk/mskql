@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <signal.h>
 #include "database.h"
 #include "pgwire.h"
@@ -25,8 +26,12 @@ int main(void)
     struct database db = {0};
     db_init(&db, "mskql");
 
+    int port = 5433;
+    const char *port_env = getenv("MSKQL_PORT");
+    if (port_env) port = atoi(port_env);
+
     struct pgwire_server srv = {0};
-    if (pgwire_init(&srv, &db, 5433) != 0) {
+    if (pgwire_init(&srv, &db, port) != 0) {
         fprintf(stderr, "failed to start pgwire server\n");
         return 1;
     }

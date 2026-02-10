@@ -5,6 +5,8 @@
 #include "table.h"
 #include "stringview.h"
 
+struct database;
+
 enum agg_func {
     AGG_NONE,
     AGG_SUM,
@@ -35,6 +37,7 @@ struct win_expr {
     sv partition_col;
     int has_order;
     sv order_col;
+    int order_desc; /* 1 = DESC, 0 = ASC (default) */
 };
 
 enum select_expr_kind {
@@ -72,7 +75,8 @@ enum cond_type {
     COND_COMPARE,
     COND_AND,
     COND_OR,
-    COND_NOT
+    COND_NOT,
+    COND_MULTI_IN
 };
 
 struct condition {
@@ -92,6 +96,14 @@ struct condition {
     /* for COND_AND / COND_OR */
     struct condition *left;
     struct condition *right;
+    /* for COND_MULTI_IN: WHERE (a, b) IN ((1,2), (3,4)) */
+    DYNAMIC_ARRAY(sv) multi_columns;        /* column names */
+    int multi_tuple_width;                   /* number of columns per tuple */
+    DYNAMIC_ARRAY(struct cell) multi_values; /* flat array: tuples concatenated */
+    /* for ANY/ALL/SOME: col op ANY(ARRAY[...]) */
+    int is_any;  /* 1 = ANY/SOME, 0 = not */
+    int is_all;  /* 1 = ALL, 0 = not */
+    DYNAMIC_ARRAY(struct cell) array_values; /* values for ANY/ALL */
 };
 
 void condition_free(struct condition *c);
@@ -100,6 +112,8 @@ int eval_condition(struct condition *cond, struct row *row, struct table *t);
 struct set_clause {
     sv column;
     struct cell value;
+    sv value_expr; /* raw expression text for evaluation (e.g. "score + 10") */
+    int has_expr;  /* 1 if value_expr should be evaluated per-row */
 };
 
 enum query_type {
@@ -306,7 +320,7 @@ struct query {
     };
 };
 
-int query_exec(struct table *t, struct query *q, struct rows *result);
+int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db);
 void query_free(struct query *q);
 
 #endif

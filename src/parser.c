@@ -25,6 +25,8 @@ enum token_type {
     TOK_PLUS,
     TOK_SLASH,
     TOK_MINUS,
+    TOK_PERCENT,
+    TOK_PIPE_PIPE,
     TOK_EOF,
     TOK_UNKNOWN
 };
@@ -76,6 +78,9 @@ static int is_keyword(sv word)
         "UNION", "INTERSECT", "EXCEPT", "ALL",
         "WITH", "RECURSIVE", "EXISTS",
         "CONFLICT", "DO", "NOTHING",
+        "NULLIF", "GREATEST", "LEAST",
+        "UPPER", "LOWER", "LENGTH", "SUBSTRING", "TRIM",
+        "ANY", "SOME", "ARRAY",
         NULL
     };
     for (int i = 0; keywords[i]; i++) {
@@ -139,6 +144,18 @@ static struct token lexer_next(struct lexer *l)
         tok.type = TOK_SLASH;
         tok.value = sv_from(&l->input[l->pos], 1);
         l->pos++;
+        return tok;
+    }
+    if (c == '%') {
+        tok.type = TOK_PERCENT;
+        tok.value = sv_from(&l->input[l->pos], 1);
+        l->pos++;
+        return tok;
+    }
+    if (c == '|' && l->input[l->pos + 1] == '|') {
+        tok.type = TOK_PIPE_PIPE;
+        tok.value = sv_from(&l->input[l->pos], 2);
+        l->pos += 2;
         return tok;
     }
     if (c == '=' ) {
@@ -369,6 +386,15 @@ static int parse_over_clause(struct lexer *l, struct win_expr *w)
             }
             w->has_order = 1;
             w->order_col = tok.value;
+            /* consume optional ASC/DESC */
+            peek = lexer_peek(l);
+            if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "DESC")) {
+                lexer_next(l);
+                w->order_desc = 1;
+            } else if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "ASC")) {
+                lexer_next(l);
+                w->order_desc = 0;
+            }
         } else {
             fprintf(stderr, "parse error: unexpected token in OVER clause\n");
             return -1;
@@ -408,6 +434,8 @@ static enum cmp_op cmp_from_token(enum token_type t)
         case TOK_PLUS:
         case TOK_SLASH:
         case TOK_MINUS:
+        case TOK_PERCENT:
+        case TOK_PIPE_PIPE:
         case TOK_EOF:
         case TOK_UNKNOWN:
             return CMP_EQ;
@@ -499,9 +527,107 @@ static struct condition *parse_single_cond(struct lexer *l)
         return node;
     }
 
-    /* ( expr ) — parenthesized sub-expression */
+    /* ( expr ) — parenthesized sub-expression, or (a, b) IN (...) multi-column IN */
     if (tok.type == TOK_LPAREN) {
         lexer_next(l); /* consume ( */
+        size_t saved = l->pos; /* position right after ( */
+        /* look ahead: is this (col, col, ...) IN (...) ? */
+        int is_multi_in = 0;
+        {
+            struct lexer tmp = { .input = l->input, .pos = saved };
+            struct token t1 = lexer_next(&tmp);
+            if (t1.type == TOK_IDENTIFIER || t1.type == TOK_KEYWORD) {
+                struct token t1p = lexer_peek(&tmp);
+                if (t1p.type == TOK_DOT) { lexer_next(&tmp); lexer_next(&tmp); }
+                struct token t2 = lexer_peek(&tmp);
+                if (t2.type == TOK_COMMA) {
+                    int depth = 1;
+                    while (depth > 0) {
+                        struct token tt = lexer_next(&tmp);
+                        if (tt.type == TOK_LPAREN) depth++;
+                        else if (tt.type == TOK_RPAREN) depth--;
+                        else if (tt.type == TOK_EOF) break;
+                    }
+                    struct token after = lexer_peek(&tmp);
+                    if (after.type == TOK_KEYWORD &&
+                        (sv_eq_ignorecase_cstr(after.value, "IN") ||
+                         sv_eq_ignorecase_cstr(after.value, "NOT")))
+                        is_multi_in = 1;
+                }
+            }
+        }
+        if (is_multi_in) {
+            /* parse multi-column IN: (col1, col2, ...) [NOT] IN ((v1,v2), (v3,v4), ...) */
+            /* l->pos is right after (, so we can parse column list directly */
+            struct condition *c = calloc(1, sizeof(*c));
+            c->type = COND_MULTI_IN;
+            da_init(&c->multi_columns);
+            da_init(&c->multi_values);
+            for (;;) {
+                struct token col = lexer_next(l);
+                if (col.type != TOK_IDENTIFIER && col.type != TOK_KEYWORD) {
+                    fprintf(stderr, "parse error: expected column in multi-column IN\n");
+                    condition_free(c); return NULL;
+                }
+                sv colsv = consume_identifier(l, col);
+                da_push(&c->multi_columns, colsv);
+                struct token sep = lexer_next(l);
+                if (sep.type == TOK_RPAREN) break;
+                if (sep.type != TOK_COMMA) {
+                    fprintf(stderr, "parse error: expected ',' or ')' in column list\n");
+                    condition_free(c); return NULL;
+                }
+            }
+            c->multi_tuple_width = (int)c->multi_columns.count;
+            c->op = CMP_IN;
+            struct token kw = lexer_next(l);
+            if (kw.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(kw.value, "NOT")) {
+                c->op = CMP_NOT_IN;
+                kw = lexer_next(l);
+            }
+            if (kw.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(kw.value, "IN")) {
+                fprintf(stderr, "parse error: expected IN after column tuple\n");
+                condition_free(c); return NULL;
+            }
+            struct token lp = lexer_next(l);
+            if (lp.type != TOK_LPAREN) {
+                fprintf(stderr, "parse error: expected '(' after IN\n");
+                condition_free(c); return NULL;
+            }
+            for (;;) {
+                struct token tp = lexer_next(l);
+                if (tp.type != TOK_LPAREN) {
+                    fprintf(stderr, "parse error: expected '(' for value tuple\n");
+                    condition_free(c); return NULL;
+                }
+                for (int vi = 0; vi < c->multi_tuple_width; vi++) {
+                    struct token vt = lexer_next(l);
+                    struct cell v = parse_literal_value(vt);
+                    da_push(&c->multi_values, v);
+                    if (vi < c->multi_tuple_width - 1) {
+                        struct token cm = lexer_next(l);
+                        if (cm.type != TOK_COMMA) {
+                            fprintf(stderr, "parse error: expected ',' in value tuple\n");
+                            condition_free(c); return NULL;
+                        }
+                    }
+                }
+                struct token rp = lexer_next(l);
+                if (rp.type != TOK_RPAREN) {
+                    fprintf(stderr, "parse error: expected ')' after value tuple\n");
+                    condition_free(c); return NULL;
+                }
+                struct token sep = lexer_next(l);
+                if (sep.type == TOK_RPAREN) break;
+                if (sep.type != TOK_COMMA) {
+                    fprintf(stderr, "parse error: expected ',' or ')' in IN list\n");
+                    condition_free(c); return NULL;
+                }
+            }
+            return c;
+        }
+        /* not multi-column IN — restore and parse as parenthesized sub-expression */
+        l->pos = saved;
         struct condition *inner = parse_or_cond(l);
         if (!inner) return NULL;
         tok = lexer_next(l);
@@ -669,6 +795,50 @@ parse_in_list:
         condition_free(c); return NULL;
     }
     c->op = cmp_from_token(op_tok.type);
+
+    /* check for ANY/ALL/SOME: col op ANY(ARRAY[...]) or col op ANY(v1,v2,...) */
+    {
+        struct token peek_aas = lexer_peek(l);
+        if (peek_aas.type == TOK_KEYWORD &&
+            (sv_eq_ignorecase_cstr(peek_aas.value, "ANY") ||
+             sv_eq_ignorecase_cstr(peek_aas.value, "ALL") ||
+             sv_eq_ignorecase_cstr(peek_aas.value, "SOME"))) {
+            int is_all = sv_eq_ignorecase_cstr(peek_aas.value, "ALL");
+            lexer_next(l); /* consume ANY/ALL/SOME */
+            struct token lp = lexer_next(l);
+            if (lp.type != TOK_LPAREN) {
+                fprintf(stderr, "parse error: expected '(' after ANY/ALL/SOME\n");
+                condition_free(c); return NULL;
+            }
+            /* optional ARRAY keyword */
+            struct token arr_peek = lexer_peek(l);
+            if (arr_peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(arr_peek.value, "ARRAY")) {
+                lexer_next(l); /* consume ARRAY */
+                struct token lb = lexer_next(l);
+                /* expect '[' — but our lexer doesn't have TOK_LBRACKET, so check raw char */
+                (void)lb; /* ARRAY[ is handled by consuming until ] */
+            }
+            da_init(&c->array_values);
+            c->is_any = is_all ? 0 : 1;
+            c->is_all = is_all ? 1 : 0;
+            /* parse values until ) or ] */
+            for (;;) {
+                struct token vt = lexer_next(l);
+                if (vt.type == TOK_RPAREN) break;
+                /* skip ] before ) */
+                if (vt.type == TOK_UNKNOWN && vt.value.len == 1 && vt.value.data[0] == ']') {
+                    struct token rp = lexer_next(l);
+                    if (rp.type == TOK_RPAREN) break;
+                    continue;
+                }
+                struct cell v = parse_literal_value(vt);
+                da_push(&c->array_values, v);
+                struct token sep = lexer_peek(l);
+                if (sep.type == TOK_COMMA) lexer_next(l);
+            }
+            return c;
+        }
+    }
 
     /* check for scalar subquery: col > (SELECT ...) */
     {
@@ -1085,7 +1255,7 @@ static int parse_select(struct lexer *l, struct query *out)
             if (has_over) {
                 /* parse mixed select expression list starting with window func */
                 da_init(&s->select_exprs);
-                struct select_expr se;
+                struct select_expr se = {0};
                 se.kind = SEL_WINDOW;
                 if (parse_win_call(l, tok.value, &se.win) != 0) return -1;
                 da_push(&s->select_exprs, se);
@@ -1097,12 +1267,12 @@ static int parse_select(struct lexer *l, struct query *out)
                     tok = lexer_next(l);
                     if (tok.type == TOK_KEYWORD && is_win_keyword(tok.value)
                         && peek_has_over(l)) {
-                        struct select_expr se2;
+                        struct select_expr se2 = {0};
                         se2.kind = SEL_WINDOW;
                         if (parse_win_call(l, tok.value, &se2.win) != 0) return -1;
                         da_push(&s->select_exprs, se2);
                     } else if (tok.type == TOK_IDENTIFIER) {
-                        struct select_expr se2;
+                        struct select_expr se2 = {0};
                         se2.kind = SEL_COLUMN;
                         se2.column = tok.value;
                         da_push(&s->select_exprs, se2);
@@ -1152,7 +1322,7 @@ static int parse_select(struct lexer *l, struct query *out)
             if (found_win) {
                 /* mixed column + window function list */
                 da_init(&s->select_exprs);
-                struct select_expr se;
+                struct select_expr se = {0};
                 se.kind = SEL_COLUMN;
                 se.column = tok.value;
                 da_push(&s->select_exprs, se);
@@ -1164,12 +1334,12 @@ static int parse_select(struct lexer *l, struct query *out)
                     tok = lexer_next(l);
                     if (tok.type == TOK_KEYWORD && is_win_keyword(tok.value)
                         && peek_has_over(l)) {
-                        struct select_expr se2;
+                        struct select_expr se2 = {0};
                         se2.kind = SEL_WINDOW;
                         if (parse_win_call(l, tok.value, &se2.win) != 0) return -1;
                         da_push(&s->select_exprs, se2);
                     } else if (tok.type == TOK_IDENTIFIER) {
-                        struct select_expr se2;
+                        struct select_expr se2 = {0};
                         se2.kind = SEL_COLUMN;
                         se2.column = tok.value;
                         da_push(&s->select_exprs, se2);
@@ -1268,6 +1438,81 @@ static int parse_select(struct lexer *l, struct query *out)
         da_push(&s->insert_rows, lit_row);
         s->insert_row = &s->insert_rows.items[0];
         return 0;
+    } else if (tok.type == TOK_LPAREN) {
+        /* parenthesized expression as first column: (SELECT ...) or (expr) */
+        const char *col_start = tok.value.data; /* points at '(' */
+        int depth = 1;
+        const char *col_end = tok.value.data + tok.value.len;
+        while (depth > 0) {
+            struct token pt = lexer_next(l);
+            if (pt.type == TOK_EOF) break;
+            if (pt.type == TOK_LPAREN) depth++;
+            if (pt.type == TOK_RPAREN) depth--;
+            col_end = pt.value.data + pt.value.len;
+        }
+        /* continue parsing more columns after this one */
+        for (;;) {
+            struct token peek = lexer_peek(l);
+            /* skip optional column alias */
+            if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "AS")) {
+                lexer_next(l); /* consume AS */
+                struct token alias_tok = lexer_next(l);
+                col_end = alias_tok.value.data + alias_tok.value.len;
+            }
+            peek = lexer_peek(l);
+            if (peek.type == TOK_COMMA) {
+                lexer_next(l); /* consume comma */
+                tok = lexer_next(l);
+                if (tok.type == TOK_LPAREN) {
+                    /* another parenthesized subquery */
+                    depth = 1;
+                    col_end = tok.value.data + tok.value.len;
+                    while (depth > 0) {
+                        struct token pt = lexer_next(l);
+                        if (pt.type == TOK_EOF) break;
+                        if (pt.type == TOK_LPAREN) depth++;
+                        if (pt.type == TOK_RPAREN) depth--;
+                        col_end = pt.value.data + pt.value.len;
+                    }
+                } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
+                    sv id = consume_identifier(l, tok);
+                    col_end = id.data + id.len;
+                    /* consume parenthesized args if present */
+                    peek = lexer_peek(l);
+                    if (peek.type == TOK_LPAREN) {
+                        depth = 1;
+                        lexer_next(l);
+                        while (depth > 0) {
+                            struct token pt = lexer_next(l);
+                            if (pt.type == TOK_EOF) break;
+                            if (pt.type == TOK_LPAREN) depth++;
+                            if (pt.type == TOK_RPAREN) depth--;
+                            col_end = pt.value.data + pt.value.len;
+                        }
+                    }
+                } else if (tok.type == TOK_NUMBER) {
+                    col_end = tok.value.data + tok.value.len;
+                } else {
+                    break;
+                }
+            } else if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "FROM")) {
+                s->columns = sv_from(col_start, (size_t)(col_end - col_start));
+                lexer_next(l); /* consume FROM */
+                goto parse_table_name;
+            } else if (peek.type == TOK_EOF || peek.type == TOK_SEMICOLON) {
+                /* no FROM — could be SELECT (SELECT ...) with no table */
+                s->columns = sv_from(col_start, (size_t)(col_end - col_start));
+                return 0;
+            } else {
+                break;
+            }
+        }
+        s->columns = sv_from(col_start, (size_t)(col_end - col_start));
+        tok = lexer_next(l);
+        if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "FROM"))
+            goto parse_table_name;
+        fprintf(stderr, "parse error: expected FROM after SELECT columns\n");
+        return -1;
     } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
         const char *col_start = tok.value.data;
         sv last = consume_identifier(l, tok);
@@ -1300,10 +1545,15 @@ static int parse_select(struct lexer *l, struct query *out)
             }
             /* consume arithmetic operators and operands as part of expression */
             if (peek.type == TOK_STAR || peek.type == TOK_PLUS ||
-                peek.type == TOK_MINUS || peek.type == TOK_SLASH) {
-                lexer_next(l); /* consume operator */
+                peek.type == TOK_MINUS || peek.type == TOK_SLASH ||
+                peek.type == TOK_PERCENT || peek.type == TOK_PIPE_PIPE) {
+                struct token op = lexer_next(l); /* consume operator */
+                col_end = op.value.data + op.value.len;
                 struct token operand = lexer_next(l); /* consume operand */
                 col_end = operand.value.data + operand.value.len;
+                /* if operand is a string literal, col_end points at closing quote; skip it */
+                if (operand.type == TOK_STRING)
+                    col_end++; /* include closing quote char */
                 continue;
             }
             /* skip optional column alias: AS alias — include in col_end so
@@ -1334,6 +1584,17 @@ static int parse_select(struct lexer *l, struct query *out)
                     }
                 } else if (tok.type == TOK_NUMBER) {
                     col_end = tok.value.data + tok.value.len;
+                } else if (tok.type == TOK_LPAREN) {
+                    /* parenthesized subquery or expression after comma */
+                    int depth = 1;
+                    col_end = tok.value.data + tok.value.len;
+                    while (depth > 0) {
+                        struct token pt = lexer_next(l);
+                        if (pt.type == TOK_EOF) break;
+                        if (pt.type == TOK_LPAREN) depth++;
+                        if (pt.type == TOK_RPAREN) depth--;
+                        col_end = pt.value.data + pt.value.len;
+                    }
                 } else {
                     fprintf(stderr, "parse error: expected column name or expression after ','\n");
                     return -1;
@@ -2263,12 +2524,40 @@ static int parse_update(struct lexer *l, struct query *out)
         }
 
         tok = lexer_next(l);
-        sc.value = parse_literal_value(tok);
+        /* check if the value is a simple literal or an expression */
+        {
+            struct token peek = lexer_peek(l);
+            if (peek.type == TOK_PLUS || peek.type == TOK_MINUS ||
+                peek.type == TOK_STAR || peek.type == TOK_SLASH ||
+                peek.type == TOK_PERCENT || peek.type == TOK_PIPE_PIPE) {
+                /* expression: capture from first token to end of expression */
+                const char *expr_start = tok.value.data;
+                const char *expr_end = tok.value.data + tok.value.len;
+                while (peek.type == TOK_PLUS || peek.type == TOK_MINUS ||
+                       peek.type == TOK_STAR || peek.type == TOK_SLASH ||
+                       peek.type == TOK_PERCENT || peek.type == TOK_PIPE_PIPE) {
+                    struct token op = lexer_next(l);
+                    expr_end = op.value.data + op.value.len;
+                    struct token operand = lexer_next(l);
+                    expr_end = operand.value.data + operand.value.len;
+                    if (operand.type == TOK_STRING) expr_end++;
+                    peek = lexer_peek(l);
+                }
+                sc.has_expr = 1;
+                sc.value_expr = sv_from(expr_start, (size_t)(expr_end - expr_start));
+                sc.value = (struct cell){0};
+            } else {
+                sc.has_expr = 0;
+                sc.value = parse_literal_value(tok);
+            }
+        }
         da_push(&u->set_clauses, sc);
 
-        struct token peek = lexer_peek(l);
-        if (peek.type != TOK_COMMA) break;
-        lexer_next(l); /* consume comma */
+        {
+            struct token peek = lexer_peek(l);
+            if (peek.type != TOK_COMMA) break;
+            lexer_next(l); /* consume comma */
+        }
     }
 
     /* optional FROM table */

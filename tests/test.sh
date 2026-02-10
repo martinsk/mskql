@@ -16,54 +16,85 @@
 # All sections except the test name are optional.
 # Each testcase file is run in isolation (server is restarted).
 #
+# Tests run in parallel across all available CPU cores.
+# Each worker gets a unique port (base 15433 + worker index).
+#
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TESTCASE_DIR="$(cd "$SCRIPT_DIR/cases" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PORT=5433
-PSQL="psql -h 127.0.0.1 -p $PORT -U test -d mskql --no-psqlrc -tA"
-PASS=0
-FAIL=0
-SERVER_PID=""
+BASE_PORT=${MSKQL_TEST_BASE_PORT:-15433}
+
+# detect available parallelism
+if command -v nproc >/dev/null 2>&1; then
+    NWORKERS=$(nproc)
+elif command -v sysctl >/dev/null 2>&1; then
+    NWORKERS=$(sysctl -n hw.ncpu)
+else
+    NWORKERS=4
+fi
+
+TMPDIR_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/mskql-test.XXXXXX")
+
+cleanup_all() {
+    # kill any leftover server processes we may have spawned
+    for pidfile in "$TMPDIR_ROOT"/worker-*/server.pid; do
+        [ -f "$pidfile" ] || continue
+        local pid
+        pid=$(<"$pidfile")
+        kill -TERM "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null || true
+    done
+    rm -rf "$TMPDIR_ROOT"
+}
+trap cleanup_all EXIT
+
+psql_cmd() {
+    local port="$1"; shift
+    psql -h 127.0.0.1 -p "$port" -U test -d mskql --no-psqlrc -tA "$@"
+}
 
 start_server() {
-    "$PROJECT_DIR/build/mskql" &
-    SERVER_PID=$!
+    local port="$1"
+    local pidfile="$2"
+    MSKQL_PORT="$port" "$PROJECT_DIR/build/mskql" &
+    local srv_pid=$!
+    echo "$srv_pid" > "$pidfile"
     # wait until the server is accepting connections
     for i in $(seq 1 20); do
-        if $PSQL -c "SELECT 1" >/dev/null 2>&1; then
-            return
+        if psql_cmd "$port" -c "SELECT 1" >/dev/null 2>&1; then
+            return 0
         fi
         sleep 0.25
     done
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "FATAL: server failed to start"
-        exit 1
+    if ! kill -0 "$srv_pid" 2>/dev/null; then
+        return 1
     fi
+    return 0
 }
 
 stop_server() {
-    if [ -n "$SERVER_PID" ]; then
-        kill -TERM "$SERVER_PID" 2>/dev/null
-        wait "$SERVER_PID" 2>/dev/null || true
+    local pidfile="$1"
+    if [ -f "$pidfile" ]; then
+        local pid
+        pid=$(<"$pidfile")
+        kill -TERM "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null || true
+        rm -f "$pidfile"
     fi
-    SERVER_PID=""
 }
-
-cleanup() {
-    stop_server
-}
-trap cleanup EXIT
 
 run_sql() {
-    $PSQL -c "$1" 2>&1
+    local port="$1"; shift
+    psql_cmd "$port" -c "$1" 2>&1
 }
 
 # Run multiple SQL statements in a single psql session (piped via stdin).
 # This keeps transactions alive across statements.
 run_sql_session() {
-    echo "$1" | $PSQL 2>&1
+    local port="$1"; shift
+    echo "$1" | psql_cmd "$port" 2>&1
 }
 
 # Parse a testcase file into variables:
@@ -123,23 +154,33 @@ parse_testcase() {
     fi
 }
 
+# Run a single testcase on a given port.
+# Writes "PASS" or "FAIL\n<details>" to the result file.
 run_testcase() {
     local file="$1"
+    local port="$2"
+    local result_file="$3"
+    local pidfile="$4"
+
     parse_testcase "$file"
 
     # start a fresh server for each test
-    start_server
+    if ! start_server "$port" "$pidfile"; then
+        echo "FAIL" > "$result_file"
+        echo "  FAIL: $TC_NAME (server failed to start on port $port)" >> "$result_file"
+        return
+    fi
 
     # run setup SQL — use a single session if it contains transaction statements
     # (BEGIN), otherwise run one statement at a time for reliability
     if [ -n "$TC_SETUP" ]; then
         if echo "$TC_SETUP" | grep -qiE '^BEGIN'; then
-            run_sql_session "$TC_SETUP" >/dev/null 2>&1
+            run_sql_session "$port" "$TC_SETUP" >/dev/null 2>&1
         else
             while IFS= read -r stmt; do
                 stmt="$(echo "$stmt" | sed 's/;$//')"
                 [ -z "$stmt" ] && continue
-                run_sql "$stmt" >/dev/null 2>&1
+                run_sql "$port" "$stmt" >/dev/null 2>&1
             done <<< "$TC_SETUP"
         fi
     fi
@@ -149,14 +190,14 @@ run_testcase() {
     local actual="" status=0
     if [ -n "$TC_INPUT" ]; then
         if echo "$TC_INPUT" | grep -qiE '^BEGIN|^COMMIT|^ROLLBACK'; then
-            actual=$(run_sql_session "$TC_INPUT") || status=$?
+            actual=$(run_sql_session "$port" "$TC_INPUT") || status=$?
         else
             local combined=""
             while IFS= read -r stmt; do
                 stmt="$(echo "$stmt" | sed 's/;$//')"
                 [ -z "$stmt" ] && continue
                 local out
-                out=$(run_sql "$stmt" 2>&1) || status=$?
+                out=$(run_sql "$port" "$stmt" 2>&1) || status=$?
                 if [ -n "$out" ]; then
                     if [ -n "$combined" ]; then combined="$combined"$'\n'"$out"
                     else combined="$out"; fi
@@ -166,7 +207,7 @@ run_testcase() {
         fi
     fi
 
-    stop_server
+    stop_server "$pidfile"
 
     # compare
     local ok=1
@@ -187,19 +228,21 @@ run_testcase() {
     fi
 
     if [ "$ok" -eq 1 ]; then
-        PASS=$((PASS + 1))
+        echo "PASS" > "$result_file"
     else
-        echo "  FAIL: $TC_NAME"
-        if [ -n "$TC_EXPECTED" ] && [ "$TC_EXPECTED" != "$actual" ]; then
-            echo "    expected output:"
-            echo "$TC_EXPECTED" | sed 's/^/      /'
-            echo "    actual output:"
-            echo "$actual" | sed 's/^/      /'
-        fi
-        if [ "$TC_STATUS" = "0" ] && [ "$status" -ne 0 ]; then
-            echo "    expected status 0, got $status"
-        fi
-        FAIL=$((FAIL + 1))
+        {
+            echo "FAIL"
+            echo "  FAIL: $TC_NAME"
+            if [ -n "$TC_EXPECTED" ] && [ "$TC_EXPECTED" != "$actual" ]; then
+                echo "    expected output:"
+                echo "$TC_EXPECTED" | sed 's/^/      /'
+                echo "    actual output:"
+                echo "$actual" | sed 's/^/      /'
+            fi
+            if [ "$TC_STATUS" = "0" ] && [ "$status" -ne 0 ]; then
+                echo "    expected status 0, got $status"
+            fi
+        } > "$result_file"
     fi
 }
 
@@ -210,16 +253,114 @@ if ! BUILD_OUT=$(cd "$PROJECT_DIR/src" && make clean && make 2>&1); then
     exit 1
 fi
 
-# ---- discover and run testcases ----
-
+# ---- discover testcases ----
+testfiles=()
 for f in "$TESTCASE_DIR"/*.sql; do
     [ -f "$f" ] || continue
-    run_testcase "$f"
+    testfiles+=("$f")
+done
+
+total=${#testfiles[@]}
+if [ "$total" -eq 0 ]; then
+    echo "No test cases found"
+    exit 0
+fi
+
+echo "Running $total tests across $NWORKERS workers..."
+
+# ---- run testcases in parallel ----
+# We use a simple job-slot approach: maintain up to NWORKERS background jobs.
+# Each job gets a unique port = BASE_PORT + slot_index.
+
+slot_pids=()    # PID of background job in each slot (empty = free)
+slot_files=()   # test file being run in each slot
+slot_results=() # result file path for each slot
+slot_dirs=()    # temp dir for each slot
+
+for ((i = 0; i < NWORKERS; i++)); do
+    slot_pids+=("")
+    slot_files+=("")
+    slot_results+=("")
+    d="$TMPDIR_ROOT/worker-$i"
+    mkdir -p "$d"
+    slot_dirs+=("$d")
+done
+
+PASS=0
+FAIL=0
+FAIL_OUTPUT=""
+
+# Wait for a specific slot to finish and collect its result.
+collect_slot() {
+    local s="$1"
+    wait "${slot_pids[$s]}" 2>/dev/null || true
+    local rf="${slot_results[$s]}"
+    if [ -f "$rf" ]; then
+        local first
+        first=$(head -1 "$rf")
+        if [ "$first" = "PASS" ]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            # append everything after the first line (the details)
+            local details
+            details=$(tail -n +2 "$rf")
+            if [ -n "$details" ]; then
+                FAIL_OUTPUT="${FAIL_OUTPUT}${details}"$'\n'
+            fi
+        fi
+        rm -f "$rf"
+    fi
+    slot_pids[$s]=""
+}
+
+# Find a free slot, blocking until one opens up.
+acquire_slot() {
+    while true; do
+        for ((s = 0; s < NWORKERS; s++)); do
+            if [ -z "${slot_pids[$s]}" ]; then
+                ACQUIRED_SLOT=$s
+                return
+            fi
+            # check if this slot's job has finished
+            if ! kill -0 "${slot_pids[$s]}" 2>/dev/null; then
+                collect_slot "$s"
+                ACQUIRED_SLOT=$s
+                return
+            fi
+        done
+        # all slots busy — wait briefly then retry
+        sleep 0.05
+    done
+}
+
+for f in "${testfiles[@]}"; do
+    acquire_slot
+    s=$ACQUIRED_SLOT
+    port=$((BASE_PORT + s))
+    rf="$TMPDIR_ROOT/result-$(basename "$f" .sql).txt"
+    pidfile="${slot_dirs[$s]}/server.pid"
+
+    slot_files[$s]="$f"
+    slot_results[$s]="$rf"
+
+    run_testcase "$f" "$port" "$rf" "$pidfile" &
+    slot_pids[$s]=$!
+done
+
+# wait for all remaining slots
+for ((s = 0; s < NWORKERS; s++)); do
+    if [ -n "${slot_pids[$s]}" ]; then
+        collect_slot "$s"
+    fi
 done
 
 # ---- summary ----
+if [ -n "$FAIL_OUTPUT" ]; then
+    echo "$FAIL_OUTPUT"
+fi
+
 if [ "$FAIL" -gt 0 ]; then
-    echo ""
     echo "$PASS passed, $FAIL failed"
     exit 1
 else
