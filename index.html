@@ -247,7 +247,7 @@
 <span class="subtitle">A lightweight, in-memory SQL database engine written in&nbsp;C</span>
 <p class="byline">
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-    &ensp;&middot;&ensp; ~9,100 lines of C11 &ensp;&middot;&ensp; 305 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~10,000 lines of C11 &ensp;&middot;&ensp; 350 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -279,10 +279,63 @@
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
-<!--  2. Architecture                                            -->
+<!--  2. How This Project Was Built                              -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
-<h2 id="architecture">2. Architecture</h2>
+<h2 id="construction">2. How This Project Was Built</h2>
+
+<p>
+    mskql was written entirely by AI through an adversarial collaboration between
+    two agents. No human wrote any of the C code or SQL test cases.<span class="sidenote">The
+    adversarial loop drove the implementation toward correctness the same way a rigorous
+    code-review culture does on a human team&mdash;except both sides were machines.</span>
+</p>
+
+<div class="diagram">
+<svg viewBox="0 0 620 340" xmlns="http://www.w3.org/2000/svg" font-family="'EB Garamond', Georgia, serif">
+  <rect width="620" height="340" fill="#fffff8"/>
+  <rect x="40" y="40" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
+  <text x="140" y="72" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Writer</text>
+  <text x="140" y="96" text-anchor="middle" font-size="12" fill="#555">Designs architecture</text>
+  <text x="140" y="114" text-anchor="middle" font-size="12" fill="#555">Writes code &amp; fixes bugs</text>
+  <rect x="380" y="40" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
+  <text x="480" y="72" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Challenger</text>
+  <text x="480" y="96" text-anchor="middle" font-size="12" fill="#555">Reads source code</text>
+  <text x="480" y="114" text-anchor="middle" font-size="12" fill="#555">Writes adversarial tests</text>
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#a00"/>
+    </marker>
+  </defs>
+  <path d="M240,70 C310,70 310,70 380,70" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <text x="310" y="62" text-anchor="middle" font-size="11" fill="#a00" font-style="italic">production code</text>
+  <path d="M380,120 C310,120 310,120 240,120" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <text x="310" y="136" text-anchor="middle" font-size="11" fill="#a00" font-style="italic">.sql test cases</text>
+  <path d="M140,140 L140,190 C140,210 140,210 200,210 L310,210" stroke="#ccc" stroke-width="1.2" fill="none" stroke-dasharray="4,3"/>
+  <path d="M480,140 L480,190 C480,210 480,210 420,210 L310,210" stroke="#ccc" stroke-width="1.2" fill="none" stroke-dasharray="4,3"/>
+  <circle cx="310" cy="210" r="22" fill="#fff" stroke="#a00" stroke-width="1.5"/>
+  <text x="310" y="206" text-anchor="middle" font-size="10" fill="#a00" font-weight="600">iterate</text>
+  <text x="310" y="218" text-anchor="middle" font-size="10" fill="#a00" font-weight="600">rounds</text>
+  <line x1="310" y1="232" x2="310" y2="270" stroke="#a00" stroke-width="1.5" marker-end="url(#ah)"/>
+  <rect x="180" y="275" width="260" height="48" rx="6" fill="#a00" stroke="none"/>
+  <text x="310" y="296" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">350 tests pass</text>
+  <text x="310" y="314" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.8)">~10,000 lines of C &middot; zero human code</text>
+</svg>
+</div>
+
+<p>
+    The two agents worked in iterative rounds. The Challenger would study the current
+    codebase and produce <code>.sql</code> test files exercising corner
+    cases&mdash;empty tables, NULL handling, multi-column ordering, stale index entries
+    after deletes, and more. The Writer would then run the new tests, diagnose failures,
+    and ship fixes. This continued until the full suite passed cleanly.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  3. Architecture                                            -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="architecture">3. Architecture</h2>
 
 <p>
     The system is structured as a pipeline of four stages:
@@ -304,7 +357,7 @@
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
-                2,826 lines the parser is the largest single file. It handles the full
+                3,252 lines the parser is the largest single file. It handles the full
                 grammar including CTEs, window functions, and set operations.</span></td>
         </tr>
         <tr>
@@ -333,7 +386,7 @@
 <!--  3. Supported SQL                                           -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
-<h2 id="supported-sql">3. Supported SQL</h2>
+<h2 id="supported-sql">4. Supported SQL</h2>
 
 <table>
     <thead>
@@ -396,7 +449,8 @@
         </tr>
         <tr>
             <td><strong>Expressions</strong></td>
-            <td><code>+</code> <code>-</code> <code>*</code> <code>%</code>,
+            <td><code>+</code> <code>-</code> <code>*</code> <code>/</code> <code>%</code>,
+                unary <code>-</code>, operator precedence,
                 <code>CASE WHEN&hellip;THEN&hellip;ELSE&hellip;END</code>,
                 <code>COALESCE()</code>, <code>NULLIF()</code>,
                 <code>GREATEST()</code>, <code>LEAST()</code></td>
@@ -420,7 +474,8 @@
         <tr>
             <td><strong>String functions</strong></td>
             <td><code>UPPER()</code>, <code>LOWER()</code>, <code>LENGTH()</code>,
-                <code>TRIM()</code>, <code>CONCAT()</code>, <code>||</code></td>
+                <code>TRIM()</code>, <code>CONCAT()</code>, <code>||</code>,
+                <code>SUBSTRING()</code></td>
         </tr>
         <tr>
             <td><strong>Subqueries</strong></td>
@@ -434,7 +489,7 @@
 <!--  4. Data Types                                              -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
-<h2 id="data-types">4. Data Types</h2>
+<h2 id="data-types">5. Data Types</h2>
 
 <table>
     <thead>
@@ -460,7 +515,7 @@
 <!--  5. Getting Started                                         -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
-<h2 id="getting-started">5. Getting Started</h2>
+<h2 id="getting-started">6. Getting Started</h2>
 
 <p>
     Prerequisites: a C11 compiler and <code>make</code>. Nothing else.
@@ -493,10 +548,10 @@ SELECT * FROM users;</code></pre>
 <!--  6. Testing                                                 -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
-<h2 id="testing">6. Testing</h2>
+<h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes 305 SQL test cases covering DDL, DML, joins, aggregation,
+    The project includes 350 SQL test cases covering DDL, DML, joins, aggregation,
     window functions, set operations, CTEs, transactions, NULL handling, type coercion,
     constraint enforcement, string functions, and various edge cases. A separate
     concurrent test harness exercises multi-client scenarios.<span class="sidenote">Each
@@ -511,7 +566,7 @@ SELECT * FROM users;</code></pre>
 <!--  7. Benchmarks                                              -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
-<h2 id="benchmarks">7. Benchmarks</h2>
+<h2 id="benchmarks">8. Benchmarks</h2>
 
 <p>
     A micro-benchmark suite measures wall-clock time for core operations: bulk insert,
@@ -521,76 +576,6 @@ SELECT * FROM users;</code></pre>
 
 <p>
     &#8594;&ensp;<a href="dev/bench/index.html"><strong>View historical benchmark charts</strong></a>
-</p>
-
-<!-- ═══════════════════════════════════════════════════════════ -->
-<!--  8. How This Project Was Built                              -->
-<!-- ═══════════════════════════════════════════════════════════ -->
-
-<h2 id="construction">8. How This Project Was Built</h2>
-
-<p>
-    mskql was written entirely by AI through an adversarial collaboration between
-    two agents. No human wrote any of the C code or SQL test cases.<span class="sidenote">The
-    adversarial loop drove the implementation toward correctness the same way a rigorous
-    code-review culture does on a human team&mdash;except both sides were machines.</span>
-</p>
-
-<div class="diagram">
-<svg viewBox="0 0 620 340" xmlns="http://www.w3.org/2000/svg" font-family="'EB Garamond', Georgia, serif">
-  <!-- Background -->
-  <rect width="620" height="340" fill="#fffff8"/>
-
-  <!-- Writer box -->
-  <rect x="40" y="40" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
-  <text x="140" y="72" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Writer</text>
-  <text x="140" y="96" text-anchor="middle" font-size="12" fill="#555">Designs architecture</text>
-  <text x="140" y="114" text-anchor="middle" font-size="12" fill="#555">Writes code &amp; fixes bugs</text>
-
-  <!-- Challenger box -->
-  <rect x="380" y="40" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
-  <text x="480" y="72" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Challenger</text>
-  <text x="480" y="96" text-anchor="middle" font-size="12" fill="#555">Reads source code</text>
-  <text x="480" y="114" text-anchor="middle" font-size="12" fill="#555">Writes adversarial tests</text>
-
-  <!-- Arrow: Writer -> Challenger (top) -->
-  <defs>
-    <marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-      <path d="M0,0 L8,3 L0,6" fill="#a00"/>
-    </marker>
-  </defs>
-  <path d="M240,70 C310,70 310,70 380,70" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  <text x="310" y="62" text-anchor="middle" font-size="11" fill="#a00" font-style="italic">production code</text>
-
-  <!-- Arrow: Challenger -> Writer (bottom) -->
-  <path d="M380,120 C310,120 310,120 240,120" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  <text x="310" y="136" text-anchor="middle" font-size="11" fill="#a00" font-style="italic">.sql test cases</text>
-
-  <!-- Cycle arrow down from both -->
-  <path d="M140,140 L140,190 C140,210 140,210 200,210 L310,210" stroke="#ccc" stroke-width="1.2" fill="none" stroke-dasharray="4,3"/>
-  <path d="M480,140 L480,190 C480,210 480,210 420,210 L310,210" stroke="#ccc" stroke-width="1.2" fill="none" stroke-dasharray="4,3"/>
-
-  <!-- Iteration circle -->
-  <circle cx="310" cy="210" r="22" fill="#fff" stroke="#a00" stroke-width="1.5"/>
-  <text x="310" y="206" text-anchor="middle" font-size="10" fill="#a00" font-weight="600">iterate</text>
-  <text x="310" y="218" text-anchor="middle" font-size="10" fill="#a00" font-weight="600">rounds</text>
-
-  <!-- Arrow down to result -->
-  <line x1="310" y1="232" x2="310" y2="270" stroke="#a00" stroke-width="1.5" marker-end="url(#ah)"/>
-
-  <!-- Result box -->
-  <rect x="180" y="275" width="260" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="296" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">305 tests pass</text>
-  <text x="310" y="314" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.8)">~9,100 lines of C &middot; zero human code</text>
-</svg>
-</div>
-
-<p>
-    The two agents worked in iterative rounds. The Challenger would study the current
-    codebase and produce <code>.sql</code> test files exercising corner
-    cases&mdash;empty tables, NULL handling, multi-column ordering, stale index entries
-    after deletes, and more. The Writer would then run the new tests, diagnose failures,
-    and ship fixes. This continued until the full suite passed cleanly.
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
