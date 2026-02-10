@@ -192,6 +192,9 @@ static char *make_aliased_name(const char *alias, const char *col_name)
     return buf;
 }
 
+/* JPL ownership: column names allocated here (make_aliased_name, strdup) are
+ * freed by free_merged_columns → column_free, called from exec_join (same
+ * logical scope within database.c). */
 static void build_merged_columns_ex(struct table *t1, const char *alias1,
                                      struct table *t2, const char *alias2,
                                      struct table *out_meta)
@@ -376,7 +379,9 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
 
     if (ji->is_lateral && ji->lateral_subquery_sql != IDX_NONE) {
         /* LATERAL JOIN: for each row of t1, execute the subquery and cross-join */
-        /* build merged column metadata: t1 columns + lateral result columns */
+        /* build merged column metadata: t1 columns + lateral result columns.
+         * JPL ownership: strdup'd column names freed by free_merged_columns
+         * at end of exec_join (same function scope). */
         for (size_t c = 0; c < t1->columns.count; c++) {
             struct column col = {0};
             if (a1) {
@@ -588,7 +593,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
         for (size_t i = 0; i < merged.count; i++) {
             merged_t.rows.items = merged.data;
             merged_t.rows.count = merged.count;
-            if (eval_condition(s->where.where_cond, a, &merged.data[i], &merged_t)) {
+            if (eval_condition(s->where.where_cond, a, &merged.data[i], &merged_t, db)) {
                 if (write != i)
                     merged.data[write] = merged.data[i];
                 write++;
@@ -758,23 +763,11 @@ static void resolve_subqueries(struct database *db, struct query_arena *arena, u
         resolve_subqueries(db, arena, c->left);
         return;
     }
-    /* EXISTS / NOT EXISTS subquery */
+    /* EXISTS / NOT EXISTS: defer to eval_condition for per-row evaluation
+     * (supports correlated subqueries that reference outer table columns) */
     if (c->type == COND_COMPARE && c->subquery_sql != IDX_NONE &&
         (c->op == CMP_EXISTS || c->op == CMP_NOT_EXISTS)) {
-        struct query sq = {0};
-        if (query_parse(ASTRING(arena, c->subquery_sql), &sq) == 0) {
-            struct rows sq_result = {0};
-            if (db_exec(db, &sq, &sq_result) == 0) {
-                c->value.type = COLUMN_TYPE_INT;
-                c->value.value.as_int = (sq_result.count > 0) ? 1 : 0;
-                for (size_t i = 0; i < sq_result.count; i++)
-                    row_free(&sq_result.data[i]);
-                free(sq_result.data);
-            }
-        }
-        query_free(&sq);
-        c->subquery_sql = IDX_NONE;
-        return;
+        return; /* leave subquery_sql set for eval_condition */
     }
     if (c->type == COND_COMPARE && c->subquery_sql != IDX_NONE &&
         (c->op == CMP_IN || c->op == CMP_NOT_IN)) {
@@ -889,6 +882,10 @@ static void snapshot_restore(struct database *db, struct db_snapshot *snap)
 /* Materialize a subquery into a temporary table added to db->tables.
  * Returns a pointer to the new table, or NULL on failure.
  * The caller is responsible for removing the table when done. */
+/* JPL ownership: the temp table returned here (column names, row cells) is
+ * freed by remove_temp_table → table_free, called from db_exec_query which
+ * is the sole caller.  Ownership is: materialize allocates, db_exec_query
+ * uses and then removes — a clear producer/consumer pair in the same file. */
 static struct table *materialize_subquery(struct database *db, const char *sql,
                                           const char *table_name)
 {
@@ -918,7 +915,7 @@ static struct table *materialize_subquery(struct database *db, const char *sql,
                 col.type = src_t->columns.items[c].type;
                 da_push(&ct.columns, col);
             }
-        } else if (src_t) {
+        } else if (src_t || sq.select.columns.len > 0) {
             sv cols = sq.select.columns;
             size_t ci = 0;
             while (cols.len > 0 && ci < ncells) {
@@ -1587,21 +1584,56 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                         t_join_col = r_in_t; ft_join_col = l_in_ft;
                     }
                 }
+                /* build merged table descriptor: target columns + FROM columns
+                 * (prefixed with FROM table name for qualified refs) */
+                struct table merged_meta = {0};
+                da_init(&merged_meta.columns);
+                da_init(&merged_meta.rows);
+                da_init(&merged_meta.indexes);
+                for (size_t c = 0; c < t->columns.count; c++) {
+                    struct column col = {0};
+                    col.name = strdup(t->columns.items[c].name);
+                    col.type = t->columns.items[c].type;
+                    da_push(&merged_meta.columns, col);
+                }
+                char ft_name_buf[256];
+                snprintf(ft_name_buf, sizeof(ft_name_buf), "%.*s",
+                         (int)u->update_from_table.len, u->update_from_table.data);
+                for (size_t c = 0; c < ft->columns.count; c++) {
+                    struct column col = {0};
+                    char buf[512];
+                    snprintf(buf, sizeof(buf), "%s.%s", ft_name_buf, ft->columns.items[c].name);
+                    col.name = strdup(buf);
+                    col.type = ft->columns.items[c].type;
+                    da_push(&merged_meta.columns, col);
+                }
+
                 size_t updated = 0;
                 for (size_t i = 0; i < t->rows.count; i++) {
                     int matched = 0;
+                    size_t matched_j = 0;
                     for (size_t j = 0; j < ft->rows.count; j++) {
                         if (t_join_col >= 0 && ft_join_col >= 0) {
                             if (cell_equal(&t->rows.items[i].cells.items[t_join_col],
                                             &ft->rows.items[j].cells.items[ft_join_col])) {
                                 matched = 1;
+                                matched_j = j;
                                 break;
                             }
                         }
                     }
                     if (!matched) continue;
                     updated++;
-                    /* evaluate all SET expressions against pre-update snapshot */
+
+                    /* build merged row: target row cells + FROM row cells */
+                    struct row merged_row = {0};
+                    da_init(&merged_row.cells);
+                    for (size_t c = 0; c < t->rows.items[i].cells.count; c++)
+                        da_push(&merged_row.cells, t->rows.items[i].cells.items[c]);
+                    for (size_t c = 0; c < ft->rows.items[matched_j].cells.count; c++)
+                        da_push(&merged_row.cells, ft->rows.items[matched_j].cells.items[c]);
+
+                    /* evaluate all SET expressions against merged row */
                     uint32_t nsc = u->set_clauses_count;
                     struct cell *new_vals = calloc(nsc, sizeof(struct cell));
                     int *col_idxs = calloc(nsc, sizeof(int));
@@ -1610,7 +1642,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                         col_idxs[sc] = table_find_column_sv(t, scp->column);
                         if (col_idxs[sc] < 0) { new_vals[sc] = (struct cell){0}; continue; }
                         if (scp->expr_idx != IDX_NONE) {
-                            new_vals[sc] = eval_expr(scp->expr_idx, &q->arena, t, &t->rows.items[i], db);
+                            new_vals[sc] = eval_expr(scp->expr_idx, &q->arena, &merged_meta, &merged_row, db);
                         } else {
                             cell_copy(&new_vals[sc], &scp->value);
                         }
@@ -1624,7 +1656,14 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     }
                     free(new_vals);
                     free(col_idxs);
+                    da_free(&merged_row.cells);
                 }
+                /* free merged table descriptor */
+                for (size_t c = 0; c < merged_meta.columns.count; c++)
+                    free(merged_meta.columns.items[c].name);
+                da_free(&merged_meta.columns);
+                da_free(&merged_meta.rows);
+                da_free(&merged_meta.indexes);
                 if (result) {
                     struct row r = {0};
                     da_init(&r.cells);

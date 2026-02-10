@@ -6,5 +6,5 @@ INSERT INTO sales (dept, amount) VALUES ('eng', 100), ('eng', NULL), ('eng', 200
 SELECT dept, SUM(amount) FROM sales GROUP BY dept ORDER BY dept;
 -- expected output:
 eng|300
-sales|0
+sales|
 -- expected status: 0

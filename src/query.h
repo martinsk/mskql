@@ -22,6 +22,7 @@ struct agg_expr {
     enum agg_func func;
     sv column;
     sv alias; /* optional AS alias name */
+    int has_distinct; /* COUNT(DISTINCT col) */
 };
 
 enum win_func {
@@ -120,7 +121,8 @@ struct condition {
 };
 
 int eval_condition(uint32_t cond_idx, struct query_arena *arena,
-                   struct row *row, struct table *t);
+                   struct row *row, struct table *t,
+                   struct database *db);
 
 /* ---------------------------------------------------------------------------
  * Expression AST — tagged union for all SQL expressions.

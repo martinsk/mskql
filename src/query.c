@@ -7,6 +7,11 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+/* forward declarations for cell helpers used by legacy eval functions */
+static void cell_release(struct cell *c);
+static struct cell cell_deep_copy(const struct cell *src);
+static int cell_is_null(const struct cell *c);
+
 /* SQL LIKE pattern matching: % = any sequence, _ = any single char */
 static int like_match(const char *pattern, const char *text, int case_insensitive)
 {
@@ -37,23 +42,24 @@ static int like_match(const char *pattern, const char *text, int case_insensitiv
 
 /* cell_cmp → use shared cell_compare from row.h (returns -2 for incompatible types) */
 
-static int row_matches(struct table *t, struct where_clause *w, struct query_arena *arena, struct row *row);
+static int row_matches(struct table *t, struct where_clause *w, struct query_arena *arena, struct row *row, struct database *db);
 static double cell_to_double(const struct cell *c);
 
 int eval_condition(uint32_t cond_idx, struct query_arena *arena,
-                   struct row *row, struct table *t)
+                   struct row *row, struct table *t,
+                   struct database *db)
 {
     if (cond_idx == IDX_NONE) return 1;
     struct condition *cond = &COND(arena, cond_idx);
     switch (cond->type) {
         case COND_AND:
-            return eval_condition(cond->left, arena, row, t) &&
-                   eval_condition(cond->right, arena, row, t);
+            return eval_condition(cond->left, arena, row, t, db) &&
+                   eval_condition(cond->right, arena, row, t, db);
         case COND_OR:
-            return eval_condition(cond->left, arena, row, t) ||
-                   eval_condition(cond->right, arena, row, t);
+            return eval_condition(cond->left, arena, row, t, db) ||
+                   eval_condition(cond->right, arena, row, t, db);
         case COND_NOT:
-            return !eval_condition(cond->left, arena, row, t);
+            return !eval_condition(cond->left, arena, row, t, db);
         case COND_MULTI_IN: {
             /* multi-column IN: (a, b) IN ((1,2), (3,4)) */
             int width = cond->multi_tuple_width;
@@ -83,11 +89,62 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
             return cond->op == CMP_NOT_IN ? !found : found;
         }
         case COND_COMPARE: {
-            /* EXISTS / NOT EXISTS — no column reference needed */
-            if (cond->op == CMP_EXISTS)
-                return cond->value.value.as_int != 0;
-            if (cond->op == CMP_NOT_EXISTS)
+            /* EXISTS / NOT EXISTS */
+            if (cond->op == CMP_EXISTS || cond->op == CMP_NOT_EXISTS) {
+                /* correlated: subquery_sql still set → execute per-row */
+                if (cond->subquery_sql != IDX_NONE && db) {
+                    const char *sql_tmpl = ASTRING(arena, cond->subquery_sql);
+                    /* substitute outer table.col references with literal values */
+                    char sql_buf[4096];
+                    strncpy(sql_buf, sql_tmpl, sizeof(sql_buf) - 1);
+                    sql_buf[sizeof(sql_buf) - 1] = '\0';
+                    for (size_t ci = 0; ci < t->columns.count; ci++) {
+                        const char *cname = t->columns.items[ci].name;
+                        char ref[256];
+                        snprintf(ref, sizeof(ref), "%s.%s", t->name, cname);
+                        size_t rlen = strlen(ref);
+                        char lit[256];
+                        struct cell *cv = &row->cells.items[ci];
+                        if (cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text))
+                            snprintf(lit, sizeof(lit), "NULL");
+                        else if (cv->type == COLUMN_TYPE_INT)
+                            snprintf(lit, sizeof(lit), "%d", cv->value.as_int);
+                        else if (cv->type == COLUMN_TYPE_FLOAT)
+                            snprintf(lit, sizeof(lit), "%g", cv->value.as_float);
+                        else if (column_type_is_text(cv->type) && cv->value.as_text)
+                            snprintf(lit, sizeof(lit), "'%s'", cv->value.as_text);
+                        else
+                            continue;
+                        size_t llen = strlen(lit);
+                        char *pos;
+                        while ((pos = strstr(sql_buf, ref)) != NULL) {
+                            char after = pos[rlen];
+                            if (isalnum((unsigned char)after) || after == '_') break;
+                            size_t cur_len = strlen(sql_buf);
+                            if (cur_len - rlen + llen >= sizeof(sql_buf) - 1) break;
+                            memmove(pos + llen, pos + rlen, cur_len - (size_t)(pos - sql_buf) - rlen + 1);
+                            memcpy(pos, lit, llen);
+                        }
+                    }
+                    struct query sq = {0};
+                    int has_rows = 0;
+                    if (query_parse(sql_buf, &sq) == 0) {
+                        struct rows sq_result = {0};
+                        if (db_exec(db, &sq, &sq_result) == 0) {
+                            has_rows = (sq_result.count > 0);
+                            for (size_t i = 0; i < sq_result.count; i++)
+                                row_free(&sq_result.data[i]);
+                            free(sq_result.data);
+                        }
+                    }
+                    query_free(&sq);
+                    return cond->op == CMP_EXISTS ? has_rows : !has_rows;
+                }
+                /* pre-resolved (non-correlated) */
+                if (cond->op == CMP_EXISTS)
+                    return cond->value.value.as_int != 0;
                 return cond->value.value.as_int == 0;
+            }
             struct cell lhs_tmp = {0};
             struct cell *c;
             if (cond->lhs_expr != IDX_NONE) {
@@ -106,9 +163,10 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                        ? (c->value.as_text != NULL) : 1);
             /* IN / NOT IN */
             if (cond->op == CMP_IN || cond->op == CMP_NOT_IN) {
-                /* SQL standard: NULL IN (...) → UNKNOWN (false) */
+                /* SQL standard: NULL IN (...) → UNKNOWN (false);
+                 * NULL NOT IN (...) → UNKNOWN (false) */
                 if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
-                    return cond->op == CMP_NOT_IN ? 1 : 0;
+                    return 0;
                 int found = 0;
                 for (uint32_t i = 0; i < cond->in_values_count; i++) {
                     struct cell *iv = &ACELL(arena, cond->in_values_start + i);
@@ -309,6 +367,7 @@ static struct cell resolve_arg(sv arg, struct table *t, struct row *src)
     if (arg.len >= 2 && arg.data[0] == '\'') {
         struct cell c = {0};
         c.type = COLUMN_TYPE_TEXT;
+        /* caller owns returned text — see JPL contract at cell_release() */
         c.value.as_text = malloc(arg.len - 1);
         memcpy(c.value.as_text, arg.data + 1, arg.len - 2);
         c.value.as_text[arg.len - 2] = '\0';
@@ -327,12 +386,8 @@ static struct cell resolve_arg(sv arg, struct table *t, struct row *src)
                 struct cell c = { .type = sc->type, .is_null = 1 };
                 return c;
             }
-            struct cell copy = { .type = sc->type };
-            if (column_type_is_text(sc->type) && sc->value.as_text)
-                copy.value.as_text = strdup(sc->value.as_text);
-            else
-                copy.value = sc->value;
-            return copy;
+            /* caller owns returned cell — see JPL contract at cell_release() */
+            return cell_deep_copy(sc);
         }
     }
 
@@ -365,9 +420,9 @@ static struct cell eval_coalesce(sv expr, struct table *t, struct row *src)
 
     for (int i = 0; i < n; i++) {
         struct cell c = resolve_arg(args[i], t, src);
-        if (!c.is_null && !(column_type_is_text(c.type) && !c.value.as_text))
-            return c;
-        if (column_type_is_text(c.type) && c.value.as_text) free(c.value.as_text);
+        if (!cell_is_null(&c))
+            return c; /* ownership transfers to caller */
+        cell_release(&c);
     }
 
     /* all NULL */
@@ -402,14 +457,14 @@ static struct cell eval_scalar_func(sv expr, struct table *t, struct row *src)
         struct cell a = resolve_arg(args[0], t, src);
         struct cell b = resolve_arg(args[1], t, src);
         /* if a == b, return NULL; else return a */
-        if (!a.is_null && !b.is_null && cell_equal(&a, &b)) {
-            if (column_type_is_text(a.type) && a.value.as_text) free(a.value.as_text);
-            if (column_type_is_text(b.type) && b.value.as_text) free(b.value.as_text);
+        if (!cell_is_null(&a) && !cell_is_null(&b) && cell_equal(&a, &b)) {
+            cell_release(&a);
+            cell_release(&b);
             struct cell null_cell = { .type = a.type, .is_null = 1 };
             return null_cell;
         }
-        if (column_type_is_text(b.type) && b.value.as_text) free(b.value.as_text);
-        return a;
+        cell_release(&b);
+        return a; /* ownership transfers to caller */
     }
 
     if (sv_eq_ignorecase_cstr(fname, "GREATEST") || sv_eq_ignorecase_cstr(fname, "LEAST")) {
@@ -421,26 +476,26 @@ static struct cell eval_scalar_func(sv expr, struct table *t, struct row *src)
             return null_cell;
         }
         struct cell best = resolve_arg(args[0], t, src);
-        int best_null = best.is_null || (column_type_is_text(best.type) && !best.value.as_text);
+        int best_null = cell_is_null(&best);
         for (int i = 1; i < n; i++) {
             struct cell cur = resolve_arg(args[i], t, src);
-            int cur_null = cur.is_null || (column_type_is_text(cur.type) && !cur.value.as_text);
+            int cur_null = cell_is_null(&cur);
             if (best_null) {
-                if (column_type_is_text(best.type) && best.value.as_text) free(best.value.as_text);
+                cell_release(&best);
                 best = cur;
                 best_null = cur_null;
                 continue;
             }
-            if (cur_null) { if (column_type_is_text(cur.type) && cur.value.as_text) free(cur.value.as_text); continue; }
+            if (cur_null) { cell_release(&cur); continue; }
             int cmp = cell_compare(&cur, &best);
             if ((is_greatest && cmp > 0) || (!is_greatest && cmp < 0)) {
-                if (column_type_is_text(best.type) && best.value.as_text) free(best.value.as_text);
+                cell_release(&best);
                 best = cur;
             } else {
-                if (column_type_is_text(cur.type) && cur.value.as_text) free(cur.value.as_text);
+                cell_release(&cur);
             }
         }
-        return best;
+        return best; /* ownership transfers to caller */
     }
 
     if (sv_eq_ignorecase_cstr(fname, "UPPER") || sv_eq_ignorecase_cstr(fname, "LOWER")) {
@@ -458,11 +513,11 @@ static struct cell eval_scalar_func(sv expr, struct table *t, struct row *src)
         struct cell arg = resolve_arg(body, t, src);
         struct cell result = {0};
         result.type = COLUMN_TYPE_INT;
-        if (arg.is_null || (column_type_is_text(arg.type) && !arg.value.as_text)) {
+        if (cell_is_null(&arg)) {
             result.is_null = 1;
         } else if (column_type_is_text(arg.type) && arg.value.as_text) {
             result.value.as_int = (int)strlen(arg.value.as_text);
-            free(arg.value.as_text);
+            cell_release(&arg);
         } else {
             result.value.as_int = 0;
         }
@@ -480,7 +535,7 @@ static struct cell eval_scalar_func(sv expr, struct table *t, struct row *src)
             char *trimmed = malloc((size_t)(e - s) + 1);
             memcpy(trimmed, s, (size_t)(e - s));
             trimmed[e - s] = '\0';
-            free(arg.value.as_text);
+            free(arg.value.as_text); /* replace in-place, not a cross-scope transfer */
             arg.value.as_text = trimmed;
         }
         return arg;
@@ -582,8 +637,8 @@ static struct cell eval_case_when(sv expr, struct table *t, struct row *src)
                     if ((size_t)(cond_sv.data + cond_sv.len - after_is) >= 4 &&
                         strncasecmp(after_is, "NULL", 4) == 0) {
                         struct cell col_val = resolve_arg(col_part, t, src);
-                        int col_is_null = col_val.is_null || (column_type_is_text(col_val.type) && !col_val.value.as_text);
-                        if (column_type_is_text(col_val.type) && col_val.value.as_text) free(col_val.value.as_text);
+                        int col_is_null = cell_is_null(&col_val);
+                        cell_release(&col_val);
                         cond_match = is_not_null ? !col_is_null : col_is_null;
                         goto case_cond_done;
                     }
@@ -845,6 +900,7 @@ static struct cell eval_arith_expr(sv expr, struct table *t, struct row *src)
         }
         buf[buf_len] = '\0';
         result.type = COLUMN_TYPE_TEXT;
+        /* caller owns returned text — see JPL contract at cell_release() */
         result.value.as_text = strdup(buf);
         return result;
     }
@@ -917,7 +973,27 @@ static struct cell eval_arith_expr(sv expr, struct table *t, struct row *src)
 /* ---------------------------------------------------------------------------
  * AST-based expression evaluator — walks the expression tree produced by
  * parse_expr and returns a cell value.
+ *
+ * JPL ownership contract for cell text:
+ *   - Factory functions (cell_make_text, cell_deep_copy, cell_to_text)
+ *     allocate text via strdup/malloc.  Ownership transfers to the caller.
+ *   - The caller must either:
+ *       (a) pass the cell into a result row (row_free releases the text), or
+ *       (b) call cell_release() to free the text when discarding the cell.
+ *   - cell_release() is the single canonical release function; all discard
+ *     paths must go through it so ownership is auditable.
  * ------------------------------------------------------------------------- */
+
+/* Release any owned text in a cell.  After this call the cell must not be
+ * used.  This is the ONLY function that should free cell text outside of
+ * row_free (which iterates cells at end-of-life). */
+static void cell_release(struct cell *c)
+{
+    if (column_type_is_text(c->type) && c->value.as_text) {
+        free(c->value.as_text);
+        c->value.as_text = NULL;
+    }
+}
 
 static struct cell cell_make_null(void)
 {
@@ -943,6 +1019,8 @@ static struct cell cell_make_float(double v)
     return c;
 }
 
+/* Allocate a TEXT cell with a strdup'd copy of s.  Caller owns the text
+ * and must either push the cell into a result row or call cell_release(). */
 static struct cell cell_make_text(const char *s)
 {
     struct cell c = {0};
@@ -952,6 +1030,8 @@ static struct cell cell_make_text(const char *s)
     return c;
 }
 
+/* Deep-copy a cell, strdup'ing any text.  Caller owns the copy and must
+ * either push it into a result row or call cell_release(). */
 static struct cell cell_deep_copy(const struct cell *src)
 {
     struct cell c = { .type = src->type, .is_null = src->is_null };
@@ -975,6 +1055,8 @@ static double cell_to_double_val(const struct cell *c)
     return 0.0;
 }
 
+/* Return a malloc'd NUL-terminated string representation of the cell.
+ * Caller owns the returned pointer and must free() it. */
 static char *cell_to_text(const struct cell *c)
 {
     if (cell_is_null(c)) return NULL;
@@ -1045,8 +1127,8 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         if (e->binary.op == OP_CONCAT) {
             /* SQL standard: NULL || anything = NULL */
             if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
-                if (column_type_is_text(lhs.type) && lhs.value.as_text) free(lhs.value.as_text);
-                if (column_type_is_text(rhs.type) && rhs.value.as_text) free(rhs.value.as_text);
+                cell_release(&lhs);
+                cell_release(&rhs);
                 return cell_make_null();
             }
             char *ls = cell_to_text(&lhs);
@@ -1058,8 +1140,9 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             if (rs) memcpy(buf + llen, rs, rlen);
             buf[llen + rlen] = '\0';
             free(ls); free(rs);
-            if (column_type_is_text(lhs.type) && lhs.value.as_text) free(lhs.value.as_text);
-            if (column_type_is_text(rhs.type) && rhs.value.as_text) free(rhs.value.as_text);
+            cell_release(&lhs);
+            cell_release(&rhs);
+            /* caller owns returned text — see JPL contract at cell_release() */
             struct cell c = {0};
             c.type = COLUMN_TYPE_TEXT;
             c.value.as_text = buf;
@@ -1068,8 +1151,8 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
 
         /* arithmetic: NULL propagation */
         if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
-            if (column_type_is_text(lhs.type) && lhs.value.as_text) free(lhs.value.as_text);
-            if (column_type_is_text(rhs.type) && rhs.value.as_text) free(rhs.value.as_text);
+            cell_release(&lhs);
+            cell_release(&rhs);
             struct cell c = {0};
             c.type = COLUMN_TYPE_INT;
             c.is_null = 1;
@@ -1090,8 +1173,8 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         }
 
         int use_float = (lhs.type == COLUMN_TYPE_FLOAT || rhs.type == COLUMN_TYPE_FLOAT);
-        if (column_type_is_text(lhs.type) && lhs.value.as_text) free(lhs.value.as_text);
-        if (column_type_is_text(rhs.type) && rhs.value.as_text) free(rhs.value.as_text);
+        cell_release(&lhs);
+        cell_release(&rhs);
 
         if (use_float || result_v != (double)(int)result_v)
             return cell_make_float(result_v);
@@ -1106,8 +1189,8 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         if (fn == FUNC_COALESCE) {
             for (uint32_t i = 0; i < nargs; i++) {
                 struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db);
-                if (!cell_is_null(&c)) return c;
-                if (column_type_is_text(c.type) && c.value.as_text) free(c.value.as_text);
+                if (!cell_is_null(&c)) return c; /* ownership transfers to caller */
+                cell_release(&c);
             }
             return cell_make_null();
         }
@@ -1117,13 +1200,13 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db);
             struct cell b = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db);
             if (!cell_is_null(&a) && !cell_is_null(&b) && cell_equal(&a, &b)) {
-                if (column_type_is_text(a.type) && a.value.as_text) free(a.value.as_text);
-                if (column_type_is_text(b.type) && b.value.as_text) free(b.value.as_text);
+                cell_release(&a);
+                cell_release(&b);
                 struct cell n = { .type = a.type, .is_null = 1 };
                 return n;
             }
-            if (column_type_is_text(b.type) && b.value.as_text) free(b.value.as_text);
-            return a;
+            cell_release(&b);
+            return a; /* ownership transfers to caller */
         }
 
         if (fn == FUNC_GREATEST || fn == FUNC_LEAST) {
@@ -1135,20 +1218,20 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
                 struct cell cur = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db);
                 int cur_null = cell_is_null(&cur);
                 if (best_null) {
-                    if (column_type_is_text(best.type) && best.value.as_text) free(best.value.as_text);
+                    cell_release(&best);
                     best = cur; best_null = cur_null;
                     continue;
                 }
                 if (cur_null) {
-                    if (column_type_is_text(cur.type) && cur.value.as_text) free(cur.value.as_text);
+                    cell_release(&cur);
                     continue;
                 }
                 int cmp = cell_compare(&cur, &best);
                 if ((is_greatest && cmp > 0) || (!is_greatest && cmp < 0)) {
-                    if (column_type_is_text(best.type) && best.value.as_text) free(best.value.as_text);
+                    cell_release(&best);
                     best = cur;
                 } else {
-                    if (column_type_is_text(cur.type) && cur.value.as_text) free(cur.value.as_text);
+                    cell_release(&cur);
                 }
             }
             return best;
@@ -1175,7 +1258,7 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             }
             if (column_type_is_text(arg.type) && arg.value.as_text) {
                 int len = (int)strlen(arg.value.as_text);
-                free(arg.value.as_text);
+                cell_release(&arg);
                 return cell_make_int(len);
             }
             return cell_make_int(0);
@@ -1193,10 +1276,10 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
                 char *trimmed = malloc((size_t)(end - s) + 1);
                 memcpy(trimmed, s, (size_t)(end - s));
                 trimmed[end - s] = '\0';
-                free(arg.value.as_text);
+                free(arg.value.as_text); /* replace in-place, not a cross-scope transfer */
                 arg.value.as_text = trimmed;
             }
-            return arg;
+            return arg; /* ownership transfers to caller */
         }
 
         if (fn == FUNC_SUBSTRING) {
@@ -1204,13 +1287,13 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db);
             struct cell from_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db);
             if (cell_is_null(&str)) {
-                if (column_type_is_text(from_c.type) && from_c.value.as_text) free(from_c.value.as_text);
+                cell_release(&from_c);
                 return str;
             }
             int from = (int)cell_to_double_val(&from_c);
             if (from < 1) from = 1;
             from--; /* convert to 0-based */
-            if (column_type_is_text(from_c.type) && from_c.value.as_text) free(from_c.value.as_text);
+            cell_release(&from_c);
 
             if (column_type_is_text(str.type) && str.value.as_text) {
                 int slen = (int)strlen(str.value.as_text);
@@ -1218,7 +1301,7 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
                 if (nargs >= 3) {
                     struct cell len_c = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db);
                     len = (int)cell_to_double_val(&len_c);
-                    if (column_type_is_text(len_c.type) && len_c.value.as_text) free(len_c.value.as_text);
+                    cell_release(&len_c);
                 }
                 if (from >= slen || len <= 0) {
                     free(str.value.as_text);
@@ -1241,7 +1324,7 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
     case EXPR_CASE_WHEN: {
         for (uint32_t i = 0; i < e->case_when.branches_count; i++) {
             struct case_when_branch *b = &ABRANCH(arena, e->case_when.branches_start + i);
-            if (eval_condition(b->cond_idx, arena, row, t))
+            if (eval_condition(b->cond_idx, arena, row, t, NULL))
                 return eval_expr(b->then_expr_idx, arena, t, row, db);
         }
         if (e->case_when.else_expr != IDX_NONE)
@@ -1316,6 +1399,11 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
     return cell_make_null();
 }
 
+/* JPL ownership: emit_row receives cells with owned text from eval_expr,
+ * eval_scalar_func, and resolve_arg.  It pushes them into the result row
+ * without copying — ownership transfers from the producer to the result row.
+ * row_free() is the single release point for all cell text in the result.
+ * The select_all path strdup's source cells (alloc+push in same scope). */
 static void emit_row(struct table *t, struct query_select *s, struct query_arena *arena,
                      struct row *src, struct rows *result, int select_all,
                      struct database *db)
@@ -1578,7 +1666,7 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
     for (size_t i = 0; i < t->rows.count; i++) {
         if (s->where.has_where) {
             if (s->where.where_cond != IDX_NONE) {
-                if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t))
+                if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
                     continue;
             } else if (where_col >= 0) {
                 if (!cell_equal(&t->rows.items[i].cells.items[where_col],
@@ -1613,11 +1701,43 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
         switch (ae->func) {
             case AGG_COUNT:
                 c.type = COLUMN_TYPE_INT;
-                /* COUNT(*) counts all rows; COUNT(col) counts non-NULL */
-                c.value.as_int = (agg_col[a] < 0) ? (int)row_count : (int)nonnull_count[a];
+                if (ae->has_distinct && agg_col[a] >= 0) {
+                    /* COUNT(DISTINCT col): count unique non-NULL values */
+                    int distinct_count = 0;
+                    struct cell *seen = NULL;
+                    if (nonnull_count[a] > 0)
+                        seen = calloc(nonnull_count[a], sizeof(struct cell));
+                    for (size_t i = 0; i < t->rows.count; i++) {
+                        if (s->where.has_where) {
+                            if (s->where.where_cond != IDX_NONE) {
+                                if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
+                                    continue;
+                            } else if (where_col >= 0) {
+                                if (!cell_equal(&t->rows.items[i].cells.items[where_col], &s->where.where_value))
+                                    continue;
+                            }
+                        }
+                        struct cell *cv = &t->rows.items[i].cells.items[agg_col[a]];
+                        if (cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text))
+                            continue;
+                        int dup = 0;
+                        for (int d = 0; d < distinct_count; d++) {
+                            if (cell_compare(cv, &seen[d]) == 0) { dup = 1; break; }
+                        }
+                        if (!dup) { seen[distinct_count++] = *cv; }
+                    }
+                    free(seen);
+                    c.value.as_int = distinct_count;
+                } else {
+                    /* COUNT(*) counts all rows; COUNT(col) counts non-NULL */
+                    c.value.as_int = (agg_col[a] < 0) ? (int)row_count : (int)nonnull_count[a];
+                }
                 break;
             case AGG_SUM:
-                if (col_is_float) {
+                if (nonnull_count[a] == 0) {
+                    c.type = col_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
+                    c.is_null = 1;
+                } else if (col_is_float) {
                     c.type = COLUMN_TYPE_FLOAT;
                     c.value.as_float = sums[a];
                 } else {
@@ -1627,17 +1747,26 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                 break;
             case AGG_AVG:
                 c.type = COLUMN_TYPE_FLOAT;
-                c.value.as_float = nonnull_count[a] > 0 ? sums[a] / (double)nonnull_count[a] : 0.0;
+                if (nonnull_count[a] == 0) {
+                    c.is_null = 1;
+                } else {
+                    c.value.as_float = sums[a] / (double)nonnull_count[a];
+                }
                 break;
             case AGG_MIN:
             case AGG_MAX: {
-                double val = (ae->func == AGG_MIN) ? mins[a] : maxs[a];
-                if (col_is_float) {
-                    c.type = COLUMN_TYPE_FLOAT;
-                    c.value.as_float = val;
+                if (nonnull_count[a] == 0) {
+                    c.type = col_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
+                    c.is_null = 1;
                 } else {
-                    c.type = COLUMN_TYPE_INT;
-                    c.value.as_int = (int)val;
+                    double val = (ae->func == AGG_MIN) ? mins[a] : maxs[a];
+                    if (col_is_float) {
+                        c.type = COLUMN_TYPE_FLOAT;
+                        c.value.as_float = val;
+                    } else {
+                        c.type = COLUMN_TYPE_INT;
+                        c.value.as_int = (int)val;
+                    }
                 }
                 break;
             }
@@ -1792,7 +1921,7 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
     DYNAMIC_ARRAY(size_t) match_idx;
     da_init(&match_idx);
     for (size_t i = 0; i < nrows; i++) {
-        if (!row_matches(t, &s->where, arena, &t->rows.items[i]))
+        if (!row_matches(t, &s->where, arena, &t->rows.items[i], NULL))
             continue;
         da_push(&match_idx, i);
     }
@@ -2064,7 +2193,7 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
     da_init(&matching);
     for (size_t i = 0; i < t->rows.count; i++) {
         if (s->where.has_where && s->where.where_cond != IDX_NONE) {
-            if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t))
+            if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
                 continue;
         }
         da_push(&matching, i);
@@ -2117,7 +2246,9 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             gagg_cols[a] = table_find_column_sv(t, ae->column);
     }
 
-    /* build HAVING tmp_t once (columns don't change between groups) */
+    /* build HAVING tmp_t once (columns don't change between groups).
+     * JPL ownership: column names are strdup'd here and freed by
+     * column_free at the end of this function (same scope). */
     struct table having_t = {0};
     int has_having_t = 0;
     if (s->has_having && s->having_cond != IDX_NONE) {
@@ -2224,7 +2355,10 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                     c.value.as_int = (gagg_cols[a] < 0) ? (int)grp_count : (int)gnonnull[a];
                     break;
                 case AGG_SUM:
-                    if (col_is_float) {
+                    if (gnonnull[a] == 0) {
+                        c.type = col_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
+                        c.is_null = 1;
+                    } else if (col_is_float) {
                         c.type = COLUMN_TYPE_FLOAT;
                         c.value.as_float = sums[a];
                     } else {
@@ -2234,17 +2368,26 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                     break;
                 case AGG_AVG:
                     c.type = COLUMN_TYPE_FLOAT;
-                    c.value.as_float = gnonnull[a] > 0 ? sums[a] / (double)gnonnull[a] : 0.0;
+                    if (gnonnull[a] == 0) {
+                        c.is_null = 1;
+                    } else {
+                        c.value.as_float = sums[a] / (double)gnonnull[a];
+                    }
                     break;
                 case AGG_MIN:
                 case AGG_MAX: {
-                    double val = (ae->func == AGG_MIN) ? gmins[a] : gmaxs[a];
-                    if (col_is_float) {
-                        c.type = COLUMN_TYPE_FLOAT;
-                        c.value.as_float = val;
+                    if (gnonnull[a] == 0) {
+                        c.type = col_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
+                        c.is_null = 1;
                     } else {
-                        c.type = COLUMN_TYPE_INT;
-                        c.value.as_int = (int)val;
+                        double val = (ae->func == AGG_MIN) ? gmins[a] : gmaxs[a];
+                        if (col_is_float) {
+                            c.type = COLUMN_TYPE_FLOAT;
+                            c.value.as_float = val;
+                        } else {
+                            c.type = COLUMN_TYPE_INT;
+                            c.value.as_int = (int)val;
+                        }
                     }
                     break;
                 }
@@ -2255,7 +2398,7 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
         }
         /* HAVING filter */
         if (has_having_t) {
-            int passes = eval_condition(s->having_cond, arena, &dst, &having_t);
+            int passes = eval_condition(s->having_cond, arena, &dst, &having_t, NULL);
             if (!passes) {
                 row_free(&dst);
                 continue;
@@ -2310,11 +2453,11 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
     return 0;
 }
 
-static int row_matches(struct table *t, struct where_clause *w, struct query_arena *arena, struct row *row)
+static int row_matches(struct table *t, struct where_clause *w, struct query_arena *arena, struct row *row, struct database *db)
 {
     if (!w->has_where) return 1;
     if (w->where_cond != IDX_NONE)
-        return eval_condition(w->where_cond, arena, row, t);
+        return eval_condition(w->where_cond, arena, row, t, db);
     /* legacy single-column = value */
     int where_col = -1;
     for (size_t j = 0; j < t->columns.count; j++) {
@@ -2369,7 +2512,7 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
     DYNAMIC_ARRAY(size_t) match_idx;
     da_init(&match_idx);
     for (size_t i = 0; i < t->rows.count; i++) {
-        if (!row_matches(t, &s->where, arena, &t->rows.items[i]))
+        if (!row_matches(t, &s->where, arena, &t->rows.items[i], db))
             continue;
         da_push(&match_idx, i);
     }
@@ -2552,7 +2695,7 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct que
     int return_all = has_ret && sv_eq_cstr(d->returning_columns, "*");
     size_t deleted = 0;
     for (size_t i = 0; i < t->rows.count; ) {
-        if (row_matches(t, &d->where, arena, &t->rows.items[i])) {
+        if (row_matches(t, &d->where, arena, &t->rows.items[i], NULL)) {
             /* capture row for RETURNING before freeing */
             if (has_ret && result)
                 emit_returning_row(t, &t->rows.items[i], d->returning_columns, return_all, result);
@@ -2587,7 +2730,7 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
     int return_all = has_ret && sv_eq_cstr(u->returning_columns, "*");
     size_t updated = 0;
     for (size_t i = 0; i < t->rows.count; i++) {
-        if (!row_matches(t, &u->where, arena, &t->rows.items[i]))
+        if (!row_matches(t, &u->where, arena, &t->rows.items[i], db))
             continue;
         updated++;
         /* evaluate all SET expressions against the pre-update row snapshot

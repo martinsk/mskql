@@ -1544,6 +1544,10 @@ static int parse_single_agg(struct lexer *l, sv func_name, struct agg_expr *agg)
         return -1;
     }
     tok = lexer_next(l);
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "DISTINCT")) {
+        agg->has_distinct = 1;
+        tok = lexer_next(l);
+    }
     if (tok.type == TOK_STAR) {
         agg->column = tok.value;
     } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
@@ -1613,7 +1617,11 @@ static int parse_agg_list(struct lexer *l, struct query_arena *a, struct query_s
         fprintf(stderr, "parse error: expected '(' after aggregate function\n");
         return -1;
     }
-    tok = lexer_next(l); /* column or * */
+    tok = lexer_next(l); /* column or * or DISTINCT */
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "DISTINCT")) {
+        agg.has_distinct = 1;
+        tok = lexer_next(l); /* column after DISTINCT */
+    }
     if (tok.type == TOK_STAR) {
         agg.column = tok.value;
     } else if (tok.type == TOK_IDENTIFIER) {
@@ -1723,14 +1731,15 @@ static int parse_select(struct lexer *l, struct query *out, struct query_arena *
             size_t saved_pos = l->pos;
             struct token t1 = lexer_next(l); /* ( */
             (void)t1;
-            struct token t2 = lexer_next(l); /* arg */
+            struct token t2 = lexer_next(l); /* arg or DISTINCT */
+            /* skip DISTINCT keyword if present */
+            if (t2.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(t2.value, "DISTINCT"))
+                t2 = lexer_next(l); /* actual arg */
             (void)t2;
             struct token t3 = lexer_next(l); /* ) or more */
             /* if t2 was ), t3 might be OVER; if t3 is ), next might be OVER */
             struct token maybe_over;
             if (t2.type == TOK_RPAREN) {
-                maybe_over = lexer_peek(l);
-                /* actually t3 is already the next token */
                 maybe_over = t3;
             } else {
                 maybe_over = lexer_peek(l);
