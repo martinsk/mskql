@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770760548348,
+  "lastUpdate": 1770764544158,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -473,6 +473,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 32.976,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "0b3d1cde97e08453f61a7df6cd7ffc7cd236ab1a",
+          "message": "add bump allocator for arena-based string management, implement ON CONFLICT DO UPDATE, and enable full condition evaluation in JOIN ON clauses\n\nReplace per-string malloc with bump_alloc slab allocator in query_arena to eliminate individual string allocations. Add query_arena_reset() to reuse arena memory across queries by resetting counts and bump slabs while keeping backing buffers. Implement INSERT...ON CONFLICT DO UPDATE by detecting conflicts on unique/primary key columns and applying SET clauses",
+          "timestamp": "2026-02-10T15:01:42-08:00",
+          "tree_id": "d27a4455f633350dd3226f3730c7b8d02dc679fd",
+          "url": "https://github.com/martinsk/mskql/commit/0b3d1cde97e08453f61a7df6cd7ffc7cd236ab1a"
+        },
+        "date": 1770764543387,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.419,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 88.822,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 179.784,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 220.559,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 162.563,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 2519.37,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 24.5,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 100.126,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 171.962,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 4.182,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 25.06,
             "unit": "ms"
           }
         ]
