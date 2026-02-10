@@ -253,7 +253,7 @@
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-    &ensp;&middot;&ensp; ~10,500 lines of C11 &ensp;&middot;&ensp; ~400 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~10,800 lines of C11 &ensp;&middot;&ensp; ~430 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -363,7 +363,7 @@
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
-                3,200 lines the parser is the largest single file. It includes a
+                3,300 lines the parser is the largest single file. It includes a
                 recursive-descent expression parser with proper operator precedence
                 (<code>||</code>&nbsp;&lt;&nbsp;<code>+-</code>&nbsp;&lt;&nbsp;<code>*/%</code>)
                 and handles the full grammar including CTEs, window functions, and
@@ -373,9 +373,10 @@
             <td><strong>Query executor</strong></td>
             <td><code>query.c</code>, <code>database.c</code></td>
             <td>Tree-walking evaluator that executes the AST against in-memory tables.
-                Handles joins, aggregation (including <code>DISTINCT</code> aggregates),
+                Handles joins (with compound <code>ON</code> conditions),
+                aggregation (including <code>DISTINCT</code> aggregates),
                 window functions, set operations, CTEs, correlated subqueries,
-                and transactions</td>
+                upserts, and transactions</td>
         </tr>
         <tr>
             <td><strong>Storage</strong></td>
@@ -400,6 +401,10 @@
     <code>eval_expr()</code>. Ownership follows JPL rules: the allocating module
     deallocates, with <code>cell_release()</code> as the single canonical release
     function for cell text.
+    A bump allocator (<code>arena.scratch</code>) handles temporary executor
+    allocations&mdash;aggregate accumulators, sort buffers, window-function
+    state&mdash;all freed in bulk by <code>query_arena_destroy()</code>, yielding
+    zero per-query <code>malloc</code>/<code>free</code> calls at steady state.
     A generic dynamic-array macro (<code>dynamic_array.h</code>) and zero-copy string views
     (<code>stringview.h</code>) round out the internal abstractions.
 </p>
@@ -428,7 +433,9 @@
             <td><code>INSERT</code> (single, multi-row, <code>INSERT&hellip;SELECT</code>),
                 <code>SELECT</code>, <code>UPDATE</code> (incl. <code>UPDATE&hellip;FROM</code>),
                 <code>DELETE</code>,
-                <code>RETURNING</code>, <code>ON CONFLICT DO NOTHING</code></td>
+                <code>RETURNING</code>,
+                <code>ON CONFLICT DO NOTHING</code>,
+                <code>ON CONFLICT DO UPDATE</code></td>
         </tr>
         <tr>
             <td><strong>Filtering</strong></td>
@@ -445,7 +452,8 @@
             <td><code>INNER</code>, <code>LEFT</code>, <code>RIGHT</code>,
                 <code>FULL OUTER</code>, <code>CROSS</code>,
                 <code>NATURAL</code>, <code>USING</code>,
-                <code>LATERAL</code>, multi-table</td>
+                <code>LATERAL</code>, multi-table,
+                compound <code>ON</code> conditions (<code>AND</code>/<code>OR</code>)</td>
         </tr>
         <tr>
             <td><strong>Aggregation</strong></td>
@@ -639,9 +647,9 @@ ORDER BY d.dt;</code></pre>
 <h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes ~400 SQL test cases covering DDL, DML, joins, aggregation,
+    The project includes ~430 SQL test cases covering DDL, DML, joins, aggregation,
     window functions, set operations, CTEs, transactions, NULL handling, type coercion,
-    constraint enforcement, string functions, expression evaluation, correlated
+    constraint enforcement, string functions, expression evaluation, upserts, correlated
     subqueries, and various edge cases. A separate
     concurrent test harness exercises multi-client scenarios.<span class="sidenote">Each
     test case starts a fresh server instance, sends SQL via <code>psql</code>, and validates
