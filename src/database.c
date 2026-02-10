@@ -725,7 +725,13 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
     return 0;
 }
 
-/* recursively resolve subqueries in condition tree */
+/* recursively resolve subqueries in condition tree.
+ * Subquery SQL strings (subquery_sql, scalar_subquery_sql) were allocated by
+ * parser.c; after consumption they are released via condition_release_subquery_sql
+ * (also in parser.c) so the allocating module remains the deallocating module.
+ * New in_values / value text written here uses strdup; those allocations are
+ * freed by condition_free (parser.c) which handles both parser- and
+ * resolver-originated text uniformly via cell_free_text. */
 static void resolve_subqueries(struct database *db, struct condition *c)
 {
     if (!c) return;
@@ -753,8 +759,7 @@ static void resolve_subqueries(struct database *db, struct condition *c)
             }
         }
         query_free(&sq);
-        free(c->subquery_sql);
-        c->subquery_sql = NULL;
+        condition_release_subquery_sql(c);
         return;
     }
     if (c->type == COND_COMPARE && c->subquery_sql &&
@@ -787,8 +792,7 @@ static void resolve_subqueries(struct database *db, struct condition *c)
             }
         }
         query_free(&sq);
-        free(c->subquery_sql);
-        c->subquery_sql = NULL;
+        condition_release_subquery_sql(c);
     }
     /* scalar subquery: WHERE col > (SELECT ...) */
     if (c->type == COND_COMPARE && c->scalar_subquery_sql) {
@@ -813,8 +817,7 @@ static void resolve_subqueries(struct database *db, struct condition *c)
             }
         }
         query_free(&sq);
-        free(c->scalar_subquery_sql);
-        c->scalar_subquery_sql = NULL;
+        condition_release_subquery_sql(c);
     }
 }
 
@@ -1056,6 +1059,11 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             return -1;
         }
         case QUERY_TYPE_CREATE_TYPE: {
+            /* Ownership transfer: enum_values strings were allocated by parser.c
+             * and are moved into the database's enum_type via NULL-swap below.
+             * After transfer, query_create_type_free (parser.c) skips the
+             * NULLed slots, and enum_type_free (table.c) frees the strings
+             * when the type is dropped. */
             struct query_create_type *ct = &q->create_type;
             if (db_find_type_sv(db, ct->type_name)) {
                 fprintf(stderr, "type '" SV_FMT "' already exists\n", SV_ARG(ct->type_name));

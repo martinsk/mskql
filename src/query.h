@@ -106,7 +106,6 @@ struct condition {
     DYNAMIC_ARRAY(struct cell) array_values; /* values for ANY/ALL */
 };
 
-void condition_free(struct condition *c);
 int eval_condition(struct condition *cond, struct row *row, struct table *t);
 
 struct set_clause {
@@ -321,6 +320,5 @@ struct query {
 };
 
 int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db);
-void query_free(struct query *q);
 
 #endif
