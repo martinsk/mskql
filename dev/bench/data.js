@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770697906513,
+  "lastUpdate": 1770699131301,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -157,6 +157,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 32.472,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "647e8080309e5efad26d40dd845a2058a1e68924",
+          "message": "move query_free and condition_free from query.c to parser.c to satisfy JPL ownership rule that allocating module must deallocate, add condition_release_subquery_sql helper, and document ownership transfer for enum_values and subquery SQL strings",
+          "timestamp": "2026-02-09T20:51:55-08:00",
+          "tree_id": "d2617385c58b4a7512278372472d2318973a7a1a",
+          "url": "https://github.com/martinsk/mskql/commit/647e8080309e5efad26d40dd845a2058a1e68924"
+        },
+        "date": 1770699130866,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 24.479,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 158.848,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 277.74,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 487.39,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 329.556,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 717.492,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 44.24,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 269.867,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 389.717,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 10.695,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 32.698,
             "unit": "ms"
           }
         ]
