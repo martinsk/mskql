@@ -635,6 +635,21 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
         qsort(merged.data, merged.count, sizeof(struct row), cmp_rows_join);
     }
 
+    /* GROUP BY / aggregate on joined result */
+    if (s->has_group_by || s->aggregates.count > 0) {
+        merged_t.rows.items = merged.data;
+        merged_t.rows.count = merged.count;
+        merged_t.rows.capacity = merged.count;
+        int rc;
+        if (s->has_group_by)
+            rc = query_group_by(&merged_t, s, result);
+        else
+            rc = query_aggregate(&merged_t, s, result);
+        free_merged_rows(&merged);
+        free_merged_columns(&merged_t);
+        return rc;
+    }
+
     /* OFFSET / LIMIT */
     size_t start = 0, end = merged.count;
     if (s->has_offset) {
@@ -1292,8 +1307,18 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             if (s->where.has_where && s->where.where_cond)
                 resolve_subqueries(db, s->where.where_cond);
             int sel_rc;
-            if (s->table.len == 0 && s->insert_row && result) {
-                /* SELECT <literal> — no table, return literal values */
+            if (s->table.len == 0 && s->parsed_columns.count > 0 && result) {
+                /* SELECT <expr>, ... — no table, evaluate expression ASTs */
+                struct row dst = {0};
+                da_init(&dst.cells);
+                for (size_t i = 0; i < s->parsed_columns.count; i++) {
+                    struct cell c = eval_expr(s->parsed_columns.items[i].expr, NULL, NULL, db);
+                    da_push(&dst.cells, c);
+                }
+                rows_push(result, dst);
+                sel_rc = 0;
+            } else if (s->table.len == 0 && s->insert_row && result) {
+                /* legacy: SELECT <literal> via insert_row */
                 struct row dst = {0};
                 da_init(&dst.cells);
                 for (size_t i = 0; i < s->insert_row->cells.count; i++) {
@@ -1566,21 +1591,28 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     }
                     if (!matched) continue;
                     updated++;
-                    for (size_t sc = 0; sc < u->set_clauses.count; sc++) {
-                        int ci = table_find_column_sv(t, u->set_clauses.items[sc].column);
-                        if (ci < 0) continue;
-                        if (column_type_is_text(t->rows.items[i].cells.items[ci].type)
-                            && t->rows.items[i].cells.items[ci].value.as_text)
-                            free(t->rows.items[i].cells.items[ci].value.as_text);
-                        t->rows.items[i].cells.items[ci].type = u->set_clauses.items[sc].value.type;
-                        if (column_type_is_text(u->set_clauses.items[sc].value.type)
-                            && u->set_clauses.items[sc].value.value.as_text)
-                            t->rows.items[i].cells.items[ci].value.as_text =
-                                strdup(u->set_clauses.items[sc].value.value.as_text);
-                        else
-                            t->rows.items[i].cells.items[ci].value = u->set_clauses.items[sc].value.value;
-                        t->rows.items[i].cells.items[ci].is_null = 0;
+                    /* evaluate all SET expressions against pre-update snapshot */
+                    size_t nsc = u->set_clauses.count;
+                    struct cell *new_vals = calloc(nsc, sizeof(struct cell));
+                    int *col_idxs = calloc(nsc, sizeof(int));
+                    for (size_t sc = 0; sc < nsc; sc++) {
+                        col_idxs[sc] = table_find_column_sv(t, u->set_clauses.items[sc].column);
+                        if (col_idxs[sc] < 0) { new_vals[sc] = (struct cell){0}; continue; }
+                        if (u->set_clauses.items[sc].expr) {
+                            new_vals[sc] = eval_expr(u->set_clauses.items[sc].expr, t, &t->rows.items[i], db);
+                        } else {
+                            cell_copy(&new_vals[sc], &u->set_clauses.items[sc].value);
+                        }
                     }
+                    for (size_t sc = 0; sc < nsc; sc++) {
+                        if (col_idxs[sc] < 0) continue;
+                        struct cell *dst = &t->rows.items[i].cells.items[col_idxs[sc]];
+                        if (column_type_is_text(dst->type) && dst->value.as_text)
+                            free(dst->value.as_text);
+                        *dst = new_vals[sc];
+                    }
+                    free(new_vals);
+                    free(col_idxs);
                 }
                 if (result) {
                     struct row r = {0};

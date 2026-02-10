@@ -70,7 +70,8 @@ int cell_compare(const struct cell *a, const struct cell *b)
             if (!a->value.as_text && !b->value.as_text) return 0;
             if (!a->value.as_text) return -1;
             if (!b->value.as_text) return  1;
-            return strcmp(a->value.as_text, b->value.as_text);
+            { int cmp = strcmp(a->value.as_text, b->value.as_text);
+              return (cmp < 0) ? -1 : (cmp > 0) ? 1 : 0; }
     }
     return -2;
 }

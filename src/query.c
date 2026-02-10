@@ -87,9 +87,16 @@ int eval_condition(struct condition *cond, struct row *row,
                 return cond->value.value.as_int != 0;
             if (cond->op == CMP_NOT_EXISTS)
                 return cond->value.value.as_int == 0;
-            int col_idx = table_find_column_sv(t, cond->column);
-            if (col_idx < 0) return 0;
-            struct cell *c = &row->cells.items[col_idx];
+            struct cell lhs_tmp = {0};
+            struct cell *c;
+            if (cond->lhs_expr) {
+                lhs_tmp = eval_expr(cond->lhs_expr, t, row, NULL);
+                c = &lhs_tmp;
+            } else {
+                int col_idx = table_find_column_sv(t, cond->column);
+                if (col_idx < 0) return 0;
+                c = &row->cells.items[col_idx];
+            }
             if (cond->op == CMP_IS_NULL)
                 return c->is_null || (column_type_is_text(c->type)
                        ? (c->value.as_text == NULL) : 0);
@@ -904,6 +911,404 @@ static struct cell eval_arith_expr(sv expr, struct table *t, struct row *src)
     return result;
 }
 
+/* ---------------------------------------------------------------------------
+ * AST-based expression evaluator — walks the expression tree produced by
+ * parse_expr and returns a cell value.
+ * ------------------------------------------------------------------------- */
+
+static struct cell cell_make_null(void)
+{
+    struct cell c = {0};
+    c.type = COLUMN_TYPE_TEXT;
+    c.is_null = 1;
+    return c;
+}
+
+static struct cell cell_make_int(int v)
+{
+    struct cell c = {0};
+    c.type = COLUMN_TYPE_INT;
+    c.value.as_int = v;
+    return c;
+}
+
+static struct cell cell_make_float(double v)
+{
+    struct cell c = {0};
+    c.type = COLUMN_TYPE_FLOAT;
+    c.value.as_float = v;
+    return c;
+}
+
+static struct cell cell_make_text(const char *s)
+{
+    struct cell c = {0};
+    c.type = COLUMN_TYPE_TEXT;
+    c.value.as_text = s ? strdup(s) : NULL;
+    c.is_null = (s == NULL);
+    return c;
+}
+
+static struct cell cell_deep_copy(const struct cell *src)
+{
+    struct cell c = { .type = src->type, .is_null = src->is_null };
+    if (column_type_is_text(src->type) && src->value.as_text)
+        c.value.as_text = strdup(src->value.as_text);
+    else
+        c.value = src->value;
+    return c;
+}
+
+static int cell_is_null(const struct cell *c)
+{
+    return c->is_null || (column_type_is_text(c->type) && !c->value.as_text);
+}
+
+static double cell_to_double_val(const struct cell *c)
+{
+    if (c->type == COLUMN_TYPE_INT)    return (double)c->value.as_int;
+    if (c->type == COLUMN_TYPE_FLOAT)  return c->value.as_float;
+    if (c->type == COLUMN_TYPE_BIGINT) return (double)c->value.as_bigint;
+    return 0.0;
+}
+
+static char *cell_to_text(const struct cell *c)
+{
+    if (cell_is_null(c)) return NULL;
+    if (column_type_is_text(c->type) && c->value.as_text)
+        return strdup(c->value.as_text);
+    char buf[64];
+    if (c->type == COLUMN_TYPE_INT)
+        snprintf(buf, sizeof(buf), "%d", c->value.as_int);
+    else if (c->type == COLUMN_TYPE_FLOAT)
+        snprintf(buf, sizeof(buf), "%g", c->value.as_float);
+    else if (c->type == COLUMN_TYPE_BIGINT)
+        snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint);
+    else if (c->type == COLUMN_TYPE_BOOLEAN)
+        snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "true" : "false");
+    else
+        buf[0] = '\0';
+    return strdup(buf);
+}
+
+struct cell eval_expr(struct expr *e, struct table *t, struct row *row,
+                      struct database *db)
+{
+    if (!e) return cell_make_null();
+
+    switch (e->type) {
+
+    case EXPR_LITERAL:
+        return cell_deep_copy(&e->literal);
+
+    case EXPR_COLUMN_REF: {
+        if (!t || !row) return cell_make_null();
+        sv col = e->column_ref.column;
+        int idx = table_find_column_sv(t, col);
+        if (idx < 0 && e->column_ref.table.len > 0) {
+            /* try table.column qualified lookup */
+            char qname[256];
+            snprintf(qname, sizeof(qname), SV_FMT "." SV_FMT,
+                     SV_ARG(e->column_ref.table), SV_ARG(col));
+            sv qsv = sv_from(qname, strlen(qname));
+            idx = table_find_column_sv(t, qsv);
+        }
+        if (idx < 0) return cell_make_null();
+        return cell_deep_copy(&row->cells.items[idx]);
+    }
+
+    case EXPR_UNARY_OP: {
+        struct cell operand = eval_expr(e->unary.operand, t, row, db);
+        if (cell_is_null(&operand)) return operand;
+        if (e->unary.op == OP_NEG) {
+            if (operand.type == COLUMN_TYPE_INT) {
+                operand.value.as_int = -operand.value.as_int;
+            } else if (operand.type == COLUMN_TYPE_FLOAT) {
+                operand.value.as_float = -operand.value.as_float;
+            } else if (operand.type == COLUMN_TYPE_BIGINT) {
+                operand.value.as_bigint = -operand.value.as_bigint;
+            }
+        }
+        return operand;
+    }
+
+    case EXPR_BINARY_OP: {
+        struct cell lhs = eval_expr(e->binary.left, t, row, db);
+        struct cell rhs = eval_expr(e->binary.right, t, row, db);
+
+        /* string concatenation */
+        if (e->binary.op == OP_CONCAT) {
+            /* SQL standard: NULL || anything = NULL */
+            if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
+                if (column_type_is_text(lhs.type) && lhs.value.as_text) free(lhs.value.as_text);
+                if (column_type_is_text(rhs.type) && rhs.value.as_text) free(rhs.value.as_text);
+                return cell_make_null();
+            }
+            char *ls = cell_to_text(&lhs);
+            char *rs = cell_to_text(&rhs);
+            size_t llen = ls ? strlen(ls) : 0;
+            size_t rlen = rs ? strlen(rs) : 0;
+            char *buf = malloc(llen + rlen + 1);
+            if (ls) memcpy(buf, ls, llen);
+            if (rs) memcpy(buf + llen, rs, rlen);
+            buf[llen + rlen] = '\0';
+            free(ls); free(rs);
+            if (column_type_is_text(lhs.type) && lhs.value.as_text) free(lhs.value.as_text);
+            if (column_type_is_text(rhs.type) && rhs.value.as_text) free(rhs.value.as_text);
+            struct cell c = {0};
+            c.type = COLUMN_TYPE_TEXT;
+            c.value.as_text = buf;
+            return c;
+        }
+
+        /* arithmetic: NULL propagation */
+        if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
+            if (column_type_is_text(lhs.type) && lhs.value.as_text) free(lhs.value.as_text);
+            if (column_type_is_text(rhs.type) && rhs.value.as_text) free(rhs.value.as_text);
+            struct cell c = {0};
+            c.type = COLUMN_TYPE_INT;
+            c.is_null = 1;
+            return c;
+        }
+
+        double lv = cell_to_double_val(&lhs);
+        double rv = cell_to_double_val(&rhs);
+        double result_v = 0.0;
+        switch (e->binary.op) {
+            case OP_ADD: result_v = lv + rv; break;
+            case OP_SUB: result_v = lv - rv; break;
+            case OP_MUL: result_v = lv * rv; break;
+            case OP_DIV: result_v = (rv != 0.0) ? lv / rv : 0.0; break;
+            case OP_MOD: result_v = (rv != 0.0) ? (double)((long long)lv % (long long)rv) : 0.0; break;
+            case OP_CONCAT: break; /* handled above */
+            case OP_NEG: break;    /* not a binary op */
+        }
+
+        int use_float = (lhs.type == COLUMN_TYPE_FLOAT || rhs.type == COLUMN_TYPE_FLOAT);
+        if (column_type_is_text(lhs.type) && lhs.value.as_text) free(lhs.value.as_text);
+        if (column_type_is_text(rhs.type) && rhs.value.as_text) free(rhs.value.as_text);
+
+        if (use_float || result_v != (double)(int)result_v)
+            return cell_make_float(result_v);
+        return cell_make_int((int)result_v);
+    }
+
+    case EXPR_FUNC_CALL: {
+        enum expr_func fn = e->func_call.func;
+        size_t nargs = e->func_call.args.count;
+
+        if (fn == FUNC_COALESCE) {
+            for (size_t i = 0; i < nargs; i++) {
+                struct cell c = eval_expr(e->func_call.args.items[i], t, row, db);
+                if (!cell_is_null(&c)) return c;
+                if (column_type_is_text(c.type) && c.value.as_text) free(c.value.as_text);
+            }
+            return cell_make_null();
+        }
+
+        if (fn == FUNC_NULLIF) {
+            if (nargs < 2) return cell_make_null();
+            struct cell a = eval_expr(e->func_call.args.items[0], t, row, db);
+            struct cell b = eval_expr(e->func_call.args.items[1], t, row, db);
+            if (!cell_is_null(&a) && !cell_is_null(&b) && cell_equal(&a, &b)) {
+                if (column_type_is_text(a.type) && a.value.as_text) free(a.value.as_text);
+                if (column_type_is_text(b.type) && b.value.as_text) free(b.value.as_text);
+                struct cell n = { .type = a.type, .is_null = 1 };
+                return n;
+            }
+            if (column_type_is_text(b.type) && b.value.as_text) free(b.value.as_text);
+            return a;
+        }
+
+        if (fn == FUNC_GREATEST || fn == FUNC_LEAST) {
+            int is_greatest = (fn == FUNC_GREATEST);
+            if (nargs == 0) return cell_make_null();
+            struct cell best = eval_expr(e->func_call.args.items[0], t, row, db);
+            int best_null = cell_is_null(&best);
+            for (size_t i = 1; i < nargs; i++) {
+                struct cell cur = eval_expr(e->func_call.args.items[i], t, row, db);
+                int cur_null = cell_is_null(&cur);
+                if (best_null) {
+                    if (column_type_is_text(best.type) && best.value.as_text) free(best.value.as_text);
+                    best = cur; best_null = cur_null;
+                    continue;
+                }
+                if (cur_null) {
+                    if (column_type_is_text(cur.type) && cur.value.as_text) free(cur.value.as_text);
+                    continue;
+                }
+                int cmp = cell_compare(&cur, &best);
+                if ((is_greatest && cmp > 0) || (!is_greatest && cmp < 0)) {
+                    if (column_type_is_text(best.type) && best.value.as_text) free(best.value.as_text);
+                    best = cur;
+                } else {
+                    if (column_type_is_text(cur.type) && cur.value.as_text) free(cur.value.as_text);
+                }
+            }
+            return best;
+        }
+
+        if (fn == FUNC_UPPER || fn == FUNC_LOWER) {
+            if (nargs == 0) return cell_make_null();
+            struct cell arg = eval_expr(e->func_call.args.items[0], t, row, db);
+            if (cell_is_null(&arg)) return arg;
+            if (column_type_is_text(arg.type) && arg.value.as_text) {
+                int is_upper = (fn == FUNC_UPPER);
+                for (char *p = arg.value.as_text; *p; p++)
+                    *p = is_upper ? toupper((unsigned char)*p) : tolower((unsigned char)*p);
+            }
+            return arg;
+        }
+
+        if (fn == FUNC_LENGTH) {
+            if (nargs == 0) return cell_make_null();
+            struct cell arg = eval_expr(e->func_call.args.items[0], t, row, db);
+            if (cell_is_null(&arg)) {
+                struct cell r = {0}; r.type = COLUMN_TYPE_INT; r.is_null = 1;
+                return r;
+            }
+            if (column_type_is_text(arg.type) && arg.value.as_text) {
+                int len = (int)strlen(arg.value.as_text);
+                free(arg.value.as_text);
+                return cell_make_int(len);
+            }
+            return cell_make_int(0);
+        }
+
+        if (fn == FUNC_TRIM) {
+            if (nargs == 0) return cell_make_null();
+            struct cell arg = eval_expr(e->func_call.args.items[0], t, row, db);
+            if (cell_is_null(&arg)) return arg;
+            if (column_type_is_text(arg.type) && arg.value.as_text) {
+                char *s = arg.value.as_text;
+                while (*s == ' ' || *s == '\t') s++;
+                char *end = s + strlen(s);
+                while (end > s && (end[-1] == ' ' || end[-1] == '\t')) end--;
+                char *trimmed = malloc((size_t)(end - s) + 1);
+                memcpy(trimmed, s, (size_t)(end - s));
+                trimmed[end - s] = '\0';
+                free(arg.value.as_text);
+                arg.value.as_text = trimmed;
+            }
+            return arg;
+        }
+
+        if (fn == FUNC_SUBSTRING) {
+            if (nargs < 2) return cell_make_null();
+            struct cell str = eval_expr(e->func_call.args.items[0], t, row, db);
+            struct cell from_c = eval_expr(e->func_call.args.items[1], t, row, db);
+            if (cell_is_null(&str)) {
+                if (column_type_is_text(from_c.type) && from_c.value.as_text) free(from_c.value.as_text);
+                return str;
+            }
+            int from = (int)cell_to_double_val(&from_c);
+            if (from < 1) from = 1;
+            from--; /* convert to 0-based */
+            if (column_type_is_text(from_c.type) && from_c.value.as_text) free(from_c.value.as_text);
+
+            if (column_type_is_text(str.type) && str.value.as_text) {
+                int slen = (int)strlen(str.value.as_text);
+                int len = slen - from;
+                if (nargs >= 3) {
+                    struct cell len_c = eval_expr(e->func_call.args.items[2], t, row, db);
+                    len = (int)cell_to_double_val(&len_c);
+                    if (column_type_is_text(len_c.type) && len_c.value.as_text) free(len_c.value.as_text);
+                }
+                if (from >= slen || len <= 0) {
+                    free(str.value.as_text);
+                    str.value.as_text = strdup("");
+                    return str;
+                }
+                if (from + len > slen) len = slen - from;
+                char *sub = malloc((size_t)len + 1);
+                memcpy(sub, str.value.as_text + from, (size_t)len);
+                sub[len] = '\0';
+                free(str.value.as_text);
+                str.value.as_text = sub;
+            }
+            return str;
+        }
+
+        return cell_make_null();
+    }
+
+    case EXPR_CASE_WHEN: {
+        for (size_t i = 0; i < e->case_when.branches.count; i++) {
+            struct case_when_branch *b = &e->case_when.branches.items[i];
+            if (eval_condition(b->cond, row, t))
+                return eval_expr(b->then_expr, t, row, db);
+        }
+        if (e->case_when.else_expr)
+            return eval_expr(e->case_when.else_expr, t, row, db);
+        return cell_make_null();
+    }
+
+    case EXPR_SUBQUERY: {
+        if (!db || !e->subquery.sql) return cell_make_null();
+        /* correlated subquery: substitute outer column refs with literals */
+        char sql_buf[2048];
+        size_t sql_len = strlen(e->subquery.sql);
+        if (sql_len >= sizeof(sql_buf)) sql_len = sizeof(sql_buf) - 1;
+        memcpy(sql_buf, e->subquery.sql, sql_len);
+        sql_buf[sql_len] = '\0';
+
+        if (t && row) {
+            for (size_t ci = 0; ci < t->columns.count; ci++) {
+                const char *cname = t->columns.items[ci].name;
+                char ref[256];
+                snprintf(ref, sizeof(ref), "%s.%s", t->name, cname);
+                size_t rlen = strlen(ref);
+                char lit[256];
+                struct cell *cv = &row->cells.items[ci];
+                if (cell_is_null(cv)) {
+                    snprintf(lit, sizeof(lit), "NULL");
+                } else if (cv->type == COLUMN_TYPE_INT) {
+                    snprintf(lit, sizeof(lit), "%d", cv->value.as_int);
+                } else if (cv->type == COLUMN_TYPE_FLOAT) {
+                    snprintf(lit, sizeof(lit), "%g", cv->value.as_float);
+                } else if (column_type_is_text(cv->type) && cv->value.as_text) {
+                    snprintf(lit, sizeof(lit), "'%s'", cv->value.as_text);
+                } else {
+                    continue;
+                }
+                size_t llen = strlen(lit);
+                char *pos;
+                while ((pos = strstr(sql_buf, ref)) != NULL) {
+                    char after = pos[rlen];
+                    if (isalnum((unsigned char)after) || after == '_') break;
+                    size_t cur_len = strlen(sql_buf);
+                    if (cur_len - rlen + llen >= sizeof(sql_buf) - 1) break;
+                    memmove(pos + llen, pos + rlen,
+                            cur_len - (size_t)(pos - sql_buf) - rlen + 1);
+                    memcpy(pos, lit, llen);
+                }
+            }
+        }
+
+        struct query sub_q = {0};
+        if (query_parse(sql_buf, &sub_q) == 0) {
+            struct rows sub_rows = {0};
+            if (db_exec(db, &sub_q, &sub_rows) == 0 && sub_rows.count > 0
+                && sub_rows.data[0].cells.count > 0) {
+                struct cell result = cell_deep_copy(&sub_rows.data[0].cells.items[0]);
+                for (size_t ri = 0; ri < sub_rows.count; ri++)
+                    row_free(&sub_rows.data[ri]);
+                free(sub_rows.data);
+                query_free(&sub_q);
+                return result;
+            }
+            for (size_t ri = 0; ri < sub_rows.count; ri++)
+                row_free(&sub_rows.data[ri]);
+            free(sub_rows.data);
+        }
+        query_free(&sub_q);
+        return cell_make_null();
+    }
+
+    }
+    return cell_make_null();
+}
+
 static void emit_row(struct table *t, struct query_select *s, struct row *src,
                      struct rows *result, int select_all, struct database *db)
 {
@@ -920,8 +1325,14 @@ static void emit_row(struct table *t, struct query_select *s, struct row *src,
                 copy.value = c.value;
             da_push(&dst.cells, copy);
         }
+    } else if (s->parsed_columns.count > 0) {
+        /* AST-based column evaluation */
+        for (size_t i = 0; i < s->parsed_columns.count; i++) {
+            struct cell c = eval_expr(s->parsed_columns.items[i].expr, t, src, db);
+            da_push(&dst.cells, c);
+        }
     } else {
-        /* walk comma-separated column list */
+        /* legacy: walk comma-separated column list (used by aggregate/window paths) */
         sv cols = s->columns;
         while (cols.len > 0) {
             /* trim leading whitespace */
@@ -1101,7 +1512,7 @@ next_col:
     rows_push(result, dst);
 }
 
-static int query_aggregate(struct table *t, struct query_select *s, struct rows *result)
+int query_aggregate(struct table *t, struct query_select *s, struct rows *result)
 {
     /* find WHERE column index if applicable (legacy path) */
     int where_col = -1;
@@ -1299,11 +1710,13 @@ static double cell_to_double(const struct cell *c)
 
 /* sort helper for window ORDER BY */
 struct sort_entry { size_t idx; const struct cell *key; };
+static int _sort_entry_desc; /* 0=ASC, 1=DESC */
 
 static int sort_entry_cmp(const void *a, const void *b)
 {
     const struct sort_entry *sa = a, *sb = b;
-    return cell_compare(sa->key, sb->key);
+    int cmp = cell_compare(sa->key, sb->key);
+    return _sort_entry_desc ? -cmp : cmp;
 }
 
 static int query_window(struct table *t, struct query_select *s, struct rows *result)
@@ -1389,8 +1802,17 @@ static int query_window(struct table *t, struct query_select *s, struct rows *re
         else
             sorted[i].key = NULL;
     }
-    if (global_ord >= 0)
+    int global_ord_desc = 0;
+    for (size_t e = 0; e < nexprs; e++) {
+        if (s->select_exprs.items[e].kind == SEL_WINDOW && ord_idx[e] >= 0) {
+            global_ord_desc = s->select_exprs.items[e].win.order_desc;
+            break;
+        }
+    }
+    if (global_ord >= 0) {
+        _sort_entry_desc = global_ord_desc;
         qsort(sorted, nmatch, sizeof(struct sort_entry), sort_entry_cmp);
+    }
 
     /* for each row (in sorted order), compute all expressions */
     for (size_t ri = 0; ri < nmatch; ri++) {
@@ -1425,9 +1847,11 @@ static int query_window(struct table *t, struct query_select *s, struct rows *re
                     }
                     part_count++;
 
-                    /* for SUM/AVG, accumulate */
+                    /* for SUM/AVG, accumulate (skip NULLs) */
                     if (arg_idx[e] >= 0) {
-                        part_sum += cell_to_double(&peer->cells.items[arg_idx[e]]);
+                        struct cell *ac = &peer->cells.items[arg_idx[e]];
+                        if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text))
+                            part_sum += cell_to_double(ac);
                     }
 
                     /* for ROW_NUMBER/RANK, track position */
@@ -1477,12 +1901,45 @@ static int query_window(struct table *t, struct query_select *s, struct rows *re
                         break;
                     case WIN_COUNT:
                         c.type = COLUMN_TYPE_INT;
-                        c.value.as_int = (int)part_count;
+                        /* COUNT(col) should count non-NULL; COUNT(*) counts all */
+                        if (arg_idx[e] >= 0) {
+                            int nn = 0;
+                            for (size_t rj2 = 0; rj2 < nmatch; rj2++) {
+                                size_t j2 = sorted[rj2].idx;
+                                struct row *p2 = &t->rows.items[j2];
+                                if (se->win.has_partition && part_idx[e] >= 0 &&
+                                    !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
+                                                         &p2->cells.items[part_idx[e]]))
+                                    continue;
+                                struct cell *ac = &p2->cells.items[arg_idx[e]];
+                                if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text))
+                                    nn++;
+                            }
+                            c.value.as_int = nn;
+                        } else {
+                            c.value.as_int = (int)part_count;
+                        }
                         break;
-                    case WIN_AVG:
+                    case WIN_AVG: {
                         c.type = COLUMN_TYPE_FLOAT;
-                        c.value.as_float = part_count > 0 ? part_sum / (double)part_count : 0.0;
+                        /* count non-NULL peers for AVG denominator */
+                        int nn = 0;
+                        if (arg_idx[e] >= 0) {
+                            for (size_t rj2 = 0; rj2 < nmatch; rj2++) {
+                                size_t j2 = sorted[rj2].idx;
+                                struct row *p2 = &t->rows.items[j2];
+                                if (se->win.has_partition && part_idx[e] >= 0 &&
+                                    !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
+                                                         &p2->cells.items[part_idx[e]]))
+                                    continue;
+                                struct cell *ac = &p2->cells.items[arg_idx[e]];
+                                if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text))
+                                    nn++;
+                            }
+                        }
+                        c.value.as_float = nn > 0 ? part_sum / (double)nn : 0.0;
                         break;
+                    }
                 }
             }
             da_push(&dst.cells, c);
@@ -1562,7 +2019,7 @@ static int grp_find_result_col(struct table *t, int *grp_cols, size_t ngrp,
     return -1;
 }
 
-static int query_group_by(struct table *t, struct query_select *s, struct rows *result)
+int query_group_by(struct table *t, struct query_select *s, struct rows *result)
 {
     /* resolve GROUP BY column indices */
     size_t ngrp = s->group_by_cols.count;
@@ -1898,11 +2355,16 @@ static int query_select_exec(struct table *t, struct query_select *s, struct row
     }
 
     /* ORDER BY — sort indices using the original table data (multi-column) */
+    int order_on_result = 0; /* set to 1 if we need to sort projected rows */
+    int result_ord_cols[32];
+    int result_ord_descs[32];
+    size_t result_nord = 0;
     if (s->has_order_by && s->order_by_items.count > 0) {
         /* resolve column indices for all ORDER BY items */
         int ord_cols[32];
         int ord_descs[32];
         size_t nord = s->order_by_items.count < 32 ? s->order_by_items.count : 32;
+        int all_resolved = 1;
         for (size_t k = 0; k < nord; k++) {
             ord_cols[k] = table_find_column_sv(t, s->order_by_items.items[k].column);
             /* if not found, try resolving as a SELECT alias */
@@ -1910,11 +2372,45 @@ static int query_select_exec(struct table *t, struct query_select *s, struct row
                 ord_cols[k] = resolve_alias_to_column(t, s->columns,
                                                        s->order_by_items.items[k].column);
             }
+            /* if still not found, try resolving as a parsed_columns alias (output position) */
+            if (ord_cols[k] < 0 && s->parsed_columns.count > 0) {
+                for (size_t pc = 0; pc < s->parsed_columns.count; pc++) {
+                    if (s->parsed_columns.items[pc].alias.len > 0 &&
+                        sv_eq_ignorecase(s->order_by_items.items[k].column,
+                                         s->parsed_columns.items[pc].alias)) {
+                        result_ord_cols[k] = (int)pc;
+                        result_ord_descs[k] = s->order_by_items.items[k].desc;
+                        order_on_result = 1;
+                        ord_cols[k] = -2; /* mark as alias-resolved */
+                        break;
+                    }
+                }
+            }
+            if (ord_cols[k] < 0 && ord_cols[k] != -2) all_resolved = 0;
             ord_descs[k] = s->order_by_items.items[k].desc;
         }
-        _sort_ctx = (struct sort_ctx){ .cols = ord_cols, .descs = ord_descs,
-                                       .ncols = nord, .table = t };
-        qsort(match_idx.items, match_idx.count, sizeof(size_t), cmp_indices_multi);
+        if (order_on_result) {
+            /* defer sorting to after projection */
+            result_nord = nord;
+            for (size_t k = 0; k < nord; k++) {
+                if (ord_cols[k] != -2) {
+                    /* table column — find its position in parsed_columns output */
+                    result_ord_cols[k] = -1;
+                    for (size_t pc = 0; pc < s->parsed_columns.count; pc++) {
+                        struct expr *e = s->parsed_columns.items[pc].expr;
+                        if (e && e->type == EXPR_COLUMN_REF) {
+                            int ci = table_find_column_sv(t, e->column_ref.column);
+                            if (ci == ord_cols[k]) { result_ord_cols[k] = (int)pc; break; }
+                        }
+                    }
+                    result_ord_descs[k] = ord_descs[k];
+                }
+            }
+        } else if (all_resolved) {
+            _sort_ctx = (struct sort_ctx){ .cols = ord_cols, .descs = ord_descs,
+                                           .ncols = nord, .table = t };
+            qsort(match_idx.items, match_idx.count, sizeof(size_t), cmp_indices_multi);
+        }
     }
 
     /* project into result rows */
@@ -1923,6 +2419,13 @@ static int query_select_exec(struct table *t, struct query_select *s, struct row
         emit_row(t, s, &t->rows.items[match_idx.items[i]], &tmp, select_all, db);
     }
     da_free(&match_idx);
+
+    /* sort projected result rows if ORDER BY references a SELECT alias */
+    if (order_on_result && result_nord > 0 && tmp.count > 1) {
+        _sort_ctx = (struct sort_ctx){ .cols = result_ord_cols, .descs = result_ord_descs,
+                                       .ncols = result_nord };
+        qsort(tmp.data, tmp.count, sizeof(struct row), cmp_rows_multi);
+    }
 
     // TODO: DISTINCT dedup is O(n^2); could sort rows first then deduplicate
     // in a single linear pass for O(n log n) performance
@@ -2058,7 +2561,7 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct row
     return 0;
 }
 
-static int query_update_exec(struct table *t, struct query_update *u, struct rows *result)
+static int query_update_exec(struct table *t, struct query_update *u, struct rows *result, struct database *db)
 {
     int has_ret = (u->has_returning && u->returning_columns.len > 0);
     int return_all = has_ret && sv_eq_cstr(u->returning_columns, "*");
@@ -2067,22 +2570,30 @@ static int query_update_exec(struct table *t, struct query_update *u, struct row
         if (!row_matches(t, &u->where, &t->rows.items[i]))
             continue;
         updated++;
-        for (size_t sc = 0; sc < u->set_clauses.count; sc++) {
-            int col_idx = table_find_column_sv(t, u->set_clauses.items[sc].column);
-            if (col_idx < 0) continue;
-            struct cell *dst = &t->rows.items[i].cells.items[col_idx];
-            /* free old text */
-            if (column_type_is_text(dst->type) && dst->value.as_text)
-                free(dst->value.as_text);
-            if (u->set_clauses.items[sc].has_expr) {
-                /* evaluate expression per-row */
-                struct cell val = eval_arith_expr(u->set_clauses.items[sc].value_expr, t, &t->rows.items[i]);
-                *dst = val;
+        /* evaluate all SET expressions against the pre-update row snapshot
+         * before applying any changes (SQL standard: SET a=b, b=a swaps) */
+        size_t nsc = u->set_clauses.count;
+        struct cell *new_vals = calloc(nsc, sizeof(struct cell));
+        int *col_idxs = calloc(nsc, sizeof(int));
+        for (size_t sc = 0; sc < nsc; sc++) {
+            col_idxs[sc] = table_find_column_sv(t, u->set_clauses.items[sc].column);
+            if (col_idxs[sc] < 0) { new_vals[sc] = (struct cell){0}; continue; }
+            if (u->set_clauses.items[sc].expr) {
+                new_vals[sc] = eval_expr(u->set_clauses.items[sc].expr, t, &t->rows.items[i], db);
             } else {
-                /* copy literal value */
-                cell_copy(dst, &u->set_clauses.items[sc].value);
+                cell_copy(&new_vals[sc], &u->set_clauses.items[sc].value);
             }
         }
+        /* now apply all new values */
+        for (size_t sc = 0; sc < nsc; sc++) {
+            if (col_idxs[sc] < 0) continue;
+            struct cell *dst = &t->rows.items[i].cells.items[col_idxs[sc]];
+            if (column_type_is_text(dst->type) && dst->value.as_text)
+                free(dst->value.as_text);
+            *dst = new_vals[sc];
+        }
+        free(new_vals);
+        free(col_idxs);
         /* capture row for RETURNING after SET */
         if (has_ret && result)
             emit_returning_row(t, &t->rows.items[i], u->returning_columns, return_all, result);
@@ -2204,7 +2715,7 @@ int query_exec(struct table *t, struct query *q, struct rows *result, struct dat
         case QUERY_TYPE_DELETE:
             return query_delete_exec(t, &q->del, result);
         case QUERY_TYPE_UPDATE:
-            return query_update_exec(t, &q->update, result);
+            return query_update_exec(t, &q->update, result, db);
     }
     return -1;
 }

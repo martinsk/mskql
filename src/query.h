@@ -51,6 +51,13 @@ struct select_expr {
     struct win_expr win; /* for SEL_WINDOW */
 };
 
+/* A parsed SELECT column: expression + optional alias.
+ * Replaces the raw `sv columns` text for expression evaluation. */
+struct select_column {
+    struct expr *expr;   /* parsed expression AST */
+    sv alias;            /* optional AS alias (empty if none) */
+};
+
 enum cmp_op {
     CMP_EQ,
     CMP_NE,
@@ -85,6 +92,7 @@ struct condition {
     sv column;
     enum cmp_op op;
     struct cell value;
+    struct expr *lhs_expr;   /* optional: expression AST for LHS (e.g. COALESCE(val,0)) */
     /* for CMP_IN / CMP_NOT_IN: list of values */
     DYNAMIC_ARRAY(struct cell) in_values;
     /* for CMP_IN subquery: raw SQL text to be resolved before execution */
@@ -108,11 +116,101 @@ struct condition {
 
 int eval_condition(struct condition *cond, struct row *row, struct table *t);
 
+/* ---------------------------------------------------------------------------
+ * Expression AST — tagged union for all SQL expressions.
+ * Replaces raw-text expression evaluation with a proper tree structure.
+ * ------------------------------------------------------------------------- */
+
+enum expr_type {
+    EXPR_LITERAL,       /* integer, float, string, boolean, or NULL */
+    EXPR_COLUMN_REF,    /* column reference: optional table.column */
+    EXPR_BINARY_OP,     /* a op b  (arithmetic, concat) */
+    EXPR_UNARY_OP,      /* -a */
+    EXPR_FUNC_CALL,     /* UPPER(x), COALESCE(a,b), etc. */
+    EXPR_CASE_WHEN,     /* CASE WHEN ... THEN ... ELSE ... END */
+    EXPR_SUBQUERY       /* (SELECT ...) */
+};
+
+enum expr_op {
+    OP_ADD,             /* + */
+    OP_SUB,             /* - */
+    OP_MUL,             /* * */
+    OP_DIV,             /* / */
+    OP_MOD,             /* % */
+    OP_CONCAT,          /* || */
+    OP_NEG              /* unary minus */
+};
+
+enum expr_func {
+    FUNC_COALESCE,
+    FUNC_NULLIF,
+    FUNC_GREATEST,
+    FUNC_LEAST,
+    FUNC_UPPER,
+    FUNC_LOWER,
+    FUNC_LENGTH,
+    FUNC_TRIM,
+    FUNC_SUBSTRING
+};
+
+struct case_when_branch {
+    struct condition *cond;  /* WHEN condition */
+    struct expr *then_expr;  /* THEN expression */
+};
+
+struct expr {
+    enum expr_type type;
+    union {
+        /* EXPR_LITERAL */
+        struct cell literal;
+
+        /* EXPR_COLUMN_REF */
+        struct {
+            sv table;       /* empty if unqualified */
+            sv column;
+        } column_ref;
+
+        /* EXPR_BINARY_OP */
+        struct {
+            enum expr_op op;
+            struct expr *left;
+            struct expr *right;
+        } binary;
+
+        /* EXPR_UNARY_OP */
+        struct {
+            enum expr_op op;
+            struct expr *operand;
+        } unary;
+
+        /* EXPR_FUNC_CALL */
+        struct {
+            enum expr_func func;
+            DYNAMIC_ARRAY(struct expr *) args;
+        } func_call;
+
+        /* EXPR_CASE_WHEN */
+        struct {
+            DYNAMIC_ARRAY(struct case_when_branch) branches;
+            struct expr *else_expr; /* NULL if no ELSE */
+        } case_when;
+
+        /* EXPR_SUBQUERY */
+        struct {
+            char *sql; /* raw SQL text of the subquery */
+        } subquery;
+    };
+
+    sv alias; /* optional AS alias */
+};
+
+struct cell eval_expr(struct expr *e, struct table *t, struct row *row,
+                      struct database *db);
+
 struct set_clause {
     sv column;
-    struct cell value;
-    sv value_expr; /* raw expression text for evaluation (e.g. "score + 10") */
-    int has_expr;  /* 1 if value_expr should be evaluated per-row */
+    struct cell value;     /* literal value (used when expr is NULL) */
+    struct expr *expr;     /* parsed expression AST (NULL for simple literals) */
 };
 
 enum query_type {
@@ -176,6 +274,7 @@ struct query_select {
     sv table;
     sv table_alias;
     sv columns;
+    DYNAMIC_ARRAY(struct select_column) parsed_columns;
     int has_distinct;
     /* WHERE */
     struct where_clause where;
@@ -320,5 +419,7 @@ struct query {
 };
 
 int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db);
+int query_aggregate(struct table *t, struct query_select *s, struct rows *result);
+int query_group_by(struct table *t, struct query_select *s, struct rows *result);
 
 #endif
