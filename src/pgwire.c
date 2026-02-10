@@ -357,8 +357,8 @@ static int send_row_description(int fd, struct database *db, struct query *q,
         const char *colname = "?";
         uint32_t type_oid = 25; /* text */
 
-        if (q->select.select_exprs.count > 0 && (size_t)i < q->select.select_exprs.count) {
-            struct select_expr *se = &q->select.select_exprs.items[i];
+        if (q->select.select_exprs_count > 0 && (uint32_t)i < q->select.select_exprs_count) {
+            struct select_expr *se = &q->arena.select_exprs.items[q->select.select_exprs_start + i];
             if (se->kind == SEL_COLUMN) {
                 /* try to get name from table */
                 int ci = -1;
@@ -384,8 +384,8 @@ static int send_row_description(int fd, struct database *db, struct query *q,
                 if (result->count > 0)
                     type_oid = column_type_to_oid(result->data[0].cells.items[i].type);
             }
-        } else if (q->select.aggregates.count > 0 && (size_t)i < q->select.aggregates.count) {
-            switch (q->select.aggregates.items[i].func) {
+        } else if (q->select.aggregates_count > 0 && (uint32_t)i < q->select.aggregates_count) {
+            switch (q->arena.aggregates.items[q->select.aggregates_start + i].func) {
                 case AGG_SUM:   colname = "sum";   break;
                 case AGG_COUNT: colname = "count"; break;
                 case AGG_AVG:   colname = "avg";   break;
@@ -494,7 +494,7 @@ static int handle_query(int fd, struct database *db, const char *sql,
                 send_data_rows(fd, &result);
             }
             {
-                size_t ins_count = q.insert.insert_rows.count;
+                size_t ins_count = q.insert.insert_rows_count;
                 if (rc > 0) ins_count = (size_t)rc; /* INSERT...SELECT */
                 snprintf(tag, sizeof(tag), "INSERT 0 %zu", ins_count);
             }

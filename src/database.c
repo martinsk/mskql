@@ -367,13 +367,14 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
     struct rows merged = {0};
 
     /* first join */
-    struct join_info *ji = &s->joins.items[0];
+    struct query_arena *a = &q->arena;
+    struct join_info *ji = &a->joins.items[s->joins_start];
     char t1_alias_buf[128] = {0};
     if (s->table_alias.len > 0)
         snprintf(t1_alias_buf, sizeof(t1_alias_buf), "%.*s", (int)s->table_alias.len, s->table_alias.data);
     const char *a1 = t1_alias_buf[0] ? t1_alias_buf : NULL;
 
-    if (ji->is_lateral && ji->lateral_subquery_sql) {
+    if (ji->is_lateral && ji->lateral_subquery_sql != IDX_NONE) {
         /* LATERAL JOIN: for each row of t1, execute the subquery and cross-join */
         /* build merged column metadata: t1 columns + lateral result columns */
         for (size_t c = 0; c < t1->columns.count; c++) {
@@ -399,7 +400,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
             const char *outer_prefix = a1 ? a1 : t1->name;
             size_t pfx_len = strlen(outer_prefix);
             char rewritten[4096];
-            const char *src = ji->lateral_subquery_sql;
+            const char *src = ASTRING(a, ji->lateral_subquery_sql);
             size_t wp = 0;
             while (*src && wp < sizeof(rewritten) - 128) {
                 /* check for outer_prefix.col_name */
@@ -445,7 +446,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
             if (!lat_cols_added && lat_rows.count > 0) {
                 /* infer column names from the lateral subquery's column list */
                 struct query lat_q = {0};
-                int lat_parsed = (query_parse(ji->lateral_subquery_sql, &lat_q) == 0);
+                int lat_parsed = (query_parse(ASTRING(a, ji->lateral_subquery_sql), &lat_q) == 0);
                 if (lat_parsed) {
                     /* parse the SELECT column list to get names */
                     sv cols = lat_q.select.columns;
@@ -538,8 +539,8 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
     }
 
     /* subsequent joins: build a temp table from merged results, join with next */
-    for (size_t jn = 1; jn < s->joins.count; jn++) {
-        ji = &s->joins.items[jn];
+    for (uint32_t jn = 1; jn < s->joins_count; jn++) {
+        ji = &a->joins.items[s->joins_start + jn];
         struct table *tn = db_find_table_sv(db, ji->join_table);
         if (!tn) {
             fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(ji->join_table));
@@ -582,12 +583,12 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
     }
 
     /* WHERE filter — compact in-place */
-    if (s->where.has_where && s->where.where_cond) {
+    if (s->where.has_where && s->where.where_cond != IDX_NONE) {
         size_t write = 0;
         for (size_t i = 0; i < merged.count; i++) {
             merged_t.rows.items = merged.data;
             merged_t.rows.count = merged.count;
-            if (eval_condition(s->where.where_cond, &merged.data[i], &merged_t)) {
+            if (eval_condition(s->where.where_cond, a, &merged.data[i], &merged_t)) {
                 if (write != i)
                     merged.data[write] = merged.data[i];
                 write++;
@@ -599,12 +600,12 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
     }
 
     /* ORDER BY (multi-column) */
-    if (s->has_order_by && s->order_by_items.count > 0 && merged.count > 1) {
+    if (s->has_order_by && s->order_by_count > 0 && merged.count > 1) {
         int ord_cols[32];
         int ord_descs[32];
-        size_t nord = s->order_by_items.count < 32 ? s->order_by_items.count : 32;
+        size_t nord = s->order_by_count < 32 ? s->order_by_count : 32;
         for (size_t k = 0; k < nord; k++) {
-            sv ordcol = s->order_by_items.items[k].column;
+            sv ordcol = a->order_items.items[s->order_by_start + k].column;
             ord_cols[k] = -1;
             /* try exact match first (for aliased columns like b.name) */
             for (size_t c = 0; c < merged_t.columns.count; c++) {
@@ -629,22 +630,22 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
                     }
                 }
             }
-            ord_descs[k] = s->order_by_items.items[k].desc;
+            ord_descs[k] = a->order_items.items[s->order_by_start + k].desc;
         }
         _jsort_ctx = (struct join_sort_ctx){ .cols = ord_cols, .descs = ord_descs, .ncols = nord };
         qsort(merged.data, merged.count, sizeof(struct row), cmp_rows_join);
     }
 
     /* GROUP BY / aggregate on joined result */
-    if (s->has_group_by || s->aggregates.count > 0) {
+    if (s->has_group_by || s->aggregates_count > 0) {
         merged_t.rows.items = merged.data;
         merged_t.rows.count = merged.count;
         merged_t.rows.capacity = merged.count;
         int rc;
         if (s->has_group_by)
-            rc = query_group_by(&merged_t, s, result);
+            rc = query_group_by(&merged_t, s, a, result);
         else
-            rc = query_aggregate(&merged_t, s, result);
+            rc = query_aggregate(&merged_t, s, a, result);
         free_merged_rows(&merged);
         free_merged_columns(&merged_t);
         return rc;
@@ -740,30 +741,28 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
     return 0;
 }
 
-/* recursively resolve subqueries in condition tree.
- * Subquery SQL strings (subquery_sql, scalar_subquery_sql) were allocated by
- * parser.c; after consumption they are released via condition_release_subquery_sql
- * (also in parser.c) so the allocating module remains the deallocating module.
- * New in_values / value text written here uses strdup; those allocations are
- * freed by condition_free (parser.c) which handles both parser- and
- * resolver-originated text uniformly via cell_free_text. */
-static void resolve_subqueries(struct database *db, struct condition *c)
+/* recursively resolve subqueries in condition tree (arena-based).
+ * Subquery SQL strings are stored in the arena; after consumption we set
+ * the index to IDX_NONE so they won't be re-resolved.
+ * New in_values are pushed into the arena cells pool. */
+static void resolve_subqueries(struct database *db, struct query_arena *arena, uint32_t cond_idx)
 {
-    if (!c) return;
+    if (cond_idx == IDX_NONE) return;
+    struct condition *c = &COND(arena, cond_idx);
     if (c->type == COND_AND || c->type == COND_OR) {
-        resolve_subqueries(db, c->left);
-        resolve_subqueries(db, c->right);
+        resolve_subqueries(db, arena, c->left);
+        resolve_subqueries(db, arena, c->right);
         return;
     }
     if (c->type == COND_NOT) {
-        resolve_subqueries(db, c->left);
+        resolve_subqueries(db, arena, c->left);
         return;
     }
     /* EXISTS / NOT EXISTS subquery */
-    if (c->type == COND_COMPARE && c->subquery_sql &&
+    if (c->type == COND_COMPARE && c->subquery_sql != IDX_NONE &&
         (c->op == CMP_EXISTS || c->op == CMP_NOT_EXISTS)) {
         struct query sq = {0};
-        if (query_parse(c->subquery_sql, &sq) == 0) {
+        if (query_parse(ASTRING(arena, c->subquery_sql), &sq) == 0) {
             struct rows sq_result = {0};
             if (db_exec(db, &sq, &sq_result) == 0) {
                 c->value.type = COLUMN_TYPE_INT;
@@ -774,20 +773,18 @@ static void resolve_subqueries(struct database *db, struct condition *c)
             }
         }
         query_free(&sq);
-        condition_release_subquery_sql(c);
+        c->subquery_sql = IDX_NONE;
         return;
     }
-    if (c->type == COND_COMPARE && c->subquery_sql &&
+    if (c->type == COND_COMPARE && c->subquery_sql != IDX_NONE &&
         (c->op == CMP_IN || c->op == CMP_NOT_IN)) {
         struct query sq = {0};
-        if (query_parse(c->subquery_sql, &sq) == 0) {
+        if (query_parse(ASTRING(arena, c->subquery_sql), &sq) == 0) {
             struct rows sq_result = {0};
             if (db_exec(db, &sq, &sq_result) == 0) {
-                /* free any pre-existing in_values from the parser */
-                for (size_t i = 0; i < c->in_values.count; i++)
-                    cell_free_text(&c->in_values.items[i]);
-                da_free(&c->in_values);
-                da_init(&c->in_values);
+                /* push resolved values into arena cells pool */
+                uint32_t iv_start = (uint32_t)arena->cells.count;
+                uint32_t iv_count = 0;
                 for (size_t i = 0; i < sq_result.count; i++) {
                     if (sq_result.data[i].cells.count > 0) {
                         struct cell v = {0};
@@ -798,21 +795,24 @@ static void resolve_subqueries(struct database *db, struct condition *c)
                             v.value.as_text = strdup(src->value.as_text);
                         else
                             v.value = src->value;
-                        da_push(&c->in_values, v);
+                        arena_push_cell(arena, v);
+                        iv_count++;
                     }
                 }
+                c->in_values_start = iv_start;
+                c->in_values_count = iv_count;
                 for (size_t i = 0; i < sq_result.count; i++)
                     row_free(&sq_result.data[i]);
                 free(sq_result.data);
             }
         }
         query_free(&sq);
-        condition_release_subquery_sql(c);
+        c->subquery_sql = IDX_NONE;
     }
     /* scalar subquery: WHERE col > (SELECT ...) */
-    if (c->type == COND_COMPARE && c->scalar_subquery_sql) {
+    if (c->type == COND_COMPARE && c->scalar_subquery_sql != IDX_NONE) {
         struct query sq = {0};
-        if (query_parse(c->scalar_subquery_sql, &sq) == 0) {
+        if (query_parse(ASTRING(arena, c->scalar_subquery_sql), &sq) == 0) {
             struct rows sq_result = {0};
             if (db_exec(db, &sq, &sq_result) == 0) {
                 if (sq_result.count > 0 && sq_result.data[0].cells.count > 0) {
@@ -832,7 +832,7 @@ static void resolve_subqueries(struct database *db, struct condition *c)
             }
         }
         query_free(&sq);
-        condition_release_subquery_sql(c);
+        c->scalar_subquery_sql = IDX_NONE;
     }
 }
 
@@ -956,12 +956,13 @@ static struct table *materialize_subquery(struct database *db, const char *sql,
                 if (end < cols.len) { cols.data += end + 1; cols.len -= end + 1; }
                 else break;
             }
-            for (size_t a = 0; a < sq.select.aggregates.count && ci < ncells; a++, ci++) {
+            for (uint32_t ai = 0; ai < sq.select.aggregates_count && ci < ncells; ai++, ci++) {
+                struct agg_expr *ae = &sq.arena.aggregates.items[sq.select.aggregates_start + ai];
                 struct column col = {0};
-                if (sq.select.aggregates.items[a].alias.len > 0)
-                    col.name = sv_to_cstr(sq.select.aggregates.items[a].alias);
+                if (ae->alias.len > 0)
+                    col.name = sv_to_cstr(ae->alias);
                 else
-                    col.name = sv_to_cstr(sq.select.aggregates.items[a].column);
+                    col.name = sv_to_cstr(ae->column);
                 col.type = sq_rows.data[0].cells.items[ci].type;
                 da_push(&ct.columns, col);
             }
@@ -1051,8 +1052,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             struct query_create_table *crt = &q->create_table;
             struct table t;
             table_init_own(&t, sv_to_cstr(crt->table));
-            for (size_t i = 0; i < crt->create_columns.count; i++) {
-                table_add_column(&t, &crt->create_columns.items[i]);
+            for (uint32_t i = 0; i < crt->columns_count; i++) {
+                table_add_column(&t, &q->arena.columns.items[crt->columns_start + i]);
             }
             da_push(&db->tables, t);
             return 0;
@@ -1087,9 +1088,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             struct enum_type et;
             et.name = sv_to_cstr(ct->type_name);
             da_init(&et.values);
-            for (size_t i = 0; i < ct->enum_values.count; i++) {
-                da_push(&et.values, ct->enum_values.items[i]);
-                ct->enum_values.items[i] = NULL; /* transfer ownership */
+            for (uint32_t i = 0; i < ct->enum_values_count; i++) {
+                /* copy the string (arena owns the original) */
+                da_push(&et.values, strdup(q->arena.strings.items[ct->enum_values_start + i]));
             }
             da_push(&db->types, et);
             return 0;
@@ -1156,16 +1157,19 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             size_t n_cte_temps = 0;
 
             /* multiple CTEs (new path) */
-            if (s->ctes.count > 0) {
-                for (size_t ci = 0; ci < s->ctes.count && n_cte_temps < 32; ci++) {
-                    struct cte_def *cd = &s->ctes.items[ci];
+            struct query_arena *qa = &q->arena;
+            if (s->ctes_count > 0) {
+                for (uint32_t ci = 0; ci < s->ctes_count && n_cte_temps < 32; ci++) {
+                    struct cte_def *cd = &qa->ctes.items[s->ctes_start + ci];
+                    const char *cd_sql = ASTRING(qa, cd->sql_idx);
+                    const char *cd_name = ASTRING(qa, cd->name_idx);
                     if (cd->is_recursive) {
                         /* Recursive CTE: the SQL should be "base UNION ALL recursive"
                          * We execute the base case, create the temp table, then
                          * repeatedly execute the recursive part until no new rows. */
                         /* find UNION ALL separator */
                         const char *union_pos = NULL;
-                        const char *p = cd->sql;
+                        const char *p = cd_sql;
                         int depth = 0;
                         while (*p) {
                             if (*p == '(') depth++;
@@ -1181,14 +1185,14 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                         }
                         if (!union_pos) {
                             /* no UNION — just materialize normally */
-                            cte_temps[n_cte_temps] = materialize_subquery(db, cd->sql, cd->name);
+                            cte_temps[n_cte_temps] = materialize_subquery(db, cd_sql, cd_name);
                             n_cte_temps++;
                             continue;
                         }
                         /* extract base SQL (before UNION) */
-                        size_t base_len = (size_t)(union_pos - cd->sql);
+                        size_t base_len = (size_t)(union_pos - cd_sql);
                         char *base_sql = malloc(base_len + 1);
-                        memcpy(base_sql, cd->sql, base_len);
+                        memcpy(base_sql, cd_sql, base_len);
                         base_sql[base_len] = '\0';
                         /* skip "UNION ALL " */
                         const char *rec_start = union_pos + 5;
@@ -1200,7 +1204,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                         char *rec_sql = strdup(rec_start);
 
                         /* execute base case */
-                        struct table *ct = materialize_subquery(db, base_sql, cd->name);
+                        struct table *ct = materialize_subquery(db, base_sql, cd_name);
                         free(base_sql);
                         if (!ct) { free(rec_sql); continue; }
                         cte_temps[n_cte_temps++] = ct;
@@ -1223,7 +1227,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
 
                         for (int iter = 0; iter < 1000; iter++) {
                             /* ct currently holds only the working set (new rows) */
-                            ct = db_find_table(db, cd->name);
+                            ct = db_find_table(db, cd_name);
                             if (!ct) break;
                             struct rows rec_rows = {0};
                             if (db_exec_sql(db, rec_sql, &rec_rows) != 0) break;
@@ -1260,7 +1264,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                         }
 
                         /* replace CTE table rows with the full accumulator */
-                        ct = db_find_table(db, cd->name);
+                        ct = db_find_table(db, cd_name);
                         if (ct) {
                             for (size_t ri = 0; ri < ct->rows.count; ri++)
                                 row_free(&ct->rows.items[ri]);
@@ -1280,19 +1284,19 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                         }
                         free(rec_sql);
                     } else {
-                        cte_temps[n_cte_temps] = materialize_subquery(db, cd->sql, cd->name);
+                        cte_temps[n_cte_temps] = materialize_subquery(db, cd_sql, cd_name);
                         n_cte_temps++;
                     }
                 }
-            } else if (s->cte_name && s->cte_sql) {
+            } else if (s->cte_name != IDX_NONE && s->cte_sql != IDX_NONE) {
                 /* legacy single CTE */
-                cte_temps[0] = materialize_subquery(db, s->cte_sql, s->cte_name);
+                cte_temps[0] = materialize_subquery(db, ASTRING(qa, s->cte_sql), ASTRING(qa, s->cte_name));
                 n_cte_temps = 1;
             }
 
             /* FROM subquery: create temp table */
             struct table *from_sub_table = NULL;
-            if (s->from_subquery_sql) {
+            if (s->from_subquery_sql != IDX_NONE) {
                 char alias_buf[256];
                 if (s->from_subquery_alias.len > 0) {
                     snprintf(alias_buf, sizeof(alias_buf), "%.*s",
@@ -1300,36 +1304,38 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 } else {
                     snprintf(alias_buf, sizeof(alias_buf), "_from_sub");
                 }
-                from_sub_table = materialize_subquery(db, s->from_subquery_sql, alias_buf);
+                from_sub_table = materialize_subquery(db, ASTRING(&q->arena, s->from_subquery_sql), alias_buf);
             }
 
             /* resolve any IN (SELECT ...) / EXISTS subqueries */
-            if (s->where.has_where && s->where.where_cond)
-                resolve_subqueries(db, s->where.where_cond);
+            if (s->where.has_where && s->where.where_cond != IDX_NONE)
+                resolve_subqueries(db, &q->arena, s->where.where_cond);
             int sel_rc;
-            if (s->table.len == 0 && s->parsed_columns.count > 0 && result) {
+            if (s->table.len == 0 && s->parsed_columns_count > 0 && result) {
                 /* SELECT <expr>, ... — no table, evaluate expression ASTs */
                 struct row dst = {0};
                 da_init(&dst.cells);
-                for (size_t i = 0; i < s->parsed_columns.count; i++) {
-                    struct cell c = eval_expr(s->parsed_columns.items[i].expr, NULL, NULL, db);
+                for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+                    struct select_column *sc = &q->arena.select_cols.items[s->parsed_columns_start + i];
+                    struct cell c = eval_expr(sc->expr_idx, &q->arena, NULL, NULL, db);
                     da_push(&dst.cells, c);
                 }
                 rows_push(result, dst);
                 sel_rc = 0;
-            } else if (s->table.len == 0 && s->insert_row && result) {
-                /* legacy: SELECT <literal> via insert_row */
+            } else if (s->table.len == 0 && s->insert_rows_count > 0 && result) {
+                /* legacy: SELECT <literal> via insert_rows in arena */
+                struct row *ir = &qa->rows.items[s->insert_rows_start];
                 struct row dst = {0};
                 da_init(&dst.cells);
-                for (size_t i = 0; i < s->insert_row->cells.count; i++) {
+                for (size_t i = 0; i < ir->cells.count; i++) {
                     struct cell c = {0};
-                    c.is_null = s->insert_row->cells.items[i].is_null;
-                    c.type = s->insert_row->cells.items[i].type;
+                    c.is_null = ir->cells.items[i].is_null;
+                    c.type = ir->cells.items[i].type;
                     if (column_type_is_text(c.type)
-                        && s->insert_row->cells.items[i].value.as_text)
-                        c.value.as_text = strdup(s->insert_row->cells.items[i].value.as_text);
+                        && ir->cells.items[i].value.as_text)
+                        c.value.as_text = strdup(ir->cells.items[i].value.as_text);
                     else
-                        c.value = s->insert_row->cells.items[i].value;
+                        c.value = ir->cells.items[i].value;
                     da_push(&dst.cells, c);
                 }
                 rows_push(result, dst);
@@ -1344,9 +1350,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             // TODO: CONTAINER REUSE: the row-equality comparison loop (iterate cells,
             // call cell_equal) is duplicated three times below for UNION, INTERSECT, and
             // EXCEPT. Extract a rows_equal(row*, row*) helper into row.c.
-            if (sel_rc == 0 && s->has_set_op && s->set_rhs_sql && result) {
+            if (sel_rc == 0 && s->has_set_op && s->set_rhs_sql != IDX_NONE && result) {
                 struct query rhs_q = {0};
-                int rhs_parsed = (query_parse(s->set_rhs_sql, &rhs_q) == 0);
+                int rhs_parsed = (query_parse(ASTRING(&q->arena, s->set_rhs_sql), &rhs_q) == 0);
                 if (rhs_parsed) {
                     struct rows rhs_rows = {0};
                     if (db_exec(db, &rhs_q, &rhs_rows) == 0) {
@@ -1409,31 +1415,33 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             }
 
             /* ORDER BY on combined set operation result */
-            if (sel_rc == 0 && s->has_set_op && s->set_order_by &&
+            if (sel_rc == 0 && s->has_set_op && s->set_order_by != IDX_NONE &&
                 result && result->count > 1) {
                 /* parse the ORDER BY clause stored as text */
                 char ob_wrap[512];
-                snprintf(ob_wrap, sizeof(ob_wrap), "SELECT x FROM t %s", s->set_order_by);
+                snprintf(ob_wrap, sizeof(ob_wrap), "SELECT x FROM t %s", ASTRING(qa, s->set_order_by));
                 struct query ob_q = {0};
                 if (query_parse(ob_wrap, &ob_q) == 0 && ob_q.select.has_order_by &&
-                    ob_q.select.order_by_items.count > 0) {
+                    ob_q.select.order_by_count > 0) {
                     /* resolve column indices against the source table */
                     struct table *src_t = db_find_table_sv(db, s->table);
+                    struct query_arena *ob_a = &ob_q.arena;
                     int ord_cols[32];
                     int ord_descs[32];
-                    size_t nord = ob_q.select.order_by_items.count < 32 ? ob_q.select.order_by_items.count : 32;
+                    size_t nord = ob_q.select.order_by_count < 32 ? ob_q.select.order_by_count : 32;
                     for (size_t k = 0; k < nord; k++) {
+                        struct order_by_item *obi = &ob_a->order_items.items[ob_q.select.order_by_start + k];
                         ord_cols[k] = -1;
-                        ord_descs[k] = ob_q.select.order_by_items.items[k].desc;
+                        ord_descs[k] = obi->desc;
                         if (src_t) {
                             char obuf[256];
                             const char *ord_name = extract_col_name(
-                                ob_q.select.order_by_items.items[k].column, obuf, sizeof(obuf));
+                                obi->column, obuf, sizeof(obuf));
                             ord_cols[k] = table_find_column(src_t, ord_name);
                             /* if not found, try resolving as a SELECT alias */
                             if (ord_cols[k] < 0 && s->columns.len > 0) {
                                 ord_cols[k] = resolve_alias_to_column(src_t, s->columns,
-                                    ob_q.select.order_by_items.items[k].column);
+                                    obi->column);
                             }
                         }
                     }
@@ -1458,9 +1466,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
         case QUERY_TYPE_INSERT: {
             struct query_insert *ins = &q->insert;
             /* INSERT ... SELECT */
-            if (ins->insert_select_sql) {
+            if (ins->insert_select_sql != IDX_NONE) {
                 struct query sel_q = {0};
-                if (query_parse(ins->insert_select_sql, &sel_q) != 0) {
+                if (query_parse(ASTRING(&q->arena, ins->insert_select_sql), &sel_q) != 0) {
                     query_free(&sel_q);
                     return -1;
                 }
@@ -1512,9 +1520,11 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     }
                     if (conflict_col >= 0) {
                         /* filter out rows that conflict */
-                        size_t orig_count = ins->insert_rows.count;
-                        for (size_t ri = 0; ri < ins->insert_rows.count; ) {
-                            struct cell *new_cell = &ins->insert_rows.items[ri].cells.items[conflict_col];
+                        struct row *ir_items = &q->arena.rows.items[ins->insert_rows_start];
+                        uint32_t ir_count = ins->insert_rows_count;
+                        size_t orig_count = ir_count;
+                        for (uint32_t ri = 0; ri < ir_count; ) {
+                            struct cell *new_cell = &ir_items[ri].cells.items[conflict_col];
                             int conflict = 0;
                             for (size_t ei = 0; ei < t->rows.count; ei++) {
                                 if (cell_equal(new_cell, &t->rows.items[ei].cells.items[conflict_col])) {
@@ -1523,15 +1533,15 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                                 }
                             }
                             if (conflict) {
-                                /* skip this row — shift remaining */
-                                row_free(&ins->insert_rows.items[ri]);
-                                for (size_t j = ri; j + 1 < ins->insert_rows.count; j++)
-                                    ins->insert_rows.items[j] = ins->insert_rows.items[j + 1];
-                                ins->insert_rows.count--;
-                                if (ins->insert_rows.count > 0)
-                                    ins->insert_row = &ins->insert_rows.items[0];
-                                else
-                                    ins->insert_row = NULL;
+                                /* skip this row — free cells and shift remaining.
+                                 * Zero the vacated slot so arena_destroy won't double-free. */
+                                row_free(&ir_items[ri]);
+                                for (uint32_t j = ri; j + 1 < ir_count; j++)
+                                    ir_items[j] = ir_items[j + 1];
+                                ir_count--;
+                                ins->insert_rows_count = ir_count;
+                                /* zero the now-unused tail slot */
+                                memset(&ir_items[ir_count], 0, sizeof(ir_items[ir_count]));
                             } else {
                                 ri++;
                             }
@@ -1539,20 +1549,20 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                         (void)orig_count;
                     }
                 }
-                if (ins->insert_rows.count == 0) return 0;
+                if (ins->insert_rows_count == 0) return 0;
             }
             return db_table_exec_query(db, ins->table, q, result);
         }
         case QUERY_TYPE_DELETE:
             /* resolve subqueries in WHERE */
-            if (q->del.where.has_where && q->del.where.where_cond)
-                resolve_subqueries(db, q->del.where.where_cond);
+            if (q->del.where.has_where && q->del.where.where_cond != IDX_NONE)
+                resolve_subqueries(db, &q->arena, q->del.where.where_cond);
             return db_table_exec_query(db, q->del.table, q, result);
         case QUERY_TYPE_UPDATE: {
             struct query_update *u = &q->update;
             /* resolve subqueries in WHERE */
-            if (u->where.has_where && u->where.where_cond)
-                resolve_subqueries(db, u->where.where_cond);
+            if (u->where.has_where && u->where.where_cond != IDX_NONE)
+                resolve_subqueries(db, &q->arena, u->where.where_cond);
             /* UPDATE ... FROM — use parsed join columns */
             if (u->has_update_from) {
                 struct table *t = db_find_table_sv(db, u->table);
@@ -1592,16 +1602,17 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     if (!matched) continue;
                     updated++;
                     /* evaluate all SET expressions against pre-update snapshot */
-                    size_t nsc = u->set_clauses.count;
+                    uint32_t nsc = u->set_clauses_count;
                     struct cell *new_vals = calloc(nsc, sizeof(struct cell));
                     int *col_idxs = calloc(nsc, sizeof(int));
-                    for (size_t sc = 0; sc < nsc; sc++) {
-                        col_idxs[sc] = table_find_column_sv(t, u->set_clauses.items[sc].column);
+                    for (uint32_t sc = 0; sc < nsc; sc++) {
+                        struct set_clause *scp = &q->arena.set_clauses.items[u->set_clauses_start + sc];
+                        col_idxs[sc] = table_find_column_sv(t, scp->column);
                         if (col_idxs[sc] < 0) { new_vals[sc] = (struct cell){0}; continue; }
-                        if (u->set_clauses.items[sc].expr) {
-                            new_vals[sc] = eval_expr(u->set_clauses.items[sc].expr, t, &t->rows.items[i], db);
+                        if (scp->expr_idx != IDX_NONE) {
+                            new_vals[sc] = eval_expr(scp->expr_idx, &q->arena, t, &t->rows.items[i], db);
                         } else {
-                            cell_copy(&new_vals[sc], &u->set_clauses.items[sc].value);
+                            cell_copy(&new_vals[sc], &scp->value);
                         }
                     }
                     for (size_t sc = 0; sc < nsc; sc++) {

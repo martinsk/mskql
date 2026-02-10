@@ -1,9 +1,11 @@
 #ifndef QUERY_H
 #define QUERY_H
 
+#include <stdint.h>
 #include "row.h"
 #include "table.h"
 #include "stringview.h"
+#include "arena.h"
 
 struct database;
 
@@ -51,10 +53,9 @@ struct select_expr {
     struct win_expr win; /* for SEL_WINDOW */
 };
 
-/* A parsed SELECT column: expression + optional alias.
- * Replaces the raw `sv columns` text for expression evaluation. */
+/* A parsed SELECT column: expression + optional alias. */
 struct select_column {
-    struct expr *expr;   /* parsed expression AST */
+    uint32_t expr_idx;   /* index into arena.exprs, or IDX_NONE */
     sv alias;            /* optional AS alias (empty if none) */
 };
 
@@ -92,33 +93,38 @@ struct condition {
     sv column;
     enum cmp_op op;
     struct cell value;
-    struct expr *lhs_expr;   /* optional: expression AST for LHS (e.g. COALESCE(val,0)) */
-    /* for CMP_IN / CMP_NOT_IN: list of values */
-    DYNAMIC_ARRAY(struct cell) in_values;
-    /* for CMP_IN subquery: raw SQL text to be resolved before execution */
-    char *subquery_sql;
-    /* for scalar subquery comparison: WHERE x > (SELECT ...) */
-    char *scalar_subquery_sql;
-    /* for CMP_BETWEEN: low and high */
+    uint32_t lhs_expr;           /* index into arena.exprs, or IDX_NONE */
+    /* for CMP_IN / CMP_NOT_IN: range in arena.cells */
+    uint32_t in_values_start;    /* index into arena.cells */
+    uint32_t in_values_count;
+    /* for CMP_IN subquery: index into arena.strings, or IDX_NONE */
+    uint32_t subquery_sql;
+    /* for scalar subquery comparison: index into arena.strings, or IDX_NONE */
+    uint32_t scalar_subquery_sql;
+    /* for CMP_BETWEEN: low (in value) and high */
     struct cell between_high;
-    /* for COND_AND / COND_OR */
-    struct condition *left;
-    struct condition *right;
+    /* for COND_AND / COND_OR / COND_NOT */
+    uint32_t left;               /* index into arena.conditions, or IDX_NONE */
+    uint32_t right;              /* index into arena.conditions, or IDX_NONE */
     /* for COND_MULTI_IN: WHERE (a, b) IN ((1,2), (3,4)) */
-    DYNAMIC_ARRAY(sv) multi_columns;        /* column names */
-    int multi_tuple_width;                   /* number of columns per tuple */
-    DYNAMIC_ARRAY(struct cell) multi_values; /* flat array: tuples concatenated */
+    uint32_t multi_columns_start; /* index into arena.svs */
+    uint32_t multi_columns_count;
+    int multi_tuple_width;
+    uint32_t multi_values_start;  /* index into arena.cells */
+    uint32_t multi_values_count;
     /* for ANY/ALL/SOME: col op ANY(ARRAY[...]) */
-    int is_any;  /* 1 = ANY/SOME, 0 = not */
-    int is_all;  /* 1 = ALL, 0 = not */
-    DYNAMIC_ARRAY(struct cell) array_values; /* values for ANY/ALL */
+    int is_any;
+    int is_all;
+    uint32_t array_values_start;  /* index into arena.cells */
+    uint32_t array_values_count;
 };
 
-int eval_condition(struct condition *cond, struct row *row, struct table *t);
+int eval_condition(uint32_t cond_idx, struct query_arena *arena,
+                   struct row *row, struct table *t);
 
 /* ---------------------------------------------------------------------------
  * Expression AST — tagged union for all SQL expressions.
- * Replaces raw-text expression evaluation with a proper tree structure.
+ * All child references are uint32_t indices into the query arena pools.
  * ------------------------------------------------------------------------- */
 
 enum expr_type {
@@ -154,8 +160,8 @@ enum expr_func {
 };
 
 struct case_when_branch {
-    struct condition *cond;  /* WHEN condition */
-    struct expr *then_expr;  /* THEN expression */
+    uint32_t cond_idx;       /* index into arena.conditions */
+    uint32_t then_expr_idx;  /* index into arena.exprs */
 };
 
 struct expr {
@@ -173,44 +179,47 @@ struct expr {
         /* EXPR_BINARY_OP */
         struct {
             enum expr_op op;
-            struct expr *left;
-            struct expr *right;
+            uint32_t left;   /* index into arena.exprs */
+            uint32_t right;  /* index into arena.exprs */
         } binary;
 
         /* EXPR_UNARY_OP */
         struct {
             enum expr_op op;
-            struct expr *operand;
+            uint32_t operand; /* index into arena.exprs */
         } unary;
 
         /* EXPR_FUNC_CALL */
         struct {
             enum expr_func func;
-            DYNAMIC_ARRAY(struct expr *) args;
+            uint32_t args_start; /* index into arena.arg_indices (consecutive) */
+            uint32_t args_count;
         } func_call;
 
         /* EXPR_CASE_WHEN */
         struct {
-            DYNAMIC_ARRAY(struct case_when_branch) branches;
-            struct expr *else_expr; /* NULL if no ELSE */
+            uint32_t branches_start; /* index into arena.branches (consecutive) */
+            uint32_t branches_count;
+            uint32_t else_expr;      /* index into arena.exprs, or IDX_NONE */
         } case_when;
 
         /* EXPR_SUBQUERY */
         struct {
-            char *sql; /* raw SQL text of the subquery */
+            uint32_t sql_idx; /* index into arena.strings */
         } subquery;
     };
 
     sv alias; /* optional AS alias */
 };
 
-struct cell eval_expr(struct expr *e, struct table *t, struct row *row,
+struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
+                      struct table *t, struct row *row,
                       struct database *db);
 
 struct set_clause {
     sv column;
-    struct cell value;     /* literal value (used when expr is NULL) */
-    struct expr *expr;     /* parsed expression AST (NULL for simple literals) */
+    struct cell value;     /* literal value (used when expr_idx is IDX_NONE) */
+    uint32_t expr_idx;     /* index into arena.exprs, or IDX_NONE */
 };
 
 enum query_type {
@@ -248,12 +257,12 @@ struct join_info {
     sv using_col;
     int is_natural;
     int is_lateral;
-    char *lateral_subquery_sql; /* for LATERAL (SELECT ...) */
+    uint32_t lateral_subquery_sql; /* index into arena.strings, or IDX_NONE */
 };
 
 struct cte_def {
-    char *name;
-    char *sql;
+    uint32_t name_idx;   /* index into arena.strings */
+    uint32_t sql_idx;    /* index into arena.strings */
     int is_recursive;
 };
 
@@ -267,14 +276,15 @@ struct where_clause {
     int has_where;
     sv where_column;
     struct cell where_value;
-    struct condition *where_cond;
+    uint32_t where_cond;  /* index into arena.conditions, or IDX_NONE */
 };
 
 struct query_select {
     sv table;
     sv table_alias;
     sv columns;
-    DYNAMIC_ARRAY(struct select_column) parsed_columns;
+    uint32_t parsed_columns_start; /* index into arena.select_cols (consecutive) */
+    uint32_t parsed_columns_count;
     int has_distinct;
     /* WHERE */
     struct where_clause where;
@@ -284,57 +294,63 @@ struct query_select {
     sv join_table;
     sv join_left_col;
     sv join_right_col;
-    DYNAMIC_ARRAY(struct join_info) joins;
+    uint32_t joins_start;  /* index into arena.joins (consecutive) */
+    uint32_t joins_count;
     /* GROUP BY */
     int has_group_by;
     sv group_by_col;
-    DYNAMIC_ARRAY(sv) group_by_cols;
+    uint32_t group_by_start; /* index into arena.svs (consecutive) */
+    uint32_t group_by_count;
     /* HAVING */
     int has_having;
-    struct condition *having_cond;
+    uint32_t having_cond;  /* index into arena.conditions, or IDX_NONE */
     /* ORDER BY */
     int has_order_by;
     sv order_by_col;
     int order_desc;
-    DYNAMIC_ARRAY(struct order_by_item) order_by_items;
+    uint32_t order_by_start; /* index into arena.order_items (consecutive) */
+    uint32_t order_by_count;
     /* LIMIT / OFFSET */
     int has_limit;
     int limit_count;
     int has_offset;
     int offset_count;
     /* aggregates & window functions */
-    DYNAMIC_ARRAY(struct agg_expr) aggregates;
-    DYNAMIC_ARRAY(struct select_expr) select_exprs;
+    uint32_t aggregates_start; /* index into arena.aggregates (consecutive) */
+    uint32_t aggregates_count;
+    uint32_t select_exprs_start; /* index into arena.select_exprs (consecutive) */
+    uint32_t select_exprs_count;
     /* set operations: UNION / INTERSECT / EXCEPT */
     int has_set_op;
     int set_op;       /* 0=UNION, 1=INTERSECT, 2=EXCEPT */
     int set_all;      /* UNION ALL etc. */
-    char *set_rhs_sql;
-    char *set_order_by;
+    uint32_t set_rhs_sql;   /* index into arena.strings, or IDX_NONE */
+    uint32_t set_order_by;  /* index into arena.strings, or IDX_NONE */
     /* CTE support (legacy single CTE) */
-    char *cte_name;
-    char *cte_sql;
+    uint32_t cte_name;      /* index into arena.strings, or IDX_NONE */
+    uint32_t cte_sql;       /* index into arena.strings, or IDX_NONE */
     /* multiple / recursive CTEs */
-    DYNAMIC_ARRAY(struct cte_def) ctes;
+    uint32_t ctes_start;    /* index into arena.ctes (consecutive) */
+    uint32_t ctes_count;
     int has_recursive_cte;
     /* FROM subquery: SELECT * FROM (SELECT ...) AS alias */
-    char *from_subquery_sql;
+    uint32_t from_subquery_sql; /* index into arena.strings, or IDX_NONE */
     sv from_subquery_alias;
-    /* literal SELECT (no table): reuse insert_row for literal values */
-    DYNAMIC_ARRAY(struct row) insert_rows;
-    struct row *insert_row;
+    /* literal SELECT (no table): rows in arena.rows */
+    uint32_t insert_rows_start; /* index into arena.rows (consecutive) */
+    uint32_t insert_rows_count;
 };
 
 struct query_insert {
     sv table;
     sv columns;
-    struct row *insert_row; /* alias into insert_rows (never independently owned) */
-    DYNAMIC_ARRAY(struct row) insert_rows;
+    uint32_t insert_rows_start; /* index into arena.rows (consecutive) */
+    uint32_t insert_rows_count;
     /* RETURNING */
     int has_returning;
     sv returning_columns;
     /* INSERT ... SELECT */
-    char *insert_select_sql;
+    uint32_t insert_select_sql; /* index into arena.strings, or IDX_NONE */
     /* ON CONFLICT */
     int has_on_conflict;
     int on_conflict_do_nothing;
@@ -343,7 +359,8 @@ struct query_insert {
 
 struct query_update {
     sv table;
-    DYNAMIC_ARRAY(struct set_clause) set_clauses;
+    uint32_t set_clauses_start; /* index into arena.set_clauses (consecutive) */
+    uint32_t set_clauses_count;
     /* WHERE */
     struct where_clause where;
     /* RETURNING */
@@ -367,7 +384,8 @@ struct query_delete {
 
 struct query_create_table {
     sv table;
-    DYNAMIC_ARRAY(struct column) create_columns;
+    uint32_t columns_start; /* index into arena.columns (consecutive) */
+    uint32_t columns_count;
 };
 
 struct query_drop_table {
@@ -394,7 +412,8 @@ struct query_drop_index {
 
 struct query_create_type {
     sv type_name;
-    DYNAMIC_ARRAY(char *) enum_values;
+    uint32_t enum_values_start; /* index into arena.strings (consecutive) */
+    uint32_t enum_values_count;
 };
 
 struct query_drop_type {
@@ -403,6 +422,7 @@ struct query_drop_type {
 
 struct query {
     enum query_type query_type;
+    struct query_arena arena;
     union {
         struct query_select select;
         struct query_insert insert;
@@ -419,7 +439,10 @@ struct query {
 };
 
 int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db);
-int query_aggregate(struct table *t, struct query_select *s, struct rows *result);
-int query_group_by(struct table *t, struct query_select *s, struct rows *result);
+int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result);
+int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result);
+
+/* arena helpers that need complete type definitions — must come after all structs */
+#include "arena_helpers.h"
 
 #endif
