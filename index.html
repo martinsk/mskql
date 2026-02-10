@@ -253,7 +253,7 @@
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-    &ensp;&middot;&ensp; ~10,300 lines of C11 &ensp;&middot;&ensp; 350 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~10,500 lines of C11 &ensp;&middot;&ensp; ~400 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -363,15 +363,19 @@
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
-                3,200 lines the parser is the largest single file. It handles the full
-                grammar including CTEs, window functions, and set operations.</span></td>
+                3,200 lines the parser is the largest single file. It includes a
+                recursive-descent expression parser with proper operator precedence
+                (<code>||</code>&nbsp;&lt;&nbsp;<code>+-</code>&nbsp;&lt;&nbsp;<code>*/%</code>)
+                and handles the full grammar including CTEs, window functions, and
+                set operations.</span></td>
         </tr>
         <tr>
             <td><strong>Query executor</strong></td>
             <td><code>query.c</code>, <code>database.c</code></td>
-            <td>Walks the AST and executes against in-memory tables. Handles joins,
-                aggregation, window functions, set operations, CTEs, subqueries,
-                transactions</td>
+            <td>Tree-walking evaluator that executes the AST against in-memory tables.
+                Handles joins, aggregation (including <code>DISTINCT</code> aggregates),
+                window functions, set operations, CTEs, correlated subqueries,
+                and transactions</td>
         </tr>
         <tr>
             <td><strong>Storage</strong></td>
@@ -390,6 +394,12 @@
     replaced the earlier recursive-deallocation approach, eliminating an entire class of
     memory leaks and simplifying the parser&rsquo;s public API to just two functions:
     <code>query_parse()</code> and <code>query_free()</code>.</span>
+    Expressions are represented as a tagged-union AST (<code>struct&nbsp;expr</code>)
+    with types for literals, column references, binary/unary operators, function calls,
+    <code>CASE&nbsp;WHEN</code>, and subqueries&mdash;evaluated by a tree-walking
+    <code>eval_expr()</code>. Ownership follows JPL rules: the allocating module
+    deallocates, with <code>cell_release()</code> as the single canonical release
+    function for cell text.
     A generic dynamic-array macro (<code>dynamic_array.h</code>) and zero-copy string views
     (<code>stringview.h</code>) round out the internal abstractions.
 </p>
@@ -441,6 +451,7 @@
             <td><strong>Aggregation</strong></td>
             <td><code>COUNT</code>, <code>SUM</code>, <code>AVG</code>,
                 <code>MIN</code>, <code>MAX</code>,
+                <code>COUNT(DISTINCT&nbsp;col)</code>,
                 <code>GROUP BY</code> (multi-column), <code>HAVING</code></td>
         </tr>
         <tr>
@@ -492,7 +503,9 @@
         <tr>
             <td><strong>Subqueries</strong></td>
             <td>Scalar subqueries in <code>SELECT</code> list,
-                correlated subqueries, <code>IN (SELECT&hellip;)</code></td>
+                correlated subqueries,
+                <code>EXISTS</code> / <code>NOT EXISTS</code> (correlated),
+                <code>IN (SELECT&hellip;)</code></td>
         </tr>
     </tbody>
 </table>
@@ -626,9 +639,10 @@ ORDER BY d.dt;</code></pre>
 <h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes 350 SQL test cases covering DDL, DML, joins, aggregation,
+    The project includes ~400 SQL test cases covering DDL, DML, joins, aggregation,
     window functions, set operations, CTEs, transactions, NULL handling, type coercion,
-    constraint enforcement, string functions, and various edge cases. A separate
+    constraint enforcement, string functions, expression evaluation, correlated
+    subqueries, and various edge cases. A separate
     concurrent test harness exercises multi-client scenarios.<span class="sidenote">Each
     test case starts a fresh server instance, sends SQL via <code>psql</code>, and validates
     output against expected results. No test framework&mdash;just shell scripts and
