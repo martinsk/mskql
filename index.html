@@ -7,6 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
     <style>
         /* ── Reset & base ────────────────────────────────────── */
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -65,15 +66,10 @@
         .byline {
             font-size: 0.95rem;
             color: var(--fg-dim);
-            margin-bottom: 0.4rem;
-        }
-        .byline a { font-size: 0.95rem; }
-
-        .author {
-            font-size: 1.05rem;
             margin-bottom: 2rem;
         }
-        .author a { font-size: 1.05rem; }
+        .byline a { font-size: 0.95rem; }
+        .byline .author-name { font-size: 1.0rem; }
 
         h2 {
             font-weight: 400;
@@ -172,6 +168,8 @@
             margin: 1rem 0 1.4rem 0;
         }
         pre code { background: none; padding: 0; border-radius: 0; }
+        pre code.hljs { background: var(--code-bg); padding: 0; }
+        .hljs { background: var(--code-bg); }
 
         /* ── Tables (Tufte: full-width, minimal rules) ───────── */
         .fullwidth { width: 100%; }
@@ -252,11 +250,10 @@
 <h1>mskql</h1>
 <span class="subtitle">A lightweight, in-memory SQL database engine written in&nbsp;C</span>
 <p class="byline">
+    <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
+    &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
     &ensp;&middot;&ensp; ~10,300 lines of C11 &ensp;&middot;&ensp; 350 test cases &ensp;&middot;&ensp; zero dependencies
-</p>
-<p class="author">
-    by <a href="https://www.linkedin.com/in/martinskristiansen"><strong>Martin S. Kristiansen</strong></a>
 </p>
 <hr class="title-rule">
 
@@ -536,7 +533,7 @@
     Prerequisites: a C11 compiler and <code>make</code>. Nothing else.
 </p>
 
-<pre><code>make                                          # build
+<pre><code class="language-bash">make                                          # build
 ./build/mskql                                 # start server on port 5433
 psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 
@@ -544,13 +541,13 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
     Set <code>MSKQL_PORT</code> to listen on a different port:
 </p>
 
-<pre><code>MSKQL_PORT=5444 ./build/mskql</code></pre>
+<pre><code class="language-bash">MSKQL_PORT=5444 ./build/mskql</code></pre>
 
 <h3>A small company in six queries</h3>
 
 <p>Start with a schema&mdash;two tables and a handful of rows:</p>
 
-<pre><code>CREATE TABLE departments (
+<pre><code class="language-sql">CREATE TABLE departments (
     id    SERIAL PRIMARY KEY,
     name  TEXT NOT NULL UNIQUE
 );
@@ -576,20 +573,20 @@ INSERT INTO employees (id, name, dept_id, salary, hired) VALUES
 
 <p>A simple lookup&mdash;who earns above six figures?</p>
 
-<pre><code>SELECT name, salary FROM employees
+<pre><code class="language-sql">SELECT name, salary FROM employees
 WHERE salary > 100000
 ORDER BY salary DESC;</code></pre>
 
 <p>Join the tables to see which department each person belongs to
     (and catch Frank, who hasn&rsquo;t been assigned yet):</p>
 
-<pre><code>SELECT e.name, COALESCE(d.name, 'Unassigned') AS department
+<pre><code class="language-sql">SELECT e.name, COALESCE(d.name, 'Unassigned') AS department
 FROM employees e
 LEFT JOIN departments d ON e.dept_id = d.id;</code></pre>
 
 <p>Aggregate&mdash;average salary per department, but only the big spenders:</p>
 
-<pre><code>SELECT d.name AS department,
+<pre><code class="language-sql">SELECT d.name AS department,
        COUNT(*) AS headcount,
        AVG(e.salary) AS avg_salary
 FROM employees e
@@ -599,7 +596,7 @@ HAVING AVG(e.salary) > 100000;</code></pre>
 
 <p>Window function&mdash;rank everyone within their department:</p>
 
-<pre><code>SELECT e.name,
+<pre><code class="language-sql">SELECT e.name,
        d.name AS department,
        e.salary,
        RANK() OVER (PARTITION BY d.name ORDER BY e.salary DESC) AS dept_rank
@@ -608,7 +605,7 @@ JOIN departments d ON e.dept_id = d.id;</code></pre>
 
 <p>Finally, a recursive CTE&mdash;generate a running headcount timeline by hire date:</p>
 
-<pre><code>WITH RECURSIVE dates AS (
+<pre><code class="language-sql">WITH RECURSIVE dates AS (
     SELECT MIN(hired) AS dt FROM employees
     UNION ALL
     SELECT dt + 1 FROM dates
@@ -638,7 +635,7 @@ ORDER BY d.dt;</code></pre>
     <code>diff</code>.</span>
 </p>
 
-<pre><code>make test</code></pre>
+<pre><code class="language-bash">make test</code></pre>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--  7. Benchmarks                                              -->
@@ -661,12 +658,16 @@ ORDER BY d.dt;</code></pre>
 <!-- ═══════════════════════════════════════════════════════════ -->
 
 <footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
     &ensp;&middot;&ensp;
     <a href="dev/bench/index.html">Benchmarks</a>
-    &ensp;&middot;&ensp;
-    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
 </footer>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script>hljs.highlightAll();</script>
 </body>
 </html>
