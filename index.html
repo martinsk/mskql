@@ -247,7 +247,7 @@
 <span class="subtitle">A lightweight, in-memory SQL database engine written in&nbsp;C</span>
 <p class="byline">
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-    &ensp;&middot;&ensp; ~8,200 lines of C11 &ensp;&middot;&ensp; 241 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~9,100 lines of C11 &ensp;&middot;&ensp; 305 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -272,8 +272,8 @@
     behind a proprietary protocol. mskql takes a different approach: it implements the
     PostgreSQL wire protocol&nbsp;(v3) directly, so any tool that can talk to Postgres can
     talk to mskql without modification.<span class="sidenote">This means <code>psql</code>,
-    pgAdmin, DBeaver, any language driver for Postgres&mdash;they all work out of the box
-    on port&nbsp;5433.</span>
+    pgAdmin, DBeaver, any language driver for Postgres&mdash;they all work out of the box.
+    The default port is&nbsp;5433, configurable via <code>MSKQL_PORT</code>.</span>
     The goal is a minimal, understandable, single-binary database useful for prototyping,
     testing, and education.
 </p>
@@ -304,7 +304,7 @@
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
-                2,537 lines the parser is the largest single file. It handles the full
+                2,826 lines the parser is the largest single file. It handles the full
                 grammar including CTEs, window functions, and set operations.</span></td>
         </tr>
         <tr>
@@ -358,7 +358,8 @@
         <tr>
             <td><strong>Filtering</strong></td>
             <td><code>WHERE</code> with <code>AND</code>/<code>OR</code>/<code>NOT</code>,
-                <code>BETWEEN</code>, <code>IN</code> (values &amp; subqueries),
+                <code>BETWEEN</code>, <code>IN</code> (values, subqueries, multi-column),
+                <code>ANY</code>/<code>ALL</code>,
                 <code>LIKE</code>, <code>ILIKE</code>,
                 <code>IS [NOT] NULL</code>, <code>IS [NOT] DISTINCT FROM</code>,
                 <code>=</code> <code>!=</code> <code>&lt;&gt;</code>
@@ -368,7 +369,8 @@
             <td><strong>Joins</strong></td>
             <td><code>INNER</code>, <code>LEFT</code>, <code>RIGHT</code>,
                 <code>FULL OUTER</code>, <code>CROSS</code>,
-                <code>NATURAL</code>, <code>USING</code>, multi-table</td>
+                <code>NATURAL</code>, <code>USING</code>,
+                <code>LATERAL</code>, multi-table</td>
         </tr>
         <tr>
             <td><strong>Aggregation</strong></td>
@@ -389,13 +391,15 @@
         </tr>
         <tr>
             <td><strong>CTEs</strong></td>
-            <td><code>WITH name AS (SELECT &hellip;) SELECT &hellip;</code></td>
+            <td><code>WITH name AS (SELECT &hellip;) SELECT &hellip;</code>,
+                <code>WITH RECURSIVE</code></td>
         </tr>
         <tr>
             <td><strong>Expressions</strong></td>
-            <td><code>+</code> <code>-</code> <code>*</code>,
+            <td><code>+</code> <code>-</code> <code>*</code> <code>%</code>,
                 <code>CASE WHEN&hellip;THEN&hellip;ELSE&hellip;END</code>,
-                <code>COALESCE()</code></td>
+                <code>COALESCE()</code>, <code>NULLIF()</code>,
+                <code>GREATEST()</code>, <code>LEAST()</code></td>
         </tr>
         <tr>
             <td><strong>Result control</strong></td>
@@ -412,6 +416,16 @@
             <td><strong>Transactions</strong></td>
             <td><code>BEGIN</code>, <code>COMMIT</code>, <code>ROLLBACK</code>
                 (snapshot-based)</td>
+        </tr>
+        <tr>
+            <td><strong>String functions</strong></td>
+            <td><code>UPPER()</code>, <code>LOWER()</code>, <code>LENGTH()</code>,
+                <code>TRIM()</code>, <code>CONCAT()</code>, <code>||</code></td>
+        </tr>
+        <tr>
+            <td><strong>Subqueries</strong></td>
+            <td>Scalar subqueries in <code>SELECT</code> list,
+                correlated subqueries, <code>IN (SELECT&hellip;)</code></td>
         </tr>
     </tbody>
 </table>
@@ -456,6 +470,12 @@
 ./build/mskql                                 # start server on port 5433
 psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 
+<p>
+    Set <code>MSKQL_PORT</code> to listen on a different port:
+</p>
+
+<pre><code>MSKQL_PORT=5444 ./build/mskql</code></pre>
+
 <p>Then run SQL as usual:</p>
 
 <pre><code>CREATE TABLE users (
@@ -476,11 +496,12 @@ SELECT * FROM users;</code></pre>
 <h2 id="testing">6. Testing</h2>
 
 <p>
-    The project includes 241 SQL test cases covering DDL, DML, joins, aggregation,
+    The project includes 305 SQL test cases covering DDL, DML, joins, aggregation,
     window functions, set operations, CTEs, transactions, NULL handling, type coercion,
-    constraint enforcement, and various edge cases.<span class="sidenote">Each test case
-    starts a fresh server instance, sends SQL via <code>psql</code>, and validates output
-    against expected results. No test framework&mdash;just shell scripts and
+    constraint enforcement, string functions, and various edge cases. A separate
+    concurrent test harness exercises multi-client scenarios.<span class="sidenote">Each
+    test case starts a fresh server instance, sends SQL via <code>psql</code>, and validates
+    output against expected results. No test framework&mdash;just shell scripts and
     <code>diff</code>.</span>
 </p>
 
@@ -559,8 +580,8 @@ SELECT * FROM users;</code></pre>
 
   <!-- Result box -->
   <rect x="180" y="275" width="260" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="296" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">241 tests pass</text>
-  <text x="310" y="314" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.8)">~8,200 lines of C &middot; zero human code</text>
+  <text x="310" y="296" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">305 tests pass</text>
+  <text x="310" y="314" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.8)">~9,100 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
