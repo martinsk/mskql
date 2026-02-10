@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770747456708,
+  "lastUpdate": 1770755166990,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -315,6 +315,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 33.966,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "f782fc7e5eac3c234b5d80e11a3c2582390fe515",
+          "message": "introduce arena-based memory management for query parsing to eliminate recursive deallocation and fix memory leaks\n\nReplace pointer-based query AST with pool-based arena allocator where each parsed type (expr, condition, case_when_branch, set_clause, select_column, select_expr, agg_expr, order_by_item, join_info, cte_def) gets its own flat dynamic array. Structures reference items by uint32_t index instead of pointers, with IDX_NONE (0xFFFFFFFF) marking unused references. Add query_arena struct containing",
+          "timestamp": "2026-02-10T12:25:49-08:00",
+          "tree_id": "56c69e895f77d7b17e70e643299710d48110be30",
+          "url": "https://github.com/martinsk/mskql/commit/f782fc7e5eac3c234b5d80e11a3c2582390fe515"
+        },
+        "date": 1770755166537,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 21.753,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 153.302,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 272.642,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 426.748,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 321.988,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 750.835,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 49.891,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 253.75,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 366.65,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 9.347,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 29.931,
             "unit": "ms"
           }
         ]
