@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770668430413,
+  "lastUpdate": 1770697906513,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -78,6 +78,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 31.892,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "78bb8857b65fc527c6d2f215b703a5d543162c2f",
+          "message": "add support for multi-column IN, ANY/ALL operators, arithmetic expressions in UPDATE SET, configurable port via MSKQL_PORT, and use table names as fallback JOIN aliases",
+          "timestamp": "2026-02-09T20:31:30-08:00",
+          "tree_id": "2f24a4f4394acc145f9555bf552a5e0a4e9728b5",
+          "url": "https://github.com/martinsk/mskql/commit/78bb8857b65fc527c6d2f215b703a5d543162c2f"
+        },
+        "date": 1770697905973,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 24.625,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 163.403,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 273.365,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 473.77,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 329.538,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 695.834,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 42.286,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 269.252,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 391.473,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 10.635,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 32.472,
             "unit": "ms"
           }
         ]
