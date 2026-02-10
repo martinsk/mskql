@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770699131301,
+  "lastUpdate": 1770747456708,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -236,6 +236,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 32.698,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "7acf3e2f70609f069137b6bf62f0f9076269e660",
+          "message": "add expression AST parser with operator precedence, enable GROUP BY/aggregates on JOINs, and support arithmetic expressions in UPDATE SET clauses\n\nImplement recursive descent expression parser supporting literals, column references, arithmetic operators (+, -, *, /, %, unary -), string concatenation (||), function calls (COALESCE, NULLIF, GREATEST, LEAST, UPPER, LOWER, LENGTH, TRIM, SUBSTRING), CASE WHEN expressions, and subqueries. Add expr_free to recursively deallocate expression trees. Extend",
+          "timestamp": "2026-02-10T10:17:18-08:00",
+          "tree_id": "32b2378e1128154cd43ab0bfbff9db85af5abb0b",
+          "url": "https://github.com/martinsk/mskql/commit/7acf3e2f70609f069137b6bf62f0f9076269e660"
+        },
+        "date": 1770747456078,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 23.671,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 159.402,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 277.193,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 535.205,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 326.224,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 698.492,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 53.419,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 265.747,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 403.096,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 10.254,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 33.966,
             "unit": "ms"
           }
         ]
