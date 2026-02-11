@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770839847603,
+  "lastUpdate": 1770842577713,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1342,6 +1342,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.12,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "1410c8cb7de05f4142e50493ee4dfdf42dece6dc",
+          "message": "add Extended Query Protocol with prepared statements, portals, parameter substitution, and SQL-standard doubled-quote escaping in string literals\n\nImplement Parse/Bind/Execute/Describe/Close messages for prepared statements and portals. Add struct prepared_stmt and struct portal with MAX_PREPARED=32 and MAX_PORTALS=16 slots per connection. Implement substitute_params() to replace $1, $2, ... placeholders with literal values: numeric/boolean parameters inserted unquoted, text parameters single-quoted with",
+          "timestamp": "2026-02-11T12:42:32-08:00",
+          "tree_id": "5c0ddfcd1780e6b972fa8e83944831686923dd64",
+          "url": "https://github.com/martinsk/mskql/commit/1410c8cb7de05f4142e50493ee4dfdf42dece6dc"
+        },
+        "date": 1770842576760,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.206,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 85.482,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 106.349,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 163.775,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 112.216,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.616,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 22.487,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 107.555,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 231.12,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.182,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 18.546,
             "unit": "ms"
           }
         ]
