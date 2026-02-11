@@ -27,6 +27,7 @@ enum token_type {
     TOK_MINUS,
     TOK_PERCENT,
     TOK_PIPE_PIPE,
+    TOK_DOUBLE_COLON,
     TOK_EOF,
     TOK_UNKNOWN
 };
@@ -89,6 +90,8 @@ static int is_keyword(sv word)
         "SEQUENCE", "VIEW", "REPLACE", "START", "INCREMENT",
         "MINVALUE", "MAXVALUE", "REFERENCES", "CASCADE",
         "NEXTVAL", "CURRVAL",
+        "CAST",
+        "EXTRACT", "CURRENT_TIMESTAMP",
         NULL
     };
     for (int i = 0; keywords[i]; i++) {
@@ -162,6 +165,12 @@ static struct token lexer_next(struct lexer *l)
     }
     if (c == '|' && l->input[l->pos + 1] == '|') {
         tok.type = TOK_PIPE_PIPE;
+        tok.value = sv_from(&l->input[l->pos], 2);
+        l->pos += 2;
+        return tok;
+    }
+    if (c == ':' && l->input[l->pos + 1] == ':') {
+        tok.type = TOK_DOUBLE_COLON;
         tok.value = sv_from(&l->input[l->pos], 2);
         l->pos += 2;
         return tok;
@@ -521,6 +530,7 @@ static enum cmp_op cmp_from_token(enum token_type t)
         case TOK_MINUS:
         case TOK_PERCENT:
         case TOK_PIPE_PIPE:
+        case TOK_DOUBLE_COLON:
         case TOK_EOF:
         case TOK_UNKNOWN:
             return CMP_EQ;
@@ -563,7 +573,12 @@ static int is_expr_func_keyword(sv name)
            sv_eq_ignorecase_cstr(name, "SUBSTRING") ||
            sv_eq_ignorecase_cstr(name, "NEXTVAL") ||
            sv_eq_ignorecase_cstr(name, "CURRVAL") ||
-           sv_eq_ignorecase_cstr(name, "GEN_RANDOM_UUID");
+           sv_eq_ignorecase_cstr(name, "GEN_RANDOM_UUID") ||
+           sv_eq_ignorecase_cstr(name, "NOW") ||
+           sv_eq_ignorecase_cstr(name, "DATE_TRUNC") ||
+           sv_eq_ignorecase_cstr(name, "DATE_PART") ||
+           sv_eq_ignorecase_cstr(name, "AGE") ||
+           sv_eq_ignorecase_cstr(name, "TO_CHAR");
 }
 
 static enum expr_func expr_func_from_name(sv name)
@@ -580,6 +595,11 @@ static enum expr_func expr_func_from_name(sv name)
     if (sv_eq_ignorecase_cstr(name, "NEXTVAL"))   return FUNC_NEXTVAL;
     if (sv_eq_ignorecase_cstr(name, "CURRVAL"))   return FUNC_CURRVAL;
     if (sv_eq_ignorecase_cstr(name, "GEN_RANDOM_UUID")) return FUNC_GEN_RANDOM_UUID;
+    if (sv_eq_ignorecase_cstr(name, "NOW"))            return FUNC_NOW;
+    if (sv_eq_ignorecase_cstr(name, "DATE_TRUNC"))     return FUNC_DATE_TRUNC;
+    if (sv_eq_ignorecase_cstr(name, "DATE_PART"))      return FUNC_DATE_PART;
+    if (sv_eq_ignorecase_cstr(name, "AGE"))            return FUNC_AGE;
+    if (sv_eq_ignorecase_cstr(name, "TO_CHAR"))        return FUNC_TO_CHAR;
     return FUNC_COALESCE; /* fallback, should not happen */
 }
 
@@ -645,10 +665,115 @@ static int is_expr_terminator_keyword(sv name)
            sv_eq_ignorecase_cstr(name, "RECURSIVE");
 }
 
+/* forward declaration — defined later in the file */
+static enum column_type parse_column_type(sv type_name);
+
+/* parse a SQL type name token and return the column_type */
+static enum column_type parse_cast_type_name(struct lexer *l)
+{
+    struct token tok = lexer_next(l);
+    enum column_type ct = parse_column_type(tok.value);
+    /* skip optional (n) or (p,s) after type name */
+    struct token peek = lexer_peek(l);
+    if (peek.type == TOK_LPAREN) {
+        lexer_next(l); /* consume ( */
+        for (;;) {
+            struct token t = lexer_next(l);
+            if (t.type == TOK_RPAREN || t.type == TOK_EOF) break;
+        }
+    }
+    return ct;
+}
+
 /* parse an atom: literal, column ref, function call, CASE, subquery, parens */
 static uint32_t parse_expr_atom(struct lexer *l, struct query_arena *a)
 {
     struct token tok = lexer_peek(l);
+
+    /* CAST(expr AS type) */
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "CAST")) {
+        lexer_next(l); /* consume CAST */
+        struct token lp = lexer_next(l); /* consume ( */
+        if (lp.type != TOK_LPAREN) {
+            fprintf(stderr, "parse error: expected '(' after CAST\n");
+            return IDX_NONE;
+        }
+        uint32_t operand = parse_expr(l, a);
+        struct token as_tok = lexer_next(l); /* consume AS */
+        if (as_tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(as_tok.value, "AS")) {
+            fprintf(stderr, "parse error: expected AS in CAST\n");
+            return IDX_NONE;
+        }
+        enum column_type target = parse_cast_type_name(l);
+        struct token rp = lexer_next(l); /* consume ) */
+        if (rp.type != TOK_RPAREN) {
+            fprintf(stderr, "parse error: expected ')' after CAST type\n");
+        }
+        uint32_t ei = expr_alloc(a, EXPR_CAST);
+        EXPR(a, ei).cast.operand = operand;
+        EXPR(a, ei).cast.target = target;
+        return ei;
+    }
+
+    /* EXTRACT(field FROM expr) */
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "EXTRACT")) {
+        lexer_next(l); /* consume EXTRACT */
+        struct token lp = lexer_next(l); /* consume ( */
+        if (lp.type != TOK_LPAREN) {
+            fprintf(stderr, "parse error: expected '(' after EXTRACT\n");
+            return IDX_NONE;
+        }
+        /* parse field name as a string literal argument */
+        struct token field_tok = lexer_next(l);
+        uint32_t field_ei = expr_alloc(a, EXPR_LITERAL);
+        EXPR(a, field_ei).literal.type = COLUMN_TYPE_TEXT;
+        /* lowercase the field name */
+        char fbuf[64];
+        size_t flen = field_tok.value.len < 63 ? field_tok.value.len : 63;
+        for (size_t fi = 0; fi < flen; fi++)
+            fbuf[fi] = tolower((unsigned char)field_tok.value.data[fi]);
+        fbuf[flen] = '\0';
+        EXPR(a, field_ei).literal.value.as_text = bump_strndup(&a->bump, fbuf, flen);
+        /* consume FROM */
+        struct token from_tok = lexer_next(l);
+        if (from_tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(from_tok.value, "FROM")) {
+            fprintf(stderr, "parse error: expected FROM in EXTRACT\n");
+            return IDX_NONE;
+        }
+        uint32_t src_expr = parse_expr(l, a);
+        struct token rp = lexer_next(l); /* consume ) */
+        if (rp.type != TOK_RPAREN) {
+            fprintf(stderr, "parse error: expected ')' after EXTRACT\n");
+        }
+        uint32_t ei = expr_alloc(a, EXPR_FUNC_CALL);
+        EXPR(a, ei).func_call.func = FUNC_EXTRACT;
+        uint32_t args_start = (uint32_t)a->arg_indices.count;
+        da_push(&a->arg_indices, field_ei);
+        da_push(&a->arg_indices, src_expr);
+        EXPR(a, ei).func_call.args_start = args_start;
+        EXPR(a, ei).func_call.args_count = 2;
+        return ei;
+    }
+
+    /* CURRENT_TIMESTAMP / CURRENT_DATE (no parens needed) */
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "CURRENT_TIMESTAMP")) {
+        lexer_next(l);
+        uint32_t ei = expr_alloc(a, EXPR_FUNC_CALL);
+        EXPR(a, ei).func_call.func = FUNC_CURRENT_TIMESTAMP;
+        EXPR(a, ei).func_call.args_start = 0;
+        EXPR(a, ei).func_call.args_count = 0;
+        return ei;
+    }
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "CURRENT")) {
+        /* look ahead for _DATE or _TIMESTAMP — but CURRENT is also used in window frames */
+        size_t saved = l->pos;
+        lexer_next(l); /* consume CURRENT */
+        /* CURRENT_DATE is a single keyword, but our lexer splits on _ boundaries?
+         * Actually no — our lexer keeps underscores in identifiers. So CURRENT_TIMESTAMP
+         * would be one token. This path handles bare CURRENT which might be CURRENT ROW. */
+        l->pos = saved;
+        /* fall through to column ref handling */
+    }
 
     /* unary minus */
     if (tok.type == TOK_MINUS) {
@@ -876,10 +1001,27 @@ static uint32_t parse_expr_atom(struct lexer *l, struct query_arena *a)
     return IDX_NONE;
 }
 
+/* wrap an expression in a CAST node if followed by :: */
+static uint32_t maybe_parse_postfix_cast(struct lexer *l, struct query_arena *a, uint32_t node)
+{
+    while (node != IDX_NONE) {
+        struct token peek = lexer_peek(l);
+        if (peek.type != TOK_DOUBLE_COLON) break;
+        lexer_next(l); /* consume :: */
+        enum column_type target = parse_cast_type_name(l);
+        uint32_t ei = expr_alloc(a, EXPR_CAST);
+        EXPR(a, ei).cast.operand = node;
+        EXPR(a, ei).cast.target = target;
+        node = ei;
+    }
+    return node;
+}
+
 /* multiplicative: atom (('*' | '/' | '%') atom)* */
 static uint32_t parse_expr_mul(struct lexer *l, struct query_arena *a)
 {
     uint32_t left = parse_expr_atom(l, a);
+    left = maybe_parse_postfix_cast(l, a, left);
     if (left == IDX_NONE) return IDX_NONE;
 
     for (;;) {
@@ -892,6 +1034,7 @@ static uint32_t parse_expr_mul(struct lexer *l, struct query_arena *a)
 
         lexer_next(l); /* consume operator */
         uint32_t right = parse_expr_atom(l, a);
+        right = maybe_parse_postfix_cast(l, a, right);
         if (right == IDX_NONE) return left;
 
         uint32_t bin = expr_alloc(a, EXPR_BINARY_OP);
@@ -3069,7 +3212,7 @@ static int parse_create(struct lexer *l, struct query *out)
     for (;;) {
         /* column name */
         tok = lexer_next(l);
-        if (tok.type != TOK_IDENTIFIER) {
+        if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
             fprintf(stderr, "parse error: expected column name\n");
             return -1;
         }

@@ -162,7 +162,8 @@ enum expr_type {
     EXPR_UNARY_OP,      /* -a */
     EXPR_FUNC_CALL,     /* UPPER(x), COALESCE(a,b), etc. */
     EXPR_CASE_WHEN,     /* CASE WHEN ... THEN ... ELSE ... END */
-    EXPR_SUBQUERY       /* (SELECT ...) */
+    EXPR_SUBQUERY,      /* (SELECT ...) */
+    EXPR_CAST           /* CAST(expr AS type) or expr::type */
 };
 
 enum expr_op {
@@ -187,7 +188,15 @@ enum expr_func {
     FUNC_SUBSTRING,
     FUNC_NEXTVAL,
     FUNC_CURRVAL,
-    FUNC_GEN_RANDOM_UUID
+    FUNC_GEN_RANDOM_UUID,
+    FUNC_NOW,
+    FUNC_CURRENT_TIMESTAMP,
+    FUNC_CURRENT_DATE,
+    FUNC_EXTRACT,
+    FUNC_DATE_TRUNC,
+    FUNC_DATE_PART,
+    FUNC_AGE,
+    FUNC_TO_CHAR
 };
 
 struct case_when_branch {
@@ -238,6 +247,12 @@ struct expr {
         struct {
             uint32_t sql_idx; /* index into arena.strings */
         } subquery;
+
+        /* EXPR_CAST */
+        struct {
+            uint32_t operand;          /* index into arena.exprs */
+            enum column_type target;   /* target type */
+        } cast;
     };
 
     sv alias; /* optional AS alias */
