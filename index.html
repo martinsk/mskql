@@ -194,39 +194,38 @@
         tbody tr:last-child td { border-bottom: 2px solid var(--fg); }
         td code { font-size: 0.8rem; }
 
-        /* ── Result tables (polished mathematical style) ─────────── */
+        /* ── Result tables (Tufte style) ───────────────────────── */
         .result-table {
-            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
-            font-size: 0.76rem;
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 0.92rem;
             border-collapse: collapse;
             margin: 0.6rem 0 1.2rem 0;
             width: 100%;
-            background: #fff;
-            border: 1px solid var(--rule);
-            border-radius: 3px;
+            border-top: 2px solid var(--fg);
+            border-bottom: 2px solid var(--fg);
         }
         .result-table th {
-            font-weight: 700;
-            font-size: 0.7rem;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            border-bottom: 2px solid var(--fg);
-            padding: 0.35rem 0.6rem;
+            font-weight: 400;
+            font-size: 0.78rem;
+            font-variant: small-caps;
+            text-transform: lowercase;
+            letter-spacing: 0.05em;
+            border-bottom: 1px solid var(--fg);
+            padding: 0.3rem 0.6rem 0.25rem;
             text-align: left;
-            background: #f7f5ef;
-            color: var(--fg-dim);
+            color: var(--fg);
         }
         .result-table td {
-            padding: 0.25rem 0.6rem;
-            border-bottom: 1px solid #e8e6e0;
+            padding: 0.22rem 0.6rem;
+            border: none;
             white-space: nowrap;
         }
-        .result-table tbody tr:nth-child(even) { background: #faf9f5; }
-        .result-table tbody tr:last-child td {
-            border-bottom: none;
-        }
         .result-table .null-val { color: #999; font-style: italic; }
-        .result-table .num-val { text-align: right; font-variant-numeric: tabular-nums; }
+        .result-table .num-val {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+            font-family: 'EB Garamond', Georgia, serif;
+        }
         .result-label {
             font-family: 'EB Garamond', Georgia, serif;
             font-size: 0.8rem;
