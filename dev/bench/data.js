@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770838332618,
+  "lastUpdate": 1770839847603,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1263,6 +1263,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 21.287,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "9b40df34ad39f0642565fc83d1fce9bba2a4a97c",
+          "message": "add scan cache for repeated sequential scans, optimize sort emit phase with flat column arrays, replace snprintf with fast integer-to-string conversion, and track table generation to invalidate caches on mutations\n\nIntroduce struct scan_cache to cache columnar representation of tables for repeated scans. Add generation counter to struct table, incremented on INSERT/UPDATE/DELETE. Implement scan_cache_build() to materialize row-store into flat typed arrays and scan_cache_read() to copy slices into",
+          "timestamp": "2026-02-11T11:57:06-08:00",
+          "tree_id": "1a63625138f59cf4c58803ce7f65580b0fa7a175",
+          "url": "https://github.com/martinsk/mskql/commit/9b40df34ad39f0642565fc83d1fce9bba2a4a97c"
+        },
+        "date": 1770839847299,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.535,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 81.223,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 103.747,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 173.752,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 118.121,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.223,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 23.709,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 112.801,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 216.827,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.024,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.12,
             "unit": "ms"
           }
         ]
