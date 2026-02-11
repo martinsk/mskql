@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770834088454,
+  "lastUpdate": 1770836993029,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1105,6 +1105,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 18.783,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "a9f499f85eac134ac0c96fcfcf26257ca67843bb",
+          "message": "replace heap allocations with arena scratch allocations in JOIN, UPDATE...FROM, and UNION operations to eliminate manual free() calls and fix memory leak in recursive CTE when table is dropped mid-iteration\n\nConvert t1_matched/t2_matched arrays and hash table structures (ht_buckets/ht_nexts/ht_hashes) in do_single_join() from calloc to bump_calloc on arena scratch, removing corresponding free() calls. Replace calloc with bump_calloc for new_vals/col_idxs arrays in UPDATE...FROM SET clause evaluation",
+          "timestamp": "2026-02-11T11:09:29-08:00",
+          "tree_id": "dd7afa8efd03d47d42d0cb8f73f9210393dc0bf6",
+          "url": "https://github.com/martinsk/mskql/commit/a9f499f85eac134ac0c96fcfcf26257ca67843bb"
+        },
+        "date": 1770836992683,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.846,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 85.315,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 116.616,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 176.911,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 122.411,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.851,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 23.575,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 115.582,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 228.091,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.086,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.12,
             "unit": "ms"
           }
         ]
