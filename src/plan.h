@@ -176,7 +176,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
 /* Execute a full plan tree, collecting all results into struct rows.
  * This is the main entry point for the plan executor. */
 int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
-                      struct rows *result);
+                      struct rows *result, struct bump_alloc *rb);
 
 /* ---- Block utility functions ---- */
 
@@ -191,6 +191,6 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
                           struct bump_alloc *scratch);
 
 /* Convert a row_block back to struct rows (for final output). */
-void block_to_rows(const struct row_block *rb, struct rows *result);
+void block_to_rows(const struct row_block *blk, struct rows *result, struct bump_alloc *rb);
 
 #endif

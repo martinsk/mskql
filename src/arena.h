@@ -169,6 +169,8 @@ struct query_arena {
     struct bump_alloc bump;
     /* result rows: bump-allocated cells, reset with arena */
     struct rows result;
+    /* bump slab for result row text — bulk-freed instead of per-cell free */
+    struct bump_alloc result_text;
     /* scratch area for temporary per-query allocations */
     struct bump_alloc scratch;
 };
@@ -196,6 +198,8 @@ static inline void query_arena_init(struct query_arena *a)
     a->result.data = NULL;
     a->result.count = 0;
     a->result.capacity = 0;
+    a->result.arena_owns_text = 0;
+    bump_init(&a->result_text);
     bump_init(&a->scratch);
 }
 

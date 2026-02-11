@@ -245,7 +245,7 @@ struct expr {
 
 struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
                       struct table *t, struct row *row,
-                      struct database *db);
+                      struct database *db, struct bump_alloc *rb);
 
 struct set_clause {
     sv column;
@@ -513,7 +513,7 @@ struct query {
     };
 };
 
-int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db);
+int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db, struct bump_alloc *rb);
 int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result);
 int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result);
 

@@ -101,11 +101,20 @@ static inline void arena_free_column_defaults(struct query_arena *a)
     }
 }
 
-/* Free execution-time result rows (cells may contain malloc'd text). */
+/* Free execution-time result rows.
+ * When arena_owns_text is set, text lives in result_text bump — just free
+ * the DA backing arrays and reset the bump in one shot.
+ * Otherwise fall back to per-cell free (heap-allocated text). */
 static inline void arena_free_result_rows(struct query_arena *a)
 {
-    for (size_t i = 0; i < a->result.count; i++)
-        row_free(&a->result.data[i]);
+    if (a->result.arena_owns_text) {
+        for (size_t i = 0; i < a->result.count; i++)
+            da_free(&a->result.data[i].cells);
+        bump_reset(&a->result_text);
+    } else {
+        for (size_t i = 0; i < a->result.count; i++)
+            row_free(&a->result.data[i]);
+    }
     a->result.count = 0;
     /* keep data/capacity for reuse */
 }
@@ -147,6 +156,7 @@ static inline void query_arena_reset(struct query_arena *a)
     da_reset(&a->arg_indices);
     da_reset(&a->plan_nodes);
     bump_reset(&a->bump);
+    bump_reset(&a->result_text);
     bump_reset(&a->scratch);
 }
 
@@ -177,15 +187,22 @@ static inline void query_arena_destroy(struct query_arena *a)
     da_free(&a->arg_indices);
     da_free(&a->plan_nodes);
     bump_destroy(&a->bump);
+    bump_destroy(&a->result_text);
     bump_destroy(&a->scratch);
 
     /* free result rows */
-    for (size_t i = 0; i < a->result.count; i++)
-        row_free(&a->result.data[i]);
+    if (a->result.arena_owns_text) {
+        for (size_t i = 0; i < a->result.count; i++)
+            da_free(&a->result.data[i].cells);
+    } else {
+        for (size_t i = 0; i < a->result.count; i++)
+            row_free(&a->result.data[i]);
+    }
     free(a->result.data);
     a->result.data = NULL;
     a->result.count = 0;
     a->result.capacity = 0;
+    a->result.arena_owns_text = 0;
 }
 
 #endif

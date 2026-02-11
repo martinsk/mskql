@@ -5,6 +5,8 @@
 #include "dynamic_array.h"
 #include "column.h"
 
+struct bump_alloc; /* forward declaration — defined in arena.h */
+
 union cell_value {
     int as_int;
     double as_float;
@@ -31,6 +33,7 @@ struct rows {
     struct row *data;
     size_t count;
     size_t capacity;
+    int arena_owns_text; /* when set, text cells are bump-allocated — skip per-cell free */
 };
 
 void rows_push(struct rows *rows, struct row row);
@@ -42,6 +45,7 @@ int  cell_compare(const struct cell *a, const struct cell *b);
 int  cell_equal(const struct cell *a, const struct cell *b);
 int  cell_equal_nullsafe(const struct cell *a, const struct cell *b);
 void cell_copy(struct cell *dst, const struct cell *src);
+void cell_copy_bump(struct cell *dst, const struct cell *src, struct bump_alloc *b);
 void cell_free_text(struct cell *c);
 
 /* row-level equality (same cell count and all cells equal) */

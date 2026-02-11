@@ -303,7 +303,7 @@ static void client_disconnect(struct client_state *c, struct database *db)
         struct query q = {0};
         q.query_type = QUERY_TYPE_ROLLBACK;
         struct rows r = {0};
-        db_exec(db, &q, &r);
+        db_exec(db, &q, &r, NULL);
         rows_free(&r);
     }
     client_free(c);
@@ -480,7 +480,8 @@ static int handle_query(int fd, struct database *db, const char *sql,
     }
 
     struct rows *result = &conn_arena->result;
-    int rc = db_exec(db, &q, result);
+    result->arena_owns_text = 1;
+    int rc = db_exec(db, &q, result, &conn_arena->result_text);
 
     if (rc < 0) {
         send_error(fd, m, "ERROR", "42000", "query execution failed");

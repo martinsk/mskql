@@ -1,4 +1,5 @@
 #include "row.h"
+#include "arena.h"
 #include "column.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,17 @@ void cell_copy(struct cell *dst, const struct cell *src)
     dst->is_null = src->is_null;
     if (column_type_is_text(src->type) && src->value.as_text) {
         dst->value.as_text = strdup(src->value.as_text);
+    } else {
+        dst->value = src->value;
+    }
+}
+
+void cell_copy_bump(struct cell *dst, const struct cell *src, struct bump_alloc *b)
+{
+    dst->type = src->type;
+    dst->is_null = src->is_null;
+    if (column_type_is_text(src->type) && src->value.as_text) {
+        dst->value.as_text = bump_strdup(b, src->value.as_text);
     } else {
         dst->value = src->value;
     }

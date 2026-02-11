@@ -179,16 +179,17 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
 }
 
 /* Convert a row_block back to struct rows for final output.
- * Text values are strdup'd (caller owns the result rows). */
-void block_to_rows(const struct row_block *rb, struct rows *result)
+ * When rb is non-NULL, text is bump-allocated (bulk-freed).
+ * Otherwise text is strdup'd (caller owns the result rows). */
+void block_to_rows(const struct row_block *blk, struct rows *result, struct bump_alloc *rb)
 {
-    uint16_t active = row_block_active_count(rb);
+    uint16_t active = row_block_active_count(blk);
     for (uint16_t i = 0; i < active; i++) {
-        uint16_t ri = row_block_row_idx(rb, i);
+        uint16_t ri = row_block_row_idx(blk, i);
         struct row dst = {0};
         da_init(&dst.cells);
-        for (uint16_t c = 0; c < rb->ncols; c++) {
-            const struct col_block *cb = &rb->cols[c];
+        for (uint16_t c = 0; c < blk->ncols; c++) {
+            const struct col_block *cb = &blk->cols[c];
             struct cell cell = {0};
             cell.type = cb->type;
             if (cb->nulls[ri]) {
@@ -218,7 +219,9 @@ void block_to_rows(const struct row_block *rb, struct rows *result)
                     case COLUMN_TYPE_TIMESTAMPTZ:
                     case COLUMN_TYPE_INTERVAL:
                     case COLUMN_TYPE_UUID:
-                        cell.value.as_text = cb->data.str[ri] ? strdup(cb->data.str[ri]) : NULL;
+                        cell.value.as_text = cb->data.str[ri]
+                            ? (rb ? bump_strdup(rb, cb->data.str[ri]) : strdup(cb->data.str[ri]))
+                            : NULL;
                         break;
                 }
             }
@@ -1059,7 +1062,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
 /* ---- Full plan execution to rows ---- */
 
 int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
-                      struct rows *result)
+                      struct rows *result, struct bump_alloc *rb)
 {
     struct plan_node *root = &PLAN_NODE(ctx->arena, root_node);
     uint16_t ncols = 0;
@@ -1079,7 +1082,7 @@ int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
     row_block_alloc(&block, ncols, &ctx->arena->scratch);
 
     while (plan_next_block(ctx, root_node, &block) == 0) {
-        block_to_rows(&block, result);
+        block_to_rows(&block, result, rb);
         row_block_reset(&block);
     }
 

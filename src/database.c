@@ -66,14 +66,14 @@ struct table *db_find_table_sv(struct database *db, sv name)
 }
 
 int db_table_exec_query(struct database *db, sv table_name,
-                        struct query *q, struct rows *result)
+                        struct query *q, struct rows *result, struct bump_alloc *rb)
 {
     struct table *t = db_find_table_sv(db, table_name);
     if (!t) {
         fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(table_name));
         return -1;
     }
-    return query_exec(t, q, result, db);
+    return query_exec(t, q, result, db, rb);
 }
 
 /* find_column_index / find_column_index_sv → use shared table_find_column / table_find_column_sv from table.h */
@@ -131,28 +131,35 @@ static int cmp_rows_join(const void *a, const void *b)
 
 static void emit_merged_row(struct row *r1, size_t ncols1,
                             struct row *r2, size_t ncols2,
-                            struct rows *out)
+                            struct rows *out, struct bump_alloc *rb)
 {
     struct row full = {0};
     da_init(&full.cells);
     for (size_t c = 0; c < ncols1; c++) {
-        struct cell cp; cell_copy(&cp, &r1->cells.items[c]);
+        struct cell cp;
+        if (rb) cell_copy_bump(&cp, &r1->cells.items[c], rb);
+        else    cell_copy(&cp, &r1->cells.items[c]);
         da_push(&full.cells, cp);
     }
     for (size_t c = 0; c < ncols2; c++) {
-        struct cell cp; cell_copy(&cp, &r2->cells.items[c]);
+        struct cell cp;
+        if (rb) cell_copy_bump(&cp, &r2->cells.items[c], rb);
+        else    cell_copy(&cp, &r2->cells.items[c]);
         da_push(&full.cells, cp);
     }
     rows_push(out, full);
 }
 
 static void emit_null_right(struct row *r1, size_t ncols1,
-                             struct table *t2, struct rows *out)
+                             struct table *t2, struct rows *out,
+                             struct bump_alloc *rb)
 {
     struct row full = {0};
     da_init(&full.cells);
     for (size_t c = 0; c < ncols1; c++) {
-        struct cell cp; cell_copy(&cp, &r1->cells.items[c]);
+        struct cell cp;
+        if (rb) cell_copy_bump(&cp, &r1->cells.items[c], rb);
+        else    cell_copy(&cp, &r1->cells.items[c]);
         da_push(&full.cells, cp);
     }
     for (size_t c = 0; c < t2->columns.count; c++) {
@@ -163,7 +170,8 @@ static void emit_null_right(struct row *r1, size_t ncols1,
 }
 
 static void emit_null_left(struct table *t1, struct row *r2,
-                            size_t ncols2, struct rows *out)
+                            size_t ncols2, struct rows *out,
+                            struct bump_alloc *rb)
 {
     struct row full = {0};
     da_init(&full.cells);
@@ -172,7 +180,9 @@ static void emit_null_left(struct table *t1, struct row *r2,
         da_push(&full.cells, cp);
     }
     for (size_t c = 0; c < ncols2; c++) {
-        struct cell cp; cell_copy(&cp, &r2->cells.items[c]);
+        struct cell cp;
+        if (rb) cell_copy_bump(&cp, &r2->cells.items[c], rb);
+        else    cell_copy(&cp, &r2->cells.items[c]);
         da_push(&full.cells, cp);
     }
     rows_push(out, full);
@@ -293,7 +303,8 @@ static int do_single_join(struct table *t1, const char *alias1,
                           enum cmp_op join_op,
                           struct rows *out_rows,
                           struct table *out_meta,
-                          struct query_arena *arena, uint32_t join_on_cond)
+                          struct query_arena *arena, uint32_t join_on_cond,
+                          struct bump_alloc *rb)
 {
     size_t ncols1 = t1->columns.count;
     size_t ncols2 = t2->columns.count;
@@ -303,7 +314,7 @@ static int do_single_join(struct table *t1, const char *alias1,
         for (size_t i = 0; i < t1->rows.count; i++) {
             for (size_t j = 0; j < t2->rows.count; j++) {
                 emit_merged_row(&t1->rows.items[i], ncols1,
-                                &t2->rows.items[j], ncols2, out_rows);
+                                &t2->rows.items[j], ncols2, out_rows, rb);
             }
         }
         build_merged_columns_ex(t1, alias1, t2, alias2, out_meta);
@@ -398,7 +409,7 @@ static int do_single_join(struct table *t1, const char *alias1,
                     t1_matched[i] = 1;
                     t2_matched[entry] = 1;
                     emit_merged_row(&t1->rows.items[i], ncols1,
-                                    &t2->rows.items[entry], ncols2, out_rows);
+                                    &t2->rows.items[entry], ncols2, out_rows, rb);
                 }
                 entry = ht_nexts[entry];
             }
@@ -424,7 +435,7 @@ static int do_single_join(struct table *t1, const char *alias1,
                 if (!match) continue;
                 t1_matched[i] = 1;
                 t2_matched[j] = 1;
-                emit_merged_row(r1, ncols1, r2, ncols2, out_rows);
+                emit_merged_row(r1, ncols1, r2, ncols2, out_rows, rb);
             }
         }
     } else {
@@ -452,7 +463,7 @@ static int do_single_join(struct table *t1, const char *alias1,
                     continue;
                 t1_matched[i] = 1;
                 t2_matched[j] = 1;
-                emit_merged_row(r1, ncols1, r2, ncols2, out_rows);
+                emit_merged_row(r1, ncols1, r2, ncols2, out_rows, rb);
             }
         }
     }
@@ -461,7 +472,7 @@ static int do_single_join(struct table *t1, const char *alias1,
     if (join_type == 1 || join_type == 3) {
         for (size_t i = 0; i < t1->rows.count; i++) {
             if (t1_matched[i]) continue;
-            emit_null_right(&t1->rows.items[i], ncols1, t2, out_rows);
+            emit_null_right(&t1->rows.items[i], ncols1, t2, out_rows, rb);
         }
     }
 
@@ -469,7 +480,7 @@ static int do_single_join(struct table *t1, const char *alias1,
     if (join_type == 2 || join_type == 3) {
         for (size_t j = 0; j < t2->rows.count; j++) {
             if (t2_matched[j]) continue;
-            emit_null_left(t1, &t2->rows.items[j], ncols2, out_rows);
+            emit_null_left(t1, &t2->rows.items[j], ncols2, out_rows, rb);
         }
     }
 
@@ -518,7 +529,7 @@ static void resolve_join_cols(struct join_info *ji, struct table *left, struct t
     }
 }
 
-static int exec_join(struct database *db, struct query *q, struct rows *result)
+static int exec_join(struct database *db, struct query *q, struct rows *result, struct bump_alloc *rb)
 {
     struct query_select *s = &q->select;
     struct table *t1 = db_find_table_sv(db, s->table);
@@ -698,7 +709,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
         if (!a1) a1 = t1->name;
         if (!a2) a2 = t2->name;
         if (do_single_join(t1, a1, t2, a2, ji->join_left_col, ji->join_right_col, ji->join_type,
-                           ji->join_op, &merged, &merged_t, a, ji->join_on_cond) != 0) {
+                           ji->join_op, &merged, &merged_t, a, ji->join_on_cond, rb) != 0) {
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
             return -1;
@@ -733,7 +744,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result)
             snprintf(jn_alias_buf, sizeof(jn_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
         if (do_single_join(&merged_t, NULL, tn, jn_alias_buf[0] ? jn_alias_buf : NULL,
                            ji->join_left_col, ji->join_right_col, ji->join_type,
-                           ji->join_op, &next_merged, &next_meta, a, ji->join_on_cond) != 0) {
+                           ji->join_op, &next_merged, &next_meta, a, ji->join_on_cond, rb) != 0) {
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
             return -1;
@@ -936,7 +947,7 @@ static void resolve_subqueries(struct database *db, struct query_arena *arena, u
         struct query sq = {0};
         if (query_parse(ASTRING(arena, c->subquery_sql), &sq) == 0) {
             struct rows sq_result = {0};
-            if (db_exec(db, &sq, &sq_result) == 0) {
+            if (db_exec(db, &sq, &sq_result, NULL) == 0) {
                 /* push resolved values into arena cells pool */
                 uint32_t iv_start = (uint32_t)arena->cells.count;
                 uint32_t iv_count = 0;
@@ -969,7 +980,7 @@ static void resolve_subqueries(struct database *db, struct query_arena *arena, u
         struct query sq = {0};
         if (query_parse(ASTRING(arena, c->scalar_subquery_sql), &sq) == 0) {
             struct rows sq_result = {0};
-            if (db_exec(db, &sq, &sq_result) == 0) {
+            if (db_exec(db, &sq, &sq_result, NULL) == 0) {
                 if (sq_result.count > 0 && sq_result.data[0].cells.count > 0) {
                     /* Don't call cell_free_text — the old value's text (if any)
                      * lives in the bump slab and must not be free()'d. */
@@ -1057,7 +1068,7 @@ static struct table *materialize_subquery(struct database *db, const char *sql,
         return NULL;
     }
     struct rows sq_rows = {0};
-    if (db_exec(db, &sq, &sq_rows) != 0) {
+    if (db_exec(db, &sq, &sq_rows, NULL) != 0) {
         query_free(&sq);
         return NULL;
     }
@@ -1172,7 +1183,7 @@ static void remove_temp_table(struct database *db, struct table *t)
     }
 }
 
-int db_exec(struct database *db, struct query *q, struct rows *result)
+int db_exec(struct database *db, struct query *q, struct rows *result, struct bump_alloc *rb)
 {
     /* handle transaction statements first */
     if (q->query_type == QUERY_TYPE_BEGIN) {
@@ -1564,7 +1575,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 da_init(&dst.cells);
                 for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
                     struct select_column *sc = &q->arena.select_cols.items[s->parsed_columns_start + i];
-                    struct cell c = eval_expr(sc->expr_idx, &q->arena, NULL, NULL, db);
+                    struct cell c = eval_expr(sc->expr_idx, &q->arena, NULL, NULL, db, rb);
                     da_push(&dst.cells, c);
                 }
                 rows_push(result, dst);
@@ -1580,7 +1591,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     c.type = ir->cells.items[i].type;
                     if (column_type_is_text(c.type)
                         && ir->cells.items[i].value.as_text)
-                        c.value.as_text = strdup(ir->cells.items[i].value.as_text);
+                        c.value.as_text = rb ? bump_strdup(rb, ir->cells.items[i].value.as_text)
+                                             : strdup(ir->cells.items[i].value.as_text);
                     else
                         c.value = ir->cells.items[i].value;
                     da_push(&dst.cells, c);
@@ -1588,9 +1600,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 rows_push(result, dst);
                 sel_rc = 0;
             } else if (s->has_join) {
-                sel_rc = exec_join(db, q, result);
+                sel_rc = exec_join(db, q, result, NULL);
             } else {
-                sel_rc = db_table_exec_query(db, s->table, q, result);
+                sel_rc = db_table_exec_query(db, s->table, q, result, rb);
             }
 
             /* UNION / INTERSECT / EXCEPT */
@@ -1602,7 +1614,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 int rhs_parsed = (query_parse(ASTRING(&q->arena, s->set_rhs_sql), &rhs_q) == 0);
                 if (rhs_parsed) {
                     struct rows rhs_rows = {0};
-                    if (db_exec(db, &rhs_q, &rhs_rows) == 0) {
+                    if (db_exec(db, &rhs_q, &rhs_rows, NULL) == 0) {
                         if (s->set_op == 0) {
                             // TODO: UNION duplicate check is O(n*m); could hash or sort
                             // for better performance on large result sets
@@ -1614,7 +1626,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                                     for (size_t j = 0; j < result->count; j++) {
                                         if (row_equal_nullsafe(&result->data[j], &rhs_rows.data[i])) { dup = 1; break; }
                                     }
-                                    if (dup) { row_free(&rhs_rows.data[i]); continue; }
+                                    if (dup) {
+                                        row_free(&rhs_rows.data[i]);
+                                        continue;
+                                    }
                                 }
                                 rows_push(result, rhs_rows.data[i]);
                                 rhs_rows.data[i].cells.items = NULL;
@@ -1632,7 +1647,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                                     if (w != i) result->data[w] = result->data[i];
                                     w++;
                                 } else {
-                                    row_free(&result->data[i]);
+                                    if (result->arena_owns_text)
+                                        da_free(&result->data[i].cells);
+                                    else
+                                        row_free(&result->data[i]);
                                 }
                             }
                             result->count = w;
@@ -1648,7 +1666,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                                     if (w != i) result->data[w] = result->data[i];
                                     w++;
                                 } else {
-                                    row_free(&result->data[i]);
+                                    if (result->arena_owns_text)
+                                        da_free(&result->data[i].cells);
+                                    else
+                                        row_free(&result->data[i]);
                                 }
                             }
                             result->count = w;
@@ -1724,7 +1745,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     return -1;
                 }
                 struct rows sel_rows = {0};
-                if (db_exec(db, &sel_q, &sel_rows) != 0) {
+                if (db_exec(db, &sel_q, &sel_rows, NULL) != 0) {
                     query_free(&sel_q);
                     return -1;
                 }
@@ -1791,7 +1812,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                                     if (ci < 0) continue;
                                     struct cell val;
                                     if (scp->expr_idx != IDX_NONE)
-                                        val = eval_expr(scp->expr_idx, &q->arena, t, &t->rows.items[conflict_row], db);
+                                        val = eval_expr(scp->expr_idx, &q->arena, t, &t->rows.items[conflict_row], db, NULL);
                                     else
                                         cell_copy(&val, &scp->value);
                                     struct cell *dst = &t->rows.items[conflict_row].cells.items[ci];
@@ -1871,13 +1892,13 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 }
                 if (ins->insert_rows_count == 0) return 0;
             }
-            return db_table_exec_query(db, ins->table, q, result);
+            return db_table_exec_query(db, ins->table, q, result, NULL);
         }
         case QUERY_TYPE_DELETE:
             /* resolve subqueries in WHERE */
             if (q->del.where.has_where && q->del.where.where_cond != IDX_NONE)
                 resolve_subqueries(db, &q->arena, q->del.where.where_cond);
-            return db_table_exec_query(db, q->del.table, q, result);
+            return db_table_exec_query(db, q->del.table, q, result, NULL);
         case QUERY_TYPE_UPDATE: {
             struct query_update *u = &q->update;
             /* resolve subqueries in WHERE */
@@ -1968,7 +1989,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                         col_idxs[sc] = table_find_column_sv(t, scp->column);
                         if (col_idxs[sc] < 0) { new_vals[sc] = (struct cell){0}; continue; }
                         if (scp->expr_idx != IDX_NONE) {
-                            new_vals[sc] = eval_expr(scp->expr_idx, &q->arena, &merged_meta, &merged_row, db);
+                            new_vals[sc] = eval_expr(scp->expr_idx, &q->arena, &merged_meta, &merged_row, db, NULL);
                         } else {
                             cell_copy(&new_vals[sc], &scp->value);
                         }
@@ -2000,7 +2021,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 }
                 return 0;
             }
-            return db_table_exec_query(db, u->table, q, result);
+            return db_table_exec_query(db, u->table, q, result, NULL);
         }
         case QUERY_TYPE_ALTER: {
             struct query_alter *a = &q->alter;
@@ -2089,7 +2110,7 @@ int db_exec_sql(struct database *db, const char *sql, struct rows *result)
         query_free(&q);
         return -1;
     }
-    int rc = db_exec(db, &q, result);
+    int rc = db_exec(db, &q, result, NULL);
     query_free(&q);
     return rc;
 }
