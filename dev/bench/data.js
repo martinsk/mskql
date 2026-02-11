@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770764544158,
+  "lastUpdate": 1770768874893,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -552,6 +552,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 25.06,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "658f772d120e07bdbc3f7c1a6f3cee88c0d9a1e3",
+          "message": "add support for TIME, TIMESTAMPTZ, INTERVAL types, SERIAL/BIGSERIAL auto-increment, foreign key constraints, sequences, views, window function frames, ROLLUP/CUBE grouping, and sequence functions (NEXTVAL/CURRVAL/GEN_RANDOM_UUID)\n\nExtend column_type enum with COLUMN_TYPE_TIME, COLUMN_TYPE_TIMESTAMPTZ, and COLUMN_TYPE_INTERVAL. Add SERIAL/BIGSERIAL support via is_serial flag and serial_next counter in column struct. Implement foreign key constraints with fk_table, fk_column, fk_on_delete_cascade, and fk_on_update",
+          "timestamp": "2026-02-10T16:14:10-08:00",
+          "tree_id": "66ebe07a4a86ca6cc552d6a073cc3a7e7113a76b",
+          "url": "https://github.com/martinsk/mskql/commit/658f772d120e07bdbc3f7c1a6f3cee88c0d9a1e3"
+        },
+        "date": 1770768874578,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.34,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 91.285,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 172.972,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 224.703,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 163.654,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 2557.962,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 24.441,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 112.77,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 218.791,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 4.92,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 25.851,
             "unit": "ms"
           }
         ]
