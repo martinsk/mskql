@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770791928771,
+  "lastUpdate": 1770831662456,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -868,6 +868,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 18.675,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "c804ff9a33851e883a416f8b8ba76dfd66f9a282",
+          "message": "add direct columnar-to-wire serialization path for SELECT queries bypassing row materialization and optimize sort comparator with flattened key arrays\n\nImplement try_plan_send() in pgwire.c to execute SELECT queries via plan executor and stream columnar blocks directly to PostgreSQL wire protocol without converting to struct rows. Add msgbuf_push_col_cell() to serialize col_block cells as pgwire text fields and send_row_desc_plan() to build RowDescription from plan metadata. Batch DataRow messages",
+          "timestamp": "2026-02-11T09:40:36-08:00",
+          "tree_id": "1c3f315f5c39f57728d97c5098a8c7b099b5e520",
+          "url": "https://github.com/martinsk/mskql/commit/c804ff9a33851e883a416f8b8ba76dfd66f9a282"
+        },
+        "date": 1770831661983,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 11.004,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 77.981,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 105.809,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 166.948,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 113.87,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 28.072,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 19.074,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 85.652,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 165.74,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 3.881,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 22.074,
             "unit": "ms"
           }
         ]
