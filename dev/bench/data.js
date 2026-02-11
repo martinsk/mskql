@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770832883372,
+  "lastUpdate": 1770834088454,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1026,6 +1026,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 18.326,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "2280a2dfac84dc6b699c7017e6874e36157e9a9c",
+          "message": "add PLAN_INDEX_SCAN operator to query planner for equality WHERE predicates on indexed columns\n\nImplement index_scan_next() to execute index lookups via index_lookup() and materialize matching rows into columnar blocks. Add PLAN_INDEX_SCAN case to plan_node_ncols() and plan_next_block(). Extend plan_build_select() to detect equality conditions on indexed columns and emit INDEX_SCAN instead of SEQ_SCAN + FILTER when applicable, setting est_rows to 1.0 for point lookups.",
+          "timestamp": "2026-02-11T10:21:01-08:00",
+          "tree_id": "aad22179118523bdb9ee862b4feb3e253ae6aa45",
+          "url": "https://github.com/martinsk/mskql/commit/2280a2dfac84dc6b699c7017e6874e36157e9a9c"
+        },
+        "date": 1770834088175,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.375,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 85.33,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 119.802,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 183.873,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 122.371,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.43,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 23.556,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 110.961,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 216.526,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 4.988,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 18.783,
             "unit": "ms"
           }
         ]
