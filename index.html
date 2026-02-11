@@ -253,7 +253,7 @@
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-    &ensp;&middot;&ensp; ~10,800 lines of C11 &ensp;&middot;&ensp; ~430 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~12,000 lines of C11 &ensp;&middot;&ensp; ~500 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -363,19 +363,21 @@
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
-                3,300 lines the parser is the largest single file. It includes a
+                3,700 lines the parser is the largest single file. It includes a
                 recursive-descent expression parser with proper operator precedence
                 (<code>||</code>&nbsp;&lt;&nbsp;<code>+-</code>&nbsp;&lt;&nbsp;<code>*/%</code>)
-                and handles the full grammar including CTEs, window functions, and
-                set operations.</span></td>
+                and handles the full grammar including CTEs, window functions, views,
+                sequences, and set operations.</span></td>
         </tr>
         <tr>
             <td><strong>Query executor</strong></td>
             <td><code>query.c</code>, <code>database.c</code></td>
             <td>Tree-walking evaluator that executes the AST against in-memory tables.
                 Handles joins (with compound <code>ON</code> conditions),
-                aggregation (including <code>DISTINCT</code> aggregates),
-                window functions, set operations, CTEs, correlated subqueries,
+                aggregation (including <code>DISTINCT</code> aggregates,
+                <code>ROLLUP</code>/<code>CUBE</code>),
+                window functions (with frame clauses), set operations, CTEs,
+                correlated subqueries, views, sequences, foreign keys,
                 upserts, and transactions</td>
         </tr>
         <tr>
@@ -425,6 +427,8 @@
             <td><code>CREATE TABLE</code>, <code>DROP TABLE</code>,
                 <code>CREATE INDEX</code>, <code>DROP INDEX</code>,
                 <code>CREATE TYPE &hellip; AS ENUM</code>, <code>DROP TYPE</code>,
+                <code>CREATE SEQUENCE</code>, <code>DROP SEQUENCE</code>,
+                <code>CREATE VIEW</code>, <code>DROP VIEW</code>,
                 <code>ALTER TABLE</code> (<code>ADD</code>/<code>DROP</code>/<code>RENAME COLUMN</code>,
                 <code>ALTER COLUMN TYPE</code>)</td>
         </tr>
@@ -460,13 +464,19 @@
             <td><code>COUNT</code>, <code>SUM</code>, <code>AVG</code>,
                 <code>MIN</code>, <code>MAX</code>,
                 <code>COUNT(DISTINCT&nbsp;col)</code>,
-                <code>GROUP BY</code> (multi-column), <code>HAVING</code></td>
+                <code>GROUP BY</code> (multi-column),
+                <code>GROUP BY ROLLUP</code>, <code>GROUP BY CUBE</code>,
+                <code>HAVING</code></td>
         </tr>
         <tr>
             <td><strong>Window functions</strong></td>
-            <td><code>ROW_NUMBER()</code>, <code>RANK()</code>,
+            <td><code>ROW_NUMBER()</code>, <code>RANK()</code>, <code>DENSE_RANK()</code>,
+                <code>NTILE()</code>, <code>PERCENT_RANK()</code>, <code>CUME_DIST()</code>,
+                <code>LAG()</code>, <code>LEAD()</code>,
+                <code>FIRST_VALUE()</code>, <code>LAST_VALUE()</code>, <code>NTH_VALUE()</code>,
                 <code>SUM()</code>, <code>COUNT()</code>, <code>AVG()</code>
-                over <code>PARTITION BY &hellip; ORDER BY &hellip;</code></td>
+                over <code>PARTITION BY &hellip; ORDER BY &hellip;</code>,
+                window frames (<code>ROWS BETWEEN &hellip;</code>)</td>
         </tr>
         <tr>
             <td><strong>Set operations</strong></td>
@@ -488,14 +498,16 @@
         </tr>
         <tr>
             <td><strong>Result control</strong></td>
-            <td><code>DISTINCT</code>,
+            <td><code>DISTINCT</code>, <code>DISTINCT ON</code>,
                 <code>ORDER BY</code> (multi-column, per-column <code>ASC</code>/<code>DESC</code>),
                 <code>LIMIT</code>, <code>OFFSET</code></td>
         </tr>
         <tr>
             <td><strong>Constraints</strong></td>
             <td><code>NOT NULL</code>, <code>UNIQUE</code>, <code>PRIMARY KEY</code>,
-                <code>DEFAULT</code>, <code>CHECK</code></td>
+                <code>DEFAULT</code>, <code>CHECK</code>,
+                <code>REFERENCES</code> (foreign keys, <code>ON DELETE CASCADE</code>,
+                <code>ON UPDATE CASCADE</code>)</td>
         </tr>
         <tr>
             <td><strong>Transactions</strong></td>
@@ -507,6 +519,11 @@
             <td><code>UPPER()</code>, <code>LOWER()</code>, <code>LENGTH()</code>,
                 <code>TRIM()</code>, <code>CONCAT()</code>, <code>||</code>,
                 <code>SUBSTRING()</code></td>
+        </tr>
+        <tr>
+            <td><strong>Sequences &amp; utilities</strong></td>
+            <td><code>NEXTVAL()</code>, <code>CURRVAL()</code>,
+                <code>GEN_RANDOM_UUID()</code></td>
         </tr>
         <tr>
             <td><strong>Subqueries</strong></td>
@@ -537,9 +554,12 @@
         <tr><td><code>VARCHAR(n)</code></td><td>Length-bounded string</td></tr>
         <tr><td><code>BOOLEAN</code></td><td><code>TRUE</code> / <code>FALSE</code></td></tr>
         <tr><td><code>DATE</code></td><td>Calendar date</td></tr>
+        <tr><td><code>TIME</code></td><td>Time of day</td></tr>
         <tr><td><code>TIMESTAMP</code></td><td>Date and time</td></tr>
+        <tr><td><code>TIMESTAMPTZ</code></td><td>Date and time with time zone</td></tr>
+        <tr><td><code>INTERVAL</code></td><td>Time span</td></tr>
         <tr><td><code>UUID</code></td><td>128-bit universally unique identifier</td></tr>
-        <tr><td><code>SERIAL</code></td><td>Auto-incrementing integer</td></tr>
+        <tr><td><code>SERIAL</code> / <code>BIGSERIAL</code></td><td>Auto-incrementing integer (32-bit / 64-bit)</td></tr>
         <tr><td><code>ENUM</code></td><td>User-defined enumeration type</td></tr>
     </tbody>
 </table>
@@ -647,10 +667,10 @@ ORDER BY d.dt;</code></pre>
 <h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes ~430 SQL test cases covering DDL, DML, joins, aggregation,
-    window functions, set operations, CTEs, transactions, NULL handling, type coercion,
-    constraint enforcement, string functions, expression evaluation, upserts, correlated
-    subqueries, and various edge cases. A separate
+    The project includes ~500 SQL test cases covering DDL, DML, joins, aggregation,
+    window functions (including frames), set operations, CTEs, transactions, NULL handling,
+    type coercion, constraint enforcement, foreign keys, sequences, views, string functions,
+    expression evaluation, upserts, correlated subqueries, and various edge cases. A separate
     concurrent test harness exercises multi-client scenarios.<span class="sidenote">Each
     test case starts a fresh server instance, sends SQL via <code>psql</code>, and validates
     output against expected results. No test framework&mdash;just shell scripts and
