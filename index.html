@@ -393,50 +393,50 @@
 </p>
 
 <div class="diagram">
-<svg viewBox="0 0 700 380" xmlns="http://www.w3.org/2000/svg" font-family="'EB Garamond', Georgia, serif">
-  <rect width="700" height="380" fill="#fffff8"/>
+<svg viewBox="0 0 620 240" xmlns="http://www.w3.org/2000/svg" font-family="'EB Garamond', Georgia, serif">
+  <rect width="620" height="240" fill="#fffff8"/>
   <defs>
     <marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
       <path d="M0,0 L8,3 L0,6" fill="#a00"/>
     </marker>
   </defs>
 
-  <!-- The Writer (center top) -->
-  <rect x="250" y="30" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
-  <text x="350" y="62" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Writer</text>
-  <text x="350" y="86" text-anchor="middle" font-size="12" fill="#555">Designs architecture</text>
-  <text x="350" y="104" text-anchor="middle" font-size="12" fill="#555">Writes code &amp; fixes bugs</text>
+  <!-- The Challenger (left) -->
+  <rect x="20" y="20" width="160" height="80" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
+  <text x="100" y="50" text-anchor="middle" font-size="15" font-weight="600" fill="#111">The Challenger</text>
+  <text x="100" y="72" text-anchor="middle" font-size="11" fill="#555">adversarial test cases</text>
 
-  <!-- The Challenger (bottom-left) -->
-  <rect x="20" y="220" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
-  <text x="120" y="252" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Challenger</text>
-  <text x="120" y="276" text-anchor="middle" font-size="12" fill="#555">Reads source code</text>
-  <text x="120" y="294" text-anchor="middle" font-size="12" fill="#555">Writes adversarial tests</text>
+  <!-- The Writer (center) -->
+  <rect x="230" y="20" width="160" height="80" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
+  <text x="310" y="50" text-anchor="middle" font-size="15" font-weight="600" fill="#111">The Writer</text>
+  <text x="310" y="72" text-anchor="middle" font-size="11" fill="#555">writes &amp; fixes code</text>
 
-  <!-- The Reviewer (bottom-right) -->
-  <rect x="480" y="220" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
-  <text x="580" y="252" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Reviewer</text>
-  <text x="580" y="276" text-anchor="middle" font-size="12" fill="#555">Reviews code for quality</text>
-  <text x="580" y="294" text-anchor="middle" font-size="12" fill="#555">Leaves actionable comments</text>
+  <!-- The Reviewer (right) -->
+  <rect x="440" y="20" width="160" height="80" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
+  <text x="520" y="50" text-anchor="middle" font-size="15" font-weight="600" fill="#111">The Reviewer</text>
+  <text x="520" y="72" text-anchor="middle" font-size="11" fill="#555">actionable comments</text>
 
-  <!-- Writer ↔ Challenger arrows -->
-  <path d="M260,130 C220,165 160,195 130,220" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  <path d="M160,220 C190,190 240,160 280,130" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  <!-- Labels on the left, stacked vertically -->
-  <text x="160" y="162" text-anchor="end" font-size="11" fill="#a00" font-style="italic">production code &#x2193;</text>
-  <text x="160" y="180" text-anchor="end" font-size="11" fill="#a00" font-style="italic">&#x2191; .sql test cases</text>
+  <!-- Challenger ↔ Writer arrows -->
+  <path d="M180,45 L230,45" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <path d="M230,75 L180,75" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <text x="205" y="38" text-anchor="middle" font-size="9" fill="#a00" font-style="italic">tests</text>
+  <text x="205" y="90" text-anchor="middle" font-size="9" fill="#a00" font-style="italic">fixes</text>
 
   <!-- Writer ↔ Reviewer arrows -->
-  <path d="M440,130 C480,165 540,195 570,220" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  <path d="M540,220 C510,190 460,160 420,130" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  <!-- Labels on the right, stacked vertically -->
-  <text x="540" y="162" text-anchor="start" font-size="11" fill="#a00" font-style="italic">&#x2193; code to review</text>
-  <text x="540" y="180" text-anchor="start" font-size="11" fill="#a00" font-style="italic">actionable comments &#x2191;</text>
+  <path d="M390,45 L440,45" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <path d="M440,75 L390,75" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <text x="415" y="38" text-anchor="middle" font-size="9" fill="#a00" font-style="italic">code</text>
+  <text x="415" y="90" text-anchor="middle" font-size="9" fill="#a00" font-style="italic">feedback</text>
+
+  <!-- Loop arrow -->
+  <path d="M520,100 C520,130 310,140 100,130 C60,128 40,120 40,100"
+        stroke="#ccc" stroke-width="1.2" fill="none" stroke-dasharray="4,3"/>
+  <text x="310" y="148" text-anchor="middle" font-size="11" fill="#555" font-style="italic">iterate until stable</text>
 
   <!-- Result box -->
-  <rect x="220" y="340" width="260" height="36" rx="6" fill="#a00" stroke="none"/>
-  <text x="350" y="355" text-anchor="middle" font-size="13" fill="#fff" font-weight="600">505 tests pass</text>
-  <text x="350" y="370" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~13,800 lines of C &middot; zero human code</text>
+  <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
+  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">505 tests pass</text>
+  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~13,800 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
