@@ -12,13 +12,14 @@
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
         :root {
+            --body-width: 55%;
             --fg: #111;
             --fg-dim: #555;
             --bg: #fffff8;
             --accent: #a00;
             --rule: #ccc;
             --code-bg: #f3f1eb;
-            --nav-width: 200px;
+            --nav-width: 180px;
         }
 
         html { font-size: 15px; }
@@ -27,20 +28,19 @@
             font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
             background: var(--bg);
             color: var(--fg);
-            display: flex;
-            min-height: 100vh;
+            width: var(--body-width);
+            margin-left: auto;
+            margin-right: auto;
+            padding: 3rem 0 5rem 0;
         }
 
-        /* ── Sidebar nav ────────────────────────────────────────── */
+        /* ── Floating left-margin nav ────────────────────────────── */
         .sidebar {
+            float: left;
             width: var(--nav-width);
-            min-width: var(--nav-width);
-            padding: 2rem 1.2rem 2rem 1.5rem;
-            border-right: 1px solid var(--rule);
+            margin-left: calc(-1 * var(--nav-width) - 40px);
             position: sticky;
-            top: 0;
-            height: 100vh;
-            overflow-y: auto;
+            top: 2rem;
         }
         .sidebar-title {
             font-size: 1.1rem;
@@ -99,14 +99,6 @@
             letter-spacing: 0.06em;
             text-transform: uppercase;
             padding: 0.6rem 0.5rem 0.2rem;
-        }
-
-        /* ── Main content ───────────────────────────────────────── */
-        .content {
-            flex: 1;
-            max-width: 720px;
-            margin: 0 auto;
-            padding: 3rem 2rem 5rem 2rem;
         }
 
         p, ol, ul { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
@@ -280,9 +272,23 @@
             margin: 2.5rem 0;
         }
 
-        @media (max-width: 900px) {
-            .sidebar { display: none; }
-            .content { padding: 2rem 1.2rem 3rem 1.2rem; }
+        @media (max-width: 1100px) {
+            body { width: 80%; }
+            .sidebar {
+                float: none;
+                margin-left: 0;
+                width: auto;
+                position: static;
+                margin-bottom: 2rem;
+                padding-bottom: 1rem;
+                border-bottom: 1px solid var(--rule);
+            }
+            .sidebar nav ul { display: flex; flex-wrap: wrap; gap: 0.2rem 0.8rem; }
+            .sidebar nav .nav-label { padding-top: 0.3rem; }
+        }
+        @media (max-width: 700px) {
+            body { width: 90%; padding: 2rem 0 3rem 0; }
+            h1 { font-size: 2rem; }
             .query-pair { flex-direction: column; }
         }
     </style>
@@ -307,8 +313,6 @@
         </ul>
     </nav>
 </aside>
-
-<main class="content">
 
 <h1>Build a Task Tracker</h1>
 <span class="subtitle">CRUD, constraints, upserts, and RETURNING</span>
@@ -644,8 +648,6 @@ ORDER BY p.name, t.status;</code></pre>
     &ensp;&middot;&ensp;
     <a href="../index.html">Documentation</a>
 </footer>
-
-</main>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
