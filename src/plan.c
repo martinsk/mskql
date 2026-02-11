@@ -52,6 +52,7 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
     if (node_idx == IDX_NONE) return 0;
     struct plan_node *pn = &PLAN_NODE(arena, node_idx);
     if (pn->op == PLAN_SEQ_SCAN) return pn->seq_scan.ncols;
+    if (pn->op == PLAN_INDEX_SCAN) return pn->index_scan.ncols;
     if (pn->op == PLAN_PROJECT) return pn->project.ncols;
     if (pn->op == PLAN_HASH_JOIN) {
         uint16_t lc = plan_node_ncols(arena, pn->left);
@@ -314,6 +315,79 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                   out, pn->seq_scan.col_map,
                                   pn->seq_scan.ncols, &ctx->arena->scratch);
     if (n == 0) return -1;
+    return 0;
+}
+
+static int index_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                           struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct scan_state *st = (struct scan_state *)ctx->node_states[node_idx];
+    if (!st) {
+        st = (struct scan_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        st->cursor = 0;
+        ctx->node_states[node_idx] = st;
+    }
+
+    /* Only emit one block — all matching rows come from index_lookup */
+    if (st->cursor > 0) return -1;
+    st->cursor = 1;
+
+    struct table *t = pn->index_scan.table;
+    struct condition *cond = &COND(ctx->arena, pn->index_scan.cond_idx);
+
+    size_t *ids = NULL;
+    size_t id_count = 0;
+    index_lookup(pn->index_scan.idx, &cond->value, &ids, &id_count);
+    if (id_count == 0) return -1;
+
+    /* Cap to BLOCK_CAPACITY (should rarely matter for point lookups) */
+    if (id_count > BLOCK_CAPACITY) id_count = BLOCK_CAPACITY;
+
+    row_block_reset(out);
+    uint16_t ncols = pn->index_scan.ncols;
+    int *col_map = pn->index_scan.col_map;
+    uint16_t nrows = 0;
+
+    for (size_t k = 0; k < id_count; k++) {
+        size_t rid = ids[k];
+        if (rid >= t->rows.count) continue;
+        struct row *src = &t->rows.items[rid];
+        for (uint16_t c = 0; c < ncols; c++) {
+            int tc = col_map[c];
+            struct col_block *cb = &out->cols[c];
+            struct cell *cell = &src->cells.items[tc];
+            if (nrows == 0) {
+                /* Set type from first row's cell, fall back to column def */
+                cb->type = cell->is_null ? t->columns.items[tc].type : cell->type;
+            }
+            if (cell->is_null) {
+                cb->nulls[nrows] = 1;
+            } else {
+                cb->nulls[nrows] = 0;
+                if (cell->type == COLUMN_TYPE_INT)
+                    cb->data.i32[nrows] = cell->value.as_int;
+                else if (cell->type == COLUMN_TYPE_FLOAT)
+                    cb->data.f64[nrows] = cell->value.as_float;
+                else if (cell->type == COLUMN_TYPE_BIGINT)
+                    cb->data.i64[nrows] = cell->value.as_bigint;
+                else if (cell->type == COLUMN_TYPE_NUMERIC)
+                    cb->data.f64[nrows] = cell->value.as_numeric;
+                else if (cell->type == COLUMN_TYPE_BOOLEAN)
+                    cb->data.i32[nrows] = cell->value.as_bool;
+                else if (column_type_is_text(cell->type))
+                    cb->data.str[nrows] = cell->value.as_text;
+            }
+        }
+        nrows++;
+    }
+
+    if (nrows == 0) return -1;
+
+    out->count = nrows;
+    for (uint16_t c = 0; c < ncols; c++)
+        out->cols[c].count = nrows;
+
     return 0;
 }
 
@@ -1140,6 +1214,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
 
     if (pn->op == PLAN_SEQ_SCAN)    return seq_scan_next(ctx, node_idx, out);
+    if (pn->op == PLAN_INDEX_SCAN)   return index_scan_next(ctx, node_idx, out);
     if (pn->op == PLAN_FILTER)       return filter_next(ctx, node_idx, out);
     if (pn->op == PLAN_PROJECT)      return project_next(ctx, node_idx, out);
     if (pn->op == PLAN_LIMIT)        return limit_next(ctx, node_idx, out);
@@ -1484,24 +1559,50 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
     for (uint16_t i = 0; i < scan_ncols; i++)
         col_map[i] = (int)i;
 
-    uint32_t scan_idx = plan_alloc_node(arena, PLAN_SEQ_SCAN);
-    PLAN_NODE(arena, scan_idx).seq_scan.table = t;
-    PLAN_NODE(arena, scan_idx).seq_scan.ncols = scan_ncols;
-    PLAN_NODE(arena, scan_idx).seq_scan.col_map = col_map;
-    PLAN_NODE(arena, scan_idx).est_rows = (double)t->rows.count;
+    uint32_t current;
 
-    uint32_t current = scan_idx;
-
-    /* Add filter node if WHERE clause was validated */
-    if (filter_ok) {
+    /* Try index scan for equality WHERE on an indexed column */
+    int used_index = 0;
+    if (filter_ok && filter_col >= 0) {
         struct condition *cond = &COND(arena, s->where.where_cond);
-        uint32_t filter_idx = plan_alloc_node(arena, PLAN_FILTER);
-        PLAN_NODE(arena, filter_idx).left = current;
-        PLAN_NODE(arena, filter_idx).filter.cond_idx = s->where.where_cond;
-        PLAN_NODE(arena, filter_idx).filter.col_idx = filter_col;
-        PLAN_NODE(arena, filter_idx).filter.cmp_op = (int)cond->op;
-        PLAN_NODE(arena, filter_idx).filter.cmp_val = cond->value;
-        current = filter_idx;
+        if (cond->op == CMP_EQ) {
+            for (size_t ix = 0; ix < t->indexes.count; ix++) {
+                if (strcmp(t->indexes.items[ix].column_name,
+                           t->columns.items[filter_col].name) == 0) {
+                    uint32_t idx_node = plan_alloc_node(arena, PLAN_INDEX_SCAN);
+                    PLAN_NODE(arena, idx_node).index_scan.table = t;
+                    PLAN_NODE(arena, idx_node).index_scan.idx = &t->indexes.items[ix];
+                    PLAN_NODE(arena, idx_node).index_scan.cond_idx = s->where.where_cond;
+                    PLAN_NODE(arena, idx_node).index_scan.ncols = scan_ncols;
+                    PLAN_NODE(arena, idx_node).index_scan.col_map = col_map;
+                    PLAN_NODE(arena, idx_node).est_rows = 1.0;
+                    current = idx_node;
+                    used_index = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!used_index) {
+        uint32_t scan_idx = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+        PLAN_NODE(arena, scan_idx).seq_scan.table = t;
+        PLAN_NODE(arena, scan_idx).seq_scan.ncols = scan_ncols;
+        PLAN_NODE(arena, scan_idx).seq_scan.col_map = col_map;
+        PLAN_NODE(arena, scan_idx).est_rows = (double)t->rows.count;
+        current = scan_idx;
+
+        /* Add filter node if WHERE clause was validated */
+        if (filter_ok) {
+            struct condition *cond = &COND(arena, s->where.where_cond);
+            uint32_t filter_idx = plan_alloc_node(arena, PLAN_FILTER);
+            PLAN_NODE(arena, filter_idx).left = current;
+            PLAN_NODE(arena, filter_idx).filter.cond_idx = s->where.where_cond;
+            PLAN_NODE(arena, filter_idx).filter.col_idx = filter_col;
+            PLAN_NODE(arena, filter_idx).filter.cmp_op = (int)cond->op;
+            PLAN_NODE(arena, filter_idx).filter.cmp_val = cond->value;
+            current = filter_idx;
+        }
     }
 
     /* Add SORT node if ORDER BY was validated */
