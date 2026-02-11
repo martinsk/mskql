@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770831662456,
+  "lastUpdate": 1770832883372,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -947,6 +947,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 22.074,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "7a19c252df4b89d02d0470fbb93b935ce6054de9",
+          "message": "extend pgwire RowDescription to handle JOIN queries by passing optional second table and resolving column names across merged column space, and implement hash join fast path in plan builder for simple equi-joins without aggregates/grouping/window functions\n\nAdd t2 parameter to send_row_desc_plan() to support JOIN queries where columns come from two tables. When SELECT * on a JOIN, resolve column names by checking t1 first, then t2 with offset. For explicit column lists, search both tables and map",
+          "timestamp": "2026-02-11T10:00:40-08:00",
+          "tree_id": "f04a7dc731e31645bfff977423e0d93b80b77627",
+          "url": "https://github.com/martinsk/mskql/commit/7a19c252df4b89d02d0470fbb93b935ce6054de9"
+        },
+        "date": 1770832882512,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.368,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 88.193,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 124.347,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 177.185,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 128.563,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.731,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 22.868,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 87.906,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 164.192,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 3.895,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 18.326,
             "unit": "ms"
           }
         ]
