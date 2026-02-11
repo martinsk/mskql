@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; SQL Grammar Reference</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --body-width: 55%;
+            --fg: #111;
+            --fg-dim: #555;
+            --bg: #fffff8;
+            --accent: #a00;
+            --rule: #ccc;
+            --code-bg: #f3f1eb;
+            --implemented: #1a7a1a;
+            --not-implemented: #999;
+        }
+
+        html { font-size: 15px; }
+
+        body {
+            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+            background: var(--bg);
+            color: var(--fg);
+            width: var(--body-width);
+            margin-left: auto;
+            margin-right: auto;
+            padding: 3rem 0 5rem 0;
+        }
+
+        p { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+
+        a {
+            color: var(--fg);
+            text-decoration: none;
+            background-image: linear-gradient(var(--accent), var(--accent));
+            background-size: 1px 1px;
+            background-repeat: repeat-x;
+            background-position: 0 1.15em;
+        }
+        a:hover { color: var(--accent); }
+
+        strong { font-weight: 600; }
+
+        h1 {
+            font-weight: 400;
+            font-size: 2.6rem;
+            line-height: 1.15;
+            margin-bottom: 0.4rem;
+        }
+
+        .subtitle {
+            font-style: italic;
+            font-size: 1.3rem;
+            color: var(--fg-dim);
+            display: block;
+            margin-bottom: 0.6rem;
+            line-height: 1.4;
+        }
+
+        .byline {
+            font-size: 0.95rem;
+            color: var(--fg-dim);
+            margin-bottom: 2rem;
+        }
+        .byline a { font-size: 0.95rem; }
+
+        .title-rule {
+            border: none;
+            height: 3px;
+            background: var(--accent);
+            width: 60px;
+            margin: 0 0 2rem 0;
+        }
+
+        h2 {
+            font-weight: 400;
+            font-style: italic;
+            font-size: 1.6rem;
+            margin-top: 2.8rem;
+            margin-bottom: 0.6rem;
+            padding-bottom: 0.15rem;
+        }
+
+        h3 {
+            font-weight: 600;
+            font-style: normal;
+            font-size: 1.15rem;
+            margin-top: 1.6rem;
+            margin-bottom: 0.4rem;
+        }
+
+        code {
+            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+            font-size: 0.82rem;
+            background: var(--code-bg);
+            padding: 0.1em 0.35em;
+            border-radius: 2px;
+        }
+
+        pre {
+            background: var(--code-bg);
+            border-left: 3px solid var(--accent);
+            padding: 1rem 1.2rem;
+            overflow-x: auto;
+            font-size: 0.82rem;
+            line-height: 1.55;
+            margin: 1rem 0 1.4rem 0;
+        }
+        pre code { background: none; padding: 0; border-radius: 0; }
+
+        /* ── Grammar production rules ──────────────────────────── */
+        .grammar {
+            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+            font-size: 0.8rem;
+            line-height: 1.7;
+            background: var(--code-bg);
+            border-left: 3px solid var(--accent);
+            padding: 1rem 1.2rem;
+            margin: 0.8rem 0 1.4rem 0;
+            overflow-x: auto;
+        }
+        .grammar .kw {
+            font-weight: 700;
+            color: var(--fg);
+        }
+        .grammar .nt {
+            font-style: italic;
+            color: #36c;
+        }
+        .grammar .op {
+            color: var(--accent);
+            font-weight: 700;
+        }
+        .grammar .comment {
+            color: var(--fg-dim);
+            font-style: italic;
+        }
+
+        /* ── Status badges ─────────────────────────────────────── */
+        .badge {
+            display: inline-block;
+            font-family: 'Menlo', 'Consolas', monospace;
+            font-size: 0.65rem;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            padding: 0.15em 0.5em;
+            border-radius: 3px;
+            vertical-align: middle;
+            margin-left: 0.4rem;
+        }
+        .badge-yes {
+            background: #e6f4e6;
+            color: var(--implemented);
+            border: 1px solid #b3dab3;
+        }
+        .badge-no {
+            background: #f0f0f0;
+            color: var(--not-implemented);
+            border: 1px solid #ddd;
+        }
+        .badge-partial {
+            background: #fff8e6;
+            color: #996600;
+            border: 1px solid #e6d9a0;
+        }
+
+        /* ── Feature table ─────────────────────────────────────── */
+        table {
+            border-collapse: collapse;
+            font-size: 0.95rem;
+            width: 100%;
+            margin: 1rem 0 1.4rem 0;
+        }
+        th, td {
+            padding: 0.4rem 0.8rem;
+            text-align: left;
+            border-bottom: 1px solid var(--rule);
+        }
+        thead th {
+            border-bottom: 2px solid var(--fg);
+            font-weight: 600;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        tbody tr:last-child td { border-bottom: 2px solid var(--fg); }
+        td code { font-size: 0.8rem; }
+
+        /* ── Legend ─────────────────────────────────────────────── */
+        .legend {
+            display: flex;
+            gap: 1.5rem;
+            margin: 1rem 0 1.5rem 0;
+            font-size: 0.9rem;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        /* ── Footer ──────────────────────────────────────────────── */
+        footer.site-footer {
+            margin-top: 3rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--rule);
+            font-size: 0.85rem;
+            color: var(--fg-dim);
+        }
+        footer.site-footer a { font-size: 0.85rem; }
+
+        hr {
+            border: none;
+            border-top: 1px solid var(--rule);
+            margin: 2.5rem 0;
+        }
+
+        @media (max-width: 1100px) {
+            body { width: 80%; }
+        }
+        @media (max-width: 700px) {
+            body { width: 90%; padding: 2rem 0 3rem 0; }
+            h1 { font-size: 2rem; }
+        }
+    </style>
+</head>
+<body>
+
+<h1>mskql</h1>
+<span class="subtitle">SQL Grammar Reference</span>
+<p class="byline">
+    <a href="index.html">&larr; Back to documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
+</p>
+<hr class="title-rule">
+
+<p>
+    This page documents the SQL grammar implemented by mskql. Each production rule
+    shows the syntax accepted by the recursive-descent parser. Features are marked
+    as implemented, partially implemented, or not yet implemented.
+</p>
+
+<div class="legend">
+    <div class="legend-item"><span class="badge badge-yes">IMPLEMENTED</span> Fully supported</div>
+    <div class="legend-item"><span class="badge badge-partial">PARTIAL</span> Subset supported</div>
+    <div class="legend-item"><span class="badge badge-no">NOT IMPLEMENTED</span> Not yet available</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Statements                                                 -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>1. Top-Level Statements</h2>
+
+<div class="grammar">
+<span class="nt">statement</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="nt">select_stmt</span><br>
+&ensp;&ensp;| <span class="nt">insert_stmt</span><br>
+&ensp;&ensp;| <span class="nt">update_stmt</span><br>
+&ensp;&ensp;| <span class="nt">delete_stmt</span><br>
+&ensp;&ensp;| <span class="nt">create_table_stmt</span><br>
+&ensp;&ensp;| <span class="nt">drop_table_stmt</span><br>
+&ensp;&ensp;| <span class="nt">create_index_stmt</span><br>
+&ensp;&ensp;| <span class="nt">drop_index_stmt</span><br>
+&ensp;&ensp;| <span class="nt">create_type_stmt</span><br>
+&ensp;&ensp;| <span class="nt">drop_type_stmt</span><br>
+&ensp;&ensp;| <span class="nt">create_sequence_stmt</span><br>
+&ensp;&ensp;| <span class="nt">drop_sequence_stmt</span><br>
+&ensp;&ensp;| <span class="nt">create_view_stmt</span><br>
+&ensp;&ensp;| <span class="nt">drop_view_stmt</span><br>
+&ensp;&ensp;| <span class="nt">alter_table_stmt</span><br>
+&ensp;&ensp;| <span class="nt">transaction_stmt</span><br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  SELECT                                                     -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>2. SELECT</h2>
+
+<div class="grammar">
+<span class="nt">select_stmt</span> <span class="op">::=</span><br>
+&ensp;&ensp;  [ <span class="nt">with_clause</span> ]<br>
+&ensp;&ensp;  <span class="kw">SELECT</span> [ <span class="kw">DISTINCT</span> [ <span class="kw">ON</span> <span class="kw">(</span> <span class="nt">column_list</span> <span class="kw">)</span> ] ]<br>
+&ensp;&ensp;  <span class="nt">select_list</span><br>
+&ensp;&ensp;  [ <span class="kw">FROM</span> <span class="nt">from_clause</span> ]<br>
+&ensp;&ensp;  [ <span class="nt">join_clause</span> ... ]<br>
+&ensp;&ensp;  [ <span class="kw">WHERE</span> <span class="nt">condition</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">GROUP BY</span> <span class="nt">group_by_clause</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">HAVING</span> <span class="nt">condition</span> ]<br>
+&ensp;&ensp;  [ <span class="nt">set_operation</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">ORDER BY</span> <span class="nt">order_list</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">LIMIT</span> <span class="nt">expr</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">OFFSET</span> <span class="nt">expr</span> ]<br>
+</div>
+
+<h3>WITH clause (CTEs)</h3>
+
+<div class="grammar">
+<span class="nt">with_clause</span> <span class="op">::=</span>
+  <span class="kw">WITH</span> [ <span class="kw">RECURSIVE</span> ] <span class="nt">cte_def</span> { <span class="kw">,</span> <span class="nt">cte_def</span> }<br>
+<br>
+<span class="nt">cte_def</span> <span class="op">::=</span>
+  <span class="nt">name</span> [ <span class="kw">(</span> <span class="nt">column_list</span> <span class="kw">)</span> ] <span class="kw">AS</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span><br>
+</div>
+
+<h3>SELECT list</h3>
+
+<div class="grammar">
+<span class="nt">select_list</span> <span class="op">::=</span>
+  <span class="kw">*</span>
+  | <span class="nt">select_item</span> { <span class="kw">,</span> <span class="nt">select_item</span> }<br>
+<br>
+<span class="nt">select_item</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="nt">expr</span> [ [ <span class="kw">AS</span> ] <span class="nt">alias</span> ]<br>
+&ensp;&ensp;| <span class="nt">agg_func</span> <span class="kw">(</span> [ <span class="kw">DISTINCT</span> ] <span class="nt">expr</span> <span class="kw">)</span> [ [ <span class="kw">AS</span> ] <span class="nt">alias</span> ]<br>
+&ensp;&ensp;| <span class="nt">window_func</span> <span class="kw">(</span> <span class="nt">args</span> <span class="kw">)</span> <span class="kw">OVER</span> <span class="kw">(</span> <span class="nt">window_spec</span> <span class="kw">)</span> [ [ <span class="kw">AS</span> ] <span class="nt">alias</span> ]<br>
+&ensp;&ensp;| <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> [ [ <span class="kw">AS</span> ] <span class="nt">alias</span> ] <span class="comment">&ensp;-- scalar subquery</span><br>
+</div>
+
+<h3>FROM clause</h3>
+
+<div class="grammar">
+<span class="nt">from_clause</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="nt">table_name</span> [ [ <span class="kw">AS</span> ] <span class="nt">alias</span> ]<br>
+&ensp;&ensp;| <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> [ <span class="kw">AS</span> ] <span class="nt">alias</span> <span class="comment">&ensp;-- derived table</span><br>
+</div>
+
+<h3>JOIN clause</h3>
+
+<div class="grammar">
+<span class="nt">join_clause</span> <span class="op">::=</span><br>
+&ensp;&ensp;  [ <span class="kw">INNER</span> ] <span class="kw">JOIN</span> <span class="nt">table_ref</span> <span class="kw">ON</span> <span class="nt">condition</span><br>
+&ensp;&ensp;| <span class="kw">LEFT</span> [ <span class="kw">OUTER</span> ] <span class="kw">JOIN</span> <span class="nt">table_ref</span> <span class="kw">ON</span> <span class="nt">condition</span><br>
+&ensp;&ensp;| <span class="kw">RIGHT</span> [ <span class="kw">OUTER</span> ] <span class="kw">JOIN</span> <span class="nt">table_ref</span> <span class="kw">ON</span> <span class="nt">condition</span><br>
+&ensp;&ensp;| <span class="kw">FULL</span> [ <span class="kw">OUTER</span> ] <span class="kw">JOIN</span> <span class="nt">table_ref</span> <span class="kw">ON</span> <span class="nt">condition</span><br>
+&ensp;&ensp;| <span class="kw">CROSS JOIN</span> <span class="nt">table_ref</span><br>
+&ensp;&ensp;| <span class="kw">NATURAL</span> [ <span class="kw">LEFT</span> | <span class="kw">RIGHT</span> | <span class="kw">FULL</span> ] <span class="kw">JOIN</span> <span class="nt">table_ref</span><br>
+&ensp;&ensp;| ... <span class="kw">USING</span> <span class="kw">(</span> <span class="nt">column_list</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">LATERAL</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> [ <span class="kw">AS</span> ] <span class="nt">alias</span><br>
+&ensp;&ensp;| <span class="kw">,</span> <span class="nt">table_ref</span> <span class="comment">&ensp;-- implicit cross join</span><br>
+</div>
+
+<h3>GROUP BY clause</h3>
+
+<div class="grammar">
+<span class="nt">group_by_clause</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="nt">column_ref</span> { <span class="kw">,</span> <span class="nt">column_ref</span> }<br>
+&ensp;&ensp;| <span class="kw">ROLLUP</span> <span class="kw">(</span> <span class="nt">column_ref</span> { <span class="kw">,</span> <span class="nt">column_ref</span> } <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">CUBE</span> <span class="kw">(</span> <span class="nt">column_ref</span> { <span class="kw">,</span> <span class="nt">column_ref</span> } <span class="kw">)</span><br>
+</div>
+
+<h3>Set operations</h3>
+
+<div class="grammar">
+<span class="nt">set_operation</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">UNION</span> [ <span class="kw">ALL</span> ] <span class="nt">select_stmt</span><br>
+&ensp;&ensp;| <span class="kw">INTERSECT</span> <span class="nt">select_stmt</span><br>
+&ensp;&ensp;| <span class="kw">EXCEPT</span> <span class="nt">select_stmt</span><br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Aggregate & Window functions                               -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>3. Aggregate &amp; Window Functions</h2>
+
+<h3>Aggregate functions <span class="badge badge-yes">IMPLEMENTED</span></h3>
+
+<div class="grammar">
+<span class="nt">agg_func</span> <span class="op">::=</span>
+  <span class="kw">COUNT</span> | <span class="kw">SUM</span> | <span class="kw">AVG</span> | <span class="kw">MIN</span> | <span class="kw">MAX</span><br>
+<br>
+<span class="comment">-- COUNT(DISTINCT col) is supported</span><br>
+<span class="comment">-- COUNT(*) is supported</span><br>
+</div>
+
+<h3>Window functions <span class="badge badge-yes">IMPLEMENTED</span></h3>
+
+<div class="grammar">
+<span class="nt">window_func</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">ROW_NUMBER</span> | <span class="kw">RANK</span> | <span class="kw">DENSE_RANK</span><br>
+&ensp;&ensp;| <span class="kw">NTILE</span> | <span class="kw">PERCENT_RANK</span> | <span class="kw">CUME_DIST</span><br>
+&ensp;&ensp;| <span class="kw">LAG</span> | <span class="kw">LEAD</span><br>
+&ensp;&ensp;| <span class="kw">FIRST_VALUE</span> | <span class="kw">LAST_VALUE</span> | <span class="kw">NTH_VALUE</span><br>
+&ensp;&ensp;| <span class="kw">SUM</span> | <span class="kw">COUNT</span> | <span class="kw">AVG</span><br>
+<br>
+<span class="nt">window_spec</span> <span class="op">::=</span><br>
+&ensp;&ensp;  [ <span class="kw">PARTITION BY</span> <span class="nt">column_ref</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">ORDER BY</span> <span class="nt">column_ref</span> [ <span class="kw">ASC</span> | <span class="kw">DESC</span> ] ]<br>
+&ensp;&ensp;  [ <span class="nt">frame_clause</span> ]<br>
+<br>
+<span class="nt">frame_clause</span> <span class="op">::=</span>
+  <span class="kw">ROWS BETWEEN</span> <span class="nt">frame_bound</span> <span class="kw">AND</span> <span class="nt">frame_bound</span><br>
+<br>
+<span class="nt">frame_bound</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">UNBOUNDED PRECEDING</span><br>
+&ensp;&ensp;| <span class="nt">n</span> <span class="kw">PRECEDING</span><br>
+&ensp;&ensp;| <span class="kw">CURRENT ROW</span><br>
+&ensp;&ensp;| <span class="nt">n</span> <span class="kw">FOLLOWING</span><br>
+&ensp;&ensp;| <span class="kw">UNBOUNDED FOLLOWING</span><br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  INSERT                                                     -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>4. INSERT</h2>
+
+<div class="grammar">
+<span class="nt">insert_stmt</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">INSERT INTO</span> <span class="nt">table_name</span> [ <span class="kw">(</span> <span class="nt">column_list</span> <span class="kw">)</span> ]<br>
+&ensp;&ensp;  <span class="kw">VALUES</span> <span class="nt">value_tuple</span> { <span class="kw">,</span> <span class="nt">value_tuple</span> }<br>
+&ensp;&ensp;  [ <span class="nt">conflict_clause</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">RETURNING</span> <span class="nt">select_list</span> ]<br>
+<br>
+&ensp;&ensp;| <span class="kw">INSERT INTO</span> <span class="nt">table_name</span> [ <span class="kw">(</span> <span class="nt">column_list</span> <span class="kw">)</span> ]<br>
+&ensp;&ensp;&ensp;&ensp;<span class="nt">select_stmt</span><br>
+&ensp;&ensp;  [ <span class="nt">conflict_clause</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">RETURNING</span> <span class="nt">select_list</span> ]<br>
+<br>
+<span class="nt">conflict_clause</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">ON CONFLICT</span> [ <span class="kw">(</span> <span class="nt">column_ref</span> <span class="kw">)</span> ] <span class="kw">DO NOTHING</span><br>
+&ensp;&ensp;| <span class="kw">ON CONFLICT</span> <span class="kw">(</span> <span class="nt">column_ref</span> <span class="kw">)</span> <span class="kw">DO UPDATE SET</span> <span class="nt">set_list</span><br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  UPDATE                                                     -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>5. UPDATE</h2>
+
+<div class="grammar">
+<span class="nt">update_stmt</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">UPDATE</span> <span class="nt">table_name</span> [ [ <span class="kw">AS</span> ] <span class="nt">alias</span> ]<br>
+&ensp;&ensp;  <span class="kw">SET</span> <span class="nt">set_list</span><br>
+&ensp;&ensp;  [ <span class="kw">FROM</span> <span class="nt">table_name</span> [ [ <span class="kw">AS</span> ] <span class="nt">alias</span> ] ]<br>
+&ensp;&ensp;  [ <span class="kw">WHERE</span> <span class="nt">condition</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">RETURNING</span> <span class="nt">select_list</span> ]<br>
+<br>
+<span class="nt">set_list</span> <span class="op">::=</span>
+  <span class="nt">set_item</span> { <span class="kw">,</span> <span class="nt">set_item</span> }<br>
+<br>
+<span class="nt">set_item</span> <span class="op">::=</span>
+  <span class="nt">column_name</span> <span class="kw">=</span> <span class="nt">expr</span><br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  DELETE                                                     -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>6. DELETE</h2>
+
+<div class="grammar">
+<span class="nt">delete_stmt</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">DELETE FROM</span> <span class="nt">table_name</span><br>
+&ensp;&ensp;  [ <span class="kw">WHERE</span> <span class="nt">condition</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">RETURNING</span> <span class="nt">select_list</span> ]<br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  DDL                                                        -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>7. Data Definition (DDL)</h2>
+
+<h3>CREATE TABLE <span class="badge badge-yes">IMPLEMENTED</span></h3>
+
+<div class="grammar">
+<span class="nt">create_table_stmt</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">CREATE TABLE</span> <span class="nt">table_name</span> <span class="kw">(</span> <span class="nt">column_def</span> { <span class="kw">,</span> <span class="nt">column_def</span> } <span class="kw">)</span><br>
+<br>
+<span class="nt">column_def</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="nt">column_name</span> <span class="nt">data_type</span> { <span class="nt">column_constraint</span> }<br>
+<br>
+<span class="nt">column_constraint</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">NOT NULL</span><br>
+&ensp;&ensp;| <span class="kw">UNIQUE</span><br>
+&ensp;&ensp;| <span class="kw">PRIMARY KEY</span><br>
+&ensp;&ensp;| <span class="kw">DEFAULT</span> <span class="nt">expr</span><br>
+&ensp;&ensp;| <span class="kw">CHECK</span> <span class="kw">(</span> <span class="nt">condition</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">REFERENCES</span> <span class="nt">table_name</span> <span class="kw">(</span> <span class="nt">column_name</span> <span class="kw">)</span>
+    [ <span class="kw">ON DELETE CASCADE</span> ] [ <span class="kw">ON UPDATE CASCADE</span> ]<br>
+</div>
+
+<h3>ALTER TABLE <span class="badge badge-yes">IMPLEMENTED</span></h3>
+
+<div class="grammar">
+<span class="nt">alter_table_stmt</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">ADD COLUMN</span> <span class="nt">column_def</span><br>
+&ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">DROP COLUMN</span> <span class="nt">column_name</span><br>
+&ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">RENAME COLUMN</span> <span class="nt">old</span> <span class="kw">TO</span> <span class="nt">new</span><br>
+&ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">ALTER COLUMN</span> <span class="nt">column_name</span> <span class="kw">TYPE</span> <span class="nt">data_type</span><br>
+</div>
+
+<h3>Other DDL <span class="badge badge-yes">IMPLEMENTED</span></h3>
+
+<div class="grammar">
+<span class="nt">drop_table_stmt</span> <span class="op">::=</span>
+  <span class="kw">DROP TABLE</span> <span class="nt">table_name</span><br>
+<br>
+<span class="nt">create_index_stmt</span> <span class="op">::=</span>
+  <span class="kw">CREATE INDEX</span> <span class="nt">name</span> <span class="kw">ON</span> <span class="nt">table_name</span> <span class="kw">(</span> <span class="nt">column_name</span> <span class="kw">)</span><br>
+<br>
+<span class="nt">drop_index_stmt</span> <span class="op">::=</span>
+  <span class="kw">DROP INDEX</span> <span class="nt">name</span><br>
+<br>
+<span class="nt">create_type_stmt</span> <span class="op">::=</span>
+  <span class="kw">CREATE TYPE</span> <span class="nt">name</span> <span class="kw">AS ENUM</span> <span class="kw">(</span> <span class="nt">string_literal</span> { <span class="kw">,</span> <span class="nt">string_literal</span> } <span class="kw">)</span><br>
+<br>
+<span class="nt">drop_type_stmt</span> <span class="op">::=</span>
+  <span class="kw">DROP TYPE</span> <span class="nt">name</span><br>
+<br>
+<span class="nt">create_sequence_stmt</span> <span class="op">::=</span>
+  <span class="kw">CREATE SEQUENCE</span> <span class="nt">name</span> [ <span class="kw">START WITH</span> <span class="nt">n</span> ] [ <span class="kw">INCREMENT BY</span> <span class="nt">n</span> ]<br>
+<br>
+<span class="nt">drop_sequence_stmt</span> <span class="op">::=</span>
+  <span class="kw">DROP SEQUENCE</span> <span class="nt">name</span><br>
+<br>
+<span class="nt">create_view_stmt</span> <span class="op">::=</span>
+  <span class="kw">CREATE VIEW</span> <span class="nt">name</span> <span class="kw">AS</span> <span class="nt">select_stmt</span><br>
+<br>
+<span class="nt">drop_view_stmt</span> <span class="op">::=</span>
+  <span class="kw">DROP VIEW</span> <span class="nt">name</span><br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Data Types                                                 -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>8. Data Types</h2>
+
+<div class="grammar">
+<span class="nt">data_type</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">INT</span> | <span class="kw">INTEGER</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">BIGINT</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">FLOAT</span> | <span class="kw">DOUBLE PRECISION</span> | <span class="kw">REAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">NUMERIC</span> | <span class="kw">DECIMAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">TEXT</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">VARCHAR</span> <span class="kw">(</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CHAR</span> <span class="kw">(</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">BOOLEAN</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">DATE</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">TIME</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">TIMESTAMP</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">TIMESTAMPTZ</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">INTERVAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">UUID</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">SERIAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">BIGSERIAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">SMALLINT</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">BYTEA</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">JSON</span> | <span class="kw">JSONB</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">ARRAY</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">enum_type_name</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Expressions                                                -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>9. Expressions</h2>
+
+<div class="grammar">
+<span class="nt">expr</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="nt">literal</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">column_ref</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">binary_op</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">unary_op</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">func_call</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CASE WHEN</span> <span class="nt">condition</span> <span class="kw">THEN</span> <span class="nt">expr</span> { <span class="kw">WHEN</span> ... } [ <span class="kw">ELSE</span> <span class="nt">expr</span> ] <span class="kw">END</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="comment">&ensp;-- scalar subquery</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">::</span> <span class="nt">data_type</span> <span class="comment">&ensp;-- CAST</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CAST</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">AS</span> <span class="nt">data_type</span> <span class="kw">)</span> <span class="badge badge-partial">PARTIAL</span><br>
+<br>
+<span class="nt">binary_op</span> <span class="op">::=</span>
+  <span class="kw">+</span> | <span class="kw">-</span> | <span class="kw">*</span> | <span class="kw">/</span> | <span class="kw">%</span> | <span class="kw">||</span><br>
+<br>
+<span class="nt">unary_op</span> <span class="op">::=</span>
+  <span class="kw">-</span><br>
+<br>
+<span class="nt">literal</span> <span class="op">::=</span>
+  <span class="nt">integer</span> | <span class="nt">float</span> | <span class="nt">string</span> | <span class="kw">TRUE</span> | <span class="kw">FALSE</span> | <span class="kw">NULL</span><br>
+</div>
+
+<h3>Built-in functions</h3>
+
+<div class="grammar">
+<span class="nt">func_call</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">COALESCE</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">NULLIF</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">GREATEST</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">LEAST</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">UPPER</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">LOWER</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">LENGTH</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">TRIM</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CONCAT</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">SUBSTRING</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">FROM</span> <span class="nt">n</span> [ <span class="kw">FOR</span> <span class="nt">n</span> ] <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">NEXTVAL</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CURRVAL</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">GEN_RANDOM_UUID</span> <span class="kw">()</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">NOW</span> <span class="kw">()</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CURRENT_TIMESTAMP</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">EXTRACT</span> <span class="kw">(</span> <span class="nt">field</span> <span class="kw">FROM</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">DATE_TRUNC</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">REPLACE</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">LEFT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> / <span class="kw">RIGHT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">ABS</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">ROUND</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">CEIL</span> / <span class="kw">FLOOR</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Conditions                                                 -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>10. Conditions (WHERE / ON / HAVING)</h2>
+
+<div class="grammar">
+<span class="nt">condition</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="nt">condition</span> <span class="kw">AND</span> <span class="nt">condition</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">condition</span> <span class="kw">OR</span> <span class="nt">condition</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">NOT</span> <span class="nt">condition</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">cmp_op</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">BETWEEN</span> <span class="nt">expr</span> <span class="kw">AND</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> [ <span class="kw">NOT</span> ] <span class="kw">IN</span> <span class="kw">(</span> <span class="nt">value_list</span> | <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">(</span> <span class="nt">expr_list</span> <span class="kw">)</span> <span class="kw">IN</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="comment">&ensp;-- multi-column IN</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">cmp_op</span> <span class="kw">ANY</span> <span class="kw">(</span> <span class="nt">value_list</span> | <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">cmp_op</span> <span class="kw">ALL</span> <span class="kw">(</span> <span class="nt">value_list</span> | <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> [ <span class="kw">NOT</span> ] <span class="kw">LIKE</span> <span class="nt">pattern</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">ILIKE</span> <span class="nt">pattern</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">IS</span> [ <span class="kw">NOT</span> ] <span class="kw">NULL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">IS</span> [ <span class="kw">NOT</span> ] <span class="kw">DISTINCT FROM</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">EXISTS</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">NOT EXISTS</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">SIMILAR TO</span> <span class="nt">pattern</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">~</span> <span class="nt">pattern</span> <span class="comment">&ensp;-- POSIX regex</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+<br>
+<span class="nt">cmp_op</span> <span class="op">::=</span>
+  <span class="kw">=</span> | <span class="kw">!=</span> | <span class="kw">&lt;&gt;</span> | <span class="kw">&lt;</span> | <span class="kw">&gt;</span> | <span class="kw">&lt;=</span> | <span class="kw">&gt;=</span><br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Transactions                                               -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>11. Transactions</h2>
+
+<div class="grammar">
+<span class="nt">transaction_stmt</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">BEGIN</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">COMMIT</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">ROLLBACK</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">RELEASE SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">ROLLBACK TO SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Not Implemented Summary                                    -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>12. Not Yet Implemented</h2>
+
+<p>
+    The following PostgreSQL features are not currently supported. They are listed
+    here for completeness and to indicate the scope of the grammar relative to
+    full PostgreSQL.
+</p>
+
+<table>
+    <thead>
+        <tr><th>Category</th><th>Feature</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Types</strong></td>
+            <td><code>CHAR(n)</code>, <code>SMALLINT</code>, <code>BYTEA</code>,
+                <code>JSON</code>/<code>JSONB</code>, <code>ARRAY</code>,
+                composite types, range types</td>
+            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+        </tr>
+        <tr>
+            <td><strong>Functions</strong></td>
+            <td><code>NOW()</code>, <code>CURRENT_TIMESTAMP</code>,
+                <code>EXTRACT()</code>, <code>DATE_TRUNC()</code>,
+                <code>REPLACE()</code>, <code>LEFT()</code>/<code>RIGHT()</code>,
+                <code>ABS()</code>, <code>ROUND()</code>, <code>CEIL()</code>/<code>FLOOR()</code>,
+                <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code></td>
+            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+        </tr>
+        <tr>
+            <td><strong>Expressions</strong></td>
+            <td><code>::</code> cast operator, <code>SIMILAR TO</code>,
+                POSIX regex (<code>~</code>, <code>~*</code>),
+                <code>ARRAY[...]</code> constructor</td>
+            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+        </tr>
+        <tr>
+            <td><strong>DDL</strong></td>
+            <td><code>CREATE TABLE ... AS SELECT</code>,
+                <code>CREATE MATERIALIZED VIEW</code>,
+                <code>TRUNCATE</code>,
+                table-level constraints (<code>CONSTRAINT ... UNIQUE(...)</code>),
+                <code>IF EXISTS</code>/<code>IF NOT EXISTS</code>,
+                <code>CASCADE</code>/<code>RESTRICT</code> on DROP</td>
+            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+        </tr>
+        <tr>
+            <td><strong>Transactions</strong></td>
+            <td><code>SAVEPOINT</code>, <code>RELEASE SAVEPOINT</code>,
+                <code>ROLLBACK TO SAVEPOINT</code>,
+                isolation levels</td>
+            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+        </tr>
+        <tr>
+            <td><strong>Window</strong></td>
+            <td><code>RANGE BETWEEN</code> frame mode,
+                <code>GROUPS BETWEEN</code> frame mode,
+                named window definitions (<code>WINDOW w AS (...)</code>)</td>
+            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+        </tr>
+        <tr>
+            <td><strong>Aggregation</strong></td>
+            <td><code>GROUPING SETS</code>,
+                <code>FILTER (WHERE ...)</code> on aggregates,
+                <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code>,
+                ordered-set aggregates (<code>PERCENTILE_CONT</code>)</td>
+            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+        </tr>
+        <tr>
+            <td><strong>Subqueries</strong></td>
+            <td><code>LATERAL</code> subqueries in <code>FROM</code> (without <code>JOIN</code>),
+                <code>WITH ... INSERT/UPDATE/DELETE</code> (writable CTEs)</td>
+            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+        </tr>
+        <tr>
+            <td><strong>Other</strong></td>
+            <td><code>PREPARE</code>/<code>EXECUTE</code> (prepared statements),
+                <code>COPY</code>,
+                <code>LISTEN</code>/<code>NOTIFY</code>,
+                <code>GRANT</code>/<code>REVOKE</code>,
+                stored procedures/functions,
+                triggers</td>
+            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+        </tr>
+    </tbody>
+</table>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Documentation</a>
+</footer>
+
+</body>
+</html>

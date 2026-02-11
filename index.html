@@ -194,51 +194,74 @@
         tbody tr:last-child td { border-bottom: 2px solid var(--fg); }
         td code { font-size: 0.8rem; }
 
-        /* ── Result tables (mathematical style) ────────────────── */
+        /* ── Result tables (polished mathematical style) ─────────── */
         .result-table {
             font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
-            font-size: 0.78rem;
+            font-size: 0.76rem;
             border-collapse: collapse;
             margin: 0.6rem 0 1.2rem 0;
-            width: auto;
+            width: 100%;
+            background: #fff;
+            border: 1px solid var(--rule);
+            border-radius: 3px;
         }
         .result-table th {
-            font-weight: 600;
-            font-size: 0.72rem;
-            text-transform: none;
-            letter-spacing: 0;
+            font-weight: 700;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
             border-bottom: 2px solid var(--fg);
-            padding: 0.25rem 0.7rem;
+            padding: 0.35rem 0.6rem;
             text-align: left;
+            background: #f7f5ef;
+            color: var(--fg-dim);
         }
         .result-table td {
-            padding: 0.2rem 0.7rem;
-            border-bottom: 1px solid var(--rule);
+            padding: 0.25rem 0.6rem;
+            border-bottom: 1px solid #e8e6e0;
             white-space: nowrap;
         }
+        .result-table tbody tr:nth-child(even) { background: #faf9f5; }
         .result-table tbody tr:last-child td {
-            border-bottom: 2px solid var(--fg);
+            border-bottom: none;
         }
         .result-table .null-val { color: #999; font-style: italic; }
-        .result-table .num-val { text-align: right; }
+        .result-table .num-val { text-align: right; font-variant-numeric: tabular-nums; }
+        .result-label {
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 0.8rem;
+            font-style: italic;
+            color: var(--fg-dim);
+            margin: 0 0 0.3rem 0;
+        }
         .query-pair {
             display: flex;
-            gap: 1.5rem;
-            align-items: flex-start;
+            gap: 1.2rem;
+            align-items: stretch;
             margin: 0.8rem 0 1.4rem 0;
         }
         .query-pair pre {
-            flex: 1;
+            flex: 1 1 50%;
             min-width: 0;
             margin: 0;
         }
+        .query-pair .result-wrap {
+            flex: 1 1 50%;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
         .query-pair .result-table {
-            flex: 0 0 auto;
             margin: 0;
         }
         @media (max-width: 900px) {
             .query-pair {
                 flex-direction: column;
+            }
+            .query-pair pre,
+            .query-pair .result-wrap {
+                flex: 1 1 auto;
             }
         }
 
@@ -623,6 +646,11 @@
     </tbody>
 </table>
 
+<p>
+    &#8594;&ensp;<a href="grammar.html"><strong>Full SQL grammar reference</strong></a> &mdash; production
+    rules for every statement, with implemented/not-implemented status for each feature.
+</p>
+
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--  4. Data Types                                              -->
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -707,6 +735,8 @@ INSERT INTO employees (name, dept_id, salary, hired) VALUES
 FROM employees
 WHERE salary > 100000
 ORDER BY salary DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
 <table class="result-table">
 <thead><tr><th>name</th><th>salary</th></tr></thead>
 <tbody>
@@ -715,6 +745,7 @@ ORDER BY salary DESC;</code></pre>
 <tr><td>Eve</td><td class="num-val">105000</td></tr>
 </tbody>
 </table>
+</div>
 </div>
 
 <p><strong>Step 3 &mdash; LEFT JOIN + COALESCE.</strong> Show every employee&rsquo;s department, including unassigned.</p>
@@ -726,6 +757,8 @@ ORDER BY salary DESC;</code></pre>
 FROM employees e
 LEFT JOIN departments d
   ON e.dept_id = d.id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
 <table class="result-table">
 <thead><tr><th>name</th><th>department</th></tr></thead>
 <tbody>
@@ -738,6 +771,7 @@ LEFT JOIN departments d
 </tbody>
 </table>
 </div>
+</div>
 
 <p><strong>Step 4 &mdash; Aggregation + HAVING.</strong> Average salary per department, filtering to departments above 100k.</p>
 
@@ -749,6 +783,8 @@ FROM employees e
 JOIN departments d ON e.dept_id = d.id
 GROUP BY d.name
 HAVING AVG(e.salary) > 100000;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
 <table class="result-table">
 <thead><tr><th>department</th><th>headcount</th><th>avg_salary</th></tr></thead>
 <tbody>
@@ -756,6 +792,7 @@ HAVING AVG(e.salary) > 100000;</code></pre>
 <tr><td>Sales</td><td class="num-val">1</td><td class="num-val">105000</td></tr>
 </tbody>
 </table>
+</div>
 </div>
 
 <p><strong>Step 5 &mdash; Window function.</strong> Rank employees within each department by salary.</p>
@@ -770,6 +807,8 @@ HAVING AVG(e.salary) > 100000;</code></pre>
 FROM employees e
 JOIN departments d
   ON e.dept_id = d.id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
 <table class="result-table">
 <thead><tr><th>name</th><th>dept</th><th>salary</th><th>rnk</th></tr></thead>
 <tbody>
@@ -780,6 +819,7 @@ JOIN departments d
 <tr><td>Eve</td><td>Sales</td><td class="num-val">105000</td><td class="num-val">1</td></tr>
 </tbody>
 </table>
+</div>
 </div>
 
 <p><strong>Step 6 &mdash; Upsert.</strong> Insert-or-update with <code>ON CONFLICT DO UPDATE</code>.</p>
@@ -792,6 +832,8 @@ ON CONFLICT (id) DO UPDATE
 
 SELECT * FROM departments
 ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
 <table class="result-table">
 <thead><tr><th>id</th><th>name</th></tr></thead>
 <tbody>
@@ -800,6 +842,7 @@ ORDER BY id;</code></pre>
 <tr><td class="num-val">3</td><td>Sales</td></tr>
 </tbody>
 </table>
+</div>
 </div>
 
 <p><strong>Step 7 &mdash; View.</strong> Create a reusable view for department summaries.</p>
@@ -815,6 +858,8 @@ GROUP BY d.name;
 
 SELECT * FROM dept_summary
 ORDER BY avg_salary DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
 <table class="result-table">
 <thead><tr><th>department</th><th>headcount</th><th>avg_salary</th></tr></thead>
 <tbody>
@@ -823,6 +868,7 @@ ORDER BY avg_salary DESC;</code></pre>
 <tr><td>Product Design</td><td class="num-val">2</td><td class="num-val">100000</td></tr>
 </tbody>
 </table>
+</div>
 </div>
 
 <p><strong>Step 8 &mdash; Sequence + UUID.</strong> Use a sequence and generate a UUID.</p>
@@ -833,12 +879,15 @@ ORDER BY avg_salary DESC;</code></pre>
 
 SELECT NEXTVAL('invoice_seq') AS inv,
        GEN_RANDOM_UUID()      AS ref;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
 <table class="result-table">
 <thead><tr><th>inv</th><th>ref</th></tr></thead>
 <tbody>
 <tr><td class="num-val">1000</td><td>a3f7c&hellip;4e21</td></tr>
 </tbody>
 </table>
+</div>
 </div>
 
 <p><strong>Step 9 &mdash; Window frame.</strong> Running salary total within each department.</p>
@@ -855,6 +904,8 @@ SELECT NEXTVAL('invoice_seq') AS inv,
 FROM employees e
 JOIN departments d
   ON e.dept_id = d.id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
 <table class="result-table">
 <thead><tr><th>name</th><th>dept</th><th>salary</th><th>running_total</th></tr></thead>
 <tbody>
@@ -865,6 +916,7 @@ JOIN departments d
 <tr><td>Eve</td><td>Sales</td><td class="num-val">105000</td><td class="num-val">105000</td></tr>
 </tbody>
 </table>
+</div>
 </div>
 
 <p><strong>Step 10 &mdash; Recursive CTE.</strong> Generate a running headcount timeline by hire date.</p>
@@ -930,6 +982,8 @@ ORDER BY d.dt;</code></pre>
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
     &ensp;&middot;&ensp;
     <a href="dev/bench/index.html">Benchmarks</a>
+    &ensp;&middot;&ensp;
+    <a href="grammar.html">SQL Grammar</a>
 </footer>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
