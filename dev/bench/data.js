@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770768874893,
+  "lastUpdate": 1770772499727,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -631,6 +631,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 25.851,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "2f885f4ddf538f12adaf89c6e766698ddf69d8e7",
+          "message": "introduce vectorized query execution with columnar blocks, hash tables, and query planner\n\nReplace row-at-a-time tuple processing with columnar block execution using 1024-row blocks that fit in L1 cache. Add struct col_block for typed column arrays with null bitmaps, struct row_block for horizontal slices with optional selection vectors to avoid copying during filters, and struct block_hash_table for arena-allocated hash tables. Implement multi-slab bump allocator where new slabs are chained instead",
+          "timestamp": "2026-02-10T17:14:32-08:00",
+          "tree_id": "d9d45426687e0308cffc91897582cc835d6310dd",
+          "url": "https://github.com/martinsk/mskql/commit/2f885f4ddf538f12adaf89c6e766698ddf69d8e7"
+        },
+        "date": 1770772499189,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.891,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 87.647,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 122.509,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 177.125,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 152.699,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 2595.205,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 23.367,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 113.561,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 229.216,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.176,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.412,
             "unit": "ms"
           }
         ]
