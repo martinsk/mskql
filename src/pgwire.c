@@ -969,6 +969,10 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     if (q.query_type == QUERY_TYPE_SELECT && !skip_row_desc) {
         int plan_rows = try_plan_send(fd, db, &q, conn_arena);
         if (plan_rows >= 0) {
+            /* Copy arena state back — plan execution may have grown
+             * bump slabs and DA backing arrays in q.arena that
+             * conn_arena needs to own for reuse/destroy. */
+            *conn_arena = q.arena;
             char tag[128];
             snprintf(tag, sizeof(tag), "SELECT %d", plan_rows);
             send_command_complete(fd, m, tag);
@@ -979,6 +983,16 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     struct rows *result = &conn_arena->result;
     result->arena_owns_text = 1;
     int rc = db_exec(db, &q, result, &conn_arena->result_text);
+
+    /* Copy back arena fields that db_exec may have grown via q.arena.
+     * Only bump allocators and DAs that execution can realloc.
+     * Do NOT touch result/result_text — db_exec wrote those directly
+     * through conn_arena pointers. */
+    conn_arena->scratch = q.arena.scratch;
+    conn_arena->bump = q.arena.bump;
+    conn_arena->plan_nodes = q.arena.plan_nodes;
+    conn_arena->cells = q.arena.cells;
+    conn_arena->svs = q.arena.svs;
 
     if (rc < 0) {
         send_error(fd, m, "ERROR", "42000", "query execution failed");
