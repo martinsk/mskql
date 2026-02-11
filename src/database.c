@@ -324,11 +324,8 @@ static int do_single_join(struct table *t1, const char *alias1,
     /* build merged column metadata first (needed for condition evaluation) */
     build_merged_columns_ex(t1, alias1, t2, alias2, out_meta);
 
-    // TODO: JPL CONSISTENCY: calloc here (freed at end of this function) is
-    // correct for JPL but inconsistent with the arena scratch pattern used in
-    // query.c. Could use bump_calloc(&arena->scratch, ...) to avoid free().
-    int *t1_matched = calloc(t1->rows.count, sizeof(int));
-    int *t2_matched = calloc(t2->rows.count, sizeof(int));
+    int *t1_matched = bump_calloc(&arena->scratch, t1->rows.count, sizeof(int));
+    int *t2_matched = bump_calloc(&arena->scratch, t2->rows.count, sizeof(int));
 
     /* Try to extract simple equi-join column indices for hash join.
      * Works for both the join_on_cond path (single COND_COMPARE EQ with
@@ -370,8 +367,6 @@ static int do_single_join(struct table *t1, const char *alias1,
             use_hash_join = 1;
         else {
             fprintf(stderr, "join error: could not resolve ON columns\n");
-            free(t1_matched);
-            free(t2_matched);
             return -1;
         }
     }
@@ -382,9 +377,9 @@ static int do_single_join(struct table *t1, const char *alias1,
         uint32_t nbuckets = 1;
         while (nbuckets < build_n * 2) nbuckets <<= 1;
 
-        uint32_t *ht_buckets = calloc(nbuckets, sizeof(uint32_t));
-        uint32_t *ht_nexts = calloc(build_n ? build_n : 1, sizeof(uint32_t));
-        uint32_t *ht_hashes = calloc(build_n ? build_n : 1, sizeof(uint32_t));
+        uint32_t *ht_buckets = bump_calloc(&arena->scratch, nbuckets, sizeof(uint32_t));
+        uint32_t *ht_nexts = bump_calloc(&arena->scratch, build_n ? build_n : 1, sizeof(uint32_t));
+        uint32_t *ht_hashes = bump_calloc(&arena->scratch, build_n ? build_n : 1, sizeof(uint32_t));
         memset(ht_buckets, 0xFF, nbuckets * sizeof(uint32_t)); /* IDX_NONE */
 
         /* build phase: hash t2 join column */
@@ -415,9 +410,6 @@ static int do_single_join(struct table *t1, const char *alias1,
             }
         }
 
-        free(ht_buckets);
-        free(ht_nexts);
-        free(ht_hashes);
     } else if (join_on_cond != IDX_NONE && arena) {
         /* complex ON condition: nested-loop fallback with eval_condition */
         for (size_t i = 0; i < t1->rows.count; i++) {
@@ -450,8 +442,6 @@ static int do_single_join(struct table *t1, const char *alias1,
 
         if (t1_join_col < 0 || t2_join_col < 0) {
             fprintf(stderr, "join error: could not resolve ON columns\n");
-            free(t1_matched);
-            free(t2_matched);
             return -1;
         }
 
@@ -484,8 +474,6 @@ static int do_single_join(struct table *t1, const char *alias1,
         }
     }
 
-    free(t1_matched);
-    free(t2_matched);
     return 0;
 }
 
@@ -1472,7 +1460,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                             ct = db_find_table(db, cd_name);
                             if (!ct) break;
                             struct rows rec_rows = {0};
-                            if (db_exec_sql(db, rec_sql, &rec_rows) != 0) break;
+                            if (db_exec_sql(db, rec_sql, &rec_rows) != 0) {
+                                free(rec_rows.data);
+                                break;
+                            }
                             if (rec_rows.count == 0) { free(rec_rows.data); break; }
 
                             /* replace CTE table rows with only the new rows */
@@ -1515,11 +1506,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                 da_push(&ct->rows, accum.data[ri]);
                             free(accum.data);
                         } else {
-                            // TODO: MEMORY LEAK: if ct is NULL (table was removed between
-                            // iterations), the accum rows are freed here, but any rows that
-                            // were pushed into ct->rows during the loop iterations are now
-                            // orphaned because ct was removed. This is an edge case but
-                            // indicates fragile ownership of the working table rows.
+                            // NOTE: if ct is NULL the table was removed during iteration.
+                            // Working table rows were freed when the table was dropped.
+                            // We only need to free the accumulator copies here.
                             for (size_t ri = 0; ri < accum.count; ri++)
                                 row_free(&accum.data[ri]);
                             free(accum.data);
@@ -1615,6 +1604,23 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 if (rhs_parsed) {
                     struct rows rhs_rows = {0};
                     if (db_exec(db, &rhs_q, &rhs_rows, NULL) == 0) {
+                        /* If the caller uses bump-allocated result text (pgwire path),
+                         * re-home RHS heap-allocated text cells into the bump so they
+                         * are compatible with arena_owns_text bulk-free semantics. */
+                        if (rb) {
+                            for (size_t i = 0; i < rhs_rows.count; i++) {
+                                struct row *r = &rhs_rows.data[i];
+                                for (size_t c = 0; c < r->cells.count; c++) {
+                                    struct cell *cl = &r->cells.items[c];
+                                    if (column_type_is_text(cl->type) && cl->value.as_text) {
+                                        char *old = cl->value.as_text;
+                                        cl->value.as_text = bump_strdup(rb, old);
+                                        free(old);
+                                    }
+                                }
+                            }
+                            rhs_rows.arena_owns_text = 1;
+                        }
                         if (s->set_op == 0) {
                             // TODO: UNION duplicate check is O(n*m); could hash or sort
                             // for better performance on large result sets
@@ -1627,7 +1633,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                         if (row_equal_nullsafe(&result->data[j], &rhs_rows.data[i])) { dup = 1; break; }
                                     }
                                     if (dup) {
-                                        row_free(&rhs_rows.data[i]);
+                                        if (rhs_rows.arena_owns_text)
+                                            da_free(&rhs_rows.data[i].cells);
+                                        else
+                                            row_free(&rhs_rows.data[i]);
                                         continue;
                                     }
                                 }
@@ -1674,8 +1683,12 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                             }
                             result->count = w;
                         }
-                        for (size_t i = 0; i < rhs_rows.count; i++)
-                            row_free(&rhs_rows.data[i]);
+                        for (size_t i = 0; i < rhs_rows.count; i++) {
+                            if (rhs_rows.arena_owns_text)
+                                da_free(&rhs_rows.data[i].cells);
+                            else
+                                row_free(&rhs_rows.data[i]);
+                        }
                         free(rhs_rows.data);
                     }
                 }
@@ -1979,11 +1992,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
 
                     /* evaluate all SET expressions against merged row */
                     uint32_t nsc = u->set_clauses_count;
-                    // TODO: JPL CONSISTENCY: calloc here (freed at end of this
-                    // loop body) is correct for JPL but inconsistent with the
-                    // arena scratch pattern. Could use bump_calloc.
-                    struct cell *new_vals = calloc(nsc, sizeof(struct cell));
-                    int *col_idxs = calloc(nsc, sizeof(int));
+                    struct cell *new_vals = bump_calloc(&q->arena.scratch, nsc, sizeof(struct cell));
+                    int *col_idxs = bump_calloc(&q->arena.scratch, nsc, sizeof(int));
                     for (uint32_t sc = 0; sc < nsc; sc++) {
                         struct set_clause *scp = &q->arena.set_clauses.items[u->set_clauses_start + sc];
                         col_idxs[sc] = table_find_column_sv(t, scp->column);
@@ -2001,8 +2011,6 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                             free(dst->value.as_text);
                         *dst = new_vals[sc];
                     }
-                    free(new_vals);
-                    free(col_idxs);
                     da_free(&merged_row.cells);
                 }
                 /* free merged table descriptor */
