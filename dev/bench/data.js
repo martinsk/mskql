@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770836993029,
+  "lastUpdate": 1770838332618,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1184,6 +1184,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.12,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "3b3b99433c1852977407d2d25e456faa8f258dea",
+          "message": "add CAST syntax, EXTRACT function, date/time arithmetic, and temporal functions (NOW/DATE_TRUNC/DATE_PART/AGE/TO_CHAR) with :: postfix cast operator\n\nImplement CAST(expr AS type) and expr::type syntax by adding TOK_DOUBLE_COLON token, EXPR_CAST node type, and parse_cast_type_name() helper. Add EXTRACT(field FROM expr) parsing with field name lowercasing. Support CURRENT_TIMESTAMP keyword as zero-arg function.\n\nExtend eval_expr() with date/time arithmetic: date/timestamp +/- interval, timestamp -",
+          "timestamp": "2026-02-11T11:31:47-08:00",
+          "tree_id": "bf85f91adcdfd5c303be9fa94c6200566982f072",
+          "url": "https://github.com/martinsk/mskql/commit/3b3b99433c1852977407d2d25e456faa8f258dea"
+        },
+        "date": 1770838332333,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 14.063,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 92.272,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 143.184,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 187.113,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 126.673,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 34.185,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 22.971,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 145,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 234.159,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.237,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 21.287,
             "unit": "ms"
           }
         ]
