@@ -365,7 +365,7 @@
     The key enabler is a tight feedback loop&mdash;write code, run 505 tests, fix
     failures, repeat&mdash;that mirrors how experienced engineers ship production
     systems.<span class="sidenote">The adversarial model (one agent writes code, another
-    writes tests to break it, a third reviews the source and annotates TODOs) drove the
+    writes tests to break it, a third reviews the source and leaves actionable comments) drove the
     implementation toward correctness the same way rigorous code review does on a human
     team&mdash;except all three sides were machines.</span>
 </p>
@@ -393,59 +393,50 @@
 </p>
 
 <div class="diagram">
-<svg viewBox="0 0 620 420" xmlns="http://www.w3.org/2000/svg" font-family="'EB Garamond', Georgia, serif">
-  <rect width="620" height="420" fill="#fffff8"/>
+<svg viewBox="0 0 700 380" xmlns="http://www.w3.org/2000/svg" font-family="'EB Garamond', Georgia, serif">
+  <rect width="700" height="380" fill="#fffff8"/>
   <defs>
     <marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
       <path d="M0,0 L8,3 L0,6" fill="#a00"/>
     </marker>
   </defs>
 
-  <!-- The Writer (top-left) -->
-  <rect x="30" y="30" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
-  <text x="130" y="62" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Writer</text>
-  <text x="130" y="86" text-anchor="middle" font-size="12" fill="#555">Designs architecture</text>
-  <text x="130" y="104" text-anchor="middle" font-size="12" fill="#555">Writes code &amp; fixes bugs</text>
+  <!-- The Writer (center top) -->
+  <rect x="250" y="30" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
+  <text x="350" y="62" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Writer</text>
+  <text x="350" y="86" text-anchor="middle" font-size="12" fill="#555">Designs architecture</text>
+  <text x="350" y="104" text-anchor="middle" font-size="12" fill="#555">Writes code &amp; fixes bugs</text>
 
-  <!-- The Challenger (top-right) -->
-  <rect x="390" y="30" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
-  <text x="490" y="62" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Challenger</text>
-  <text x="490" y="86" text-anchor="middle" font-size="12" fill="#555">Reads source code</text>
-  <text x="490" y="104" text-anchor="middle" font-size="12" fill="#555">Writes adversarial tests</text>
+  <!-- The Challenger (bottom-left) -->
+  <rect x="20" y="220" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
+  <text x="120" y="252" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Challenger</text>
+  <text x="120" y="276" text-anchor="middle" font-size="12" fill="#555">Reads source code</text>
+  <text x="120" y="294" text-anchor="middle" font-size="12" fill="#555">Writes adversarial tests</text>
 
-  <!-- The Reviewer (bottom-center) -->
-  <rect x="210" y="190" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
-  <text x="310" y="222" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Reviewer</text>
-  <text x="310" y="246" text-anchor="middle" font-size="12" fill="#555">Reviews code for quality</text>
-  <text x="310" y="264" text-anchor="middle" font-size="12" fill="#555">Annotates with TODOs</text>
+  <!-- The Reviewer (bottom-right) -->
+  <rect x="480" y="220" width="200" height="100" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
+  <text x="580" y="252" text-anchor="middle" font-size="16" font-weight="600" fill="#111">The Reviewer</text>
+  <text x="580" y="276" text-anchor="middle" font-size="12" fill="#555">Reviews code for quality</text>
+  <text x="580" y="294" text-anchor="middle" font-size="12" fill="#555">Leaves actionable comments</text>
 
-  <!-- Writer → Challenger: production code -->
-  <path d="M230,60 L390,60" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  <text x="310" y="52" text-anchor="middle" font-size="11" fill="#a00" font-style="italic">production code</text>
+  <!-- Writer ↔ Challenger arrows -->
+  <path d="M260,130 C220,165 160,195 130,220" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <path d="M160,220 C190,190 240,160 280,130" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <!-- Labels on the left, stacked vertically -->
+  <text x="160" y="162" text-anchor="end" font-size="11" fill="#a00" font-style="italic">production code &#x2193;</text>
+  <text x="160" y="180" text-anchor="end" font-size="11" fill="#a00" font-style="italic">&#x2191; .sql test cases</text>
 
-  <!-- Challenger → Writer: .sql test cases -->
-  <path d="M390,110 L230,110" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  <text x="310" y="140" text-anchor="middle" font-size="11" fill="#a00" font-style="italic">.sql test cases</text>
-
-  <!-- Reviewer → Writer: TODO annotations -->
-  <path d="M210,230 C170,230 130,200 130,130" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  <text x="120" y="185" text-anchor="end" font-size="11" fill="#a00" font-style="italic">TODO annotations</text>
-
-  <!-- Challenger → Reviewer: test results -->
-  <path d="M490,130 C490,170 450,210 410,230" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  <text x="500" y="185" text-anchor="start" font-size="11" fill="#a00" font-style="italic">code to review</text>
-
-  <!-- Iterate circle -->
-  <circle cx="310" cy="330" r="22" fill="#fff" stroke="#a00" stroke-width="1.5"/>
-  <text x="310" y="326" text-anchor="middle" font-size="10" fill="#a00" font-weight="600">iterate</text>
-  <text x="310" y="338" text-anchor="middle" font-size="10" fill="#a00" font-weight="600">rounds</text>
-  <line x1="310" y1="290" x2="310" y2="308" stroke="#ccc" stroke-width="1.2" stroke-dasharray="4,3"/>
+  <!-- Writer ↔ Reviewer arrows -->
+  <path d="M440,130 C480,165 540,195 570,220" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <path d="M540,220 C510,190 460,160 420,130" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <!-- Labels on the right, stacked vertically -->
+  <text x="540" y="162" text-anchor="start" font-size="11" fill="#a00" font-style="italic">&#x2193; code to review</text>
+  <text x="540" y="180" text-anchor="start" font-size="11" fill="#a00" font-style="italic">actionable comments &#x2191;</text>
 
   <!-- Result box -->
-  <line x1="310" y1="352" x2="310" y2="370" stroke="#a00" stroke-width="1.5" marker-end="url(#ah)"/>
-  <rect x="180" y="375" width="260" height="40" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="392" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">505 tests pass</text>
-  <text x="310" y="408" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~13,800 lines of C &middot; zero human code</text>
+  <rect x="220" y="340" width="260" height="36" rx="6" fill="#a00" stroke="none"/>
+  <text x="350" y="355" text-anchor="middle" font-size="13" fill="#fff" font-weight="600">505 tests pass</text>
+  <text x="350" y="370" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~13,800 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
@@ -454,9 +445,9 @@
     codebase and produce <code>.sql</code> test files exercising corner
     cases&mdash;empty tables, NULL handling, multi-column ordering, stale index entries
     after deletes, and more. The Reviewer would read the source and annotate it with
-    <code>TODO</code> comments flagging code-quality issues, missing edge-case handling,
+    actionable comments flagging code-quality issues, missing edge-case handling,
     and architectural improvements. The Writer would then run the new tests, address the
-    TODOs, diagnose failures, and ship fixes. This continued until the full suite passed
+    comments, diagnose failures, and ship fixes. This continued until the full suite passed
     cleanly.
 </p>
 
