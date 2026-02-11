@@ -323,7 +323,7 @@
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-    &ensp;&middot;&ensp; ~13,400 lines of C11 &ensp;&middot;&ensp; ~500 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~13,800 lines of C11 &ensp;&middot;&ensp; 505 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -346,7 +346,7 @@
 <p>
     <strong>Understanding database internals.</strong>&ensp;Production databases are
     millions of lines of code. mskql distills the core ideas&mdash;wire protocol, parser,
-    query executor, storage engine, arena allocator, plan executor&mdash;into ~13,400
+    query executor, storage engine, arena allocator, plan executor&mdash;into ~13,800
     readable lines of C11 with zero dependencies. Every layer is visible and
     modifiable: from how a <code>SELECT</code> is parsed into an AST, to how a hash join
     probes its build table, to how a bump allocator recycles memory across
@@ -419,8 +419,8 @@
   <text x="310" y="218" text-anchor="middle" font-size="10" fill="#a00" font-weight="600">rounds</text>
   <line x1="310" y1="232" x2="310" y2="270" stroke="#a00" stroke-width="1.5" marker-end="url(#ah)"/>
   <rect x="180" y="275" width="260" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="296" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">495 tests pass</text>
-  <text x="310" y="314" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.8)">~13,400 lines of C &middot; zero human code</text>
+  <text x="310" y="296" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">505 tests pass</text>
+  <text x="310" y="314" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.8)">~13,800 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
@@ -966,7 +966,7 @@ ORDER BY dt;</code></pre>
 <h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes ~500 SQL test cases covering DDL, DML, joins, aggregation,
+    The project includes 505 SQL test cases covering DDL, DML, joins, aggregation,
     window functions (including frames), set operations, CTEs, transactions, NULL handling,
     type coercion, constraint enforcement, foreign keys, sequences, views, string functions,
     expression evaluation, upserts, correlated subqueries, and various edge cases. A separate
@@ -988,6 +988,9 @@ ORDER BY dt;</code></pre>
     A micro-benchmark suite measures wall-clock time for core operations: bulk insert,
     full-table scan, filtered select, aggregation, ordering, joins, update, delete,
     parsing, index lookup, and transactions. Results are tracked continuously via CI.
+    A separate comparison script (<code>bench/bench_vs_pg.py</code>) runs identical
+    workloads against both mskql and PostgreSQL over the wire, providing an
+    apples-to-apples throughput comparison.
 </p>
 
 <p>
