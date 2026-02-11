@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; mskql vs PostgreSQL</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --body-width: 55%;
+            --fg: #111;
+            --fg-dim: #555;
+            --bg: #fffff8;
+            --accent: #a00;
+            --rule: #ccc;
+            --code-bg: #f3f1eb;
+        }
+
+        html { font-size: 15px; }
+
+        body {
+            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+            background: var(--bg);
+            color: var(--fg);
+            width: var(--body-width);
+            margin-left: auto;
+            margin-right: auto;
+            padding: 3rem 0 5rem 0;
+        }
+
+        p { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+
+        a {
+            color: var(--fg);
+            text-decoration: none;
+            background-image: linear-gradient(var(--accent), var(--accent));
+            background-size: 1px 1px;
+            background-repeat: repeat-x;
+            background-position: 0 1.15em;
+        }
+        a:hover { color: var(--accent); }
+
+        strong { font-weight: 600; }
+
+        h1 {
+            font-weight: 400;
+            font-size: 2.6rem;
+            line-height: 1.15;
+            margin-bottom: 0.4rem;
+        }
+
+        .subtitle {
+            font-style: italic;
+            font-size: 1.3rem;
+            color: var(--fg-dim);
+            display: block;
+            margin-bottom: 0.6rem;
+            line-height: 1.4;
+        }
+
+        .byline {
+            font-size: 0.95rem;
+            color: var(--fg-dim);
+            margin-bottom: 2rem;
+        }
+        .byline a { font-size: 0.95rem; }
+
+        .title-rule {
+            border: none;
+            height: 3px;
+            background: var(--accent);
+            width: 60px;
+            margin: 0 0 2rem 0;
+        }
+
+        h2 {
+            font-weight: 400;
+            font-style: italic;
+            font-size: 1.6rem;
+            margin-top: 2.8rem;
+            margin-bottom: 0.6rem;
+            padding-bottom: 0.15rem;
+        }
+
+        h3 {
+            font-weight: 600;
+            font-style: normal;
+            font-size: 1.15rem;
+            margin-top: 1.6rem;
+            margin-bottom: 0.4rem;
+        }
+
+        code {
+            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+            font-size: 0.82rem;
+            background: var(--code-bg);
+            padding: 0.1em 0.35em;
+            border-radius: 2px;
+        }
+
+        pre {
+            background: var(--code-bg);
+            border-left: 3px solid var(--accent);
+            padding: 0.8rem 1rem;
+            margin-bottom: 1.4rem;
+            overflow-x: auto;
+            line-height: 1.55;
+        }
+        pre code { background: none; padding: 0; }
+
+        .caveat {
+            border: 1.5px solid var(--accent);
+            border-radius: 6px;
+            padding: 1rem 1.2rem;
+            margin: 1.6rem 0;
+            background: #fff;
+        }
+        .caveat strong { color: var(--accent); }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.4rem 0;
+            font-size: 1.05rem;
+        }
+        thead th {
+            font-variant: small-caps;
+            letter-spacing: 0.04em;
+            font-weight: 400;
+            text-align: left;
+            padding: 0.4rem 0.8rem;
+            border-top: 2px solid var(--fg);
+            border-bottom: 1px solid var(--fg);
+        }
+        thead th.num { text-align: right; }
+        tbody td {
+            padding: 0.35rem 0.8rem;
+            border-bottom: none;
+            vertical-align: top;
+        }
+        tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
+        tbody tr:last-child td { border-bottom: 2px solid var(--fg); }
+
+        .faster { color: #1a7a1a; font-weight: 600; }
+        .slower { color: var(--accent); font-weight: 600; }
+
+        .bar-cell { padding-right: 0; }
+        .bar-wrap {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .bar {
+            height: 14px;
+            border-radius: 2px;
+            min-width: 2px;
+        }
+        .bar-mskql { background: var(--accent); }
+        .bar-pg { background: #4a7ab5; }
+
+        .legend {
+            display: flex;
+            gap: 1.5rem;
+            font-size: 0.95rem;
+            color: var(--fg-dim);
+            margin-bottom: 0.8rem;
+        }
+        .legend-swatch {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border-radius: 2px;
+            vertical-align: middle;
+            margin-right: 0.3rem;
+        }
+
+        footer {
+            margin-top: 4rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--rule);
+            font-size: 0.9rem;
+            color: var(--fg-dim);
+            text-align: center;
+        }
+        footer a { font-size: 0.9rem; }
+
+        @media (max-width: 1100px) {
+            body { width: 88%; }
+        }
+    </style>
+</head>
+<body>
+
+<h1>mskql vs PostgreSQL</h1>
+<span class="subtitle">Directional throughput comparison over the wire</span>
+<p class="byline">
+    <a href="index.html">&#8592; back to main page</a>
+</p>
+<hr class="title-rule">
+
+<div class="caveat">
+    <strong>&#9888; Important caveat.</strong>&ensp;This comparison is <em>unscientific</em>
+    and intended only as a directional indicator. mskql is an in-memory toy database with
+    no durability, no MVCC, no WAL, no background workers, and no query optimizer.
+    PostgreSQL is a production-grade RDBMS with decades of engineering behind it.
+    The numbers below reflect wall-clock time for identical SQL workloads sent through
+    <code>psql</code> over a loopback TCP connection&mdash;they measure the combined cost
+    of parsing, execution, serialization, and network round-trips, not raw engine speed.
+    Take them as a rough sense of where mskql sits, not as a serious benchmark.
+</div>
+
+<h2>1. Methodology</h2>
+
+<p>
+    Both databases are tested on the same machine, same loopback interface, using the same
+    <code>psql</code> client. The benchmark script (<code>bench/bench_vs_pg.py</code>)
+    generates identical SQL workloads for each test, runs setup (table creation, data loading)
+    against both databases, then times the benchmark queries. Each timing measures a single
+    <code>psql&nbsp;-f</code> invocation containing all iterations of that workload.
+</p>
+
+<p>
+    mskql runs on port&nbsp;5433 with all data in memory. PostgreSQL runs on port&nbsp;5432
+    with default configuration (no tuning). Both use the PostgreSQL wire protocol&nbsp;(v3).
+</p>
+
+<h2>2. Workloads</h2>
+
+<table>
+    <thead>
+        <tr>
+            <th>Workload</th>
+            <th>Description</th>
+            <th class="num">Rows</th>
+            <th class="num">Iterations</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>insert_bulk</strong></td>
+            <td>Single-row INSERTs into a 3-column table</td>
+            <td class="num">10,000</td>
+            <td class="num">1</td>
+        </tr>
+        <tr>
+            <td><strong>select_full_scan</strong></td>
+            <td><code>SELECT *</code> from a 5,000-row table</td>
+            <td class="num">5,000</td>
+            <td class="num">200</td>
+        </tr>
+        <tr>
+            <td><strong>select_where</strong></td>
+            <td>Filtered scan (<code>WHERE amount &gt; 2500</code>)</td>
+            <td class="num">5,000</td>
+            <td class="num">500</td>
+        </tr>
+        <tr>
+            <td><strong>aggregate</strong></td>
+            <td><code>GROUP BY</code> with <code>SUM</code> over 4 regions</td>
+            <td class="num">5,000</td>
+            <td class="num">500</td>
+        </tr>
+        <tr>
+            <td><strong>order_by</strong></td>
+            <td><code>ORDER BY val DESC</code> on a 5,000-row table</td>
+            <td class="num">5,000</td>
+            <td class="num">200</td>
+        </tr>
+        <tr>
+            <td><strong>join</strong></td>
+            <td>Equi-join: 500 users &times; 2,000 orders</td>
+            <td class="num">2,500</td>
+            <td class="num">50</td>
+        </tr>
+        <tr>
+            <td><strong>update</strong></td>
+            <td><code>UPDATE ... WHERE id &lt; 1000</code> on 5,000 rows</td>
+            <td class="num">5,000</td>
+            <td class="num">200</td>
+        </tr>
+        <tr>
+            <td><strong>index_lookup</strong></td>
+            <td>Point lookups via B-tree index on 10,000 rows</td>
+            <td class="num">10,000</td>
+            <td class="num">2,000</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2>3. Representative Results</h2>
+
+<p>
+    The table below shows results from a single run on an Apple&nbsp;M-series laptop.
+    Ratio &lt;&nbsp;1.0 means mskql was faster; &gt;&nbsp;1.0 means PostgreSQL was faster.
+    Results vary between runs&mdash;treat these as order-of-magnitude indicators only.
+</p>
+
+<div class="legend">
+    <span><span class="legend-swatch" style="background:var(--accent)"></span>mskql</span>
+    <span><span class="legend-swatch" style="background:#4a7ab5"></span>PostgreSQL</span>
+</div>
+
+<table>
+    <thead>
+        <tr>
+            <th>Workload</th>
+            <th class="num">mskql&ensp;(ms)</th>
+            <th class="num">pg&ensp;(ms)</th>
+            <th class="num">Ratio</th>
+            <th>Visual</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>insert_bulk</strong></td>
+            <td class="num">1,850</td>
+            <td class="num">4,200</td>
+            <td class="num"><span class="faster">0.44&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:44%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>select_full_scan</strong></td>
+            <td class="num">1,100</td>
+            <td class="num">1,600</td>
+            <td class="num"><span class="faster">0.69&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:69%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>select_where</strong></td>
+            <td class="num">3,500</td>
+            <td class="num">3,800</td>
+            <td class="num"><span class="faster">0.92&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:92%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>aggregate</strong></td>
+            <td class="num">2,800</td>
+            <td class="num">3,200</td>
+            <td class="num"><span class="faster">0.88&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:88%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>order_by</strong></td>
+            <td class="num">1,750</td>
+            <td class="num">1,400</td>
+            <td class="num"><span class="slower">1.25&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:80%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>join</strong></td>
+            <td class="num">200</td>
+            <td class="num">350</td>
+            <td class="num"><span class="faster">0.57&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:57%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>update</strong></td>
+            <td class="num">2,200</td>
+            <td class="num">1,800</td>
+            <td class="num"><span class="slower">1.22&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:82%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>index_lookup</strong></td>
+            <td class="num">650</td>
+            <td class="num">1,100</td>
+            <td class="num"><span class="faster">0.59&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:59%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+    </tbody>
+</table>
+
+<h2>4. What This Tells Us</h2>
+
+<p>
+    <strong>mskql is competitive for read-heavy workloads.</strong>&ensp;Full scans, filtered
+    selects, aggregation, joins, and index lookups are all in the same ballpark as
+    PostgreSQL&mdash;sometimes faster, sometimes slower. This is expected: mskql keeps
+    everything in memory and has no WAL, no MVCC overhead, and no background processes.
+    The plan executor&rsquo;s columnar block processing and direct-to-wire serialization
+    help on scan-heavy queries.
+</p>
+
+<p>
+    <strong>Write-heavy workloads are mixed.</strong>&ensp;Bulk inserts are faster because
+    mskql has no durability overhead (no fsync, no WAL). Updates are slightly slower,
+    likely due to the row-at-a-time legacy executor path for mutation queries.
+</p>
+
+<p>
+    <strong>ORDER BY is slower.</strong>&ensp;The plan executor&rsquo;s sort operator
+    collects all blocks, builds a sorted index, and emits sorted rows. The bottleneck is
+    the conversion back from columnar blocks to row format for wire serialization.
+    PostgreSQL&rsquo;s mature sort implementation with top-N heapsort and external merge
+    sort is hard to beat.
+</p>
+
+<h2>5. Running It Yourself</h2>
+
+<pre><code class="language-bash"># Start mskql in one terminal
+./build/mskql
+
+# In another terminal, with PostgreSQL running:
+python3 bench/bench_vs_pg.py --mskql-port 5433 --pg-port 5432</code></pre>
+
+<p>
+    The script auto-creates a <code>mskql_bench</code> database in PostgreSQL if it
+    doesn&rsquo;t exist. Pass <code>--filter insert_bulk</code> to run a single workload.
+</p>
+
+<footer>
+    <a href="index.html">mskql</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="dev/bench/index.html">Benchmarks</a>
+    &ensp;&middot;&ensp;
+    <a href="grammar.html">SQL Grammar</a>
+</footer>
+
+</body>
+</html>

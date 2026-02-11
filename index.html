@@ -323,7 +323,7 @@
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-    &ensp;&middot;&ensp; ~13,800 lines of C11 &ensp;&middot;&ensp; 505 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~14,500 lines of C11 &ensp;&middot;&ensp; 512 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -346,7 +346,7 @@
 <p>
     <strong>Understanding database internals.</strong>&ensp;Production databases are
     millions of lines of code. mskql distills the core ideas&mdash;wire protocol, parser,
-    query executor, storage engine, arena allocator, plan executor&mdash;into ~13,800
+    query executor, storage engine, arena allocator, plan executor&mdash;into ~14,500
     readable lines of C11 with zero dependencies. Every layer is visible and
     modifiable: from how a <code>SELECT</code> is parsed into an AST, to how a hash join
     probes its build table, to how a bump allocator recycles memory across
@@ -362,7 +362,7 @@
     It demonstrates that adversarial AI collaboration can produce non-trivial systems
     software: a hand-written recursive-descent parser, a block-oriented vectorized
     executor, arena-based memory management, and a PostgreSQL-compatible wire protocol.
-    The key enabler is a tight feedback loop&mdash;write code, run 505 tests, fix
+    The key enabler is a tight feedback loop&mdash;write code, run 512 tests, fix
     failures, repeat&mdash;that mirrors how experienced engineers ship production
     systems.<span class="sidenote">The adversarial model (one agent writes code, another
     writes tests to break it, a third reviews the source and leaves actionable comments) drove the
@@ -435,8 +435,8 @@
 
   <!-- Result box -->
   <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">505 tests pass</text>
-  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~13,800 lines of C &middot; zero human code</text>
+  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">512 tests pass</text>
+  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~14,500 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
@@ -478,7 +478,7 @@
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
                 3,700 lines the parser is the largest single file (with <code>plan.c</code>
-                adding another 1,000 lines for the block-oriented executor). It includes a
+                adding another 1,800 lines for the block-oriented executor). It includes a
                 recursive-descent expression parser with proper operator precedence
                 (<code>||</code>&nbsp;&lt;&nbsp;<code>+-</code>&nbsp;&lt;&nbsp;<code>*/%</code>)
                 and handles the full grammar including CTEs, window functions, views,
@@ -489,14 +489,16 @@
             <td><code>query.c</code>, <code>database.c</code></td>
             <td>Tree-walking evaluator that executes the AST against in-memory tables.
                 A block-oriented plan executor (<code>plan.c</code>) handles simple
-                queries with vectorized filter/project/limit/hash-join/hash-agg
+                queries with vectorized filter/project/limit/sort/hash-join/hash-agg/index-scan
                 operators; complex queries fall back to the legacy
                 row-at-a-time path.<span class="sidenote">The plan executor processes
                 data in 1,024-row column blocks, enabling cache-friendly scans and
-                vectorized numeric comparisons. It currently covers
+                vectorized numeric comparisons. It covers
                 <code>SELECT</code> with <code>WHERE</code>, projections,
-                <code>LIMIT</code>/<code>OFFSET</code>, hash joins, and hash
-                aggregation.</span>
+                <code>ORDER BY</code>, <code>LIMIT</code>/<code>OFFSET</code>,
+                hash joins, hash aggregation, and B-tree index scans for equality
+                predicates. A direct columnar-to-wire serialization path bypasses
+                row materialization entirely for plan-executed queries.</span>
                 Handles joins (with compound <code>ON</code> conditions),
                 aggregation (including <code>DISTINCT</code> aggregates,
                 <code>ROLLUP</code>/<code>CUBE</code>),
@@ -531,11 +533,15 @@
     executor allocations&mdash;aggregate accumulators, sort buffers, match indices,
     window-function state&mdash;all freed in bulk by
     <code>query_arena_destroy()</code>, yielding zero per-query
-    <code>malloc</code>/<code>free</code> calls at steady state.<span class="sidenote">The
-    bump allocator uses a linked list of fixed-size slabs rather than a single
-    <code>realloc</code>&rsquo;d buffer, so pointers into earlier slabs remain
-    valid even after new slabs are appended&mdash;critical for the plan
-    executor which holds references across block iterations.</span>
+    <code>malloc</code>/<code>free</code> calls at steady state. A separate
+    result-text bump allocator (<code>arena.result_text</code>) eliminates
+    per-cell <code>strdup</code>/<code>free</code> for text values in query
+    results, bulk-freeing all result strings between
+    requests.<span class="sidenote">The bump allocator uses a linked list of
+    fixed-size slabs rather than a single <code>realloc</code>&rsquo;d buffer,
+    so pointers into earlier slabs remain valid even after new slabs are
+    appended&mdash;critical for the plan executor which holds references across
+    block iterations.</span>
     A generic dynamic-array macro (<code>dynamic_array.h</code>) and zero-copy string views
     (<code>stringview.h</code>) round out the internal abstractions.
 </p>
@@ -985,7 +991,7 @@ ORDER BY dt;</code></pre>
 <h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes 505 SQL test cases covering DDL, DML, joins, aggregation,
+    The project includes 512 SQL test cases covering DDL, DML, joins, aggregation,
     window functions (including frames), set operations, CTEs, transactions, NULL handling,
     type coercion, constraint enforcement, foreign keys, sequences, views, string functions,
     expression evaluation, upserts, correlated subqueries, and various edge cases. A separate
@@ -1014,6 +1020,8 @@ ORDER BY dt;</code></pre>
 
 <p>
     &#8594;&ensp;<a href="dev/bench/index.html"><strong>View historical benchmark charts</strong></a>
+    <br>
+    &#8594;&ensp;<a href="bench-vs-pg.html"><strong>mskql vs PostgreSQL comparison</strong></a>
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -1026,6 +1034,8 @@ ORDER BY dt;</code></pre>
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
     &ensp;&middot;&ensp;
     <a href="dev/bench/index.html">Benchmarks</a>
+    &ensp;&middot;&ensp;
+    <a href="bench-vs-pg.html">vs PostgreSQL</a>
     &ensp;&middot;&ensp;
     <a href="grammar.html">SQL Grammar</a>
 </footer>
