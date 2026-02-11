@@ -919,19 +919,42 @@ JOIN departments d
 </div>
 </div>
 
-<p><strong>Step 10 &mdash; Recursive CTE.</strong> Generate a running headcount timeline by hire date.</p>
+<p><strong>Step 10 &mdash; Recursive CTE.</strong> Build a running headcount at each hire date using a recursive series.</p>
 
-<pre><code class="language-sql">WITH RECURSIVE dates AS (
-    SELECT MIN(hired) AS dt FROM employees
+<div class="query-pair">
+<pre><code class="language-sql">WITH RECURSIVE hire_dates AS (
+    SELECT MIN(hired) AS dt
+    FROM employees
     UNION ALL
-    SELECT dt + 1 FROM dates
-    WHERE dt < (SELECT MAX(hired) FROM employees)
+    SELECT (SELECT MIN(e.hired)
+            FROM employees e
+            WHERE e.hired > hire_dates.dt)
+    FROM hire_dates
+    WHERE dt < (SELECT MAX(hired)
+                FROM employees)
 )
-SELECT d.dt,
-       (SELECT COUNT(*) FROM employees e
-        WHERE e.hired <= d.dt) AS headcount
-FROM dates d
-ORDER BY d.dt;</code></pre>
+SELECT dt AS hire_date,
+       (SELECT COUNT(*)
+        FROM employees e
+        WHERE e.hired <= dt)
+          AS headcount
+FROM hire_dates
+ORDER BY dt;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>hire_date</th><th>headcount</th></tr></thead>
+<tbody>
+<tr><td>2021-07-01</td><td class="num-val">1</td></tr>
+<tr><td>2022-03-15</td><td class="num-val">2</td></tr>
+<tr><td>2023-01-10</td><td class="num-val">3</td></tr>
+<tr><td>2023-06-01</td><td class="num-val">4</td></tr>
+<tr><td>2024-02-20</td><td class="num-val">5</td></tr>
+<tr><td>2024-11-01</td><td class="num-val">6</td></tr>
+</tbody>
+</table>
+</div>
+</div>
 
 <p>Ten queries, zero configuration&mdash;from <code>CREATE TABLE</code> with foreign keys
     to recursive CTEs, window frames, views, sequences, and upserts, all through a
