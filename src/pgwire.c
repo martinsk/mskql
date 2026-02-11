@@ -1,5 +1,6 @@
 #include "pgwire.h"
 #include "parser.h"
+#include "plan.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -457,6 +458,207 @@ static int send_data_rows(int fd, struct rows *result)
     return 0;
 }
 
+/* ---- direct columnar→wire send (bypasses block_to_rows) ---- */
+
+/* Push a col_block cell value directly into a msgbuf as a pgwire text field. */
+static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, uint16_t ri)
+{
+    if (cb->nulls[ri]) {
+        msgbuf_push_u32(m, (uint32_t)-1);
+        return;
+    }
+    char buf[64];
+    const char *txt;
+    size_t len;
+    if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
+        if (cb->type == COLUMN_TYPE_BOOLEAN) {
+            buf[0] = cb->data.i32[ri] ? 't' : 'f';
+            buf[1] = '\0';
+            len = 1;
+        } else {
+            len = (size_t)snprintf(buf, sizeof(buf), "%d", cb->data.i32[ri]);
+        }
+        txt = buf;
+    } else if (cb->type == COLUMN_TYPE_BIGINT) {
+        len = (size_t)snprintf(buf, sizeof(buf), "%lld", cb->data.i64[ri]);
+        txt = buf;
+    } else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC) {
+        len = (size_t)snprintf(buf, sizeof(buf), "%g", cb->data.f64[ri]);
+        txt = buf;
+    } else {
+        /* TEXT, ENUM, DATE, TIME, TIMESTAMP, etc. */
+        if (!cb->data.str[ri]) {
+            msgbuf_push_u32(m, (uint32_t)-1);
+            return;
+        }
+        txt = cb->data.str[ri];
+        len = strlen(txt);
+    }
+    msgbuf_push_u32(m, (uint32_t)len);
+    msgbuf_push(m, txt, len);
+}
+
+/* Send RowDescription using table metadata + plan column info.
+ * ncols/col_types come from the plan's output columns. */
+static int send_row_desc_plan(int fd, struct table *t, struct query *q,
+                              uint16_t ncols, const enum column_type *col_types)
+{
+    struct msgbuf m;
+    msgbuf_init(&m);
+    msgbuf_push_u16(&m, ncols);
+
+    int select_all = sv_eq_cstr(q->select.columns, "*");
+
+    for (uint16_t i = 0; i < ncols; i++) {
+        const char *colname = "?";
+        uint32_t type_oid = column_type_to_oid(col_types[i]);
+
+        if (select_all && t && (size_t)i < t->columns.count) {
+            colname = t->columns.items[i].name;
+        } else if (q->select.parsed_columns_count > 0 && (uint32_t)i < q->select.parsed_columns_count) {
+            struct select_column *sc = &q->arena.select_cols.items[q->select.parsed_columns_start + i];
+            if (sc->alias.len > 0) {
+                /* use alias as column name — need NUL-terminated copy */
+                static __thread char alias_buf[256];
+                size_t alen = sc->alias.len < 255 ? sc->alias.len : 255;
+                memcpy(alias_buf, sc->alias.data, alen);
+                alias_buf[alen] = '\0';
+                colname = alias_buf;
+            } else if (sc->expr_idx != IDX_NONE) {
+                struct expr *e = &EXPR(&q->arena, sc->expr_idx);
+                if (e->type == EXPR_COLUMN_REF && t) {
+                    int ci = table_find_column_sv(t, e->column_ref.column);
+                    if (ci >= 0) colname = t->columns.items[ci].name;
+                }
+            }
+        } else if (t && (size_t)i < t->columns.count) {
+            colname = t->columns.items[i].name;
+        }
+
+        msgbuf_push_cstr(&m, colname);
+        msgbuf_push_u32(&m, 0);            /* table OID */
+        msgbuf_push_u16(&m, 0);            /* column attr number */
+        msgbuf_push_u32(&m, type_oid);     /* type OID */
+        msgbuf_push_u16(&m, (uint16_t)-1); /* type size */
+        msgbuf_push_u32(&m, (uint32_t)-1); /* type modifier */
+        msgbuf_push_u16(&m, 0);            /* format code (text) */
+    }
+
+    int rc = msg_send(fd, 'T', &m);
+    msgbuf_free(&m);
+    return rc;
+}
+
+/* Try to execute a SELECT via the plan executor and send results directly
+ * from columnar blocks to the wire, bypassing block_to_rows entirely.
+ * Returns row count on success, -1 if the query can't use this path. */
+static int try_plan_send(int fd, struct database *db, struct query *q,
+                         struct query_arena *conn_arena)
+{
+    (void)conn_arena;
+    if (q->query_type != QUERY_TYPE_SELECT) return -1;
+
+    struct query_select *s = &q->select;
+    struct table *t = NULL;
+    if (s->table.len > 0)
+        t = db_find_table_sv(db, s->table);
+    if (!t) return -1;
+
+    uint32_t plan_root = plan_build_select(t, s, &q->arena, db);
+    if (plan_root == IDX_NONE) return -1;
+
+    struct plan_exec_ctx ctx;
+    plan_exec_init(&ctx, &q->arena, db, plan_root);
+
+    uint16_t ncols = plan_node_ncols(&q->arena, plan_root);
+    if (ncols == 0) return -1;
+
+    /* Pull first block to determine column types for RowDescription */
+    struct row_block block;
+    row_block_alloc(&block, ncols, &q->arena.scratch);
+
+    int rc = plan_next_block(&ctx, plan_root, &block);
+    if (rc != 0) {
+        /* No rows — send empty RowDescription + zero data rows */
+        enum column_type types[64];
+        for (uint16_t i = 0; i < ncols && i < 64; i++)
+            types[i] = (i < t->columns.count) ? t->columns.items[i].type : COLUMN_TYPE_TEXT;
+        send_row_desc_plan(fd, t, q, ncols, types);
+        return 0;
+    }
+
+    /* Determine column types from first block */
+    enum column_type col_types[64];
+    for (uint16_t i = 0; i < ncols && i < 64; i++)
+        col_types[i] = block.cols[i].type;
+
+    if (send_row_desc_plan(fd, t, q, ncols, col_types) != 0)
+        return -1;
+
+    /* Send data rows directly from blocks — batched into a large buffer */
+    struct msgbuf wire;
+    msgbuf_init(&wire);
+    /* Pre-allocate ~64KB to reduce reallocs */
+    msgbuf_ensure(&wire, 65536);
+
+    size_t total_rows = 0;
+
+    /* Process first block + subsequent blocks */
+    for (;;) {
+        uint16_t active = row_block_active_count(&block);
+        for (uint16_t r = 0; r < active; r++) {
+            uint16_t ri = row_block_row_idx(&block, r);
+
+            /* Build one DataRow message: type('D') + len(4) + body */
+            /* We accumulate the body in a temp area, then prepend header */
+            size_t msg_start = wire.len;
+
+            /* Reserve space for header: 1 byte type + 4 bytes length */
+            msgbuf_ensure(&wire, 5);
+            wire.len += 5;
+
+            /* Column count */
+            msgbuf_push_u16(&wire, ncols);
+
+            /* Column values */
+            for (uint16_t c = 0; c < ncols; c++)
+                msgbuf_push_col_cell(&wire, &block.cols[c], ri);
+
+            /* Fill in header */
+            wire.data[msg_start] = 'D';
+            uint32_t body_len = (uint32_t)(wire.len - msg_start - 1); /* exclude type byte */
+            put_u32(wire.data + msg_start + 1, body_len);
+
+            total_rows++;
+        }
+
+        /* Flush if buffer is large enough (~64KB) */
+        if (wire.len >= 65536) {
+            if (send_all(fd, wire.data, wire.len) != 0) {
+                msgbuf_free(&wire);
+                return -1;
+            }
+            wire.len = 0;
+        }
+
+        /* Get next block */
+        row_block_reset(&block);
+        if (plan_next_block(&ctx, plan_root, &block) != 0)
+            break;
+    }
+
+    /* Flush remaining data */
+    if (wire.len > 0) {
+        if (send_all(fd, wire.data, wire.len) != 0) {
+            msgbuf_free(&wire);
+            return -1;
+        }
+    }
+    msgbuf_free(&wire);
+
+    return (int)total_rows;
+}
+
 /* ---- handle a single query string (may contain one statement) ---- */
 
 static int handle_query(int fd, struct database *db, const char *sql,
@@ -477,6 +679,18 @@ static int handle_query(int fd, struct database *db, const char *sql,
         send_error(fd, m, "ERROR", "42601", "syntax error or unsupported statement");
         send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
         return 0;
+    }
+
+    /* Fast path: try direct columnar→wire send for SELECT queries */
+    if (q.query_type == QUERY_TYPE_SELECT) {
+        int plan_rows = try_plan_send(fd, db, &q, conn_arena);
+        if (plan_rows >= 0) {
+            char tag[128];
+            snprintf(tag, sizeof(tag), "SELECT %d", plan_rows);
+            send_command_complete(fd, m, tag);
+            send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
+            return 0;
+        }
     }
 
     struct rows *result = &conn_arena->result;

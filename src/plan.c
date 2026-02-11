@@ -47,7 +47,7 @@ static inline double cb_to_double(const struct col_block *cb, uint16_t i)
 }
 
 /* Helper: get output column count for a plan node. */
-static uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
+uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
 {
     if (node_idx == IDX_NONE) return 0;
     struct plan_node *pn = &PLAN_NODE(arena, node_idx);
@@ -129,47 +129,82 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
         /* Use the first non-null cell's type to determine the col_block type.
          * This handles ALTER TABLE ALTER COLUMN TYPE where column def and
          * cell types may diverge. Fall back to column def if all null. */
-        cb->type = t->columns.items[tc].type;
+        enum column_type col_type = t->columns.items[tc].type;
+        cb->type = col_type;
         for (uint16_t r = 0; r < nrows; r++) {
             struct cell *cell = &t->rows.items[start + r].cells.items[tc];
-            if (!cell->is_null) { cb->type = cell->type; break; }
+            if (!cell->is_null) { cb->type = cell->type; col_type = cell->type; break; }
         }
         cb->count = nrows;
 
-        for (uint16_t r = 0; r < nrows; r++) {
-            struct cell *cell = &t->rows.items[start + r].cells.items[tc];
-            if (cell->is_null || cell->type != cb->type
-                || (column_type_is_text(cell->type) && !cell->value.as_text)) {
-                cb->nulls[r] = 1;
-                continue;
-            }
-            cb->nulls[r] = 0;
-            switch (cell->type) {
-                case COLUMN_TYPE_INT:
+        /* Fast path for INT columns: tight loop without per-cell switch */
+        if (col_type == COLUMN_TYPE_INT) {
+            for (uint16_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[start + r].cells.items[tc];
+                if (cell->is_null || cell->type != COLUMN_TYPE_INT) {
+                    cb->nulls[r] = 1;
+                } else {
+                    cb->nulls[r] = 0;
                     cb->data.i32[r] = cell->value.as_int;
-                    break;
-                case COLUMN_TYPE_BOOLEAN:
-                    cb->data.i32[r] = cell->value.as_bool;
-                    break;
-                case COLUMN_TYPE_BIGINT:
-                    cb->data.i64[r] = cell->value.as_bigint;
-                    break;
-                case COLUMN_TYPE_FLOAT:
+                }
+            }
+        } else if (col_type == COLUMN_TYPE_FLOAT) {
+            for (uint16_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[start + r].cells.items[tc];
+                if (cell->is_null || cell->type != COLUMN_TYPE_FLOAT) {
+                    cb->nulls[r] = 1;
+                } else {
+                    cb->nulls[r] = 0;
                     cb->data.f64[r] = cell->value.as_float;
-                    break;
-                case COLUMN_TYPE_NUMERIC:
-                    cb->data.f64[r] = cell->value.as_numeric;
-                    break;
-                case COLUMN_TYPE_TEXT:
-                case COLUMN_TYPE_ENUM:
-                case COLUMN_TYPE_DATE:
-                case COLUMN_TYPE_TIME:
-                case COLUMN_TYPE_TIMESTAMP:
-                case COLUMN_TYPE_TIMESTAMPTZ:
-                case COLUMN_TYPE_INTERVAL:
-                case COLUMN_TYPE_UUID:
-                    cb->data.str[r] = cell->value.as_text;
-                    break;
+                }
+            }
+        } else if (col_type == COLUMN_TYPE_BIGINT) {
+            for (uint16_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[start + r].cells.items[tc];
+                if (cell->is_null || cell->type != COLUMN_TYPE_BIGINT) {
+                    cb->nulls[r] = 1;
+                } else {
+                    cb->nulls[r] = 0;
+                    cb->data.i64[r] = cell->value.as_bigint;
+                }
+            }
+        } else {
+            /* Generic path for all other types */
+            for (uint16_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[start + r].cells.items[tc];
+                if (cell->is_null || cell->type != cb->type
+                    || (column_type_is_text(cell->type) && !cell->value.as_text)) {
+                    cb->nulls[r] = 1;
+                    continue;
+                }
+                cb->nulls[r] = 0;
+                switch (cell->type) {
+                    case COLUMN_TYPE_INT:
+                        cb->data.i32[r] = cell->value.as_int;
+                        break;
+                    case COLUMN_TYPE_BOOLEAN:
+                        cb->data.i32[r] = cell->value.as_bool;
+                        break;
+                    case COLUMN_TYPE_BIGINT:
+                        cb->data.i64[r] = cell->value.as_bigint;
+                        break;
+                    case COLUMN_TYPE_FLOAT:
+                        cb->data.f64[r] = cell->value.as_float;
+                        break;
+                    case COLUMN_TYPE_NUMERIC:
+                        cb->data.f64[r] = cell->value.as_numeric;
+                        break;
+                    case COLUMN_TYPE_TEXT:
+                    case COLUMN_TYPE_ENUM:
+                    case COLUMN_TYPE_DATE:
+                    case COLUMN_TYPE_TIME:
+                    case COLUMN_TYPE_TIMESTAMP:
+                    case COLUMN_TYPE_TIMESTAMPTZ:
+                    case COLUMN_TYPE_INTERVAL:
+                    case COLUMN_TYPE_UUID:
+                        cb->data.str[r] = cell->value.as_text;
+                        break;
+                }
             }
         }
     }
@@ -881,49 +916,48 @@ struct block_sort_ctx {
     int              *sort_cols;
     int              *sort_descs;
     uint16_t          nsort_cols;
+    /* Flat arrays for fast comparator (one per sort key) */
+    void             *flat_keys[32];   /* contiguous typed array per sort key */
+    uint8_t          *flat_nulls[32];  /* contiguous null bitmap per sort key */
+    enum column_type  key_types[32];
 };
 static struct block_sort_ctx _bsort_ctx;
 
-static int cb_compare(const struct col_block *a, uint16_t ai,
-                      const struct col_block *b, uint16_t bi)
-{
-    if (a->nulls[ai] && b->nulls[bi]) return 0;
-    if (a->nulls[ai]) return 1;
-    if (b->nulls[bi]) return -1;
-    if (a->type == COLUMN_TYPE_INT || a->type == COLUMN_TYPE_BOOLEAN) {
-        int32_t va = a->data.i32[ai], vb = b->data.i32[bi];
-        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
-    }
-    if (a->type == COLUMN_TYPE_BIGINT) {
-        int64_t va = a->data.i64[ai], vb = b->data.i64[bi];
-        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
-    }
-    if (a->type == COLUMN_TYPE_FLOAT || a->type == COLUMN_TYPE_NUMERIC) {
-        double va = a->data.f64[ai], vb = b->data.f64[bi];
-        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
-    }
-    const char *sa = a->data.str[ai], *sb = b->data.str[bi];
-    if (!sa && !sb) return 0;
-    if (!sa) return -1;
-    if (!sb) return 1;
-    int cmp = strcmp(sa, sb);
-    return (cmp < 0) ? -1 : (cmp > 0) ? 1 : 0;
-}
-
-static int sort_index_cmp(const void *a, const void *b)
+/* Fast comparator using flattened contiguous arrays — no block index math. */
+static int sort_flat_cmp(const void *a, const void *b)
 {
     uint32_t ia = *(const uint32_t *)a;
     uint32_t ib = *(const uint32_t *)b;
-    uint32_t block_a = ia / _bsort_ctx.rows_per_block;
-    uint16_t row_a = (uint16_t)(ia % _bsort_ctx.rows_per_block);
-    uint32_t block_b = ib / _bsort_ctx.rows_per_block;
-    uint16_t row_b = (uint16_t)(ib % _bsort_ctx.rows_per_block);
 
     for (uint16_t k = 0; k < _bsort_ctx.nsort_cols; k++) {
-        int ci = _bsort_ctx.sort_cols[k];
-        struct col_block *ca = &_bsort_ctx.all_cols[block_a * _bsort_ctx.ncols + ci];
-        struct col_block *cblk = &_bsort_ctx.all_cols[block_b * _bsort_ctx.ncols + ci];
-        int cmp = cb_compare(ca, row_a, cblk, row_b);
+        uint8_t na = _bsort_ctx.flat_nulls[k][ia];
+        uint8_t nb = _bsort_ctx.flat_nulls[k][ib];
+        if (na && nb) { continue; }
+        if (na) { return _bsort_ctx.sort_descs[k] ? -1 : 1; }
+        if (nb) { return _bsort_ctx.sort_descs[k] ? 1 : -1; }
+
+        int cmp = 0;
+        enum column_type kt = _bsort_ctx.key_types[k];
+        if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN) {
+            int32_t va = ((const int32_t *)_bsort_ctx.flat_keys[k])[ia];
+            int32_t vb = ((const int32_t *)_bsort_ctx.flat_keys[k])[ib];
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_BIGINT) {
+            int64_t va = ((const int64_t *)_bsort_ctx.flat_keys[k])[ia];
+            int64_t vb = ((const int64_t *)_bsort_ctx.flat_keys[k])[ib];
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC) {
+            double va = ((const double *)_bsort_ctx.flat_keys[k])[ia];
+            double vb = ((const double *)_bsort_ctx.flat_keys[k])[ib];
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else {
+            const char *sa = ((const char **)_bsort_ctx.flat_keys[k])[ia];
+            const char *sb = ((const char **)_bsort_ctx.flat_keys[k])[ib];
+            if (!sa && !sb) { continue; }
+            if (!sa) cmp = -1;
+            else if (!sb) cmp = 1;
+            else cmp = strcmp(sa, sb);
+        }
         if (_bsort_ctx.sort_descs[k]) cmp = -cmp;
         if (cmp != 0) return cmp;
     }
@@ -1007,8 +1041,53 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                    st->collected[b].cols,
                    child_ncols * sizeof(struct col_block));
 
+        /* Build flat arrays for each sort key column */
+        uint16_t nsk = pn->sort.nsort_cols < 32 ? pn->sort.nsort_cols : 32;
+        for (uint16_t k = 0; k < nsk; k++) {
+            int ci = pn->sort.sort_cols[k];
+            enum column_type kt = COLUMN_TYPE_INT;
+            if (st->nblocks > 0)
+                kt = st->collected[0].cols[ci].type;
+            _bsort_ctx.key_types[k] = kt;
+
+            size_t elem_sz;
+            if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
+                elem_sz = sizeof(int32_t);
+            else if (kt == COLUMN_TYPE_BIGINT)
+                elem_sz = sizeof(int64_t);
+            else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC)
+                elem_sz = sizeof(double);
+            else
+                elem_sz = sizeof(char *);
+
+            _bsort_ctx.flat_keys[k] = bump_alloc(&ctx->arena->scratch,
+                                                  (total ? total : 1) * elem_sz);
+            _bsort_ctx.flat_nulls[k] = (uint8_t *)bump_alloc(&ctx->arena->scratch,
+                                                              (total ? total : 1));
+
+            uint32_t fi = 0;
+            for (uint32_t b = 0; b < st->nblocks; b++) {
+                struct col_block *src = &_bsort_ctx.all_cols[b * child_ncols + ci];
+                uint16_t cnt = st->collected[b].count;
+                memcpy((uint8_t *)_bsort_ctx.flat_nulls[k] + fi, src->nulls, cnt);
+                if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
+                    memcpy((int32_t *)_bsort_ctx.flat_keys[k] + fi, src->data.i32, cnt * sizeof(int32_t));
+                else if (kt == COLUMN_TYPE_BIGINT)
+                    memcpy((int64_t *)_bsort_ctx.flat_keys[k] + fi, src->data.i64, cnt * sizeof(int64_t));
+                else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC)
+                    memcpy((double *)_bsort_ctx.flat_keys[k] + fi, src->data.f64, cnt * sizeof(double));
+                else
+                    memcpy((char **)_bsort_ctx.flat_keys[k] + fi, src->data.str, cnt * sizeof(char *));
+                fi += cnt;
+            }
+        }
+
+        /* With flat arrays, sorted_indices are simple 0..total-1 indices */
+        for (uint32_t i = 0; i < total; i++)
+            st->sorted_indices[i] = i;
+
         if (total > 1)
-            qsort(st->sorted_indices, total, sizeof(uint32_t), sort_index_cmp);
+            qsort(st->sorted_indices, total, sizeof(uint32_t), sort_flat_cmp);
 
         st->input_done = 1;
         st->emit_cursor = 0;
@@ -1021,9 +1100,16 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     uint16_t out_count = 0;
 
     while (st->emit_cursor < st->sorted_count && out_count < BLOCK_CAPACITY) {
-        uint32_t encoded = st->sorted_indices[st->emit_cursor++];
-        uint32_t block_idx = encoded / BLOCK_CAPACITY;
-        uint16_t row_idx = (uint16_t)(encoded % BLOCK_CAPACITY);
+        uint32_t flat_idx = st->sorted_indices[st->emit_cursor++];
+
+        /* Map flat index back to block/row position */
+        uint32_t block_idx = 0;
+        uint32_t remaining = flat_idx;
+        while (block_idx < st->nblocks && remaining >= st->collected[block_idx].count) {
+            remaining -= st->collected[block_idx].count;
+            block_idx++;
+        }
+        uint16_t row_idx = (uint16_t)remaining;
 
         for (uint16_t c = 0; c < child_ncols; c++) {
             struct col_block *src = &_bsort_ctx.all_cols[block_idx * child_ncols + c];
