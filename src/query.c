@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <time.h>
 
 /* forward declarations for cell helpers used by legacy eval functions */
 static void cell_release(struct cell *c);
@@ -1304,6 +1305,72 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             return arg; /* ownership transfers to caller */
         }
 
+        if (fn == FUNC_NEXTVAL || fn == FUNC_CURRVAL) {
+            if (nargs == 0 || !db) return cell_make_null();
+            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db);
+            if (cell_is_null(&arg)) return cell_make_null();
+            const char *seq_name = NULL;
+            if (column_type_is_text(arg.type) && arg.value.as_text)
+                seq_name = arg.value.as_text;
+            if (!seq_name) { cell_release(&arg); return cell_make_null(); }
+            /* find sequence in database */
+            struct sequence *seq = NULL;
+            for (size_t si = 0; si < db->sequences.count; si++) {
+                if (strcmp(db->sequences.items[si].name, seq_name) == 0) {
+                    seq = &db->sequences.items[si];
+                    break;
+                }
+            }
+            cell_release(&arg);
+            if (!seq) {
+                fprintf(stderr, "sequence '%s' not found\n", seq_name);
+                return cell_make_null();
+            }
+            if (fn == FUNC_NEXTVAL) {
+                long long val;
+                if (!seq->has_been_called) {
+                    val = seq->current_value;
+                    seq->has_been_called = 1;
+                } else {
+                    seq->current_value += seq->increment;
+                    val = seq->current_value;
+                }
+                struct cell r = {0};
+                r.type = COLUMN_TYPE_BIGINT;
+                r.value.as_bigint = val;
+                return r;
+            } else {
+                /* currval */
+                if (!seq->has_been_called) {
+                    fprintf(stderr, "currval: sequence '%s' not yet called\n", seq_name);
+                    return cell_make_null();
+                }
+                struct cell r = {0};
+                r.type = COLUMN_TYPE_BIGINT;
+                r.value.as_bigint = seq->current_value;
+                return r;
+            }
+        }
+
+        if (fn == FUNC_GEN_RANDOM_UUID) {
+            /* generate a v4 UUID: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx */
+            static int uuid_seeded = 0;
+            if (!uuid_seeded) { srand((unsigned)time(NULL)); uuid_seeded = 1; }
+            char buf[37];
+            const char *hex = "0123456789abcdef";
+            for (int i = 0; i < 36; i++) {
+                if (i == 8 || i == 13 || i == 18 || i == 23) buf[i] = '-';
+                else if (i == 14) buf[i] = '4'; /* version 4 */
+                else if (i == 19) buf[i] = hex[8 + (rand() & 3)]; /* variant 10xx */
+                else buf[i] = hex[rand() & 15];
+            }
+            buf[36] = '\0';
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_UUID;
+            r.value.as_text = strdup(buf);
+            return r;
+        }
+
         if (fn == FUNC_SUBSTRING) {
             if (nargs < 2) return cell_make_null();
             struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db);
@@ -1860,7 +1927,10 @@ static double cell_to_double(const struct cell *c)
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
             return 0.0;
     }
@@ -1987,7 +2057,6 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                 /* find partition peers: rows with same partition column value */
                 size_t part_count = 0;
                 size_t part_rank = 0;
-                double part_sum = 0.0;
                 int rank_set = 0;
 
                 for (size_t rj = 0; rj < nmatch; rj++) {
@@ -2001,13 +2070,6 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                             continue;
                     }
                     part_count++;
-
-                    /* for SUM/AVG, accumulate (skip NULLs) */
-                    if (arg_idx[e] >= 0) {
-                        struct cell *ac = &peer->cells.items[arg_idx[e]];
-                        if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text))
-                            part_sum += cell_to_double(ac);
-                    }
 
                     /* for ROW_NUMBER/RANK, track position */
                     if (j == row_i && !rank_set) {
@@ -2045,54 +2107,240 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                         }
                         break;
                     case WIN_SUM:
-                        if (arg_idx[e] >= 0 &&
-                            t->columns.items[arg_idx[e]].type == COLUMN_TYPE_FLOAT) {
-                            c.type = COLUMN_TYPE_FLOAT;
-                            c.value.as_float = part_sum;
-                        } else {
-                            c.type = COLUMN_TYPE_INT;
-                            c.value.as_int = (int)part_sum;
-                        }
-                        break;
                     case WIN_COUNT:
-                        c.type = COLUMN_TYPE_INT;
-                        /* COUNT(col) should count non-NULL; COUNT(*) counts all */
-                        if (arg_idx[e] >= 0) {
-                            int nn = 0;
-                            for (size_t rj2 = 0; rj2 < nmatch; rj2++) {
-                                size_t j2 = sorted[rj2].idx;
-                                struct row *p2 = &t->rows.items[j2];
-                                if (se->win.has_partition && part_idx[e] >= 0 &&
-                                    !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                         &p2->cells.items[part_idx[e]]))
-                                    continue;
-                                struct cell *ac = &p2->cells.items[arg_idx[e]];
-                                if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text))
-                                    nn++;
+                    case WIN_AVG: {
+                        /* build partition-local index for frame support */
+                        size_t pi[4096];
+                        size_t pn = 0;
+                        size_t my_pos = 0;
+                        for (size_t rj = 0; rj < nmatch && pn < 4096; rj++) {
+                            size_t j = sorted[rj].idx;
+                            if (se->win.has_partition && part_idx[e] >= 0 &&
+                                !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
+                                                &t->rows.items[j].cells.items[part_idx[e]]))
+                                continue;
+                            if (j == row_i) my_pos = pn;
+                            pi[pn++] = j;
+                        }
+                        /* compute frame bounds */
+                        size_t fs = 0, fe = pn; /* default: entire partition */
+                        if (se->win.has_frame) {
+                            switch (se->win.frame_start) {
+                                case FRAME_UNBOUNDED_PRECEDING: fs = 0; break;
+                                case FRAME_CURRENT_ROW: fs = my_pos; break;
+                                case FRAME_N_PRECEDING: fs = (my_pos >= (size_t)se->win.frame_start_n) ? my_pos - (size_t)se->win.frame_start_n : 0; break;
+                                case FRAME_N_FOLLOWING: fs = my_pos + (size_t)se->win.frame_start_n; break;
+                                case FRAME_UNBOUNDED_FOLLOWING: fs = pn; break;
                             }
-                            c.value.as_int = nn;
-                        } else {
-                            c.value.as_int = (int)part_count;
+                            switch (se->win.frame_end) {
+                                case FRAME_UNBOUNDED_FOLLOWING: fe = pn; break;
+                                case FRAME_CURRENT_ROW: fe = my_pos + 1; break;
+                                case FRAME_N_FOLLOWING: fe = my_pos + (size_t)se->win.frame_end_n + 1; if (fe > pn) fe = pn; break;
+                                case FRAME_N_PRECEDING: fe = (my_pos >= (size_t)se->win.frame_end_n) ? my_pos - (size_t)se->win.frame_end_n + 1 : 0; break;
+                                case FRAME_UNBOUNDED_PRECEDING: fe = 0; break;
+                            }
+                            if (fs > pn) fs = pn;
+                        }
+                        /* aggregate within frame */
+                        double frame_sum = 0.0;
+                        int frame_nn = 0;
+                        int frame_count = 0;
+                        for (size_t fi = fs; fi < fe; fi++) {
+                            size_t j = pi[fi];
+                            frame_count++;
+                            if (arg_idx[e] >= 0) {
+                                struct cell *ac = &t->rows.items[j].cells.items[arg_idx[e]];
+                                if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text)) {
+                                    frame_sum += cell_to_double(ac);
+                                    frame_nn++;
+                                }
+                            }
+                        }
+                        if (se->win.func == WIN_SUM) {
+                            if (arg_idx[e] >= 0 &&
+                                t->columns.items[arg_idx[e]].type == COLUMN_TYPE_FLOAT) {
+                                c.type = COLUMN_TYPE_FLOAT;
+                                c.value.as_float = frame_sum;
+                            } else {
+                                c.type = COLUMN_TYPE_INT;
+                                c.value.as_int = (int)frame_sum;
+                            }
+                        } else if (se->win.func == WIN_COUNT) {
+                            c.type = COLUMN_TYPE_INT;
+                            c.value.as_int = (arg_idx[e] >= 0) ? frame_nn : frame_count;
+                        } else { /* WIN_AVG */
+                            c.type = COLUMN_TYPE_FLOAT;
+                            if (frame_nn > 0) {
+                                c.value.as_float = frame_sum / (double)frame_nn;
+                            } else {
+                                c.is_null = 1;
+                            }
                         }
                         break;
-                    case WIN_AVG: {
-                        c.type = COLUMN_TYPE_FLOAT;
-                        /* count non-NULL peers for AVG denominator */
-                        int nn = 0;
-                        if (arg_idx[e] >= 0) {
-                            for (size_t rj2 = 0; rj2 < nmatch; rj2++) {
-                                size_t j2 = sorted[rj2].idx;
-                                struct row *p2 = &t->rows.items[j2];
+                    }
+                    case WIN_DENSE_RANK: {
+                        c.type = COLUMN_TYPE_INT;
+                        if (se->win.has_order && ord_idx[e] >= 0) {
+                            /* count distinct order key values that are strictly less */
+                            int rank = 1;
+                            /* collect unique order key values from partition peers */
+                            for (size_t rj = 0; rj < nmatch; rj++) {
+                                size_t j = sorted[rj].idx;
                                 if (se->win.has_partition && part_idx[e] >= 0 &&
                                     !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                         &p2->cells.items[part_idx[e]]))
+                                                    &t->rows.items[j].cells.items[part_idx[e]]))
                                     continue;
-                                struct cell *ac = &p2->cells.items[arg_idx[e]];
-                                if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text))
-                                    nn++;
+                                int cmp = cell_compare(&t->rows.items[j].cells.items[ord_idx[e]],
+                                                       &src->cells.items[ord_idx[e]]);
+                                if (se->win.order_desc ? (cmp > 0) : (cmp < 0)) {
+                                    /* check if this value is distinct from all previously counted */
+                                    int is_dup = 0;
+                                    for (size_t rk = 0; rk < rj; rk++) {
+                                        size_t k = sorted[rk].idx;
+                                        if (se->win.has_partition && part_idx[e] >= 0 &&
+                                            !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
+                                                            &t->rows.items[k].cells.items[part_idx[e]]))
+                                            continue;
+                                        if (cell_equal_nullsafe(&t->rows.items[j].cells.items[ord_idx[e]],
+                                                                &t->rows.items[k].cells.items[ord_idx[e]])) {
+                                            is_dup = 1; break;
+                                        }
+                                    }
+                                    if (!is_dup) rank++;
+                                }
+                            }
+                            c.value.as_int = rank;
+                        } else {
+                            c.value.as_int = (int)part_rank;
+                        }
+                        break;
+                    }
+                    case WIN_NTILE: {
+                        c.type = COLUMN_TYPE_INT;
+                        int nbuckets = se->win.offset > 0 ? se->win.offset : 1;
+                        /* part_rank is 1-based position within partition */
+                        int bucket = (int)(((part_rank - 1) * (size_t)nbuckets) / part_count) + 1;
+                        c.value.as_int = bucket;
+                        break;
+                    }
+                    case WIN_PERCENT_RANK: {
+                        c.type = COLUMN_TYPE_FLOAT;
+                        if (part_count <= 1) {
+                            c.value.as_float = 0.0;
+                        } else if (se->win.has_order && ord_idx[e] >= 0) {
+                            /* rank - 1 / (partition_count - 1) */
+                            int rank = 1;
+                            for (size_t rj = 0; rj < nmatch; rj++) {
+                                size_t j = sorted[rj].idx;
+                                if (se->win.has_partition && part_idx[e] >= 0 &&
+                                    !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
+                                                    &t->rows.items[j].cells.items[part_idx[e]]))
+                                    continue;
+                                int cmp = cell_compare(&t->rows.items[j].cells.items[ord_idx[e]],
+                                                       &src->cells.items[ord_idx[e]]);
+                                if (se->win.order_desc ? (cmp > 0) : (cmp < 0))
+                                    rank++;
+                            }
+                            c.value.as_float = (double)(rank - 1) / (double)(part_count - 1);
+                        } else {
+                            c.value.as_float = 0.0;
+                        }
+                        break;
+                    }
+                    case WIN_CUME_DIST: {
+                        c.type = COLUMN_TYPE_FLOAT;
+                        if (se->win.has_order && ord_idx[e] >= 0) {
+                            /* count of peers with order key <= current / partition_count */
+                            int le_count = 0;
+                            for (size_t rj = 0; rj < nmatch; rj++) {
+                                size_t j = sorted[rj].idx;
+                                if (se->win.has_partition && part_idx[e] >= 0 &&
+                                    !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
+                                                    &t->rows.items[j].cells.items[part_idx[e]]))
+                                    continue;
+                                int cmp = cell_compare(&t->rows.items[j].cells.items[ord_idx[e]],
+                                                       &src->cells.items[ord_idx[e]]);
+                                if (se->win.order_desc ? (cmp >= 0) : (cmp <= 0))
+                                    le_count++;
+                            }
+                            c.value.as_float = (double)le_count / (double)part_count;
+                        } else {
+                            c.value.as_float = 1.0;
+                        }
+                        break;
+                    }
+                    case WIN_LAG:
+                    case WIN_LEAD: {
+                        /* find the row at offset positions before (LAG) or after (LEAD) */
+                        c.type = COLUMN_TYPE_INT;
+                        c.is_null = 1;
+                        int offset = se->win.offset;
+                        /* build partition-local sorted index */
+                        size_t part_pos = 0;
+                        size_t target_pos = 0;
+                        int found_self = 0;
+                        size_t part_indices[4096];
+                        size_t pn = 0;
+                        for (size_t rj = 0; rj < nmatch && pn < 4096; rj++) {
+                            size_t j = sorted[rj].idx;
+                            if (se->win.has_partition && part_idx[e] >= 0 &&
+                                !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
+                                                &t->rows.items[j].cells.items[part_idx[e]]))
+                                continue;
+                            if (j == row_i && !found_self) {
+                                part_pos = pn;
+                                found_self = 1;
+                            }
+                            part_indices[pn++] = j;
+                        }
+                        if (se->win.func == WIN_LAG)
+                            target_pos = (part_pos >= (size_t)offset) ? part_pos - (size_t)offset : pn; /* pn = out of range */
+                        else
+                            target_pos = part_pos + (size_t)offset;
+                        if (target_pos < pn && arg_idx[e] >= 0) {
+                            size_t tj = part_indices[target_pos];
+                            cell_copy(&c, &t->rows.items[tj].cells.items[arg_idx[e]]);
+                        }
+                        break;
+                    }
+                    case WIN_FIRST_VALUE:
+                    case WIN_LAST_VALUE: {
+                        c.type = COLUMN_TYPE_INT;
+                        c.is_null = 1;
+                        size_t first_j = 0, last_j = 0;
+                        int found_any = 0;
+                        for (size_t rj = 0; rj < nmatch; rj++) {
+                            size_t j = sorted[rj].idx;
+                            if (se->win.has_partition && part_idx[e] >= 0 &&
+                                !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
+                                                &t->rows.items[j].cells.items[part_idx[e]]))
+                                continue;
+                            if (!found_any) { first_j = j; found_any = 1; }
+                            last_j = j;
+                        }
+                        if (found_any && arg_idx[e] >= 0) {
+                            size_t tj = (se->win.func == WIN_FIRST_VALUE) ? first_j : last_j;
+                            cell_copy(&c, &t->rows.items[tj].cells.items[arg_idx[e]]);
+                        }
+                        break;
+                    }
+                    case WIN_NTH_VALUE: {
+                        c.type = COLUMN_TYPE_INT;
+                        c.is_null = 1;
+                        int nth = se->win.offset; /* 1-based */
+                        size_t count = 0;
+                        for (size_t rj = 0; rj < nmatch; rj++) {
+                            size_t j = sorted[rj].idx;
+                            if (se->win.has_partition && part_idx[e] >= 0 &&
+                                !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
+                                                &t->rows.items[j].cells.items[part_idx[e]]))
+                                continue;
+                            count++;
+                            if ((int)count == nth && arg_idx[e] >= 0) {
+                                cell_copy(&c, &t->rows.items[j].cells.items[arg_idx[e]]);
+                                break;
                             }
                         }
-                        c.value.as_float = nn > 0 ? part_sum / (double)nn : 0.0;
                         break;
                     }
                 }
@@ -2519,8 +2767,139 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
         return query_window(t, s, arena, result);
 
     /* dispatch to GROUP BY path */
-    if (s->has_group_by)
+    if (s->has_group_by) {
+        if (s->group_by_rollup || s->group_by_cube) {
+            /* ROLLUP/CUBE: run query_group_by for each grouping set */
+            uint32_t orig_count = s->group_by_count;
+            uint32_t orig_start = s->group_by_start;
+            int orig_rollup = s->group_by_rollup;
+            int orig_cube = s->group_by_cube;
+
+            /* generate grouping sets */
+            /* ROLLUP(a,b,c): (a,b,c), (a,b), (a), () — n+1 sets */
+            /* CUBE(a,b,c): all 2^n subsets */
+            uint32_t nsets = 0;
+            uint32_t sets[256]; /* bitmask per set */
+            if (s->group_by_rollup) {
+                for (uint32_t i = 0; i <= orig_count; i++) {
+                    uint32_t mask = 0;
+                    for (uint32_t j = 0; j < orig_count - i; j++)
+                        mask |= (1u << j);
+                    sets[nsets++] = mask;
+                }
+            } else { /* CUBE */
+                uint32_t total = 1u << orig_count;
+                for (uint32_t m = total; m > 0; m--)
+                    sets[nsets++] = m - 1;
+            }
+
+            /* resolve group column indices for NULL-out */
+            int grp_col_idx[32];
+            for (uint32_t k = 0; k < orig_count && k < 32; k++) {
+                sv gbcol = ASV(arena, orig_start + k);
+                grp_col_idx[k] = table_find_column_sv(t, gbcol);
+            }
+
+            s->group_by_rollup = 0;
+            s->group_by_cube = 0;
+
+            for (uint32_t si = 0; si < nsets; si++) {
+                uint32_t mask = sets[si];
+                /* build temporary sv list for this set's active columns */
+                uint32_t tmp_start = (uint32_t)arena->svs.count;
+                uint32_t tmp_count = 0;
+                for (uint32_t k = 0; k < orig_count; k++) {
+                    if (mask & (1u << k)) {
+                        arena_push_sv(arena, ASV(arena, orig_start + k));
+                        tmp_count++;
+                    }
+                }
+                if (tmp_count == 0) {
+                    /* grand total: run as plain aggregate (no GROUP BY) */
+                    s->has_group_by = 0;
+                    struct rows sub = {0};
+                    query_aggregate(t, s, arena, &sub);
+                    s->has_group_by = 1;
+                    /* prepend NULL group columns if agg_before_cols is 0 */
+                    for (size_t r = 0; r < sub.count; r++) {
+                        if (!s->agg_before_cols) {
+                            /* insert NULL cells for each group column at the front */
+                            struct row newrow = {0};
+                            da_init(&newrow.cells);
+                            for (uint32_t k = 0; k < orig_count; k++) {
+                                struct cell nc = {0};
+                                nc.type = (grp_col_idx[k] >= 0) ? t->columns.items[grp_col_idx[k]].type : COLUMN_TYPE_TEXT;
+                                nc.is_null = 1;
+                                da_push(&newrow.cells, nc);
+                            }
+                            for (size_t ci = 0; ci < sub.data[r].cells.count; ci++) {
+                                struct cell dup;
+                                cell_copy(&dup, &sub.data[r].cells.items[ci]);
+                                da_push(&newrow.cells, dup);
+                            }
+                            row_free(&sub.data[r]);
+                            rows_push(result, newrow);
+                        } else {
+                            rows_push(result, sub.data[r]);
+                            sub.data[r] = (struct row){0};
+                        }
+                    }
+                    free(sub.data);
+                } else {
+                    s->group_by_start = tmp_start;
+                    s->group_by_count = tmp_count;
+                    s->group_by_col = ASV(arena, tmp_start);
+                    struct rows sub = {0};
+                    query_group_by(t, s, arena, &sub);
+                    /* NULL-out columns not in this grouping set */
+                    for (size_t r = 0; r < sub.count; r++) {
+                        if (!s->agg_before_cols) {
+                            /* group columns are at the front of the row */
+                            /* we need to expand to orig_count group cols, inserting NULLs for missing ones */
+                            struct row newrow = {0};
+                            da_init(&newrow.cells);
+                            size_t sub_grp_i = 0;
+                            for (uint32_t k = 0; k < orig_count; k++) {
+                                if (mask & (1u << k)) {
+                                    if (sub_grp_i < sub.data[r].cells.count) {
+                                        struct cell dup;
+                                        cell_copy(&dup, &sub.data[r].cells.items[sub_grp_i]);
+                                        da_push(&newrow.cells, dup);
+                                    }
+                                    sub_grp_i++;
+                                } else {
+                                    struct cell nc = {0};
+                                    nc.type = (grp_col_idx[k] >= 0) ? t->columns.items[grp_col_idx[k]].type : COLUMN_TYPE_TEXT;
+                                    nc.is_null = 1;
+                                    da_push(&newrow.cells, nc);
+                                }
+                            }
+                            /* append aggregate columns */
+                            for (size_t ci = sub_grp_i; ci < sub.data[r].cells.count; ci++) {
+                                struct cell dup;
+                                cell_copy(&dup, &sub.data[r].cells.items[ci]);
+                                da_push(&newrow.cells, dup);
+                            }
+                            row_free(&sub.data[r]);
+                            rows_push(result, newrow);
+                        } else {
+                            rows_push(result, sub.data[r]);
+                            sub.data[r] = (struct row){0};
+                        }
+                    }
+                    free(sub.data);
+                }
+            }
+
+            /* restore original state */
+            s->group_by_start = orig_start;
+            s->group_by_count = orig_count;
+            s->group_by_rollup = orig_rollup;
+            s->group_by_cube = orig_cube;
+            return 0;
+        }
         return query_group_by(t, s, arena, result);
+    }
 
     /* dispatch to aggregate path if aggregates are present */
     if (s->aggregates_count > 0)
@@ -2644,6 +3023,45 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
             int dup = 0;
             for (size_t j = 0; j < deduped.count; j++) {
                 if (row_equal_nullsafe(&tmp.data[i], &deduped.data[j])) { dup = 1; break; }
+            }
+            if (!dup) {
+                rows_push(&deduped, tmp.data[i]);
+                tmp.data[i] = (struct row){0};
+            }
+        }
+        for (size_t i = 0; i < tmp.count; i++) {
+            if (tmp.data[i].cells.items) row_free(&tmp.data[i]);
+        }
+        free(tmp.data);
+        tmp = deduped;
+    }
+
+    /* DISTINCT ON: keep first row per distinct value of the ON columns */
+    if (s->has_distinct_on && s->distinct_on_count > 0 && tmp.count > 1) {
+        /* resolve DISTINCT ON column indices */
+        int don_cols[16];
+        uint32_t don_n = s->distinct_on_count < 16 ? s->distinct_on_count : 16;
+        for (uint32_t di = 0; di < don_n; di++) {
+            sv col_name = ASV(arena, s->distinct_on_start + di);
+            don_cols[di] = table_find_column_sv(t, col_name);
+        }
+        struct rows deduped = {0};
+        for (size_t i = 0; i < tmp.count; i++) {
+            int dup = 0;
+            for (size_t j = 0; j < deduped.count; j++) {
+                int same = 1;
+                for (uint32_t di = 0; di < don_n; di++) {
+                    int ci = don_cols[di];
+                    if (ci < 0) continue;
+                    if ((size_t)ci >= tmp.data[i].cells.count || (size_t)ci >= deduped.data[j].cells.count) {
+                        same = 0; break;
+                    }
+                    if (!cell_equal_nullsafe(&tmp.data[i].cells.items[ci],
+                                             &deduped.data[j].cells.items[ci])) {
+                        same = 0; break;
+                    }
+                }
+                if (same) { dup = 1; break; }
             }
             if (!dup) {
                 rows_push(&deduped, tmp.data[i]);
@@ -2820,32 +3238,101 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
 
 /* copy_cell_into → use shared cell_copy from row.h */
 
-static int query_insert_exec(struct table *t, struct query_insert *ins, struct query_arena *arena, struct rows *result)
+static int query_insert_exec(struct table *t, struct query_insert *ins, struct query_arena *arena, struct rows *result, struct database *db)
 {
     int has_returning = (ins->returning_columns.len > 0);
     int return_all = has_returning && sv_eq_cstr(ins->returning_columns, "*");
 
     for (uint32_t r = 0; r < ins->insert_rows_count; r++) {
         struct row *src = &arena->rows.items[ins->insert_rows_start + r];
+
+        /* resolve expression sentinel cells (is_null==2) in source row */
+        for (size_t ci = 0; ci < src->cells.count; ci++) {
+            if (src->cells.items[ci].is_null == 2) {
+                uint32_t ei = (uint32_t)src->cells.items[ci].value.as_int;
+                struct cell val = eval_expr(ei, arena, t, NULL, db);
+                src->cells.items[ci] = val;
+            }
+        }
+
         struct row copy = {0};
         da_init(&copy.cells);
-        for (size_t i = 0; i < src->cells.count; i++) {
-            struct cell dup;
-            cell_copy(&dup, &src->cells.items[i]);
-            da_push(&copy.cells, dup);
-        }
-        /* pad with DEFAULT or NULL if fewer values than columns */
-        while (copy.cells.count < t->columns.count) {
-            size_t ci = copy.cells.count;
-            if (t->columns.items[ci].has_default && t->columns.items[ci].default_value) {
+
+        if (ins->insert_columns_count > 0) {
+            /* column list provided: build full-width row with defaults/NULLs,
+             * then place each value at the correct column position */
+            for (size_t ci = 0; ci < t->columns.count; ci++) {
+                if (t->columns.items[ci].has_default && t->columns.items[ci].default_value) {
+                    struct cell dup;
+                    cell_copy(&dup, t->columns.items[ci].default_value);
+                    da_push(&copy.cells, dup);
+                } else {
+                    struct cell null_cell = {0};
+                    null_cell.type = t->columns.items[ci].type;
+                    null_cell.is_null = 1;
+                    da_push(&copy.cells, null_cell);
+                }
+            }
+            for (uint32_t vi = 0; vi < ins->insert_columns_count && vi < (uint32_t)src->cells.count; vi++) {
+                sv col_name = ASV(arena, ins->insert_columns_start + vi);
+                int ci = table_find_column_sv(t, col_name);
+                if (ci < 0) continue;
+                cell_free_text(&copy.cells.items[ci]);
+                cell_copy(&copy.cells.items[ci], &src->cells.items[vi]);
+            }
+        } else {
+            for (size_t i = 0; i < src->cells.count; i++) {
                 struct cell dup;
-                cell_copy(&dup, t->columns.items[ci].default_value);
+                cell_copy(&dup, &src->cells.items[i]);
                 da_push(&copy.cells, dup);
-            } else {
-                struct cell null_cell = {0};
-                null_cell.type = t->columns.items[ci].type;
-                null_cell.is_null = 1;
-                da_push(&copy.cells, null_cell);
+            }
+            /* pad with DEFAULT or NULL if fewer values than columns */
+            while (copy.cells.count < t->columns.count) {
+                size_t ci = copy.cells.count;
+                if (t->columns.items[ci].has_default && t->columns.items[ci].default_value) {
+                    struct cell dup;
+                    cell_copy(&dup, t->columns.items[ci].default_value);
+                    da_push(&copy.cells, dup);
+                } else {
+                    struct cell null_cell = {0};
+                    null_cell.type = t->columns.items[ci].type;
+                    null_cell.is_null = 1;
+                    da_push(&copy.cells, null_cell);
+                }
+            }
+        }
+        /* type coercion: promote TEXT cells to the column's temporal/UUID type */
+        for (size_t i = 0; i < t->columns.count && i < copy.cells.count; i++) {
+            struct cell *c = &copy.cells.items[i];
+            enum column_type ct = t->columns.items[i].type;
+            if (c->type == COLUMN_TYPE_TEXT && !c->is_null && c->value.as_text &&
+                (ct == COLUMN_TYPE_DATE || ct == COLUMN_TYPE_TIME ||
+                 ct == COLUMN_TYPE_TIMESTAMP || ct == COLUMN_TYPE_TIMESTAMPTZ ||
+                 ct == COLUMN_TYPE_INTERVAL || ct == COLUMN_TYPE_UUID)) {
+                c->type = ct;
+            }
+        }
+        /* auto-increment SERIAL/BIGSERIAL columns */
+        for (size_t i = 0; i < t->columns.count && i < copy.cells.count; i++) {
+            if (t->columns.items[i].is_serial) {
+                struct cell *c = &copy.cells.items[i];
+                int is_null = c->is_null || (column_type_is_text(c->type) && !c->value.as_text);
+                if (is_null) {
+                    long long val = t->columns.items[i].serial_next++;
+                    c->is_null = 0;
+                    if (t->columns.items[i].type == COLUMN_TYPE_BIGINT) {
+                        c->type = COLUMN_TYPE_BIGINT;
+                        c->value.as_bigint = val;
+                    } else {
+                        c->type = COLUMN_TYPE_INT;
+                        c->value.as_int = (int)val;
+                    }
+                } else {
+                    /* user provided a value — update serial_next if needed */
+                    long long v = (c->type == COLUMN_TYPE_BIGINT) ? c->value.as_bigint : c->value.as_int;
+                    if (v >= t->columns.items[i].serial_next)
+                        t->columns.items[i].serial_next = v + 1;
+                }
             }
         }
         /* enforce NOT NULL constraints */
@@ -2912,11 +3399,15 @@ int query_exec(struct table *t, struct query *q, struct rows *result, struct dat
         case QUERY_TYPE_BEGIN:
         case QUERY_TYPE_COMMIT:
         case QUERY_TYPE_ROLLBACK:
+        case QUERY_TYPE_CREATE_SEQUENCE:
+        case QUERY_TYPE_DROP_SEQUENCE:
+        case QUERY_TYPE_CREATE_VIEW:
+        case QUERY_TYPE_DROP_VIEW:
             return -1;
         case QUERY_TYPE_SELECT:
             return query_select_exec(t, &q->select, &q->arena, result, db);
         case QUERY_TYPE_INSERT:
-            return query_insert_exec(t, &q->insert, &q->arena, result);
+            return query_insert_exec(t, &q->insert, &q->arena, result, db);
         case QUERY_TYPE_DELETE:
             return query_delete_exec(t, &q->del, &q->arena, result);
         case QUERY_TYPE_UPDATE:

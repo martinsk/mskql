@@ -7,6 +7,7 @@
 void table_init(struct table *t, const char *name)
 {
     t->name = strdup(name);
+    t->view_sql = NULL;
     da_init(&t->columns);
     da_init(&t->rows);
     da_init(&t->indexes);
@@ -15,6 +16,7 @@ void table_init(struct table *t, const char *name)
 void table_init_own(struct table *t, char *name)
 {
     t->name = name;
+    t->view_sql = NULL;
     da_init(&t->columns);
     da_init(&t->rows);
     da_init(&t->indexes);
@@ -30,7 +32,13 @@ void table_add_column(struct table *t, struct column *col)
         .has_default = col->has_default,
         .default_value = NULL,
         .is_unique = col->is_unique,
-        .is_primary_key = col->is_primary_key
+        .is_primary_key = col->is_primary_key,
+        .is_serial = col->is_serial,
+        .serial_next = col->serial_next,
+        .fk_table = col->fk_table ? strdup(col->fk_table) : NULL,
+        .fk_column = col->fk_column ? strdup(col->fk_column) : NULL,
+        .fk_on_delete_cascade = col->fk_on_delete_cascade,
+        .fk_on_update_cascade = col->fk_on_update_cascade
     };
     if (col->has_default && col->default_value) {
         c.default_value = calloc(1, sizeof(struct cell));
@@ -47,6 +55,7 @@ void table_add_column(struct table *t, struct column *col)
 void table_deep_copy(struct table *dst, const struct table *src)
 {
     dst->name = strdup(src->name);
+    dst->view_sql = src->view_sql ? strdup(src->view_sql) : NULL;
     da_init(&dst->columns);
     da_init(&dst->rows);
     da_init(&dst->indexes);
@@ -62,7 +71,13 @@ void table_deep_copy(struct table *dst, const struct table *src)
             .has_default = sc->has_default,
             .default_value = NULL,
             .is_unique = sc->is_unique,
-            .is_primary_key = sc->is_primary_key
+            .is_primary_key = sc->is_primary_key,
+            .is_serial = sc->is_serial,
+            .serial_next = sc->serial_next,
+            .fk_table = sc->fk_table ? strdup(sc->fk_table) : NULL,
+            .fk_column = sc->fk_column ? strdup(sc->fk_column) : NULL,
+            .fk_on_delete_cascade = sc->fk_on_delete_cascade,
+            .fk_on_update_cascade = sc->fk_on_update_cascade
         };
         if (sc->has_default && sc->default_value) {
             c.default_value = calloc(1, sizeof(struct cell));
@@ -163,9 +178,12 @@ int resolve_alias_to_column(struct table *t, sv columns, sv alias)
 void table_free(struct table *t)
 {
     free(t->name);
+    free(t->view_sql);
     for (size_t i = 0; i < t->columns.count; i++) {
         free(t->columns.items[i].name);
         free(t->columns.items[i].enum_type_name);
+        free(t->columns.items[i].fk_table);
+        free(t->columns.items[i].fk_column);
         if (t->columns.items[i].default_value) {
             if (column_type_is_text(t->columns.items[i].default_value->type)
                 && t->columns.items[i].default_value->value.as_text)

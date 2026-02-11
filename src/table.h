@@ -10,6 +10,7 @@ struct table {
     // TODO: STRINGVIEW OPPORTUNITY: name is strdup'd from sv-originated strings in most
     // paths (db_exec CREATE TABLE). Could be sv if the schema had a persistent backing store.
     char *name;
+    char *view_sql;  /* non-NULL if this is a view (stores the SELECT body) */
     DYNAMIC_ARRAY(struct column) columns;
     DYNAMIC_ARRAY(struct row) rows;
     DYNAMIC_ARRAY(struct index) indexes;

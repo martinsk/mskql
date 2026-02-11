@@ -12,7 +12,10 @@ enum column_type {
     COLUMN_TYPE_BIGINT,
     COLUMN_TYPE_NUMERIC,
     COLUMN_TYPE_DATE,
+    COLUMN_TYPE_TIME,
     COLUMN_TYPE_TIMESTAMP,
+    COLUMN_TYPE_TIMESTAMPTZ,
+    COLUMN_TYPE_INTERVAL,
     COLUMN_TYPE_UUID
 };
 
@@ -20,8 +23,9 @@ enum column_type {
 static inline int column_type_is_text(enum column_type t)
 {
     return t == COLUMN_TYPE_TEXT || t == COLUMN_TYPE_ENUM ||
-           t == COLUMN_TYPE_DATE || t == COLUMN_TYPE_TIMESTAMP ||
-           t == COLUMN_TYPE_UUID;
+           t == COLUMN_TYPE_DATE || t == COLUMN_TYPE_TIME ||
+           t == COLUMN_TYPE_TIMESTAMP || t == COLUMN_TYPE_TIMESTAMPTZ ||
+           t == COLUMN_TYPE_INTERVAL || t == COLUMN_TYPE_UUID;
 }
 
 struct enum_type {
@@ -50,6 +54,13 @@ struct column {
     struct cell *default_value;
     int is_unique;
     int is_primary_key;
+    int is_serial;          /* SERIAL / BIGSERIAL auto-increment */
+    long long serial_next;  /* next value for auto-increment (starts at 1) */
+    /* REFERENCES (foreign key) */
+    char *fk_table;         /* referenced table name, or NULL */
+    char *fk_column;        /* referenced column name, or NULL */
+    int fk_on_delete_cascade;
+    int fk_on_update_cascade;
 };
 
 void column_free(struct column *col);

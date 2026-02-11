@@ -13,6 +13,7 @@ void db_init(struct database *db, const char *name)
     db->name = strdup(name);
     da_init(&db->tables);
     da_init(&db->types);
+    da_init(&db->sequences);
     db->in_transaction = 0;
     db->snapshot = NULL;
 }
@@ -1134,6 +1135,77 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             fprintf(stderr, "type '" SV_FMT "' not found\n", SV_ARG(dtn));
             return -1;
         }
+        case QUERY_TYPE_CREATE_SEQUENCE: {
+            struct query_create_sequence *cs = &q->create_seq;
+            /* check for duplicate */
+            for (size_t i = 0; i < db->sequences.count; i++) {
+                if (sv_eq_cstr(cs->name, db->sequences.items[i].name)) {
+                    fprintf(stderr, "sequence '" SV_FMT "' already exists\n", SV_ARG(cs->name));
+                    return -1;
+                }
+            }
+            struct sequence seq;
+            seq.name = sv_to_cstr(cs->name);
+            seq.current_value = cs->start_value;
+            seq.increment = cs->increment;
+            seq.min_value = cs->min_value;
+            seq.max_value = cs->max_value;
+            seq.has_been_called = 0;
+            da_push(&db->sequences, seq);
+            return 0;
+        }
+        case QUERY_TYPE_DROP_SEQUENCE: {
+            sv sn = q->drop_seq.name;
+            for (size_t i = 0; i < db->sequences.count; i++) {
+                if (sv_eq_cstr(sn, db->sequences.items[i].name)) {
+                    free(db->sequences.items[i].name);
+                    for (size_t j = i; j + 1 < db->sequences.count; j++)
+                        db->sequences.items[j] = db->sequences.items[j + 1];
+                    db->sequences.count--;
+                    return 0;
+                }
+            }
+            fprintf(stderr, "sequence '" SV_FMT "' not found\n", SV_ARG(sn));
+            return -1;
+        }
+        case QUERY_TYPE_CREATE_VIEW: {
+            struct query_create_view *cv = &q->create_view;
+            if (cv->sql_idx == IDX_NONE) {
+                fprintf(stderr, "CREATE VIEW: missing SELECT body\n");
+                return -1;
+            }
+            /* store view as a table with zero columns and the SQL in the name
+             * prefixed with "VIEW:" so we can detect it later */
+            const char *sql = ASTRING(&q->arena, cv->sql_idx);
+            /* check for existing view/table */
+            if (db_find_table_sv(db, cv->name)) {
+                fprintf(stderr, "relation '" SV_FMT "' already exists\n", SV_ARG(cv->name));
+                return -1;
+            }
+            struct table vt;
+            char vname[512];
+            snprintf(vname, sizeof(vname), "%.*s", (int)cv->name.len, cv->name.data);
+            table_init(&vt, vname);
+            /* store view SQL in a special field — we'll use a convention:
+             * a table with 0 columns and view_sql != NULL is a view */
+            vt.view_sql = strdup(sql);
+            da_push(&db->tables, vt);
+            return 0;
+        }
+        case QUERY_TYPE_DROP_VIEW: {
+            sv vn = q->drop_view.name;
+            for (size_t i = 0; i < db->tables.count; i++) {
+                if (sv_eq_cstr(vn, db->tables.items[i].name) && db->tables.items[i].view_sql) {
+                    table_free(&db->tables.items[i]);
+                    for (size_t j = i; j + 1 < db->tables.count; j++)
+                        db->tables.items[j] = db->tables.items[j + 1];
+                    db->tables.count--;
+                    return 0;
+                }
+            }
+            fprintf(stderr, "view '" SV_FMT "' not found\n", SV_ARG(vn));
+            return -1;
+        }
         case QUERY_TYPE_CREATE_INDEX: {
             struct query_create_index *ci = &q->create_index;
             struct table *t = db_find_table_sv(db, ci->table);
@@ -1332,6 +1404,22 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                 from_sub_table = materialize_subquery(db, ASTRING(&q->arena, s->from_subquery_sql), alias_buf);
             }
 
+            /* view expansion: if the table is a view, materialize it */
+            struct table *view_temp = NULL;
+            char view_temp_name[256] = {0};
+            if (s->table.len > 0 && !from_sub_table) {
+                struct table *maybe_view = db_find_table_sv(db, s->table);
+                if (maybe_view && maybe_view->view_sql) {
+                    snprintf(view_temp_name, sizeof(view_temp_name),
+                             "_view_%.*s", (int)s->table.len, s->table.data);
+                    view_temp = materialize_subquery(db, maybe_view->view_sql, view_temp_name);
+                    if (view_temp) {
+                        /* rewrite table reference to point to the temp table */
+                        s->table = sv_from(view_temp->name, strlen(view_temp->name));
+                    }
+                }
+            }
+
             /* resolve any IN (SELECT ...) / EXISTS subqueries */
             if (s->where.has_where && s->where.where_cond != IDX_NONE)
                 resolve_subqueries(db, &q->arena, s->where.where_cond);
@@ -1479,6 +1567,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
             /* clean up FROM subquery temp table */
             if (from_sub_table)
                 remove_temp_table(db, from_sub_table);
+
+            /* clean up view temp table */
+            if (view_temp)
+                remove_temp_table(db, view_temp);
 
             /* clean up CTE temp tables (reverse order to keep indices valid) */
             for (size_t ci = n_cte_temps; ci > 0; ci--) {
@@ -1874,4 +1966,8 @@ void db_free(struct database *db)
         enum_type_free(&db->types.items[i]);
     }
     da_free(&db->types);
+    for (size_t i = 0; i < db->sequences.count; i++) {
+        free(db->sequences.items[i].name);
+    }
+    da_free(&db->sequences);
 }

@@ -40,7 +40,17 @@ int cell_compare(const struct cell *a, const struct cell *b)
         if (da > db) return  1;
         return 0;
     }
-    if (a->type != b->type) return -2; /* incompatible types */
+    /* allow cross-comparison between text-based types (TEXT, DATE, TIME, etc.) */
+    if (a->type != b->type) {
+        if (column_type_is_text(a->type) && column_type_is_text(b->type)) {
+            if (!a->value.as_text && !b->value.as_text) return 0;
+            if (!a->value.as_text) return -1;
+            if (!b->value.as_text) return  1;
+            int cmp = strcmp(a->value.as_text, b->value.as_text);
+            return (cmp < 0) ? -1 : (cmp > 0) ? 1 : 0;
+        }
+        return -2; /* incompatible types */
+    }
     switch (a->type) {
         case COLUMN_TYPE_INT:
             if (a->value.as_int < b->value.as_int) return -1;
@@ -65,7 +75,10 @@ int cell_compare(const struct cell *a, const struct cell *b)
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
             if (!a->value.as_text && !b->value.as_text) return 0;
             if (!a->value.as_text) return -1;
@@ -99,7 +112,10 @@ int cell_equal(const struct cell *a, const struct cell *b)
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
             if (!a->value.as_text || !b->value.as_text) return a->value.as_text == b->value.as_text;
             return strcmp(a->value.as_text, b->value.as_text) == 0;

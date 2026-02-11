@@ -5,9 +5,19 @@
 #include "table.h"
 #include "query.h"
 
+struct sequence {
+    char *name;
+    long long current_value;
+    long long increment;
+    long long min_value;
+    long long max_value;
+    int has_been_called; /* 0 until first nextval() */
+};
+
 struct db_snapshot {
     DYNAMIC_ARRAY(struct table) tables;
     DYNAMIC_ARRAY(struct enum_type) types;
+    DYNAMIC_ARRAY(struct sequence) sequences;
 };
 
 struct database {
@@ -16,6 +26,7 @@ struct database {
     char *name;
     DYNAMIC_ARRAY(struct table) tables;
     DYNAMIC_ARRAY(struct enum_type) types;
+    DYNAMIC_ARRAY(struct sequence) sequences;
     int in_transaction;
     struct db_snapshot *snapshot;
 };

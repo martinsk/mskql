@@ -28,19 +28,44 @@ struct agg_expr {
 enum win_func {
     WIN_ROW_NUMBER,
     WIN_RANK,
+    WIN_DENSE_RANK,
+    WIN_NTILE,
+    WIN_PERCENT_RANK,
+    WIN_CUME_DIST,
+    WIN_LAG,
+    WIN_LEAD,
+    WIN_FIRST_VALUE,
+    WIN_LAST_VALUE,
+    WIN_NTH_VALUE,
     WIN_SUM,
     WIN_COUNT,
     WIN_AVG
 };
 
+/* window frame boundary types */
+enum frame_bound {
+    FRAME_UNBOUNDED_PRECEDING,
+    FRAME_N_PRECEDING,
+    FRAME_CURRENT_ROW,
+    FRAME_N_FOLLOWING,
+    FRAME_UNBOUNDED_FOLLOWING
+};
+
 struct win_expr {
     enum win_func func;
-    sv arg_column;       /* column arg for SUM/COUNT/AVG, empty for ROW_NUMBER/RANK */
+    sv arg_column;       /* column arg for SUM/COUNT/AVG/LAG/LEAD/etc, empty for ROW_NUMBER/RANK */
     int has_partition;
     sv partition_col;
     int has_order;
     sv order_col;
     int order_desc; /* 1 = DESC, 0 = ASC (default) */
+    int offset;     /* for LAG/LEAD (default 1), NTH_VALUE (n), NTILE (buckets) */
+    /* window frame */
+    int has_frame;
+    enum frame_bound frame_start;
+    enum frame_bound frame_end;
+    int frame_start_n; /* for N PRECEDING/FOLLOWING */
+    int frame_end_n;
 };
 
 enum select_expr_kind {
@@ -159,7 +184,10 @@ enum expr_func {
     FUNC_LOWER,
     FUNC_LENGTH,
     FUNC_TRIM,
-    FUNC_SUBSTRING
+    FUNC_SUBSTRING,
+    FUNC_NEXTVAL,
+    FUNC_CURRVAL,
+    FUNC_GEN_RANDOM_UUID
 };
 
 struct case_when_branch {
@@ -239,7 +267,11 @@ enum query_type {
     QUERY_TYPE_ALTER,
     QUERY_TYPE_BEGIN,
     QUERY_TYPE_COMMIT,
-    QUERY_TYPE_ROLLBACK
+    QUERY_TYPE_ROLLBACK,
+    QUERY_TYPE_CREATE_SEQUENCE,
+    QUERY_TYPE_DROP_SEQUENCE,
+    QUERY_TYPE_CREATE_VIEW,
+    QUERY_TYPE_DROP_VIEW
 };
 
 enum alter_action {
@@ -290,6 +322,10 @@ struct query_select {
     uint32_t parsed_columns_start; /* index into arena.select_cols (consecutive) */
     uint32_t parsed_columns_count;
     int has_distinct;
+    /* DISTINCT ON */
+    int has_distinct_on;
+    uint32_t distinct_on_start; /* index into arena.svs (consecutive column names) */
+    uint32_t distinct_on_count;
     /* WHERE */
     struct where_clause where;
     /* JOIN */
@@ -305,6 +341,8 @@ struct query_select {
     sv group_by_col;
     uint32_t group_by_start; /* index into arena.svs (consecutive) */
     uint32_t group_by_count;
+    int group_by_rollup;  /* 1 if GROUP BY ROLLUP(...) */
+    int group_by_cube;    /* 1 if GROUP BY CUBE(...) */
     /* HAVING */
     int has_having;
     uint32_t having_cond;  /* index into arena.conditions, or IDX_NONE */
@@ -349,6 +387,8 @@ struct query_select {
 struct query_insert {
     sv table;
     sv columns;
+    uint32_t insert_columns_start; /* index into arena.svs (consecutive column names) */
+    uint32_t insert_columns_count;
     uint32_t insert_rows_start; /* index into arena.rows (consecutive) */
     uint32_t insert_rows_count;
     /* RETURNING */
@@ -429,6 +469,27 @@ struct query_drop_type {
     sv type_name;
 };
 
+struct query_create_sequence {
+    sv name;
+    long long start_value;  /* START WITH (default 1) */
+    long long increment;    /* INCREMENT BY (default 1) */
+    long long min_value;
+    long long max_value;
+};
+
+struct query_drop_sequence {
+    sv name;
+};
+
+struct query_create_view {
+    sv name;
+    uint32_t sql_idx;  /* index into arena.strings — the SELECT body */
+};
+
+struct query_drop_view {
+    sv name;
+};
+
 struct query {
     enum query_type query_type;
     struct query_arena arena;
@@ -444,6 +505,10 @@ struct query {
         struct query_drop_index drop_index;
         struct query_create_type create_type;
         struct query_drop_type drop_type;
+        struct query_create_sequence create_seq;
+        struct query_drop_sequence drop_seq;
+        struct query_create_view create_view;
+        struct query_drop_view drop_view;
     };
 };
 

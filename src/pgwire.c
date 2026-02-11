@@ -193,7 +193,10 @@ static uint32_t column_type_to_oid(enum column_type t)
         case COLUMN_TYPE_BIGINT:    return 20;    /* int8 */
         case COLUMN_TYPE_NUMERIC:   return 1700;  /* numeric */
         case COLUMN_TYPE_DATE:      return 1082;  /* date */
+        case COLUMN_TYPE_TIME:      return 1083;  /* time */
         case COLUMN_TYPE_TIMESTAMP: return 1114;  /* timestamp */
+        case COLUMN_TYPE_TIMESTAMPTZ: return 1184; /* timestamptz */
+        case COLUMN_TYPE_INTERVAL:  return 1186;  /* interval */
         case COLUMN_TYPE_UUID:      return 2950;  /* uuid */
     }
     return 25;
@@ -233,7 +236,10 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c)
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
             if (!c->value.as_text) {
                 msgbuf_push_u32(m, (uint32_t)-1);
@@ -378,11 +384,20 @@ static int send_row_description(int fd, struct database *db, struct query *q,
                 }
             } else {
                 switch (se->win.func) {
-                    case WIN_ROW_NUMBER: colname = "row_number"; break;
-                    case WIN_RANK:       colname = "rank";       break;
-                    case WIN_SUM:        colname = "sum";        break;
-                    case WIN_COUNT:      colname = "count";      break;
-                    case WIN_AVG:        colname = "avg";        break;
+                    case WIN_ROW_NUMBER:   colname = "row_number";   break;
+                    case WIN_RANK:         colname = "rank";         break;
+                    case WIN_DENSE_RANK:   colname = "dense_rank";   break;
+                    case WIN_NTILE:        colname = "ntile";        break;
+                    case WIN_PERCENT_RANK: colname = "percent_rank"; break;
+                    case WIN_CUME_DIST:    colname = "cume_dist";    break;
+                    case WIN_LAG:          colname = "lag";          break;
+                    case WIN_LEAD:         colname = "lead";         break;
+                    case WIN_FIRST_VALUE:  colname = "first_value";  break;
+                    case WIN_LAST_VALUE:   colname = "last_value";   break;
+                    case WIN_NTH_VALUE:    colname = "nth_value";    break;
+                    case WIN_SUM:          colname = "sum";          break;
+                    case WIN_COUNT:        colname = "count";        break;
+                    case WIN_AVG:          colname = "avg";          break;
                 }
                 if (result->count > 0)
                     type_oid = column_type_to_oid(result->data[0].cells.items[i].type);
@@ -541,6 +556,18 @@ static int handle_query(int fd, struct database *db, const char *sql,
             break;
         case QUERY_TYPE_ALTER:
             snprintf(tag, sizeof(tag), "ALTER TABLE");
+            break;
+        case QUERY_TYPE_CREATE_SEQUENCE:
+            snprintf(tag, sizeof(tag), "CREATE SEQUENCE");
+            break;
+        case QUERY_TYPE_DROP_SEQUENCE:
+            snprintf(tag, sizeof(tag), "DROP SEQUENCE");
+            break;
+        case QUERY_TYPE_CREATE_VIEW:
+            snprintf(tag, sizeof(tag), "CREATE VIEW");
+            break;
+        case QUERY_TYPE_DROP_VIEW:
+            snprintf(tag, sizeof(tag), "DROP VIEW");
             break;
         case QUERY_TYPE_BEGIN:
             snprintf(tag, sizeof(tag), "BEGIN");
