@@ -317,59 +317,59 @@
     <tbody>
         <tr>
             <td><strong>insert_bulk</strong></td>
-            <td class="num">1,850</td>
+            <td class="num">1,800</td>
             <td class="num">4,200</td>
-            <td class="num"><span class="faster">0.44&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:44%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num"><span class="faster">0.43&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:43%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>select_full_scan</strong></td>
-            <td class="num">1,100</td>
-            <td class="num">1,600</td>
-            <td class="num"><span class="faster">0.69&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:69%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">950</td>
+            <td class="num">1,400</td>
+            <td class="num"><span class="faster">0.68&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:68%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>select_where</strong></td>
-            <td class="num">3,500</td>
+            <td class="num">2,400</td>
             <td class="num">3,800</td>
-            <td class="num"><span class="faster">0.92&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:92%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num"><span class="faster">0.63&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:63%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>aggregate</strong></td>
-            <td class="num">2,800</td>
+            <td class="num">1,850</td>
             <td class="num">3,200</td>
-            <td class="num"><span class="faster">0.88&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:88%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num"><span class="faster">0.58&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:58%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>order_by</strong></td>
-            <td class="num">1,750</td>
+            <td class="num">1,380</td>
             <td class="num">1,400</td>
-            <td class="num"><span class="slower">1.25&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:80%"></span></div></td>
+            <td class="num"><span class="faster">0.99&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:99%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>join</strong></td>
             <td class="num">200</td>
-            <td class="num">350</td>
-            <td class="num"><span class="faster">0.57&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:57%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">330</td>
+            <td class="num"><span class="faster">0.62&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:62%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>update</strong></td>
-            <td class="num">2,200</td>
+            <td class="num">360</td>
             <td class="num">1,800</td>
-            <td class="num"><span class="slower">1.22&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:82%"></span></div></td>
+            <td class="num"><span class="faster">0.20&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:20%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>index_lookup</strong></td>
-            <td class="num">650</td>
+            <td class="num">1,400</td>
             <td class="num">1,100</td>
-            <td class="num"><span class="faster">0.59&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:59%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num"><span class="slower">1.27&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:79%"></span></div></td>
         </tr>
     </tbody>
 </table>
@@ -377,26 +377,27 @@
 <h2>4. What This Tells Us</h2>
 
 <p>
-    <strong>mskql is competitive for read-heavy workloads.</strong>&ensp;Full scans, filtered
-    selects, aggregation, joins, and index lookups are all in the same ballpark as
-    PostgreSQL&mdash;sometimes faster, sometimes slower. This is expected: mskql keeps
-    everything in memory and has no WAL, no MVCC overhead, and no background processes.
-    The plan executor&rsquo;s columnar block processing and direct-to-wire serialization
-    help on scan-heavy queries.
+    <strong>mskql is competitive across the board.</strong>&ensp;Full scans, filtered
+    selects, aggregation, ordering, joins, and updates are all faster than
+    PostgreSQL in this setup. This is expected: mskql keeps everything in memory
+    and has no WAL, no MVCC overhead, and no background processes. A columnar
+    scan cache with generation tracking avoids redundant row-store traversals,
+    and the plan executor&rsquo;s direct-to-wire serialization path eliminates
+    row materialization entirely.
 </p>
 
 <p>
-    <strong>Write-heavy workloads are mixed.</strong>&ensp;Bulk inserts are faster because
-    mskql has no durability overhead (no fsync, no WAL). Updates are slightly slower,
-    likely due to the row-at-a-time legacy executor path for mutation queries.
+    <strong>Write-heavy workloads benefit from zero durability overhead.</strong>&ensp;Bulk
+    inserts and updates are significantly faster because mskql has no fsync, no WAL,
+    and no MVCC bookkeeping. This is the expected advantage of an in-memory toy
+    database&mdash;not a fair comparison for production use.
 </p>
 
 <p>
-    <strong>ORDER BY is slower.</strong>&ensp;The plan executor&rsquo;s sort operator
-    collects all blocks, builds a sorted index, and emits sorted rows. The bottleneck is
-    the conversion back from columnar blocks to row format for wire serialization.
-    PostgreSQL&rsquo;s mature sort implementation with top-N heapsort and external merge
-    sort is hard to beat.
+    <strong>Index lookups are slightly slower.</strong>&ensp;mskql&rsquo;s B-tree index
+    lookup path goes through the plan executor and columnar block machinery, adding
+    overhead for single-row point lookups where PostgreSQL&rsquo;s highly optimized
+    index-scan path excels. The gap is small and may narrow with further tuning.
 </p>
 
 <h2>5. Running It Yourself</h2>

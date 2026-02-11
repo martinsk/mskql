@@ -323,7 +323,7 @@
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-    &ensp;&middot;&ensp; ~14,500 lines of C11 &ensp;&middot;&ensp; 512 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~15,500 lines of C11 &ensp;&middot;&ensp; 533 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -346,7 +346,7 @@
 <p>
     <strong>Understanding database internals.</strong>&ensp;Production databases are
     millions of lines of code. mskql distills the core ideas&mdash;wire protocol, parser,
-    query executor, storage engine, arena allocator, plan executor&mdash;into ~14,500
+    query executor, storage engine, arena allocator, plan executor&mdash;into ~15,500
     readable lines of C11 with zero dependencies. Every layer is visible and
     modifiable: from how a <code>SELECT</code> is parsed into an AST, to how a hash join
     probes its build table, to how a bump allocator recycles memory across
@@ -362,7 +362,7 @@
     It demonstrates that adversarial AI collaboration can produce non-trivial systems
     software: a hand-written recursive-descent parser, a block-oriented vectorized
     executor, arena-based memory management, and a PostgreSQL-compatible wire protocol.
-    The key enabler is a tight feedback loop&mdash;write code, run 512 tests, fix
+    The key enabler is a tight feedback loop&mdash;write code, run 533 tests, fix
     failures, repeat&mdash;that mirrors how experienced engineers ship production
     systems.<span class="sidenote">The adversarial model (one agent writes code, another
     writes tests to break it, a third reviews the source and leaves actionable comments) drove the
@@ -435,8 +435,8 @@
 
   <!-- Result box -->
   <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">512 tests pass</text>
-  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~14,500 lines of C &middot; zero human code</text>
+  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">533 tests pass</text>
+  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~15,500 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
@@ -497,7 +497,9 @@
                 <code>SELECT</code> with <code>WHERE</code>, projections,
                 <code>ORDER BY</code>, <code>LIMIT</code>/<code>OFFSET</code>,
                 hash joins, hash aggregation, and B-tree index scans for equality
-                predicates. A direct columnar-to-wire serialization path bypasses
+                predicates. A scan cache with generation tracking avoids
+                redundant sequential scans when the underlying table has not
+                been mutated. A direct columnar-to-wire serialization path bypasses
                 row materialization entirely for plan-executed queries.</span>
                 Handles joins (with compound <code>ON</code> conditions),
                 aggregation (including <code>DISTINCT</code> aggregates,
@@ -525,8 +527,14 @@
     <code>query_parse()</code> and <code>query_free()</code>.</span>
     Expressions are represented as a tagged-union AST (<code>struct&nbsp;expr</code>)
     with types for literals, column references, binary/unary operators, function calls,
-    <code>CASE&nbsp;WHEN</code>, and subqueries&mdash;evaluated by a tree-walking
-    <code>eval_expr()</code>. Ownership follows JPL rules: the allocating module
+    <code>CASE&nbsp;WHEN</code>, casts, and subqueries&mdash;evaluated by a tree-walking
+    <code>eval_expr()</code>. The <code>CAST()</code> function and PostgreSQL&rsquo;s
+    <code>::</code> postfix operator support numeric, text, boolean, and
+    date/timestamp conversions. Date/time arithmetic (timestamp &plusmn; interval,
+    timestamp &minus; timestamp) and temporal functions
+    (<code>EXTRACT</code>, <code>DATE_TRUNC</code>, <code>AGE</code>,
+    <code>TO_CHAR</code>, <code>NOW</code>) are handled natively.
+    Ownership follows JPL rules: the allocating module
     deallocates, with <code>cell_release()</code> as the single canonical release
     function for cell text.
     A slab-chain bump allocator (<code>arena.scratch</code>) handles temporary
@@ -908,7 +916,7 @@ SELECT NEXTVAL('invoice_seq') AS inv,
 <table class="result-table">
 <thead><tr><th>inv</th><th>ref</th></tr></thead>
 <tbody>
-<tr><td class="num-val">1000</td><td>a3f7c&hellip;4e21</td></tr>
+<tr><td class="num-val">1000</td><td style="font-family:'Menlo','Consolas',monospace;font-size:0.82rem">a3f7c2e1-90b4-4d8a-b6f3-7e2d1c4f5a21</td></tr>
 </tbody>
 </table>
 </div>
@@ -991,10 +999,13 @@ ORDER BY dt;</code></pre>
 <h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes 512 SQL test cases covering DDL, DML, joins, aggregation,
-    window functions (including frames), set operations, CTEs, transactions, NULL handling,
-    type coercion, constraint enforcement, foreign keys, sequences, views, string functions,
-    expression evaluation, upserts, correlated subqueries, and various edge cases. A separate
+    The project includes 533 SQL test cases covering DDL, DML, joins, aggregation,
+    window functions (including frames), set operations, CTEs, transactions (including
+    nested <code>BEGIN</code>), NULL handling,
+    type coercion, <code>CAST</code>/<code>::</code> conversions, constraint enforcement,
+    foreign keys, sequences, views, string functions, date/time arithmetic,
+    temporal functions, expression evaluation, upserts, correlated subqueries,
+    and various edge cases. A separate
     concurrent test harness exercises multi-client scenarios.<span class="sidenote">Each
     test case starts a fresh server instance, sends SQL via <code>psql</code>, and validates
     output against expected results. No test framework&mdash;just shell scripts and
