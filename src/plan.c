@@ -55,6 +55,8 @@ static uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
     if (pn->op == PLAN_PROJECT) return pn->project.ncols;
     if (pn->op == PLAN_HASH_AGG)
         return pn->hash_agg.ngroup_cols + (uint16_t)pn->hash_agg.agg_count;
+    if (pn->op == PLAN_SORT)
+        return plan_node_ncols(arena, pn->left);
     /* For pass-through nodes, recurse to child */
     return plan_node_ncols(arena, pn->left);
 }
@@ -867,6 +869,174 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* ---- Sort ---- */
+
+struct block_sort_ctx {
+    struct col_block *all_cols;
+    uint16_t          ncols;
+    uint32_t          rows_per_block;
+    int              *sort_cols;
+    int              *sort_descs;
+    uint16_t          nsort_cols;
+};
+static struct block_sort_ctx _bsort_ctx;
+
+static int cb_compare(const struct col_block *a, uint16_t ai,
+                      const struct col_block *b, uint16_t bi)
+{
+    if (a->nulls[ai] && b->nulls[bi]) return 0;
+    if (a->nulls[ai]) return 1;
+    if (b->nulls[bi]) return -1;
+    if (a->type == COLUMN_TYPE_INT || a->type == COLUMN_TYPE_BOOLEAN) {
+        int32_t va = a->data.i32[ai], vb = b->data.i32[bi];
+        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+    }
+    if (a->type == COLUMN_TYPE_BIGINT) {
+        int64_t va = a->data.i64[ai], vb = b->data.i64[bi];
+        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+    }
+    if (a->type == COLUMN_TYPE_FLOAT || a->type == COLUMN_TYPE_NUMERIC) {
+        double va = a->data.f64[ai], vb = b->data.f64[bi];
+        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+    }
+    const char *sa = a->data.str[ai], *sb = b->data.str[bi];
+    if (!sa && !sb) return 0;
+    if (!sa) return -1;
+    if (!sb) return 1;
+    int cmp = strcmp(sa, sb);
+    return (cmp < 0) ? -1 : (cmp > 0) ? 1 : 0;
+}
+
+static int sort_index_cmp(const void *a, const void *b)
+{
+    uint32_t ia = *(const uint32_t *)a;
+    uint32_t ib = *(const uint32_t *)b;
+    uint32_t block_a = ia / _bsort_ctx.rows_per_block;
+    uint16_t row_a = (uint16_t)(ia % _bsort_ctx.rows_per_block);
+    uint32_t block_b = ib / _bsort_ctx.rows_per_block;
+    uint16_t row_b = (uint16_t)(ib % _bsort_ctx.rows_per_block);
+
+    for (uint16_t k = 0; k < _bsort_ctx.nsort_cols; k++) {
+        int ci = _bsort_ctx.sort_cols[k];
+        struct col_block *ca = &_bsort_ctx.all_cols[block_a * _bsort_ctx.ncols + ci];
+        struct col_block *cblk = &_bsort_ctx.all_cols[block_b * _bsort_ctx.ncols + ci];
+        int cmp = cb_compare(ca, row_a, cblk, row_b);
+        if (_bsort_ctx.sort_descs[k]) cmp = -cmp;
+        if (cmp != 0) return cmp;
+    }
+    return 0;
+}
+
+static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                     struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct sort_state *st = (struct sort_state *)ctx->node_states[node_idx];
+    if (!st) {
+        st = (struct sort_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        st->block_cap = 16;
+        st->collected = (struct row_block *)bump_calloc(&ctx->arena->scratch,
+                                                         st->block_cap, sizeof(struct row_block));
+        ctx->node_states[node_idx] = st;
+    }
+
+    if (!st->input_done) {
+        uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
+        if (child_ncols == 0) child_ncols = out->ncols;
+
+        for (;;) {
+            if (st->nblocks >= st->block_cap) {
+                uint32_t new_cap = st->block_cap * 2;
+                struct row_block *new_arr = (struct row_block *)bump_calloc(
+                    &ctx->arena->scratch, new_cap, sizeof(struct row_block));
+                memcpy(new_arr, st->collected, st->nblocks * sizeof(struct row_block));
+                st->collected = new_arr;
+                st->block_cap = new_cap;
+            }
+
+            struct row_block *blk = &st->collected[st->nblocks];
+            row_block_alloc(blk, child_ncols, &ctx->arena->scratch);
+            int rc = plan_next_block(ctx, pn->left, blk);
+            if (rc != 0) break;
+
+            if (blk->sel) {
+                uint16_t active = blk->sel_count;
+                struct row_block compact;
+                row_block_alloc(&compact, child_ncols, &ctx->arena->scratch);
+                compact.count = active;
+                for (uint16_t c = 0; c < child_ncols; c++) {
+                    compact.cols[c].type = blk->cols[c].type;
+                    compact.cols[c].count = active;
+                    for (uint16_t i = 0; i < active; i++) {
+                        uint16_t ri = (uint16_t)blk->sel[i];
+                        cb_copy_value(&compact.cols[c], i, &blk->cols[c], ri);
+                    }
+                }
+                *blk = compact;
+            }
+
+            st->nblocks++;
+        }
+
+        uint32_t total = 0;
+        for (uint32_t b = 0; b < st->nblocks; b++)
+            total += st->collected[b].count;
+
+        st->sorted_count = total;
+        st->sorted_indices = (uint32_t *)bump_alloc(&ctx->arena->scratch,
+                                                     (total ? total : 1) * sizeof(uint32_t));
+
+        uint32_t idx = 0;
+        for (uint32_t b = 0; b < st->nblocks; b++)
+            for (uint16_t r = 0; r < st->collected[b].count; r++)
+                st->sorted_indices[idx++] = b * BLOCK_CAPACITY + r;
+
+        _bsort_ctx.ncols = child_ncols;
+        _bsort_ctx.rows_per_block = BLOCK_CAPACITY;
+        _bsort_ctx.sort_cols = pn->sort.sort_cols;
+        _bsort_ctx.sort_descs = pn->sort.sort_descs;
+        _bsort_ctx.nsort_cols = pn->sort.nsort_cols;
+
+        _bsort_ctx.all_cols = (struct col_block *)bump_alloc(&ctx->arena->scratch,
+                                (st->nblocks ? st->nblocks : 1) * child_ncols * sizeof(struct col_block));
+        for (uint32_t b = 0; b < st->nblocks; b++)
+            memcpy(&_bsort_ctx.all_cols[b * child_ncols],
+                   st->collected[b].cols,
+                   child_ncols * sizeof(struct col_block));
+
+        if (total > 1)
+            qsort(st->sorted_indices, total, sizeof(uint32_t), sort_index_cmp);
+
+        st->input_done = 1;
+        st->emit_cursor = 0;
+    }
+
+    if (st->emit_cursor >= st->sorted_count) return -1;
+
+    uint16_t child_ncols = _bsort_ctx.ncols;
+    row_block_reset(out);
+    uint16_t out_count = 0;
+
+    while (st->emit_cursor < st->sorted_count && out_count < BLOCK_CAPACITY) {
+        uint32_t encoded = st->sorted_indices[st->emit_cursor++];
+        uint32_t block_idx = encoded / BLOCK_CAPACITY;
+        uint16_t row_idx = (uint16_t)(encoded % BLOCK_CAPACITY);
+
+        for (uint16_t c = 0; c < child_ncols; c++) {
+            struct col_block *src = &_bsort_ctx.all_cols[block_idx * child_ncols + c];
+            out->cols[c].type = src->type;
+            cb_copy_value(&out->cols[c], out_count, src, row_idx);
+        }
+        out_count++;
+    }
+
+    out->count = out_count;
+    for (uint16_t c = 0; c < child_ncols; c++)
+        out->cols[c].count = out_count;
+
+    return 0;
+}
+
 /* ---- Dispatcher ---- */
 
 int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -881,6 +1051,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     if (pn->op == PLAN_LIMIT)        return limit_next(ctx, node_idx, out);
     if (pn->op == PLAN_HASH_JOIN)    return hash_join_next(ctx, node_idx, out);
     if (pn->op == PLAN_HASH_AGG)     return hash_agg_next(ctx, node_idx, out);
+    if (pn->op == PLAN_SORT)         return sort_next(ctx, node_idx, out);
     /* Not yet implemented */
     return -1;
 }
@@ -937,7 +1108,6 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
     if (s->has_recursive_cte)   return IDX_NONE;
     if (s->has_distinct)        return IDX_NONE;
     if (s->has_distinct_on)     return IDX_NONE;
-    if (s->has_order_by)        return IDX_NONE;
     if (!t)                     return IDX_NONE;
     if (s->insert_rows_count > 0) return IDX_NONE; /* literal SELECT */
 
@@ -969,7 +1139,77 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         return IDX_NONE;
     }
 
-    /* Build seq scan node: scan all table columns */
+    /* Pre-validate ORDER BY columns BEFORE allocating plan nodes */
+    int  sort_cols_buf[32];
+    int  sort_descs_buf[32];
+    uint16_t sort_nord = 0;
+    if (s->has_order_by && s->order_by_count > 0) {
+        sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+        for (uint16_t k = 0; k < sort_nord; k++) {
+            struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
+            sort_descs_buf[k] = obi->desc;
+            sort_cols_buf[k] = table_find_column_sv(t, obi->column);
+            if (sort_cols_buf[k] < 0 && need_project) {
+                for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                    struct select_column *scp = &arena->select_cols.items[s->parsed_columns_start + pc];
+                    if (scp->alias.len > 0 && sv_eq_ignorecase(obi->column, scp->alias)) {
+                        if (scp->expr_idx != IDX_NONE && EXPR(arena, scp->expr_idx).type == EXPR_COLUMN_REF)
+                            sort_cols_buf[k] = table_find_column_sv(t, EXPR(arena, scp->expr_idx).column_ref.column);
+                        break;
+                    }
+                }
+            }
+            if (sort_cols_buf[k] < 0) return IDX_NONE;
+        }
+    }
+
+    /* Pre-validate WHERE clause BEFORE allocating plan nodes */
+    int filter_col = -1;
+    int filter_ok = 0;
+    if (s->where.has_where) {
+        if (s->where.where_cond == IDX_NONE)
+            return IDX_NONE;
+        struct condition *cond = &COND(arena, s->where.where_cond);
+        if (cond->type != COND_COMPARE || cond->lhs_expr != IDX_NONE
+            || cond->rhs_column.len != 0)
+            return IDX_NONE;
+        /* Reject subqueries, IN lists, ANY/ALL arrays — plan executor can't handle */
+        if (cond->scalar_subquery_sql != IDX_NONE) return IDX_NONE;
+        if (cond->subquery_sql != IDX_NONE) return IDX_NONE;
+        if (cond->in_values_count > 0) return IDX_NONE;
+        if (cond->array_values_count > 0) return IDX_NONE;
+        if (cond->is_any || cond->is_all) return IDX_NONE;
+        filter_col = table_find_column_sv(t, cond->column);
+        if (filter_col < 0) return IDX_NONE;
+        enum column_type ct = t->columns.items[filter_col].type;
+        if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BOOLEAN &&
+            ct != COLUMN_TYPE_FLOAT && ct != COLUMN_TYPE_NUMERIC &&
+            ct != COLUMN_TYPE_BIGINT)
+            return IDX_NONE;
+        if (cond->op > CMP_GE) return IDX_NONE;
+        /* Reject cross-type comparisons (e.g. INT col vs FLOAT value from subquery) */
+        if (!cond->value.is_null && cond->value.type != ct &&
+            !(ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT) &&
+            !(ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT))
+            return IDX_NONE;
+        /* If INT column but FLOAT value, reject — fast path can't handle */
+        if (ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)
+            return IDX_NONE;
+        filter_ok = 1;
+    }
+
+    /* Bail out if table has mixed cell types (e.g. after ALTER COLUMN TYPE) */
+    if (t->rows.count > 0) {
+        struct row *first = &t->rows.items[0];
+        for (size_t c = 0; c < first->cells.count && c < t->columns.count; c++) {
+            if (!first->cells.items[c].is_null &&
+                first->cells.items[c].type != t->columns.items[c].type)
+                return IDX_NONE;
+        }
+    }
+
+    /* --- All validation passed, now allocate plan nodes --- */
+
     uint16_t scan_ncols = (uint16_t)t->columns.count;
     int *col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
     for (uint16_t i = 0; i < scan_ncols; i++)
@@ -983,35 +1223,31 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
 
     uint32_t current = scan_idx;
 
-    /* Add filter node if WHERE clause exists */
-    if (s->where.has_where && s->where.where_cond != IDX_NONE) {
-        /* Only handle simple numeric comparisons in the block fast path.
-         * Anything more complex falls back to legacy executor. */
+    /* Add filter node if WHERE clause was validated */
+    if (filter_ok) {
         struct condition *cond = &COND(arena, s->where.where_cond);
-        if (cond->type != COND_COMPARE || cond->lhs_expr != IDX_NONE
-            || cond->rhs_column.len != 0)
-            return IDX_NONE;
-
-        int ci = table_find_column_sv(t, cond->column);
-        if (ci < 0) return IDX_NONE;
-
-        enum column_type ct = t->columns.items[ci].type;
-        if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BOOLEAN &&
-            ct != COLUMN_TYPE_FLOAT && ct != COLUMN_TYPE_NUMERIC &&
-            ct != COLUMN_TYPE_BIGINT)
-            return IDX_NONE;
-
-        /* Only handle basic comparison ops (EQ, NE, LT, GT, LE, GE) */
-        if (cond->op > CMP_GE) return IDX_NONE;
-
         uint32_t filter_idx = plan_alloc_node(arena, PLAN_FILTER);
         PLAN_NODE(arena, filter_idx).left = current;
         PLAN_NODE(arena, filter_idx).filter.cond_idx = s->where.where_cond;
-        PLAN_NODE(arena, filter_idx).filter.col_idx = ci;
+        PLAN_NODE(arena, filter_idx).filter.col_idx = filter_col;
         PLAN_NODE(arena, filter_idx).filter.cmp_op = (int)cond->op;
         PLAN_NODE(arena, filter_idx).filter.cmp_val = cond->value;
-
         current = filter_idx;
+    }
+
+    /* Add SORT node if ORDER BY was validated */
+    if (sort_nord > 0) {
+        int *sort_cols = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
+        int *sort_descs = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
+        memcpy(sort_cols, sort_cols_buf, sort_nord * sizeof(int));
+        memcpy(sort_descs, sort_descs_buf, sort_nord * sizeof(int));
+
+        uint32_t sort_idx = plan_alloc_node(arena, PLAN_SORT);
+        PLAN_NODE(arena, sort_idx).left = current;
+        PLAN_NODE(arena, sort_idx).sort.sort_cols = sort_cols;
+        PLAN_NODE(arena, sort_idx).sort.sort_descs = sort_descs;
+        PLAN_NODE(arena, sort_idx).sort.nsort_cols = sort_nord;
+        current = sort_idx;
     }
 
     /* Add projection node if specific columns are selected */

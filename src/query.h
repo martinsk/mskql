@@ -439,6 +439,7 @@ struct query_create_table {
 
 struct query_drop_table {
     sv table;
+    int if_exists;
 };
 
 struct query_alter {

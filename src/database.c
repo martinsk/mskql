@@ -216,6 +216,48 @@ static void build_merged_columns_ex(struct table *t1, const char *alias1,
     }
 }
 
+/* FNV-1a hash for a struct cell value (mirrors block_hash_cell in block.h).
+ * Numeric types (INT, FLOAT, BIGINT, NUMERIC) are all hashed as double
+ * so that INT(1) and FLOAT(1.0) produce the same hash — required for
+ * correct cross-type equi-joins. */
+static uint32_t cell_hash(const struct cell *c)
+{
+    if (c->is_null) return 0;
+    uint32_t h = 2166136261u;
+    switch (c->type) {
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_BIGINT:
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC: {
+            double dv;
+            if (c->type == COLUMN_TYPE_INT || c->type == COLUMN_TYPE_BOOLEAN)
+                dv = (double)c->value.as_int;
+            else if (c->type == COLUMN_TYPE_BIGINT)
+                dv = (double)c->value.as_bigint;
+            else
+                dv = c->value.as_float;
+            uint8_t *p = (uint8_t *)&dv;
+            for (int i = 0; i < 8; i++) { h ^= p[i]; h *= 16777619u; }
+            break;
+        }
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+            if (c->value.as_text) {
+                const char *s = c->value.as_text;
+                while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+            }
+            break;
+    }
+    return h;
+}
+
 /* perform a single join between two table descriptors, producing merged rows and columns */
 static int join_cmp_match(const struct cell *a, const struct cell *b, enum cmp_op op)
 {
@@ -277,13 +319,100 @@ static int do_single_join(struct table *t1, const char *alias1,
     int *t1_matched = calloc(t1->rows.count, sizeof(int));
     int *t2_matched = calloc(t2->rows.count, sizeof(int));
 
+    /* Try to extract simple equi-join column indices for hash join.
+     * Works for both the join_on_cond path (single COND_COMPARE EQ with
+     * two column refs) and the simple left_col/right_col path. */
+    int hj_t1_col = -1, hj_t2_col = -1;
+    int use_hash_join = 0;
+
     if (join_on_cond != IDX_NONE && arena) {
-        /* use full condition tree for matching */
+        struct condition *cond = &COND(arena, join_on_cond);
+        if (cond->type == COND_COMPARE && cond->op == CMP_EQ &&
+            cond->column.len > 0 && cond->rhs_column.len > 0 &&
+            cond->lhs_expr == IDX_NONE) {
+            /* single equality on two column refs — extract indices from merged table */
+            int lhs = table_find_column_sv(out_meta, cond->column);
+            int rhs = table_find_column_sv(out_meta, cond->rhs_column);
+            if (lhs >= 0 && rhs >= 0) {
+                /* map merged-table indices back to t1/t2 indices */
+                if (lhs < (int)ncols1 && rhs >= (int)ncols1) {
+                    hj_t1_col = lhs;
+                    hj_t2_col = rhs - (int)ncols1;
+                    use_hash_join = 1;
+                } else if (rhs < (int)ncols1 && lhs >= (int)ncols1) {
+                    hj_t1_col = rhs;
+                    hj_t2_col = lhs - (int)ncols1;
+                    use_hash_join = 1;
+                }
+            }
+        }
+    } else if (join_op == CMP_EQ) {
+        char buf[256], buf2[256];
+        const char *left_col = extract_col_name(left_col_sv, buf, sizeof(buf));
+        const char *right_col = extract_col_name(right_col_sv, buf2, sizeof(buf2));
+
+        int left_in_t1 = (table_find_column(t1, left_col) >= 0);
+        hj_t1_col = left_in_t1 ? table_find_column(t1, left_col) : table_find_column(t1, right_col);
+        hj_t2_col = left_in_t1 ? table_find_column(t2, right_col) : table_find_column(t2, left_col);
+
+        if (hj_t1_col >= 0 && hj_t2_col >= 0)
+            use_hash_join = 1;
+        else {
+            fprintf(stderr, "join error: could not resolve ON columns\n");
+            free(t1_matched);
+            free(t2_matched);
+            return -1;
+        }
+    }
+
+    if (use_hash_join) {
+        /* Hash join: build on t2 (typically smaller), probe with t1 */
+        size_t build_n = t2->rows.count;
+        uint32_t nbuckets = 1;
+        while (nbuckets < build_n * 2) nbuckets <<= 1;
+
+        uint32_t *ht_buckets = calloc(nbuckets, sizeof(uint32_t));
+        uint32_t *ht_nexts = calloc(build_n ? build_n : 1, sizeof(uint32_t));
+        uint32_t *ht_hashes = calloc(build_n ? build_n : 1, sizeof(uint32_t));
+        memset(ht_buckets, 0xFF, nbuckets * sizeof(uint32_t)); /* IDX_NONE */
+
+        /* build phase: hash t2 join column */
+        for (size_t j = 0; j < build_n; j++) {
+            uint32_t h = cell_hash(&t2->rows.items[j].cells.items[hj_t2_col]);
+            uint32_t bucket = h & (nbuckets - 1);
+            ht_hashes[j] = h;
+            ht_nexts[j] = ht_buckets[bucket];
+            ht_buckets[bucket] = (uint32_t)j;
+        }
+
+        /* probe phase: for each t1 row, look up in hash table */
+        for (size_t i = 0; i < t1->rows.count; i++) {
+            struct cell *probe = &t1->rows.items[i].cells.items[hj_t1_col];
+            uint32_t h = cell_hash(probe);
+            uint32_t bucket = h & (nbuckets - 1);
+            uint32_t entry = ht_buckets[bucket];
+
+            while (entry != 0xFFFFFFFF) {
+                if (ht_hashes[entry] == h &&
+                    cell_equal(probe, &t2->rows.items[entry].cells.items[hj_t2_col])) {
+                    t1_matched[i] = 1;
+                    t2_matched[entry] = 1;
+                    emit_merged_row(&t1->rows.items[i], ncols1,
+                                    &t2->rows.items[entry], ncols2, out_rows);
+                }
+                entry = ht_nexts[entry];
+            }
+        }
+
+        free(ht_buckets);
+        free(ht_nexts);
+        free(ht_hashes);
+    } else if (join_on_cond != IDX_NONE && arena) {
+        /* complex ON condition: nested-loop fallback with eval_condition */
         for (size_t i = 0; i < t1->rows.count; i++) {
             struct row *r1 = &t1->rows.items[i];
             for (size_t j = 0; j < t2->rows.count; j++) {
                 struct row *r2 = &t2->rows.items[j];
-                /* build temporary merged row for eval_condition */
                 struct row tmp = {0};
                 da_init(&tmp.cells);
                 for (size_t c = 0; c < ncols1; c++)
@@ -299,6 +428,7 @@ static int do_single_join(struct table *t1, const char *alias1,
             }
         }
     } else {
+        /* non-equality join: nested-loop fallback */
         char buf[256], buf2[256];
         const char *left_col = extract_col_name(left_col_sv, buf, sizeof(buf));
         const char *right_col = extract_col_name(right_col_sv, buf2, sizeof(buf2));
@@ -1100,6 +1230,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                     return 0;
                 }
             }
+            if (q->drop_table.if_exists) return 0;
             fprintf(stderr, "drop error: table '" SV_FMT "' not found\n", SV_ARG(drop_tbl));
             return -1;
         }

@@ -2618,6 +2618,7 @@ static int parse_value_tuple(struct lexer *l, struct row *r, struct query_arena 
             c.value.as_text = bump_strndup(&a->bump, tok.value.data, tok.value.len);
         } else if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "NULL")) {
             c.type = COLUMN_TYPE_TEXT;
+            c.is_null = 1;
             c.value.as_text = NULL;
         } else if (tok.type == TOK_KEYWORD &&
                    (sv_eq_ignorecase_cstr(tok.value, "TRUE") ||
@@ -3255,7 +3256,21 @@ static int parse_drop(struct lexer *l, struct query *out)
     }
 
     out->query_type = QUERY_TYPE_DROP;
+    out->drop_table.if_exists = 0;
     tok = lexer_next(l);
+    /* handle IF EXISTS */
+    if ((tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) &&
+        sv_eq_ignorecase_cstr(tok.value, "IF")) {
+        struct token exists_tok = lexer_next(l);
+        if ((exists_tok.type == TOK_IDENTIFIER || exists_tok.type == TOK_KEYWORD) &&
+            sv_eq_ignorecase_cstr(exists_tok.value, "EXISTS")) {
+            out->drop_table.if_exists = 1;
+            tok = lexer_next(l);
+        } else {
+            fprintf(stderr, "parse error: expected EXISTS after IF\n");
+            return -1;
+        }
+    }
     if (tok.type == TOK_IDENTIFIER || tok.type == TOK_STRING) {
         out->drop_table.table = tok.value;
     } else {
