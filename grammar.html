@@ -578,8 +578,8 @@
 &ensp;&ensp;| <span class="nt">func_call</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">CASE WHEN</span> <span class="nt">condition</span> <span class="kw">THEN</span> <span class="nt">expr</span> { <span class="kw">WHEN</span> ... } [ <span class="kw">ELSE</span> <span class="nt">expr</span> ] <span class="kw">END</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="comment">&ensp;-- scalar subquery</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">::</span> <span class="nt">data_type</span> <span class="comment">&ensp;-- CAST</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CAST</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">AS</span> <span class="nt">data_type</span> <span class="kw">)</span> <span class="badge badge-partial">PARTIAL</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">::</span> <span class="nt">data_type</span> <span class="comment">&ensp;-- postfix cast</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CAST</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">AS</span> <span class="nt">data_type</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 <br>
 <span class="nt">binary_op</span> <span class="op">::=</span>
   <span class="kw">+</span> | <span class="kw">-</span> | <span class="kw">*</span> | <span class="kw">/</span> | <span class="kw">%</span> | <span class="kw">||</span><br>
@@ -608,10 +608,14 @@
 &ensp;&ensp;| <span class="kw">NEXTVAL</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">CURRVAL</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">GEN_RANDOM_UUID</span> <span class="kw">()</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">NOW</span> <span class="kw">()</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CURRENT_TIMESTAMP</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">EXTRACT</span> <span class="kw">(</span> <span class="nt">field</span> <span class="kw">FROM</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">DATE_TRUNC</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">NOW</span> <span class="kw">()</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CURRENT_TIMESTAMP</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CURRENT_DATE</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">EXTRACT</span> <span class="kw">(</span> <span class="nt">field</span> <span class="kw">FROM</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">DATE_PART</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">DATE_TRUNC</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">AGE</span> <span class="kw">(</span> <span class="nt">expr</span> [ <span class="kw">,</span> <span class="nt">expr</span> ] <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">TO_CHAR</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">string</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">REPLACE</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">LEFT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> / <span class="kw">RIGHT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">ABS</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">ROUND</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">CEIL</span> / <span class="kw">FLOOR</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
@@ -689,16 +693,14 @@
         </tr>
         <tr>
             <td><strong>Functions</strong></td>
-            <td><code>NOW()</code>, <code>CURRENT_TIMESTAMP</code>,
-                <code>EXTRACT()</code>, <code>DATE_TRUNC()</code>,
-                <code>REPLACE()</code>, <code>LEFT()</code>/<code>RIGHT()</code>,
+            <td><code>REPLACE()</code>, <code>LEFT()</code>/<code>RIGHT()</code>,
                 <code>ABS()</code>, <code>ROUND()</code>, <code>CEIL()</code>/<code>FLOOR()</code>,
                 <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code></td>
             <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
         </tr>
         <tr>
             <td><strong>Expressions</strong></td>
-            <td><code>::</code> cast operator, <code>SIMILAR TO</code>,
+            <td><code>SIMILAR TO</code>,
                 POSIX regex (<code>~</code>, <code>~*</code>),
                 <code>ARRAY[...]</code> constructor</td>
             <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
@@ -743,13 +745,15 @@
         </tr>
         <tr>
             <td><strong>Other</strong></td>
-            <td><code>PREPARE</code>/<code>EXECUTE</code> (prepared statements),
+            <td><code>PREPARE</code>/<code>EXECUTE</code> (SQL-level prepared statements;
+                wire-level Extended Query Protocol with <code>Parse</code>/<code>Bind</code>/<code>Execute</code>
+                is supported),
                 <code>COPY</code>,
                 <code>LISTEN</code>/<code>NOTIFY</code>,
                 <code>GRANT</code>/<code>REVOKE</code>,
                 stored procedures/functions,
                 triggers</td>
-            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+            <td><span class="badge badge-partial">PARTIAL</span></td>
         </tr>
     </tbody>
 </table>
