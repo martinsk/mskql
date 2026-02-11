@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770786676350,
+  "lastUpdate": 1770791928771,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -789,6 +789,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.028,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "55d9720a7431d70083baa5e185585f447328fafa",
+          "message": "add bump allocator for result row text to eliminate per-cell malloc/free in query execution\n\nIntroduce result_text bump allocator in query_arena to bulk-allocate text for result rows instead of individual malloc per cell. Add arena_owns_text flag to struct rows to track ownership mode. When flag is set, text lives in result_text bump and is freed in one shot via bump_reset; otherwise fall back to per-cell free for heap-allocated text.\n\nThread optional struct bump_alloc *rb parameter through db_exec,",
+          "timestamp": "2026-02-10T22:38:28-08:00",
+          "tree_id": "c1664650f3baa0643eb80f82a0f081b9ab30f4dd",
+          "url": "https://github.com/martinsk/mskql/commit/55d9720a7431d70083baa5e185585f447328fafa"
+        },
+        "date": 1770791928491,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.379,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 87.826,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 131.931,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 182.744,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 127.052,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.253,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 23.25,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 111.175,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 211.099,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 4.814,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 18.675,
             "unit": "ms"
           }
         ]
