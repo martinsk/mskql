@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770842577713,
+  "lastUpdate": 1770850449889,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1421,6 +1421,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 18.546,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "1f95b416fa51b45fc0808fefb6f34bd653ddb6b7",
+          "message": "add arena state synchronization after query execution to preserve bump allocator and dynamic array growth across plan and db_exec paths\n\nCopy q.arena state back to conn_arena after try_plan_send() and db_exec() to capture bump slab growth and dynamic array reallocations that occurred during query execution. After plan path, copy entire arena struct. After db_exec path, selectively copy scratch/bump/plan_nodes/cells/svs fields while leaving result/result_text untouched since db_exec wrote those directly through conn_arena pointers.",
+          "timestamp": "2026-02-11T14:53:41-08:00",
+          "tree_id": "7a55278bee491ded1a5db4dbb19d8464623ab3a2",
+          "url": "https://github.com/martinsk/mskql/commit/1f95b416fa51b45fc0808fefb6f34bd653ddb6b7"
+        },
+        "date": 1770850448852,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.845,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 80.501,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 102.859,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 174.989,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 118.993,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.285,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 23.268,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 113.697,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 217.614,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.015,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.194,
             "unit": "ms"
           }
         ]
