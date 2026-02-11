@@ -355,6 +355,39 @@ for ((s = 0; s < NWORKERS; s++)); do
     fi
 done
 
+# ---- C test suites (concurrent, extended, etc.) ----
+for ctest_dir in "$TESTCASE_DIR"/*/; do
+    [ -f "$ctest_dir/Makefile" ] || continue
+    ctest_name="$(basename "$ctest_dir")"
+    # build
+    if ! make -C "$ctest_dir" 2>/dev/null; then
+        FAIL=$((FAIL + 1))
+        FAIL_OUTPUT="${FAIL_OUTPUT}  FAIL: C test suite '$ctest_name' failed to build"$'\n'
+        continue
+    fi
+    # find the target binary from the Makefile (convention: ../../../build/test_<name>)
+    ctest_bin="$PROJECT_DIR/build/test_${ctest_name}"
+    if [ ! -x "$ctest_bin" ]; then
+        FAIL=$((FAIL + 1))
+        FAIL_OUTPUT="${FAIL_OUTPUT}  FAIL: C test suite '$ctest_name' binary not found at $ctest_bin"$'\n'
+        continue
+    fi
+    # run from project root (the binary does execl("./build/mskql", ...))
+    if ctest_out=$( cd "$PROJECT_DIR" && "$ctest_bin" 2>&1 ); then
+        # count individual checks from "All N tests passed"
+        n=$(echo "$ctest_out" | grep -oE 'All [0-9]+ tests passed' | grep -oE '[0-9]+')
+        if [ -n "$n" ]; then
+            PASS=$((PASS + n))
+        else
+            PASS=$((PASS + 1))
+        fi
+    else
+        FAIL=$((FAIL + 1))
+        FAIL_OUTPUT="${FAIL_OUTPUT}  FAIL: C test suite '$ctest_name':"$'\n'
+        FAIL_OUTPUT="${FAIL_OUTPUT}$(echo "$ctest_out" | grep -E 'FAIL')"$'\n'
+    fi
+done
+
 # ---- summary ----
 if [ -n "$FAIL_OUTPUT" ]; then
     echo "$FAIL_OUTPUT"

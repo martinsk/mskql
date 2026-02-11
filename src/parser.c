@@ -218,14 +218,39 @@ static struct token lexer_next(struct lexer *l)
         return tok;
     }
 
-    /* quoted string: "..." or '...' */
+    /* quoted string: "..." or '...' with SQL-standard '' escape */
     if (c == '"' || c == '\'') {
         char quote = c;
         l->pos++;
         size_t start = l->pos;
-        while (l->input[l->pos] && l->input[l->pos] != quote)
+        /* scan to find the end, handling doubled-quote escape */
+        int has_escape = 0;
+        while (l->input[l->pos]) {
+            if (l->input[l->pos] == quote) {
+                if (l->input[l->pos + 1] == quote) {
+                    /* doubled quote — escaped, skip both */
+                    has_escape = 1;
+                    l->pos += 2;
+                    continue;
+                }
+                break; /* end of string */
+            }
             l->pos++;
-        tok.value = sv_from(l->input + start, l->pos - start);
+        }
+        if (!has_escape) {
+            /* no escapes — zero-copy path */
+            tok.value = sv_from(l->input + start, l->pos - start);
+        } else {
+            /* collapse doubled quotes into single quotes using scratch buffer */
+            static __thread char esc_buf[8192];
+            size_t out = 0;
+            for (size_t i = start; i < l->pos && out < sizeof(esc_buf) - 1; i++) {
+                esc_buf[out++] = l->input[i];
+                if (l->input[i] == quote && l->input[i + 1] == quote)
+                    i++; /* skip the second quote */
+            }
+            tok.value = sv_from(esc_buf, out);
+        }
         tok.type = TOK_STRING;
         if (l->input[l->pos] == quote) l->pos++;
         return tok;

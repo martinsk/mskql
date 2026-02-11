@@ -258,6 +258,31 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c)
 
 #define MAX_CLIENTS 64
 
+/* ---- Extended Query Protocol: prepared statements & portals ---- */
+
+#define MAX_PARAMS 64
+#define MAX_PREPARED 32
+#define MAX_PORTALS 16
+
+struct prepared_stmt {
+    char *name;                 /* empty string = unnamed */
+    char *sql;                  /* original SQL with $1, $2, ... */
+    uint32_t *param_oids;       /* client-specified parameter OIDs (0 = unspecified) */
+    uint16_t nparams;           /* number of parameters from Parse */
+    int in_use;
+};
+
+struct portal {
+    char *name;                 /* empty string = unnamed */
+    char *sql;                  /* SQL with parameters substituted */
+    int16_t *result_formats;    /* per-column format codes (0=text, 1=binary) */
+    uint16_t nresult_formats;
+    int max_rows;               /* 0 = unlimited */
+    int in_use;
+    /* back-reference to the prepared statement for Describe */
+    int stmt_idx;               /* index into prepared[] or -1 */
+};
+
 enum client_phase {
     PHASE_STARTUP,      /* waiting for startup message (possibly after SSL) */
     PHASE_SSL_RETRY,    /* sent 'N' for SSLRequest, waiting for real startup */
@@ -272,7 +297,179 @@ struct client_state {
     size_t recv_len;
     size_t recv_cap;
     struct query_arena arena;   /* connection-scoped arena, reset per request */
+    /* Extended Query Protocol state */
+    struct prepared_stmt prepared[MAX_PREPARED];
+    struct portal portals[MAX_PORTALS];
+    int extended_error;         /* 1 = error occurred, skip until Sync */
 };
+
+static void prepared_stmt_free(struct prepared_stmt *ps)
+{
+    free(ps->name);
+    free(ps->sql);
+    free(ps->param_oids);
+    memset(ps, 0, sizeof(*ps));
+}
+
+static void portal_free(struct portal *p)
+{
+    free(p->name);
+    free(p->sql);
+    free(p->result_formats);
+    memset(p, 0, sizeof(*p));
+}
+
+static int find_prepared(struct client_state *c, const char *name)
+{
+    for (int i = 0; i < MAX_PREPARED; i++) {
+        if (c->prepared[i].in_use && strcmp(c->prepared[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static int find_portal(struct client_state *c, const char *name)
+{
+    for (int i = 0; i < MAX_PORTALS; i++) {
+        if (c->portals[i].in_use && strcmp(c->portals[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static int alloc_prepared(struct client_state *c)
+{
+    for (int i = 0; i < MAX_PREPARED; i++) {
+        if (!c->prepared[i].in_use) return i;
+    }
+    return -1;
+}
+
+static int alloc_portal(struct client_state *c)
+{
+    for (int i = 0; i < MAX_PORTALS; i++) {
+        if (!c->portals[i].in_use) return i;
+    }
+    return -1;
+}
+
+/* Substitute $1, $2, ... in SQL with literal parameter values.
+ * Text parameters are single-quoted with internal quotes doubled.
+ * NULL parameters become the literal string NULL.
+ * Returns a malloc'd string the caller must free. */
+static char *substitute_params(const char *sql, const char **param_values,
+                               const int *param_lengths, const int *param_formats,
+                               uint16_t nparams)
+{
+    /* estimate output size */
+    size_t sql_len = strlen(sql);
+    size_t est = sql_len + 256;
+    char *out = malloc(est);
+    if (!out) return NULL;
+    size_t pos = 0;
+
+    for (const char *p = sql; *p; ) {
+        if (*p == '$' && p[1] >= '1' && p[1] <= '9') {
+            /* parse parameter number */
+            const char *start = p;
+            p++; /* skip $ */
+            int num = 0;
+            while (*p >= '0' && *p <= '9') {
+                num = num * 10 + (*p - '0');
+                p++;
+            }
+            if (num < 1 || num > nparams) {
+                /* not a valid param ref — copy literally */
+                size_t span = (size_t)(p - start);
+                if (pos + span + 1 > est) {
+                    est = (pos + span + 1) * 2;
+                    out = realloc(out, est);
+                }
+                memcpy(out + pos, start, span);
+                pos += span;
+                continue;
+            }
+            int idx = num - 1;
+            if (!param_values[idx]) {
+                /* NULL parameter */
+                if (pos + 5 > est) { est = (pos + 5) * 2; out = realloc(out, est); }
+                memcpy(out + pos, "NULL", 4);
+                pos += 4;
+            } else if (param_formats && param_formats[idx] == 1) {
+                /* binary format — treat as integer for common cases */
+                /* For now, just insert as text (most drivers use text format) */
+                const char *val = param_values[idx];
+                size_t vlen = param_lengths ? (size_t)param_lengths[idx] : strlen(val);
+                size_t need = vlen + 3;
+                if (pos + need > est) { est = (pos + need) * 2; out = realloc(out, est); }
+                out[pos++] = '\'';
+                memcpy(out + pos, val, vlen);
+                pos += vlen;
+                out[pos++] = '\'';
+            } else {
+                /* text format — quote the value */
+                const char *val = param_values[idx];
+                size_t vlen = param_lengths ? (size_t)param_lengths[idx] : strlen(val);
+
+                /* check if value looks numeric (no quoting needed) */
+                int is_numeric = (vlen > 0);
+                int has_dot = 0;
+                for (size_t k = 0; k < vlen && is_numeric; k++) {
+                    char ch = val[k];
+                    if (ch == '-' && k == 0) continue;
+                    if (ch == '.' && !has_dot) { has_dot = 1; continue; }
+                    if (ch < '0' || ch > '9') is_numeric = 0;
+                }
+                /* also treat 't'/'f' as boolean literals */
+                int is_bool = (vlen == 1 && (val[0] == 't' || val[0] == 'f'));
+
+                if (is_numeric && vlen > 0 && !(vlen == 1 && val[0] == '-')) {
+                    /* numeric — insert without quotes */
+                    if (pos + vlen + 1 > est) { est = (pos + vlen + 1) * 2; out = realloc(out, est); }
+                    memcpy(out + pos, val, vlen);
+                    pos += vlen;
+                } else if (is_bool) {
+                    /* boolean — insert as TRUE/FALSE */
+                    const char *bval = (val[0] == 't') ? "TRUE" : "FALSE";
+                    size_t blen = (val[0] == 't') ? 4 : 5;
+                    if (pos + blen + 1 > est) { est = (pos + blen + 1) * 2; out = realloc(out, est); }
+                    memcpy(out + pos, bval, blen);
+                    pos += blen;
+                } else {
+                    /* text — single-quote with escaping */
+                    size_t need = vlen * 2 + 3;
+                    if (pos + need > est) { est = (pos + need) * 2; out = realloc(out, est); }
+                    out[pos++] = '\'';
+                    for (size_t k = 0; k < vlen; k++) {
+                        if (val[k] == '\'') out[pos++] = '\'';
+                        out[pos++] = val[k];
+                    }
+                    out[pos++] = '\'';
+                }
+            }
+        } else {
+            if (pos + 2 > est) { est = (pos + 2) * 2; out = realloc(out, est); }
+            out[pos++] = *p++;
+        }
+    }
+    out[pos] = '\0';
+    return out;
+}
+
+static uint16_t read_u16(const uint8_t *buf)
+{
+    return ((uint16_t)buf[0] << 8) | (uint16_t)buf[1];
+}
+
+static int16_t read_i16(const uint8_t *buf)
+{
+    return (int16_t)(((uint16_t)buf[0] << 8) | (uint16_t)buf[1]);
+}
+
+static int32_t read_i32(const uint8_t *buf)
+{
+    return (int32_t)read_u32(buf);
+}
 
 static void client_init(struct client_state *c, int fd)
 {
@@ -283,6 +480,9 @@ static void client_init(struct client_state *c, int fd)
     c->recv_len = 0;
     c->recv_cap = 0;
     query_arena_init(&c->arena);
+    memset(c->prepared, 0, sizeof(c->prepared));
+    memset(c->portals, 0, sizeof(c->portals));
+    c->extended_error = 0;
 }
 
 static void client_free(struct client_state *c)
@@ -294,6 +494,10 @@ static void client_free(struct client_state *c)
     c->recv_buf = NULL;
     c->recv_len = 0;
     c->recv_cap = 0;
+    for (int i = 0; i < MAX_PREPARED; i++)
+        if (c->prepared[i].in_use) prepared_stmt_free(&c->prepared[i]);
+    for (int i = 0; i < MAX_PORTALS; i++)
+        if (c->portals[i].in_use) portal_free(&c->portals[i]);
     query_arena_destroy(&c->arena);
 }
 
@@ -367,7 +571,31 @@ static int send_row_description(int fd, struct database *db, struct query *q,
         const char *colname = "?";
         uint32_t type_oid = 25; /* text */
 
-        if (q->select.select_exprs_count > 0 && (uint32_t)i < q->select.select_exprs_count) {
+        if (q->select.parsed_columns_count > 0 && (uint32_t)i < q->select.parsed_columns_count) {
+            struct select_column *sc = &q->arena.select_cols.items[q->select.parsed_columns_start + i];
+            if (sc->alias.len > 0) {
+                static __thread char abuf[256];
+                size_t al = sc->alias.len < 255 ? sc->alias.len : 255;
+                memcpy(abuf, sc->alias.data, al);
+                abuf[al] = '\0';
+                colname = abuf;
+            }
+            if (sc->expr_idx != IDX_NONE) {
+                struct expr *e = &EXPR(&q->arena, sc->expr_idx);
+                if (e->type == EXPR_COLUMN_REF && t) {
+                    int ci = table_find_column_sv(t, e->column_ref.column);
+                    if (ci >= 0) {
+                        if (sc->alias.len == 0)
+                            colname = t->columns.items[ci].name;
+                        type_oid = column_type_to_oid(t->columns.items[ci].type);
+                    }
+                } else if (result->count > 0 && (size_t)i < result->data[0].cells.count) {
+                    type_oid = column_type_to_oid(result->data[0].cells.items[i].type);
+                }
+            } else if (result->count > 0 && (size_t)i < result->data[0].cells.count) {
+                type_oid = column_type_to_oid(result->data[0].cells.items[i].type);
+            }
+        } else if (q->select.select_exprs_count > 0 && (uint32_t)i < q->select.select_exprs_count) {
             struct select_expr *se = &q->arena.select_exprs.items[q->select.select_exprs_start + i];
             if (se->kind == SEL_COLUMN) {
                 /* try to get name from table */
@@ -714,34 +942,36 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
 
 /* ---- handle a single query string (may contain one statement) ---- */
 
-static int handle_query(int fd, struct database *db, const char *sql,
-                        struct msgbuf *m, struct query_arena *conn_arena)
+/* Inner handler: parse, execute, send results + CommandComplete.
+ * If skip_row_desc is set, RowDescription is NOT sent (Extended Query Protocol:
+ * the client already received it from Describe, or will infer types).
+ * Does NOT send ReadyForQuery — caller decides when to send it.
+ * Returns 0 on success, -1 on error (error already sent to client). */
+static int handle_query_inner(int fd, struct database *db, const char *sql,
+                              struct msgbuf *m, struct query_arena *conn_arena,
+                              int skip_row_desc)
 {
     /* skip empty / whitespace-only queries */
     const char *p = sql;
     while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
     if (*p == '\0') {
         send_empty_query(fd, m);
-        send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
         return 0;
     }
 
     struct query q = {0};
     if (query_parse_into(sql, &q, conn_arena) != 0) {
-        /* arena is reset on next request — no query_free needed */
         send_error(fd, m, "ERROR", "42601", "syntax error or unsupported statement");
-        send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
-        return 0;
+        return -1;
     }
 
     /* Fast path: try direct columnar→wire send for SELECT queries */
-    if (q.query_type == QUERY_TYPE_SELECT) {
+    if (q.query_type == QUERY_TYPE_SELECT && !skip_row_desc) {
         int plan_rows = try_plan_send(fd, db, &q, conn_arena);
         if (plan_rows >= 0) {
             char tag[128];
             snprintf(tag, sizeof(tag), "SELECT %d", plan_rows);
             send_command_complete(fd, m, tag);
-            send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
             return 0;
         }
     }
@@ -753,8 +983,7 @@ static int handle_query(int fd, struct database *db, const char *sql,
     if (rc < 0) {
         send_error(fd, m, "ERROR", "42000", "query execution failed");
         arena_free_result_rows(conn_arena);
-        send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
-        return 0;
+        return -1;
     }
 
     /* build command tag */
@@ -767,15 +996,15 @@ static int handle_query(int fd, struct database *db, const char *sql,
             snprintf(tag, sizeof(tag), "DROP TABLE");
             break;
         case QUERY_TYPE_SELECT:
-            /* send RowDescription + DataRows */
-            send_row_description(fd, db, &q, result);
+            if (!skip_row_desc)
+                send_row_description(fd, db, &q, result);
             send_data_rows(fd, result);
             snprintf(tag, sizeof(tag), "SELECT %zu", result->count);
             break;
         case QUERY_TYPE_INSERT:
             if (result->count > 0) {
-                /* RETURNING — send rows */
-                send_row_description(fd, db, &q, result);
+                if (!skip_row_desc)
+                    send_row_description(fd, db, &q, result);
                 send_data_rows(fd, result);
             }
             {
@@ -786,7 +1015,8 @@ static int handle_query(int fd, struct database *db, const char *sql,
             break;
         case QUERY_TYPE_DELETE: {
             if (q.del.has_returning && result->count > 0) {
-                send_row_description(fd, db, &q, result);
+                if (!skip_row_desc)
+                    send_row_description(fd, db, &q, result);
                 send_data_rows(fd, result);
                 snprintf(tag, sizeof(tag), "DELETE %zu", result->count);
             } else {
@@ -799,7 +1029,8 @@ static int handle_query(int fd, struct database *db, const char *sql,
         }
         case QUERY_TYPE_UPDATE: {
             if (q.update.has_returning && result->count > 0) {
-                send_row_description(fd, db, &q, result);
+                if (!skip_row_desc)
+                    send_row_description(fd, db, &q, result);
                 send_data_rows(fd, result);
                 snprintf(tag, sizeof(tag), "UPDATE %zu", result->count);
             } else {
@@ -850,8 +1081,524 @@ static int handle_query(int fd, struct database *db, const char *sql,
 
     send_command_complete(fd, m, tag);
     arena_free_result_rows(conn_arena);
-    /* no query_free — arena is connection-scoped, reset on next request */
+    return 0;
+}
+
+/* Simple Query handler: execute + ReadyForQuery */
+static int handle_query(int fd, struct database *db, const char *sql,
+                        struct msgbuf *m, struct query_arena *conn_arena)
+{
+    handle_query_inner(fd, db, sql, m, conn_arena, 0);
     send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
+    return 0;
+}
+
+/* ---- Extended Query Protocol message handlers ---- */
+
+/* Send ParseComplete ('1') */
+static int send_parse_complete(int fd, struct msgbuf *m)
+{
+    m->len = 0;
+    return msg_send(fd, '1', m);
+}
+
+/* Send BindComplete ('2') */
+static int send_bind_complete(int fd, struct msgbuf *m)
+{
+    m->len = 0;
+    return msg_send(fd, '2', m);
+}
+
+/* Send CloseComplete ('3') */
+static int send_close_complete(int fd, struct msgbuf *m)
+{
+    m->len = 0;
+    return msg_send(fd, '3', m);
+}
+
+/* Send NoData ('n') */
+static int send_no_data(int fd, struct msgbuf *m)
+{
+    m->len = 0;
+    return msg_send(fd, 'n', m);
+}
+
+/* Send ParameterDescription ('t') */
+static int send_parameter_description(int fd, struct msgbuf *m,
+                                      const uint32_t *oids, uint16_t nparams)
+{
+    m->len = 0;
+    msgbuf_push_u16(m, nparams);
+    for (uint16_t i = 0; i < nparams; i++)
+        msgbuf_push_u32(m, oids ? oids[i] : 0);
+    return msg_send(fd, 't', m);
+}
+
+/* Handle Parse message ('P'):
+ *   string stmt_name, string query, int16 nparams, int32[nparams] param_oids
+ */
+static int handle_parse(struct client_state *c, struct database *db,
+                        const uint8_t *body, uint32_t body_len)
+{
+    (void)db;
+    const uint8_t *p = body;
+    const uint8_t *end = body + body_len;
+
+    /* statement name (NUL-terminated) */
+    const char *stmt_name = (const char *)p;
+    while (p < end && *p) p++;
+    if (p >= end) {
+        send_error(c->fd, &c->send_buf, "ERROR", "08P01", "invalid Parse message");
+        return -1;
+    }
+    p++; /* skip NUL */
+
+    /* query string (NUL-terminated) */
+    const char *query = (const char *)p;
+    while (p < end && *p) p++;
+    if (p >= end) {
+        send_error(c->fd, &c->send_buf, "ERROR", "08P01", "invalid Parse message");
+        return -1;
+    }
+    p++; /* skip NUL */
+
+    /* number of parameter types */
+    uint16_t nparams = 0;
+    if (p + 2 <= end) {
+        nparams = read_u16(p);
+        p += 2;
+    }
+
+    /* parameter type OIDs */
+    uint32_t *param_oids = NULL;
+    if (nparams > 0) {
+        if (p + (size_t)nparams * 4 > end) {
+            send_error(c->fd, &c->send_buf, "ERROR", "08P01", "invalid Parse message");
+            return -1;
+        }
+        param_oids = malloc(nparams * sizeof(uint32_t));
+        for (uint16_t i = 0; i < nparams; i++) {
+            param_oids[i] = read_u32(p);
+            p += 4;
+        }
+    }
+
+    /* if unnamed statement already exists, replace it */
+    int idx = find_prepared(c, stmt_name);
+    if (idx >= 0) {
+        prepared_stmt_free(&c->prepared[idx]);
+    } else {
+        idx = alloc_prepared(c);
+        if (idx < 0) {
+            free(param_oids);
+            send_error(c->fd, &c->send_buf, "ERROR", "53000",
+                       "too many prepared statements");
+            return -1;
+        }
+    }
+
+    c->prepared[idx].name = strdup(stmt_name);
+    c->prepared[idx].sql = strdup(query);
+    c->prepared[idx].param_oids = param_oids;
+    c->prepared[idx].nparams = nparams;
+    c->prepared[idx].in_use = 1;
+
+    send_parse_complete(c->fd, &c->send_buf);
+    return 0;
+}
+
+/* Handle Bind message ('B'):
+ *   string portal_name, string stmt_name,
+ *   int16 nformat_codes, int16[nformat_codes] format_codes,
+ *   int16 nparams, (int32 len, byte[len] value)[nparams],
+ *   int16 nresult_format_codes, int16[nresult_format_codes] result_format_codes
+ */
+static int handle_bind(struct client_state *c, struct database *db,
+                       const uint8_t *body, uint32_t body_len)
+{
+    (void)db;
+    const uint8_t *p = body;
+    const uint8_t *end = body + body_len;
+
+    /* portal name */
+    const char *portal_name = (const char *)p;
+    while (p < end && *p) p++;
+    if (p >= end) goto bad_msg;
+    p++;
+
+    /* statement name */
+    const char *stmt_name = (const char *)p;
+    while (p < end && *p) p++;
+    if (p >= end) goto bad_msg;
+    p++;
+
+    /* find the prepared statement */
+    int stmt_idx = find_prepared(c, stmt_name);
+    if (stmt_idx < 0) {
+        send_error(c->fd, &c->send_buf, "ERROR", "26000",
+                   "prepared statement does not exist");
+        return -1;
+    }
+    struct prepared_stmt *ps = &c->prepared[stmt_idx];
+
+    /* parameter format codes */
+    if (p + 2 > end) goto bad_msg;
+    uint16_t nformat_codes = read_u16(p); p += 2;
+    int *param_formats = NULL;
+    if (nformat_codes > 0) {
+        if (p + (size_t)nformat_codes * 2 > end) goto bad_msg;
+        param_formats = malloc(nformat_codes * sizeof(int));
+        for (uint16_t i = 0; i < nformat_codes; i++) {
+            param_formats[i] = read_i16(p);
+            p += 2;
+        }
+    }
+
+    /* parameter values */
+    if (p + 2 > end) { free(param_formats); goto bad_msg; }
+    uint16_t nparams = read_u16(p); p += 2;
+
+    const char **param_values = NULL;
+    int *param_lengths = NULL;
+    if (nparams > 0) {
+        param_values = calloc(nparams, sizeof(char *));
+        param_lengths = calloc(nparams, sizeof(int));
+    }
+
+    for (uint16_t i = 0; i < nparams; i++) {
+        if (p + 4 > end) {
+            free(param_formats); free(param_values); free(param_lengths);
+            goto bad_msg;
+        }
+        int32_t len = read_i32(p); p += 4;
+        if (len == -1) {
+            /* NULL parameter */
+            param_values[i] = NULL;
+            param_lengths[i] = 0;
+        } else {
+            if (len < 0 || p + (size_t)len > end) {
+                free(param_formats); free(param_values); free(param_lengths);
+                goto bad_msg;
+            }
+            /* make a NUL-terminated copy */
+            char *val = malloc((size_t)len + 1);
+            memcpy(val, p, (size_t)len);
+            val[len] = '\0';
+            param_values[i] = val;
+            param_lengths[i] = len;
+            p += (size_t)len;
+        }
+    }
+
+    /* result format codes */
+    uint16_t nresult_formats = 0;
+    int16_t *result_formats = NULL;
+    if (p + 2 <= end) {
+        nresult_formats = read_u16(p); p += 2;
+        if (nresult_formats > 0 && p + (size_t)nresult_formats * 2 <= end) {
+            result_formats = malloc(nresult_formats * sizeof(int16_t));
+            for (uint16_t i = 0; i < nresult_formats; i++) {
+                result_formats[i] = read_i16(p);
+                p += 2;
+            }
+        }
+    }
+
+    /* substitute parameters into SQL */
+    char *bound_sql = substitute_params(ps->sql, param_values, param_lengths,
+                                        param_formats, nparams);
+
+    /* free parameter value copies */
+    for (uint16_t i = 0; i < nparams; i++)
+        free((void *)param_values[i]);
+    free(param_values);
+    free(param_lengths);
+    free(param_formats);
+
+    if (!bound_sql) {
+        free(result_formats);
+        send_error(c->fd, &c->send_buf, "ERROR", "XX000",
+                   "out of memory during parameter substitution");
+        return -1;
+    }
+
+    /* create or replace portal */
+    int pidx = find_portal(c, portal_name);
+    if (pidx >= 0) {
+        portal_free(&c->portals[pidx]);
+    } else {
+        pidx = alloc_portal(c);
+        if (pidx < 0) {
+            free(bound_sql);
+            free(result_formats);
+            send_error(c->fd, &c->send_buf, "ERROR", "53000",
+                       "too many portals");
+            return -1;
+        }
+    }
+
+    c->portals[pidx].name = strdup(portal_name);
+    c->portals[pidx].sql = bound_sql;
+    c->portals[pidx].result_formats = result_formats;
+    c->portals[pidx].nresult_formats = nresult_formats;
+    c->portals[pidx].max_rows = 0;
+    c->portals[pidx].in_use = 1;
+    c->portals[pidx].stmt_idx = stmt_idx;
+
+    send_bind_complete(c->fd, &c->send_buf);
+    return 0;
+
+bad_msg:
+    send_error(c->fd, &c->send_buf, "ERROR", "08P01", "invalid Bind message");
+    return -1;
+}
+
+/* Handle Describe message ('D'):
+ *   byte type ('S' = statement, 'P' = portal), string name
+ */
+static int handle_describe(struct client_state *c, struct database *db,
+                           const uint8_t *body, uint32_t body_len)
+{
+    if (body_len < 2) {
+        send_error(c->fd, &c->send_buf, "ERROR", "08P01", "invalid Describe message");
+        return -1;
+    }
+
+    char desc_type = (char)body[0];
+    const char *name = (const char *)(body + 1);
+
+    if (desc_type == 'S') {
+        /* Describe Statement → ParameterDescription + RowDescription (or NoData) */
+        int idx = find_prepared(c, name);
+        if (idx < 0) {
+            send_error(c->fd, &c->send_buf, "ERROR", "26000",
+                       "prepared statement does not exist");
+            return -1;
+        }
+        struct prepared_stmt *ps = &c->prepared[idx];
+
+        /* Send ParameterDescription */
+        send_parameter_description(c->fd, &c->send_buf,
+                                   ps->param_oids, ps->nparams);
+
+        /* Try to determine if this is a SELECT by doing a trial parse.
+         * If it's a SELECT, send RowDescription; otherwise send NoData. */
+        /* For simplicity, substitute dummy values and try to parse */
+        const char **dummy_vals = NULL;
+        if (ps->nparams > 0) {
+            dummy_vals = calloc(ps->nparams, sizeof(char *));
+            for (uint16_t i = 0; i < ps->nparams; i++)
+                dummy_vals[i] = "0"; /* dummy value for type inference */
+        }
+        char *test_sql = substitute_params(ps->sql, dummy_vals,
+                                           NULL, NULL, ps->nparams);
+        free(dummy_vals);
+
+        if (test_sql) {
+            struct query q = {0};
+            if (query_parse_into(test_sql, &q, &c->arena) == 0) {
+                if (q.query_type == QUERY_TYPE_SELECT) {
+                    /* try to get table for column metadata */
+                    struct table *t = NULL;
+                    if (q.select.table.len > 0)
+                        t = db_find_table_sv(db, q.select.table);
+
+                    if (t) {
+                        /* build RowDescription from table metadata */
+                        int select_all = sv_eq_cstr(q.select.columns, "*");
+                        struct msgbuf rm;
+                        msgbuf_init(&rm);
+                        uint16_t ncols;
+                        if (select_all) {
+                            ncols = (uint16_t)t->columns.count;
+                        } else if (q.select.parsed_columns_count > 0) {
+                            ncols = (uint16_t)q.select.parsed_columns_count;
+                        } else {
+                            ncols = (uint16_t)t->columns.count;
+                        }
+                        msgbuf_push_u16(&rm, ncols);
+                        for (uint16_t i = 0; i < ncols; i++) {
+                            const char *colname = "?";
+                            uint32_t type_oid = 25;
+                            if (select_all && (size_t)i < t->columns.count) {
+                                colname = t->columns.items[i].name;
+                                type_oid = column_type_to_oid(t->columns.items[i].type);
+                            } else if (q.select.parsed_columns_count > 0 &&
+                                       (uint32_t)i < q.select.parsed_columns_count) {
+                                struct select_column *sc =
+                                    &q.arena.select_cols.items[q.select.parsed_columns_start + i];
+                                if (sc->alias.len > 0) {
+                                    static __thread char abuf[256];
+                                    size_t al = sc->alias.len < 255 ? sc->alias.len : 255;
+                                    memcpy(abuf, sc->alias.data, al);
+                                    abuf[al] = '\0';
+                                    colname = abuf;
+                                } else if (sc->expr_idx != IDX_NONE) {
+                                    struct expr *e = &EXPR(&q.arena, sc->expr_idx);
+                                    if (e->type == EXPR_COLUMN_REF) {
+                                        int ci = table_find_column_sv(t, e->column_ref.column);
+                                        if (ci >= 0) {
+                                            colname = t->columns.items[ci].name;
+                                            type_oid = column_type_to_oid(t->columns.items[ci].type);
+                                        }
+                                    }
+                                }
+                            } else if ((size_t)i < t->columns.count) {
+                                colname = t->columns.items[i].name;
+                                type_oid = column_type_to_oid(t->columns.items[i].type);
+                            }
+                            msgbuf_push_cstr(&rm, colname);
+                            msgbuf_push_u32(&rm, 0);
+                            msgbuf_push_u16(&rm, 0);
+                            msgbuf_push_u32(&rm, type_oid);
+                            msgbuf_push_u16(&rm, (uint16_t)-1);
+                            msgbuf_push_u32(&rm, (uint32_t)-1);
+                            msgbuf_push_u16(&rm, 0);
+                        }
+                        msg_send(c->fd, 'T', &rm);
+                        msgbuf_free(&rm);
+                    } else {
+                        send_no_data(c->fd, &c->send_buf);
+                    }
+                } else {
+                    send_no_data(c->fd, &c->send_buf);
+                }
+            } else {
+                send_no_data(c->fd, &c->send_buf);
+            }
+            free(test_sql);
+        } else {
+            send_no_data(c->fd, &c->send_buf);
+        }
+    } else if (desc_type == 'P') {
+        /* Describe Portal → RowDescription (or NoData) */
+        int idx = find_portal(c, name);
+        if (idx < 0) {
+            send_error(c->fd, &c->send_buf, "ERROR", "34000",
+                       "portal does not exist");
+            return -1;
+        }
+        struct portal *portal = &c->portals[idx];
+
+        /* Parse the bound SQL to determine if it produces rows */
+        struct query q = {0};
+        if (query_parse_into(portal->sql, &q, &c->arena) == 0 &&
+            q.query_type == QUERY_TYPE_SELECT) {
+            struct table *t = NULL;
+            if (q.select.table.len > 0)
+                t = db_find_table_sv(db, q.select.table);
+            if (t) {
+                int select_all = sv_eq_cstr(q.select.columns, "*");
+                struct msgbuf rm;
+                msgbuf_init(&rm);
+                uint16_t ncols;
+                if (select_all) {
+                    ncols = (uint16_t)t->columns.count;
+                } else if (q.select.parsed_columns_count > 0) {
+                    ncols = (uint16_t)q.select.parsed_columns_count;
+                } else {
+                    ncols = (uint16_t)t->columns.count;
+                }
+                msgbuf_push_u16(&rm, ncols);
+                for (uint16_t i = 0; i < ncols; i++) {
+                    const char *colname = "?";
+                    uint32_t type_oid = 25;
+                    if (select_all && (size_t)i < t->columns.count) {
+                        colname = t->columns.items[i].name;
+                        type_oid = column_type_to_oid(t->columns.items[i].type);
+                    } else if ((size_t)i < t->columns.count) {
+                        colname = t->columns.items[i].name;
+                        type_oid = column_type_to_oid(t->columns.items[i].type);
+                    }
+                    msgbuf_push_cstr(&rm, colname);
+                    msgbuf_push_u32(&rm, 0);
+                    msgbuf_push_u16(&rm, 0);
+                    msgbuf_push_u32(&rm, type_oid);
+                    msgbuf_push_u16(&rm, (uint16_t)-1);
+                    msgbuf_push_u32(&rm, (uint32_t)-1);
+                    msgbuf_push_u16(&rm, 0);
+                }
+                msg_send(c->fd, 'T', &rm);
+                msgbuf_free(&rm);
+            } else {
+                send_no_data(c->fd, &c->send_buf);
+            }
+        } else {
+            send_no_data(c->fd, &c->send_buf);
+        }
+    } else {
+        send_error(c->fd, &c->send_buf, "ERROR", "08P01",
+                   "invalid Describe target type");
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Handle Execute message ('E'):
+ *   string portal_name, int32 max_rows (0 = unlimited)
+ */
+static int handle_execute(struct client_state *c, struct database *db,
+                          const uint8_t *body, uint32_t body_len)
+{
+    const uint8_t *p = body;
+    const uint8_t *end = body + body_len;
+
+    /* portal name */
+    const char *portal_name = (const char *)p;
+    while (p < end && *p) p++;
+    if (p >= end) {
+        send_error(c->fd, &c->send_buf, "ERROR", "08P01", "invalid Execute message");
+        return -1;
+    }
+    p++;
+
+    /* max_rows (0 = no limit) */
+    int32_t max_rows = 0;
+    if (p + 4 <= end) {
+        max_rows = read_i32(p);
+        p += 4;
+    }
+    (void)max_rows; /* we always return all rows for now */
+
+    int idx = find_portal(c, portal_name);
+    if (idx < 0) {
+        send_error(c->fd, &c->send_buf, "ERROR", "34000",
+                   "portal does not exist");
+        return -1;
+    }
+
+    /* Execute the bound SQL (no ReadyForQuery — that comes from Sync).
+     * skip_row_desc=1: in extended protocol, RowDescription was already
+     * sent by Describe, or the client doesn't expect it from Execute. */
+    handle_query_inner(c->fd, db, c->portals[idx].sql,
+                       &c->send_buf, &c->arena, 1);
+    return 0;
+}
+
+/* Handle Close message ('C'):
+ *   byte type ('S' = statement, 'P' = portal), string name
+ */
+static int handle_close(struct client_state *c,
+                        const uint8_t *body, uint32_t body_len)
+{
+    if (body_len < 2) {
+        send_error(c->fd, &c->send_buf, "ERROR", "08P01", "invalid Close message");
+        return -1;
+    }
+
+    char close_type = (char)body[0];
+    const char *name = (const char *)(body + 1);
+
+    if (close_type == 'S') {
+        int idx = find_prepared(c, name);
+        if (idx >= 0) prepared_stmt_free(&c->prepared[idx]);
+    } else if (close_type == 'P') {
+        int idx = find_portal(c, name);
+        if (idx >= 0) portal_free(&c->portals[idx]);
+    }
+
+    send_close_complete(c->fd, &c->send_buf);
     return 0;
 }
 
@@ -925,8 +1672,16 @@ static int process_messages(struct client_state *c, struct database *db)
 
         uint32_t body_len = msg_len - 4;
 
+        /* In extended query mode, after an error the backend must discard
+         * all messages until it sees a Sync (or Terminate). */
+        if (c->extended_error && msg_type != 'S' && msg_type != 'X') {
+            client_recv_consume(c, total);
+            continue;
+        }
+
         switch (msg_type) {
             case 'Q': { /* Simple Query */
+                c->extended_error = 0; /* Simple Query resets error state */
                 if (body_len > 0) {
                     /* NUL-terminate the SQL in-place (safe — we own the buffer) */
                     c->recv_buf[1 + msg_len] = '\0'; /* just past the message */
@@ -940,6 +1695,49 @@ static int process_messages(struct client_state *c, struct database *db)
                 }
                 break;
             }
+
+            /* ---- Extended Query Protocol ---- */
+
+            case 'P': { /* Parse */
+                const uint8_t *body = c->recv_buf + 5;
+                if (handle_parse(c, db, body, body_len) < 0)
+                    c->extended_error = 1;
+                break;
+            }
+            case 'B': { /* Bind */
+                const uint8_t *body = c->recv_buf + 5;
+                if (handle_bind(c, db, body, body_len) < 0)
+                    c->extended_error = 1;
+                break;
+            }
+            case 'D': { /* Describe */
+                const uint8_t *body = c->recv_buf + 5;
+                if (handle_describe(c, db, body, body_len) < 0)
+                    c->extended_error = 1;
+                break;
+            }
+            case 'E': { /* Execute */
+                const uint8_t *body = c->recv_buf + 5;
+                if (handle_execute(c, db, body, body_len) < 0)
+                    c->extended_error = 1;
+                break;
+            }
+            case 'H': { /* Flush — send any pending output */
+                /* We write synchronously, so nothing to flush */
+                break;
+            }
+            case 'S': { /* Sync — end of extended query pipeline */
+                c->extended_error = 0; /* clear error state */
+                send_ready_for_query(c->fd, &c->send_buf,
+                                     db->in_transaction ? 'T' : 'I');
+                break;
+            }
+            case 'C': { /* Close (statement or portal) */
+                const uint8_t *body = c->recv_buf + 5;
+                handle_close(c, body, body_len);
+                break;
+            }
+
             case 'X': /* Terminate */
                 return -1;
             default:
