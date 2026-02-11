@@ -53,6 +53,11 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
     struct plan_node *pn = &PLAN_NODE(arena, node_idx);
     if (pn->op == PLAN_SEQ_SCAN) return pn->seq_scan.ncols;
     if (pn->op == PLAN_PROJECT) return pn->project.ncols;
+    if (pn->op == PLAN_HASH_JOIN) {
+        uint16_t lc = plan_node_ncols(arena, pn->left);
+        uint16_t rc = plan_node_ncols(arena, pn->right);
+        return lc + rc;
+    }
     if (pn->op == PLAN_HASH_AGG)
         return pn->hash_agg.ngroup_cols + (uint16_t)pn->hash_agg.agg_count;
     if (pn->op == PLAN_SORT)
@@ -1183,7 +1188,182 @@ int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
 uint32_t plan_build_select(struct table *t, struct query_select *s,
                            struct query_arena *arena, struct database *db)
 {
-    (void)db;
+    /* ---- Single equi-join fast path ---- */
+    if (s->has_join && s->joins_count == 1 && db) {
+        struct join_info *ji = &arena->joins.items[s->joins_start];
+        /* Only handle: INNER JOIN, equi-join (CMP_EQ), not LATERAL, not NATURAL, not USING */
+        if (ji->join_type != 0) return IDX_NONE;       /* not INNER */
+        if (ji->is_lateral)     return IDX_NONE;
+        if (ji->is_natural)     return IDX_NONE;
+        if (ji->has_using)      return IDX_NONE;
+        /* Bail out for complex queries on joined results */
+        if (s->select_exprs_count > 0) return IDX_NONE; /* window functions */
+        if (s->has_group_by)        return IDX_NONE;
+        if (s->aggregates_count > 0) return IDX_NONE;
+        if (s->has_set_op)          return IDX_NONE;
+        if (s->ctes_count > 0)     return IDX_NONE;
+        if (s->cte_sql != IDX_NONE) return IDX_NONE;
+        if (s->from_subquery_sql != IDX_NONE) return IDX_NONE;
+        if (s->has_recursive_cte)   return IDX_NONE;
+        if (s->has_distinct)        return IDX_NONE;
+        if (s->has_distinct_on)     return IDX_NONE;
+        if (s->where.has_where)     return IDX_NONE;    /* WHERE on joined result — complex */
+        if (s->has_order_by)        return IDX_NONE;    /* ORDER BY on joined result — complex */
+        if (s->insert_rows_count > 0) return IDX_NONE;
+
+        struct table *t1 = t;
+        if (!t1) return IDX_NONE;
+        struct table *t2 = db_find_table_sv(db, ji->join_table);
+        if (!t2) return IDX_NONE;
+        if (t2->view_sql) return IDX_NONE; /* view — need materialization */
+
+        /* Extract join key columns — need simple equi-join on two column refs */
+        int t1_key = -1, t2_key = -1;
+
+        if (ji->join_on_cond != IDX_NONE) {
+            struct condition *cond = &COND(arena, ji->join_on_cond);
+            if (cond->type != COND_COMPARE || cond->op != CMP_EQ)
+                return IDX_NONE;
+            if (cond->lhs_expr != IDX_NONE) return IDX_NONE;
+            if (cond->column.len == 0 || cond->rhs_column.len == 0)
+                return IDX_NONE;
+            /* Try both orderings: col might be in t1 or t2 */
+            int lhs_in_t1 = table_find_column_sv(t1, cond->column);
+            int lhs_in_t2 = table_find_column_sv(t2, cond->column);
+            int rhs_in_t1 = table_find_column_sv(t1, cond->rhs_column);
+            int rhs_in_t2 = table_find_column_sv(t2, cond->rhs_column);
+            if (lhs_in_t1 >= 0 && rhs_in_t2 >= 0) {
+                t1_key = lhs_in_t1; t2_key = rhs_in_t2;
+            } else if (lhs_in_t2 >= 0 && rhs_in_t1 >= 0) {
+                t1_key = rhs_in_t1; t2_key = lhs_in_t2;
+            } else {
+                return IDX_NONE;
+            }
+        } else if (ji->join_left_col.len > 0 && ji->join_right_col.len > 0 &&
+                   ji->join_op == CMP_EQ) {
+            int left_in_t1 = table_find_column_sv(t1, ji->join_left_col);
+            int left_in_t2 = table_find_column_sv(t2, ji->join_left_col);
+            int right_in_t1 = table_find_column_sv(t1, ji->join_right_col);
+            int right_in_t2 = table_find_column_sv(t2, ji->join_right_col);
+            if (left_in_t1 >= 0 && right_in_t2 >= 0) {
+                t1_key = left_in_t1; t2_key = right_in_t2;
+            } else if (left_in_t2 >= 0 && right_in_t1 >= 0) {
+                t1_key = right_in_t1; t2_key = left_in_t2;
+            } else {
+                return IDX_NONE;
+            }
+        } else {
+            return IDX_NONE;
+        }
+
+        /* Resolve projection columns across merged column space [t1 cols | t2 cols] */
+        uint16_t t1_ncols = (uint16_t)t1->columns.count;
+        uint16_t t2_ncols = (uint16_t)t2->columns.count;
+        int select_all_join = sv_eq_cstr(s->columns, "*");
+        int need_project_join = 0;
+        int *proj_map_join = NULL;
+        uint16_t proj_ncols_join = 0;
+
+        if (select_all_join) {
+            /* No projection — return all columns from both tables */
+        } else if (s->parsed_columns_count > 0) {
+            proj_ncols_join = (uint16_t)s->parsed_columns_count;
+            proj_map_join = (int *)bump_alloc(&arena->scratch, proj_ncols_join * sizeof(int));
+            for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+                struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
+                if (sc->expr_idx == IDX_NONE) return IDX_NONE;
+                struct expr *e = &EXPR(arena, sc->expr_idx);
+                if (e->type != EXPR_COLUMN_REF) return IDX_NONE;
+                /* Try to find in t1 first, then t2 (with offset) */
+                int ci = table_find_column_sv(t1, e->column_ref.column);
+                if (ci >= 0) {
+                    proj_map_join[i] = ci;
+                } else {
+                    ci = table_find_column_sv(t2, e->column_ref.column);
+                    if (ci >= 0) {
+                        proj_map_join[i] = t1_ncols + ci;
+                    } else {
+                        return IDX_NONE;
+                    }
+                }
+            }
+            need_project_join = 1;
+        } else {
+            return IDX_NONE; /* legacy text-based column list */
+        }
+
+        /* Bail out if either table has mixed cell types */
+        if (t1->rows.count > 0) {
+            struct row *first = &t1->rows.items[0];
+            for (size_t c = 0; c < first->cells.count && c < t1->columns.count; c++) {
+                if (!first->cells.items[c].is_null &&
+                    first->cells.items[c].type != t1->columns.items[c].type)
+                    return IDX_NONE;
+            }
+        }
+        if (t2->rows.count > 0) {
+            struct row *first = &t2->rows.items[0];
+            for (size_t c = 0; c < first->cells.count && c < t2->columns.count; c++) {
+                if (!first->cells.items[c].is_null &&
+                    first->cells.items[c].type != t2->columns.items[c].type)
+                    return IDX_NONE;
+            }
+        }
+
+        /* --- All validation passed, build plan nodes --- */
+
+        /* SEQ_SCAN for t1 (outer / left / probe side) */
+        int *col_map1 = (int *)bump_alloc(&arena->scratch, t1_ncols * sizeof(int));
+        for (uint16_t i = 0; i < t1_ncols; i++) col_map1[i] = (int)i;
+        uint32_t scan1 = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+        PLAN_NODE(arena, scan1).seq_scan.table = t1;
+        PLAN_NODE(arena, scan1).seq_scan.ncols = t1_ncols;
+        PLAN_NODE(arena, scan1).seq_scan.col_map = col_map1;
+        PLAN_NODE(arena, scan1).est_rows = (double)t1->rows.count;
+
+        /* SEQ_SCAN for t2 (inner / right / build side) */
+        int *col_map2 = (int *)bump_alloc(&arena->scratch, t2_ncols * sizeof(int));
+        for (uint16_t i = 0; i < t2_ncols; i++) col_map2[i] = (int)i;
+        uint32_t scan2 = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+        PLAN_NODE(arena, scan2).seq_scan.table = t2;
+        PLAN_NODE(arena, scan2).seq_scan.ncols = t2_ncols;
+        PLAN_NODE(arena, scan2).seq_scan.col_map = col_map2;
+        PLAN_NODE(arena, scan2).est_rows = (double)t2->rows.count;
+
+        /* HASH_JOIN node */
+        uint32_t join_idx = plan_alloc_node(arena, PLAN_HASH_JOIN);
+        PLAN_NODE(arena, join_idx).left = scan1;   /* outer (probe) */
+        PLAN_NODE(arena, join_idx).right = scan2;  /* inner (build) */
+        PLAN_NODE(arena, join_idx).hash_join.outer_key_col = t1_key;
+        PLAN_NODE(arena, join_idx).hash_join.inner_key_col = t2_key;
+        PLAN_NODE(arena, join_idx).hash_join.join_type = 0; /* INNER */
+
+        uint32_t current = join_idx;
+
+        /* PROJECT node if specific columns selected */
+        if (need_project_join) {
+            uint32_t proj_idx = plan_alloc_node(arena, PLAN_PROJECT);
+            PLAN_NODE(arena, proj_idx).left = current;
+            PLAN_NODE(arena, proj_idx).project.ncols = proj_ncols_join;
+            PLAN_NODE(arena, proj_idx).project.col_map = proj_map_join;
+            current = proj_idx;
+        }
+
+        /* LIMIT/OFFSET node if present */
+        if (s->has_limit || s->has_offset) {
+            uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
+            PLAN_NODE(arena, limit_idx).left = current;
+            PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
+            PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
+            PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
+            PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
+            current = limit_idx;
+        }
+
+        return current;
+    }
+
+    /* ---- Single-table path (original) ---- */
 
     /* Bail out for queries we don't handle yet */
     if (s->has_join)            return IDX_NONE;

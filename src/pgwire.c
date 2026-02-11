@@ -499,8 +499,10 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
 }
 
 /* Send RowDescription using table metadata + plan column info.
- * ncols/col_types come from the plan's output columns. */
-static int send_row_desc_plan(int fd, struct table *t, struct query *q,
+ * ncols/col_types come from the plan's output columns.
+ * t2 is optional — non-NULL for JOIN queries (columns from two tables). */
+static int send_row_desc_plan(int fd, struct table *t, struct table *t2,
+                              struct query *q,
                               uint16_t ncols, const enum column_type *col_types)
 {
     struct msgbuf m;
@@ -508,6 +510,7 @@ static int send_row_desc_plan(int fd, struct table *t, struct query *q,
     msgbuf_push_u16(&m, ncols);
 
     int select_all = sv_eq_cstr(q->select.columns, "*");
+    uint16_t t1_ncols = t ? (uint16_t)t->columns.count : 0;
 
     for (uint16_t i = 0; i < ncols; i++) {
         const char *colname = "?";
@@ -515,6 +518,9 @@ static int send_row_desc_plan(int fd, struct table *t, struct query *q,
 
         if (select_all && t && (size_t)i < t->columns.count) {
             colname = t->columns.items[i].name;
+        } else if (select_all && t2 && i >= t1_ncols &&
+                   (size_t)(i - t1_ncols) < t2->columns.count) {
+            colname = t2->columns.items[i - t1_ncols].name;
         } else if (q->select.parsed_columns_count > 0 && (uint32_t)i < q->select.parsed_columns_count) {
             struct select_column *sc = &q->arena.select_cols.items[q->select.parsed_columns_start + i];
             if (sc->alias.len > 0) {
@@ -526,9 +532,15 @@ static int send_row_desc_plan(int fd, struct table *t, struct query *q,
                 colname = alias_buf;
             } else if (sc->expr_idx != IDX_NONE) {
                 struct expr *e = &EXPR(&q->arena, sc->expr_idx);
-                if (e->type == EXPR_COLUMN_REF && t) {
-                    int ci = table_find_column_sv(t, e->column_ref.column);
-                    if (ci >= 0) colname = t->columns.items[ci].name;
+                if (e->type == EXPR_COLUMN_REF) {
+                    int ci = -1;
+                    if (t) ci = table_find_column_sv(t, e->column_ref.column);
+                    if (ci >= 0) {
+                        colname = t->columns.items[ci].name;
+                    } else if (t2) {
+                        ci = table_find_column_sv(t2, e->column_ref.column);
+                        if (ci >= 0) colname = t2->columns.items[ci].name;
+                    }
                 }
             }
         } else if (t && (size_t)i < t->columns.count) {
@@ -564,6 +576,13 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         t = db_find_table_sv(db, s->table);
     if (!t) return -1;
 
+    /* For JOINs, find the second table */
+    struct table *t2 = NULL;
+    if (s->has_join && s->joins_count == 1) {
+        struct join_info *ji = &q->arena.joins.items[s->joins_start];
+        t2 = db_find_table_sv(db, ji->join_table);
+    }
+
     uint32_t plan_root = plan_build_select(t, s, &q->arena, db);
     if (plan_root == IDX_NONE) return -1;
 
@@ -583,7 +602,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         enum column_type types[64];
         for (uint16_t i = 0; i < ncols && i < 64; i++)
             types[i] = (i < t->columns.count) ? t->columns.items[i].type : COLUMN_TYPE_TEXT;
-        send_row_desc_plan(fd, t, q, ncols, types);
+        send_row_desc_plan(fd, t, t2, q, ncols, types);
         return 0;
     }
 
@@ -592,7 +611,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     for (uint16_t i = 0; i < ncols && i < 64; i++)
         col_types[i] = block.cols[i].type;
 
-    if (send_row_desc_plan(fd, t, q, ncols, col_types) != 0)
+    if (send_row_desc_plan(fd, t, t2, q, ncols, col_types) != 0)
         return -1;
 
     /* Send data rows directly from blocks — batched into a large buffer */
