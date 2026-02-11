@@ -1,10 +1,22 @@
 #ifndef TABLE_H
 #define TABLE_H
 
+#include <stdint.h>
 #include "dynamic_array.h"
 #include "column.h"
 #include "row.h"
 #include "index.h"
+
+/* Cached columnar representation of a table for fast repeated scans.
+ * Invalidated when table->generation changes. */
+struct scan_cache {
+    uint64_t generation;    /* generation when cache was built */
+    uint16_t ncols;         /* number of cached columns */
+    size_t   nrows;         /* total rows cached */
+    void   **col_data;      /* [ncols] heap-allocated typed arrays */
+    uint8_t **col_nulls;    /* [ncols] heap-allocated null bitmaps */
+    enum column_type *col_types; /* [ncols] column types */
+};
 
 struct table {
     // TODO: STRINGVIEW OPPORTUNITY: name is strdup'd from sv-originated strings in most
@@ -14,6 +26,8 @@ struct table {
     DYNAMIC_ARRAY(struct column) columns;
     DYNAMIC_ARRAY(struct row) rows;
     DYNAMIC_ARRAY(struct index) indexes;
+    uint64_t generation;  /* bumped on every INSERT/UPDATE/DELETE for scan cache invalidation */
+    struct scan_cache scan_cache; /* cached columnar representation */
 };
 
 void table_init(struct table *t, const char *name);

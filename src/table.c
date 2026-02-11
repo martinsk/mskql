@@ -11,6 +11,8 @@ void table_init(struct table *t, const char *name)
     da_init(&t->columns);
     da_init(&t->rows);
     da_init(&t->indexes);
+    t->generation = 0;
+    memset(&t->scan_cache, 0, sizeof(t->scan_cache));
 }
 
 void table_init_own(struct table *t, char *name)
@@ -20,6 +22,8 @@ void table_init_own(struct table *t, char *name)
     da_init(&t->columns);
     da_init(&t->rows);
     da_init(&t->indexes);
+    t->generation = 0;
+    memset(&t->scan_cache, 0, sizeof(t->scan_cache));
 }
 
 void table_add_column(struct table *t, struct column *col)
@@ -59,6 +63,8 @@ void table_deep_copy(struct table *dst, const struct table *src)
     da_init(&dst->columns);
     da_init(&dst->rows);
     da_init(&dst->indexes);
+    dst->generation = src->generation;
+    memset(&dst->scan_cache, 0, sizeof(dst->scan_cache));
 
     /* deep-copy columns */
     for (size_t i = 0; i < src->columns.count; i++) {
@@ -202,4 +208,15 @@ void table_free(struct table *t)
         index_free(&t->indexes.items[i]);
     }
     da_free(&t->indexes);
+
+    /* free scan cache */
+    if (t->scan_cache.col_data) {
+        for (uint16_t i = 0; i < t->scan_cache.ncols; i++) {
+            free(t->scan_cache.col_data[i]);
+            free(t->scan_cache.col_nulls[i]);
+        }
+        free(t->scan_cache.col_data);
+        free(t->scan_cache.col_nulls);
+        free(t->scan_cache.col_types);
+    }
 }

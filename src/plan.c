@@ -1,7 +1,166 @@
 #include "plan.h"
 #include "arena_helpers.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* ---- Scan cache: build/invalidate flat columnar arrays on the table ---- */
+
+static void scan_cache_free(struct scan_cache *sc)
+{
+    if (!sc->col_data) return;
+    for (uint16_t i = 0; i < sc->ncols; i++) {
+        free(sc->col_data[i]);
+        free(sc->col_nulls[i]);
+    }
+    free(sc->col_data);
+    free(sc->col_nulls);
+    free(sc->col_types);
+    memset(sc, 0, sizeof(*sc));
+}
+
+static void scan_cache_build(struct table *t)
+{
+    struct scan_cache *sc = &t->scan_cache;
+    scan_cache_free(sc);
+
+    uint16_t ncols = (uint16_t)t->columns.count;
+    size_t nrows = t->rows.count;
+    sc->generation = t->generation;
+    sc->ncols = ncols;
+    sc->nrows = nrows;
+    sc->col_data = (void **)calloc(ncols, sizeof(void *));
+    sc->col_nulls = (uint8_t **)calloc(ncols, sizeof(uint8_t *));
+    sc->col_types = (enum column_type *)calloc(ncols, sizeof(enum column_type));
+
+    for (uint16_t c = 0; c < ncols; c++) {
+        enum column_type ct = t->columns.items[c].type;
+        /* Detect actual type from first non-null cell */
+        for (size_t r = 0; r < nrows; r++) {
+            struct cell *cell = &t->rows.items[r].cells.items[c];
+            if (!cell->is_null) { ct = cell->type; break; }
+        }
+        sc->col_types[c] = ct;
+
+        size_t elem_sz;
+        if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+            elem_sz = sizeof(int32_t);
+        else if (ct == COLUMN_TYPE_BIGINT)
+            elem_sz = sizeof(int64_t);
+        else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+            elem_sz = sizeof(double);
+        else
+            elem_sz = sizeof(char *);
+
+        sc->col_data[c] = calloc(nrows ? nrows : 1, elem_sz);
+        sc->col_nulls[c] = (uint8_t *)calloc(nrows ? nrows : 1, 1);
+
+        /* Fill from row-store */
+        if (ct == COLUMN_TYPE_INT) {
+            int32_t *dst = (int32_t *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != COLUMN_TYPE_INT) {
+                    sc->col_nulls[c][r] = 1;
+                } else {
+                    dst[r] = cell->value.as_int;
+                }
+            }
+        } else if (ct == COLUMN_TYPE_FLOAT) {
+            double *dst = (double *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != COLUMN_TYPE_FLOAT) {
+                    sc->col_nulls[c][r] = 1;
+                } else {
+                    dst[r] = cell->value.as_float;
+                }
+            }
+        } else if (ct == COLUMN_TYPE_BIGINT) {
+            int64_t *dst = (int64_t *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != COLUMN_TYPE_BIGINT) {
+                    sc->col_nulls[c][r] = 1;
+                } else {
+                    dst[r] = cell->value.as_bigint;
+                }
+            }
+        } else if (ct == COLUMN_TYPE_NUMERIC) {
+            double *dst = (double *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != COLUMN_TYPE_NUMERIC) {
+                    sc->col_nulls[c][r] = 1;
+                } else {
+                    dst[r] = cell->value.as_numeric;
+                }
+            }
+        } else if (ct == COLUMN_TYPE_BOOLEAN) {
+            int32_t *dst = (int32_t *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != COLUMN_TYPE_BOOLEAN) {
+                    sc->col_nulls[c][r] = 1;
+                } else {
+                    dst[r] = cell->value.as_bool;
+                }
+            }
+        } else {
+            /* text types */
+            char **dst = (char **)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != ct
+                    || (column_type_is_text(cell->type) && !cell->value.as_text)) {
+                    sc->col_nulls[c][r] = 1;
+                } else {
+                    dst[r] = cell->value.as_text; /* pointer into table — valid as long as table exists */
+                }
+            }
+        }
+    }
+}
+
+/* Copy a slice of the scan cache into a row_block.
+ * col_map[i] = which table column to read for output column i.
+ * Returns number of rows copied. */
+static uint16_t scan_cache_read(struct scan_cache *sc, size_t *cursor,
+                                struct row_block *out, int *col_map, uint16_t ncols)
+{
+    size_t start = *cursor;
+    size_t end = sc->nrows;
+    if (end - start > BLOCK_CAPACITY)
+        end = start + BLOCK_CAPACITY;
+
+    uint16_t nrows = (uint16_t)(end - start);
+    if (nrows == 0) return 0;
+
+    out->count = nrows;
+
+    for (uint16_t c = 0; c < ncols; c++) {
+        int tc = col_map[c];
+        struct col_block *cb = &out->cols[c];
+        cb->type = sc->col_types[tc];
+        cb->count = nrows;
+
+        /* Copy slice from flat cache arrays into col_block */
+        memcpy(cb->nulls, sc->col_nulls[tc] + start, nrows);
+
+        enum column_type ct = sc->col_types[tc];
+        if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+            memcpy(cb->data.i32, (int32_t *)sc->col_data[tc] + start, nrows * sizeof(int32_t));
+        else if (ct == COLUMN_TYPE_BIGINT)
+            memcpy(cb->data.i64, (int64_t *)sc->col_data[tc] + start, nrows * sizeof(int64_t));
+        else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+            memcpy(cb->data.f64, (double *)sc->col_data[tc] + start, nrows * sizeof(double));
+        else
+            memcpy(cb->data.str, (char **)sc->col_data[tc] + start, nrows * sizeof(char *));
+    }
+
+    *cursor = end;
+    return nrows;
+}
 
 /* Helper: copy a col_block value at index src_i to dst col_block at dst_i.
  * Handles all column types without triggering -Wswitch-enum. */
@@ -311,7 +470,28 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     }
 
     row_block_reset(out);
-    uint16_t n = scan_table_block(pn->seq_scan.table, &st->cursor,
+
+    /* Try scan cache: if table hasn't changed, read from cached flat arrays */
+    struct table *t = pn->seq_scan.table;
+    struct scan_cache *sc = &t->scan_cache;
+    if (sc->col_data && sc->generation == t->generation && sc->nrows == t->rows.count) {
+        uint16_t n = scan_cache_read(sc, &st->cursor, out,
+                                     pn->seq_scan.col_map, pn->seq_scan.ncols);
+        if (n == 0) return -1;
+        return 0;
+    }
+
+    /* Cache miss or stale — build cache on first scan, then read from it */
+    if (st->cursor == 0 && t->rows.count > 0) {
+        scan_cache_build(t);
+        uint16_t n = scan_cache_read(&t->scan_cache, &st->cursor, out,
+                                     pn->seq_scan.col_map, pn->seq_scan.ncols);
+        if (n == 0) return -1;
+        return 0;
+    }
+
+    /* Fallback: direct row-store scan (shouldn't normally reach here) */
+    uint16_t n = scan_table_block(t, &st->cursor,
                                   out, pn->seq_scan.col_map,
                                   pn->seq_scan.ncols, &ctx->arena->scratch);
     if (n == 0) return -1;
@@ -999,6 +1179,10 @@ struct block_sort_ctx {
     void             *flat_keys[32];   /* contiguous typed array per sort key */
     uint8_t          *flat_nulls[32];  /* contiguous null bitmap per sort key */
     enum column_type  key_types[32];
+    /* Flat arrays for ALL columns — used by emit phase to avoid block remap */
+    void            **flat_col_data;   /* [ncols] contiguous typed arrays */
+    uint8_t         **flat_col_nulls;  /* [ncols] contiguous null bitmaps */
+    enum column_type *flat_col_types;  /* [ncols] column types */
 };
 static struct block_sort_ctx _bsort_ctx;
 
@@ -1120,14 +1304,18 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                    st->collected[b].cols,
                    child_ncols * sizeof(struct col_block));
 
-        /* Build flat arrays for each sort key column */
-        uint16_t nsk = pn->sort.nsort_cols < 32 ? pn->sort.nsort_cols : 32;
-        for (uint16_t k = 0; k < nsk; k++) {
-            int ci = pn->sort.sort_cols[k];
+        /* Build flat arrays for ALL columns — used by both sort comparator and emit */
+        _bsort_ctx.flat_col_data = (void **)bump_alloc(&ctx->arena->scratch,
+                                                        child_ncols * sizeof(void *));
+        _bsort_ctx.flat_col_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch,
+                                                            child_ncols * sizeof(uint8_t *));
+        _bsort_ctx.flat_col_types = (enum column_type *)bump_alloc(&ctx->arena->scratch,
+                                                                    child_ncols * sizeof(enum column_type));
+        for (uint16_t ci = 0; ci < child_ncols; ci++) {
             enum column_type kt = COLUMN_TYPE_INT;
             if (st->nblocks > 0)
                 kt = st->collected[0].cols[ci].type;
-            _bsort_ctx.key_types[k] = kt;
+            _bsort_ctx.flat_col_types[ci] = kt;
 
             size_t elem_sz;
             if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
@@ -1139,26 +1327,35 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             else
                 elem_sz = sizeof(char *);
 
-            _bsort_ctx.flat_keys[k] = bump_alloc(&ctx->arena->scratch,
-                                                  (total ? total : 1) * elem_sz);
-            _bsort_ctx.flat_nulls[k] = (uint8_t *)bump_alloc(&ctx->arena->scratch,
-                                                              (total ? total : 1));
+            _bsort_ctx.flat_col_data[ci] = bump_alloc(&ctx->arena->scratch,
+                                                       (total ? total : 1) * elem_sz);
+            _bsort_ctx.flat_col_nulls[ci] = (uint8_t *)bump_alloc(&ctx->arena->scratch,
+                                                                   (total ? total : 1));
 
             uint32_t fi = 0;
             for (uint32_t b = 0; b < st->nblocks; b++) {
                 struct col_block *src = &_bsort_ctx.all_cols[b * child_ncols + ci];
                 uint16_t cnt = st->collected[b].count;
-                memcpy((uint8_t *)_bsort_ctx.flat_nulls[k] + fi, src->nulls, cnt);
+                memcpy(_bsort_ctx.flat_col_nulls[ci] + fi, src->nulls, cnt);
                 if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
-                    memcpy((int32_t *)_bsort_ctx.flat_keys[k] + fi, src->data.i32, cnt * sizeof(int32_t));
+                    memcpy((int32_t *)_bsort_ctx.flat_col_data[ci] + fi, src->data.i32, cnt * sizeof(int32_t));
                 else if (kt == COLUMN_TYPE_BIGINT)
-                    memcpy((int64_t *)_bsort_ctx.flat_keys[k] + fi, src->data.i64, cnt * sizeof(int64_t));
+                    memcpy((int64_t *)_bsort_ctx.flat_col_data[ci] + fi, src->data.i64, cnt * sizeof(int64_t));
                 else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC)
-                    memcpy((double *)_bsort_ctx.flat_keys[k] + fi, src->data.f64, cnt * sizeof(double));
+                    memcpy((double *)_bsort_ctx.flat_col_data[ci] + fi, src->data.f64, cnt * sizeof(double));
                 else
-                    memcpy((char **)_bsort_ctx.flat_keys[k] + fi, src->data.str, cnt * sizeof(char *));
+                    memcpy((char **)_bsort_ctx.flat_col_data[ci] + fi, src->data.str, cnt * sizeof(char *));
                 fi += cnt;
             }
+        }
+
+        /* Point sort key flat arrays into the all-column flat arrays */
+        uint16_t nsk = pn->sort.nsort_cols < 32 ? pn->sort.nsort_cols : 32;
+        for (uint16_t k = 0; k < nsk; k++) {
+            int sci = pn->sort.sort_cols[k];
+            _bsort_ctx.flat_keys[k] = _bsort_ctx.flat_col_data[sci];
+            _bsort_ctx.flat_nulls[k] = _bsort_ctx.flat_col_nulls[sci];
+            _bsort_ctx.key_types[k] = _bsort_ctx.flat_col_types[sci];
         }
 
         /* With flat arrays, sorted_indices are simple 0..total-1 indices */
@@ -1178,22 +1375,24 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     row_block_reset(out);
     uint16_t out_count = 0;
 
-    while (st->emit_cursor < st->sorted_count && out_count < BLOCK_CAPACITY) {
-        uint32_t flat_idx = st->sorted_indices[st->emit_cursor++];
+    /* Emit sorted rows directly from flat arrays — no block remap needed */
+    for (uint16_t c = 0; c < child_ncols; c++)
+        out->cols[c].type = _bsort_ctx.flat_col_types[c];
 
-        /* Map flat index back to block/row position */
-        uint32_t block_idx = 0;
-        uint32_t remaining = flat_idx;
-        while (block_idx < st->nblocks && remaining >= st->collected[block_idx].count) {
-            remaining -= st->collected[block_idx].count;
-            block_idx++;
-        }
-        uint16_t row_idx = (uint16_t)remaining;
+    while (st->emit_cursor < st->sorted_count && out_count < BLOCK_CAPACITY) {
+        uint32_t fi = st->sorted_indices[st->emit_cursor++];
 
         for (uint16_t c = 0; c < child_ncols; c++) {
-            struct col_block *src = &_bsort_ctx.all_cols[block_idx * child_ncols + c];
-            out->cols[c].type = src->type;
-            cb_copy_value(&out->cols[c], out_count, src, row_idx);
+            out->cols[c].nulls[out_count] = _bsort_ctx.flat_col_nulls[c][fi];
+            enum column_type ct = _bsort_ctx.flat_col_types[c];
+            if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+                out->cols[c].data.i32[out_count] = ((const int32_t *)_bsort_ctx.flat_col_data[c])[fi];
+            else if (ct == COLUMN_TYPE_BIGINT)
+                out->cols[c].data.i64[out_count] = ((const int64_t *)_bsort_ctx.flat_col_data[c])[fi];
+            else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+                out->cols[c].data.f64[out_count] = ((const double *)_bsort_ctx.flat_col_data[c])[fi];
+            else
+                out->cols[c].data.str[out_count] = ((char **)_bsort_ctx.flat_col_data[c])[fi];
         }
         out_count++;
     }

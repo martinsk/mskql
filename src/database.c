@@ -1780,6 +1780,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                         da_push(&r.cells, cp);
                     }
                     da_push(&t->rows, r);
+                    t->generation++;
                 }
                 int cnt = (int)sel_rows.count;
                 for (size_t i = 0; i < sel_rows.count; i++) row_free(&sel_rows.data[i]);

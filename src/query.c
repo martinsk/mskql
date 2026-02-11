@@ -3837,6 +3837,7 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct que
                 t->rows.items[j] = t->rows.items[j + 1];
             t->rows.count--;
             deleted++;
+            t->generation++;
         } else {
             i++;
         }
@@ -3894,8 +3895,11 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
             emit_returning_row(t, &t->rows.items[i], u->returning_columns, return_all, result);
     }
     /* rebuild indexes after cell mutation */
-    if (updated > 0 && t->indexes.count > 0)
-        rebuild_indexes(t);
+    if (updated > 0) {
+        t->generation++;
+        if (t->indexes.count > 0)
+            rebuild_indexes(t);
+    }
 
     if (!has_ret && result) {
         struct row r = {0};
@@ -4039,6 +4043,7 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
             }
         }
         da_push(&t->rows, copy);
+        t->generation++;
 
         /* update indexes */
         size_t new_row_id = t->rows.count - 1;

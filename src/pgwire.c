@@ -460,6 +460,40 @@ static int send_data_rows(int fd, struct rows *result)
 
 /* ---- direct columnar→wire send (bypasses block_to_rows) ---- */
 
+/* Fast int32 → decimal string. Returns length written. buf must be >= 12 bytes. */
+static inline size_t fast_i32_to_str(int32_t v, char *buf)
+{
+    char tmp[12];
+    int neg = 0;
+    uint32_t uv;
+    if (v < 0) { neg = 1; uv = (uint32_t)(-(int64_t)v); } else { uv = (uint32_t)v; }
+    int pos = 0;
+    do { tmp[pos++] = '0' + (char)(uv % 10); uv /= 10; } while (uv);
+    size_t len = (size_t)pos + (size_t)neg;
+    int out = 0;
+    if (neg) buf[out++] = '-';
+    while (pos > 0) buf[out++] = tmp[--pos];
+    buf[out] = '\0';
+    return len;
+}
+
+/* Fast int64 → decimal string. Returns length written. buf must be >= 21 bytes. */
+static inline size_t fast_i64_to_str(int64_t v, char *buf)
+{
+    char tmp[21];
+    int neg = 0;
+    uint64_t uv;
+    if (v < 0) { neg = 1; uv = (uint64_t)(-v); } else { uv = (uint64_t)v; }
+    int pos = 0;
+    do { tmp[pos++] = '0' + (char)(uv % 10); uv /= 10; } while (uv);
+    size_t len = (size_t)pos + (size_t)neg;
+    int out = 0;
+    if (neg) buf[out++] = '-';
+    while (pos > 0) buf[out++] = tmp[--pos];
+    buf[out] = '\0';
+    return len;
+}
+
 /* Push a col_block cell value directly into a msgbuf as a pgwire text field. */
 static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, uint16_t ri)
 {
@@ -476,11 +510,11 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
             buf[1] = '\0';
             len = 1;
         } else {
-            len = (size_t)snprintf(buf, sizeof(buf), "%d", cb->data.i32[ri]);
+            len = fast_i32_to_str(cb->data.i32[ri], buf);
         }
         txt = buf;
     } else if (cb->type == COLUMN_TYPE_BIGINT) {
-        len = (size_t)snprintf(buf, sizeof(buf), "%lld", cb->data.i64[ri]);
+        len = fast_i64_to_str(cb->data.i64[ri], buf);
         txt = buf;
     } else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC) {
         len = (size_t)snprintf(buf, sizeof(buf), "%g", cb->data.f64[ri]);
