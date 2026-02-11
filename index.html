@@ -194,6 +194,54 @@
         tbody tr:last-child td { border-bottom: 2px solid var(--fg); }
         td code { font-size: 0.8rem; }
 
+        /* ── Result tables (mathematical style) ────────────────── */
+        .result-table {
+            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+            font-size: 0.78rem;
+            border-collapse: collapse;
+            margin: 0.6rem 0 1.2rem 0;
+            width: auto;
+        }
+        .result-table th {
+            font-weight: 600;
+            font-size: 0.72rem;
+            text-transform: none;
+            letter-spacing: 0;
+            border-bottom: 2px solid var(--fg);
+            padding: 0.25rem 0.7rem;
+            text-align: left;
+        }
+        .result-table td {
+            padding: 0.2rem 0.7rem;
+            border-bottom: 1px solid var(--rule);
+            white-space: nowrap;
+        }
+        .result-table tbody tr:last-child td {
+            border-bottom: 2px solid var(--fg);
+        }
+        .result-table .null-val { color: #999; font-style: italic; }
+        .result-table .num-val { text-align: right; }
+        .query-pair {
+            display: flex;
+            gap: 1.5rem;
+            align-items: flex-start;
+            margin: 0.8rem 0 1.4rem 0;
+        }
+        .query-pair pre {
+            flex: 1;
+            min-width: 0;
+            margin: 0;
+        }
+        .query-pair .result-table {
+            flex: 0 0 auto;
+            margin: 0;
+        }
+        @media (max-width: 900px) {
+            .query-pair {
+                flex-direction: column;
+            }
+        }
+
         /* ── Divider ─────────────────────────────────────────── */
         hr {
             border: none;
@@ -253,7 +301,7 @@
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-    &ensp;&middot;&ensp; ~12,000 lines of C11 &ensp;&middot;&ensp; ~500 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~13,400 lines of C11 &ensp;&middot;&ensp; ~500 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -274,14 +322,39 @@
 <h2 id="motivation">1. Motivation</h2>
 
 <p>
-    Most embeddable databases either expose a custom API or implement a subset of SQL
-    behind a proprietary protocol. mskql takes a different approach: it implements the
-    PostgreSQL wire protocol&nbsp;(v3) directly, so any tool that can talk to Postgres can
-    talk to mskql without modification.<span class="sidenote">This means <code>psql</code>,
-    pgAdmin, DBeaver, any language driver for Postgres&mdash;they all work out of the box.
-    The default port is&nbsp;5433, configurable via <code>MSKQL_PORT</code>.</span>
-    The goal is a minimal, understandable, single-binary database useful for prototyping,
-    testing, and education.
+    <strong>Understanding database internals.</strong>&ensp;Production databases are
+    millions of lines of code. mskql distills the core ideas&mdash;wire protocol, parser,
+    query executor, storage engine, arena allocator, plan executor&mdash;into ~13,400
+    readable lines of C11 with zero dependencies. Every layer is visible and
+    modifiable: from how a <code>SELECT</code> is parsed into an AST, to how a hash join
+    probes its build table, to how a bump allocator recycles memory across
+    requests.<span class="sidenote">The codebase is structured so each subsystem
+    (<code>pgwire.c</code>, <code>parser.c</code>, <code>query.c</code>,
+    <code>plan.c</code>, <code>database.c</code>) can be studied in isolation.
+    No generated code, no macros hiding control flow.</span>
+</p>
+
+<p>
+    <strong>Enabling real software development with modern AI.</strong>&ensp;This project
+    was built entirely by AI agents&mdash;no human wrote any C code or SQL test case.
+    It demonstrates that adversarial AI collaboration can produce non-trivial systems
+    software: a hand-written recursive-descent parser, a block-oriented vectorized
+    executor, arena-based memory management, and a PostgreSQL-compatible wire protocol.
+    The key enabler is a tight feedback loop&mdash;write code, run 500 tests, fix
+    failures, repeat&mdash;that mirrors how experienced engineers ship production
+    systems.<span class="sidenote">The adversarial model (one agent writes code, another
+    writes tests to break it) drove the implementation toward correctness the same way
+    rigorous code review does on a human team&mdash;except both sides were
+    machines.</span>
+</p>
+
+<p>
+    <strong>Wire-protocol compatibility.</strong>&ensp;Most embeddable databases expose a
+    custom API or implement a subset of SQL behind a proprietary protocol. mskql
+    implements the PostgreSQL wire protocol&nbsp;(v3) directly, so any tool that speaks
+    Postgres works without modification&mdash;<code>psql</code>, pgAdmin, DBeaver, any
+    language driver.<span class="sidenote">The default port is&nbsp;5433, configurable
+    via <code>MSKQL_PORT</code>.</span>
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -324,8 +397,8 @@
   <text x="310" y="218" text-anchor="middle" font-size="10" fill="#a00" font-weight="600">rounds</text>
   <line x1="310" y1="232" x2="310" y2="270" stroke="#a00" stroke-width="1.5" marker-end="url(#ah)"/>
   <rect x="180" y="275" width="260" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="296" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">350 tests pass</text>
-  <text x="310" y="314" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.8)">~10,300 lines of C &middot; zero human code</text>
+  <text x="310" y="296" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">495 tests pass</text>
+  <text x="310" y="314" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.8)">~13,400 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
@@ -363,7 +436,8 @@
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
-                3,700 lines the parser is the largest single file. It includes a
+                3,700 lines the parser is the largest single file (with <code>plan.c</code>
+                adding another 1,000 lines for the block-oriented executor). It includes a
                 recursive-descent expression parser with proper operator precedence
                 (<code>||</code>&nbsp;&lt;&nbsp;<code>+-</code>&nbsp;&lt;&nbsp;<code>*/%</code>)
                 and handles the full grammar including CTEs, window functions, views,
@@ -373,6 +447,15 @@
             <td><strong>Query executor</strong></td>
             <td><code>query.c</code>, <code>database.c</code></td>
             <td>Tree-walking evaluator that executes the AST against in-memory tables.
+                A block-oriented plan executor (<code>plan.c</code>) handles simple
+                queries with vectorized filter/project/limit/hash-join/hash-agg
+                operators; complex queries fall back to the legacy
+                row-at-a-time path.<span class="sidenote">The plan executor processes
+                data in 1,024-row column blocks, enabling cache-friendly scans and
+                vectorized numeric comparisons. It currently covers
+                <code>SELECT</code> with <code>WHERE</code>, projections,
+                <code>LIMIT</code>/<code>OFFSET</code>, hash joins, and hash
+                aggregation.</span>
                 Handles joins (with compound <code>ON</code> conditions),
                 aggregation (including <code>DISTINCT</code> aggregates,
                 <code>ROLLUP</code>/<code>CUBE</code>),
@@ -403,10 +486,15 @@
     <code>eval_expr()</code>. Ownership follows JPL rules: the allocating module
     deallocates, with <code>cell_release()</code> as the single canonical release
     function for cell text.
-    A bump allocator (<code>arena.scratch</code>) handles temporary executor
-    allocations&mdash;aggregate accumulators, sort buffers, window-function
-    state&mdash;all freed in bulk by <code>query_arena_destroy()</code>, yielding
-    zero per-query <code>malloc</code>/<code>free</code> calls at steady state.
+    A slab-chain bump allocator (<code>arena.scratch</code>) handles temporary
+    executor allocations&mdash;aggregate accumulators, sort buffers, match indices,
+    window-function state&mdash;all freed in bulk by
+    <code>query_arena_destroy()</code>, yielding zero per-query
+    <code>malloc</code>/<code>free</code> calls at steady state.<span class="sidenote">The
+    bump allocator uses a linked list of fixed-size slabs rather than a single
+    <code>realloc</code>&rsquo;d buffer, so pointers into earlier slabs remain
+    valid even after new slabs are appended&mdash;critical for the plan
+    executor which holds references across block iterations.</span>
     A generic dynamic-array macro (<code>dynamic_array.h</code>) and zero-copy string views
     (<code>stringview.h</code>) round out the internal abstractions.
 </p>
@@ -584,9 +672,9 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 
 <pre><code class="language-bash">MSKQL_PORT=5444 ./build/mskql</code></pre>
 
-<h3>A small company in six queries</h3>
+<h3>A small company in ten queries</h3>
 
-<p>Start with a schema&mdash;two tables and a handful of rows:</p>
+<p><strong>Step 1 &mdash; Schema.</strong> Two tables with constraints, a serial primary key, and a foreign key.</p>
 
 <pre><code class="language-sql">CREATE TABLE departments (
     id    SERIAL PRIMARY KEY,
@@ -596,55 +684,190 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 CREATE TABLE employees (
     id         SERIAL PRIMARY KEY,
     name       TEXT NOT NULL,
-    dept_id    INT,
+    dept_id    INT REFERENCES departments(id),
     salary     INT DEFAULT 0,
     hired      DATE
 );
 
-INSERT INTO departments (id, name) VALUES
-    (1, 'Engineering'), (2, 'Design'), (3, 'Sales');
+INSERT INTO departments (name) VALUES
+    ('Engineering'), ('Design'), ('Sales');
 
-INSERT INTO employees (id, name, dept_id, salary, hired) VALUES
-    (1, 'Alice',   1, 130000, '2022-03-15'),
-    (2, 'Bob',     1,  95000, '2023-01-10'),
-    (3, 'Carol',   2, 110000, '2021-07-01'),
-    (4, 'Dave',    2,  90000, '2024-02-20'),
-    (5, 'Eve',     3, 105000, '2023-06-01'),
-    (6, 'Frank', NULL,  80000, '2024-11-01');</code></pre>
+INSERT INTO employees (name, dept_id, salary, hired) VALUES
+    ('Alice',   1, 130000, '2022-03-15'),
+    ('Bob',     1,  95000, '2023-01-10'),
+    ('Carol',   2, 110000, '2021-07-01'),
+    ('Dave',    2,  90000, '2024-02-20'),
+    ('Eve',     3, 105000, '2023-06-01'),
+    ('Frank', NULL,  80000, '2024-11-01');</code></pre>
 
-<p>A simple lookup&mdash;who earns above six figures?</p>
+<p><strong>Step 2 &mdash; Filter.</strong> Who earns above six figures?</p>
 
-<pre><code class="language-sql">SELECT name, salary FROM employees
+<div class="query-pair">
+<pre><code class="language-sql">SELECT name, salary
+FROM employees
 WHERE salary > 100000
 ORDER BY salary DESC;</code></pre>
+<table class="result-table">
+<thead><tr><th>name</th><th>salary</th></tr></thead>
+<tbody>
+<tr><td>Alice</td><td class="num-val">130000</td></tr>
+<tr><td>Carol</td><td class="num-val">110000</td></tr>
+<tr><td>Eve</td><td class="num-val">105000</td></tr>
+</tbody>
+</table>
+</div>
 
-<p>Join the tables to see which department each person belongs to
-    (and catch Frank, who hasn&rsquo;t been assigned yet):</p>
+<p><strong>Step 3 &mdash; LEFT JOIN + COALESCE.</strong> Show every employee&rsquo;s department, including unassigned.</p>
 
-<pre><code class="language-sql">SELECT e.name, COALESCE(d.name, 'Unassigned') AS department
+<div class="query-pair">
+<pre><code class="language-sql">SELECT e.name,
+       COALESCE(d.name, 'Unassigned')
+         AS department
 FROM employees e
-LEFT JOIN departments d ON e.dept_id = d.id;</code></pre>
+LEFT JOIN departments d
+  ON e.dept_id = d.id;</code></pre>
+<table class="result-table">
+<thead><tr><th>name</th><th>department</th></tr></thead>
+<tbody>
+<tr><td>Alice</td><td>Engineering</td></tr>
+<tr><td>Bob</td><td>Engineering</td></tr>
+<tr><td>Carol</td><td>Design</td></tr>
+<tr><td>Dave</td><td>Design</td></tr>
+<tr><td>Eve</td><td>Sales</td></tr>
+<tr><td>Frank</td><td>Unassigned</td></tr>
+</tbody>
+</table>
+</div>
 
-<p>Aggregate&mdash;average salary per department, but only the big spenders:</p>
+<p><strong>Step 4 &mdash; Aggregation + HAVING.</strong> Average salary per department, filtering to departments above 100k.</p>
 
+<div class="query-pair">
 <pre><code class="language-sql">SELECT d.name AS department,
-       COUNT(*) AS headcount,
+       COUNT(*)    AS headcount,
        AVG(e.salary) AS avg_salary
 FROM employees e
 JOIN departments d ON e.dept_id = d.id
 GROUP BY d.name
 HAVING AVG(e.salary) > 100000;</code></pre>
+<table class="result-table">
+<thead><tr><th>department</th><th>headcount</th><th>avg_salary</th></tr></thead>
+<tbody>
+<tr><td>Engineering</td><td class="num-val">2</td><td class="num-val">112500</td></tr>
+<tr><td>Sales</td><td class="num-val">1</td><td class="num-val">105000</td></tr>
+</tbody>
+</table>
+</div>
 
-<p>Window function&mdash;rank everyone within their department:</p>
+<p><strong>Step 5 &mdash; Window function.</strong> Rank employees within each department by salary.</p>
 
-<pre><code class="language-sql">SELECT e.name,
-       d.name AS department,
+<div class="query-pair">
+<pre><code class="language-sql">SELECT e.name, d.name AS dept,
        e.salary,
-       RANK() OVER (PARTITION BY d.name ORDER BY e.salary DESC) AS dept_rank
+       RANK() OVER (
+         PARTITION BY d.name
+         ORDER BY e.salary DESC
+       ) AS rnk
 FROM employees e
-JOIN departments d ON e.dept_id = d.id;</code></pre>
+JOIN departments d
+  ON e.dept_id = d.id;</code></pre>
+<table class="result-table">
+<thead><tr><th>name</th><th>dept</th><th>salary</th><th>rnk</th></tr></thead>
+<tbody>
+<tr><td>Carol</td><td>Design</td><td class="num-val">110000</td><td class="num-val">1</td></tr>
+<tr><td>Dave</td><td>Design</td><td class="num-val">90000</td><td class="num-val">2</td></tr>
+<tr><td>Alice</td><td>Engineering</td><td class="num-val">130000</td><td class="num-val">1</td></tr>
+<tr><td>Bob</td><td>Engineering</td><td class="num-val">95000</td><td class="num-val">2</td></tr>
+<tr><td>Eve</td><td>Sales</td><td class="num-val">105000</td><td class="num-val">1</td></tr>
+</tbody>
+</table>
+</div>
 
-<p>Finally, a recursive CTE&mdash;generate a running headcount timeline by hire date:</p>
+<p><strong>Step 6 &mdash; Upsert.</strong> Insert-or-update with <code>ON CONFLICT DO UPDATE</code>.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">INSERT INTO departments (id, name)
+VALUES (2, 'Product Design')
+ON CONFLICT (id) DO UPDATE
+  SET name = 'Product Design';
+
+SELECT * FROM departments
+ORDER BY id;</code></pre>
+<table class="result-table">
+<thead><tr><th>id</th><th>name</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>Engineering</td></tr>
+<tr><td class="num-val">2</td><td>Product Design</td></tr>
+<tr><td class="num-val">3</td><td>Sales</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>Step 7 &mdash; View.</strong> Create a reusable view for department summaries.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">CREATE VIEW dept_summary AS
+SELECT d.name AS department,
+       COUNT(*) AS headcount,
+       AVG(e.salary) AS avg_salary
+FROM employees e
+JOIN departments d ON e.dept_id = d.id
+GROUP BY d.name;
+
+SELECT * FROM dept_summary
+ORDER BY avg_salary DESC;</code></pre>
+<table class="result-table">
+<thead><tr><th>department</th><th>headcount</th><th>avg_salary</th></tr></thead>
+<tbody>
+<tr><td>Engineering</td><td class="num-val">2</td><td class="num-val">112500</td></tr>
+<tr><td>Sales</td><td class="num-val">1</td><td class="num-val">105000</td></tr>
+<tr><td>Product Design</td><td class="num-val">2</td><td class="num-val">100000</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>Step 8 &mdash; Sequence + UUID.</strong> Use a sequence and generate a UUID.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">CREATE SEQUENCE invoice_seq
+  START WITH 1000;
+
+SELECT NEXTVAL('invoice_seq') AS inv,
+       GEN_RANDOM_UUID()      AS ref;</code></pre>
+<table class="result-table">
+<thead><tr><th>inv</th><th>ref</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1000</td><td>a3f7c&hellip;4e21</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>Step 9 &mdash; Window frame.</strong> Running salary total within each department.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT e.name, d.name AS dept,
+       e.salary,
+       SUM(e.salary) OVER (
+         PARTITION BY d.name
+         ORDER BY e.salary
+         ROWS BETWEEN UNBOUNDED
+           PRECEDING AND CURRENT ROW
+       ) AS running_total
+FROM employees e
+JOIN departments d
+  ON e.dept_id = d.id;</code></pre>
+<table class="result-table">
+<thead><tr><th>name</th><th>dept</th><th>salary</th><th>running_total</th></tr></thead>
+<tbody>
+<tr><td>Dave</td><td>Product Design</td><td class="num-val">90000</td><td class="num-val">90000</td></tr>
+<tr><td>Carol</td><td>Product Design</td><td class="num-val">110000</td><td class="num-val">200000</td></tr>
+<tr><td>Bob</td><td>Engineering</td><td class="num-val">95000</td><td class="num-val">95000</td></tr>
+<tr><td>Alice</td><td>Engineering</td><td class="num-val">130000</td><td class="num-val">225000</td></tr>
+<tr><td>Eve</td><td>Sales</td><td class="num-val">105000</td><td class="num-val">105000</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>Step 10 &mdash; Recursive CTE.</strong> Generate a running headcount timeline by hire date.</p>
 
 <pre><code class="language-sql">WITH RECURSIVE dates AS (
     SELECT MIN(hired) AS dt FROM employees
@@ -653,12 +876,14 @@ JOIN departments d ON e.dept_id = d.id;</code></pre>
     WHERE dt < (SELECT MAX(hired) FROM employees)
 )
 SELECT d.dt,
-       (SELECT COUNT(*) FROM employees e WHERE e.hired <= d.dt) AS headcount
+       (SELECT COUNT(*) FROM employees e
+        WHERE e.hired <= d.dt) AS headcount
 FROM dates d
 ORDER BY d.dt;</code></pre>
 
-<p>Six queries, zero configuration&mdash;from <code>CREATE TABLE</code> to recursive
-    CTEs with window functions, all through a standard Postgres connection.</p>
+<p>Ten queries, zero configuration&mdash;from <code>CREATE TABLE</code> with foreign keys
+    to recursive CTEs, window frames, views, sequences, and upserts, all through a
+    standard Postgres connection.</p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--  6. Testing                                                 -->

@@ -1,75 +1,142 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, minimum-scale=1.0, initial-scale=1, user-scalable=yes" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
     <style>
-      html {
-        font-family: BlinkMacSystemFont,-apple-system,"Segoe UI",Roboto,Oxygen,Ubuntu,Cantarell,"Fira Sans","Droid Sans","Helvetica Neue",Helvetica,Arial,sans-serif;
-        -webkit-font-smoothing: antialiased;
-        background-color: #fff;
-        font-size: 16px;
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      :root {
+        --fg: #111;
+        --fg-dim: #555;
+        --bg: #fffff8;
+        --accent: #a00;
+        --rule: #ccc;
       }
+
+      html { font-size: 15px; }
+
       body {
-        color: #4a4a4a;
-        margin: 8px;
-        font-size: 1em;
-        font-weight: 400;
+        font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+        background: var(--bg);
+        color: var(--fg);
+        width: 55%;
+        margin-left: auto;
+        margin-right: auto;
+        padding: 3rem 0 5rem 0;
       }
-      header {
-        margin-bottom: 8px;
+
+      a {
+        color: var(--fg);
+        text-decoration: none;
+        background-image: linear-gradient(var(--accent), var(--accent));
+        background-size: 1px 1px;
+        background-repeat: repeat-x;
+        background-position: 0 1.15em;
+      }
+      a:hover { color: var(--accent); }
+
+      h1 {
+        font-weight: 400;
+        font-size: 2.6rem;
+        line-height: 1.15;
+        margin-bottom: 0.4rem;
+      }
+
+      .subtitle {
+        font-style: italic;
+        font-size: 1.3rem;
+        color: var(--fg-dim);
+        display: block;
+        margin-bottom: 0.6rem;
+        line-height: 1.4;
+      }
+
+      .byline {
+        font-size: 0.95rem;
+        color: var(--fg-dim);
+        margin-bottom: 2rem;
+      }
+      .byline a { font-size: 0.95rem; }
+
+      .title-rule {
+        border: none;
+        height: 3px;
+        background: var(--accent);
+        width: 60px;
+        margin: 0 0 2rem 0;
+      }
+
+      p { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+
+      header#header {
+        margin-bottom: 1.5rem;
         display: flex;
         flex-direction: column;
+        gap: 0.3rem;
       }
+      .header-item {
+        font-size: 0.9rem;
+        color: var(--fg-dim);
+      }
+      .header-label {
+        font-weight: 600;
+        margin-right: 0.3rem;
+      }
+
       main {
         width: 100%;
         display: flex;
         flex-direction: column;
       }
-      a {
-        color: #3273dc;
-        cursor: pointer;
-        text-decoration: none;
-      }
-      a:hover {
-        color: #000;
-      }
+
       button {
+        font-family: 'EB Garamond', Georgia, serif;
+        font-size: 0.9rem;
         color: #fff;
-        background-color: #3298dc;
-        border-color: transparent;
+        background-color: var(--accent);
+        border: none;
+        border-radius: 3px;
+        padding: 0.4rem 1rem;
         cursor: pointer;
-        text-align: center;
       }
       button:hover {
-        background-color: #2793da;
-        flex: none;
+        background-color: #800;
       }
-      .spacer {
-        flex: auto;
-      }
-      .small {
-        font-size: 0.75rem;
-      }
-      footer {
-        margin-top: 16px;
+
+      .spacer { flex: auto; }
+      .small { font-size: 0.8rem; color: var(--fg-dim); }
+
+      footer.site-footer {
+        margin-top: 3rem;
+        padding-top: 1.5rem;
+        border-top: 1px solid var(--rule);
+        font-size: 0.85rem;
+        color: var(--fg-dim);
         display: flex;
         align-items: center;
       }
-      .header-label {
-        margin-right: 4px;
-      }
+      footer.site-footer a { font-size: 0.85rem; }
+
       .benchmark-set {
-        margin: 8px 0;
+        margin: 2rem 0;
         width: 100%;
         display: flex;
         flex-direction: column;
       }
       .benchmark-title {
-        font-size: 3rem;
-        font-weight: 600;
-        word-break: break-word;
-        text-align: center;
+        font-family: 'EB Garamond', Georgia, serif;
+        font-weight: 400;
+        font-style: italic;
+        font-size: 1.4rem;
+        color: var(--fg);
+        text-align: left;
+        margin-bottom: 0.8rem;
+        padding-bottom: 0.15rem;
+        border-bottom: 1px solid var(--rule);
       }
       .benchmark-graphs {
         display: flex;
@@ -82,11 +149,29 @@
       .benchmark-chart {
         max-width: 1000px;
       }
+
+      @media (max-width: 1100px) {
+        body { width: 80%; }
+      }
+      @media (max-width: 700px) {
+        body { width: 90%; padding: 2rem 0 3rem 0; }
+        h1 { font-size: 2rem; }
+      }
     </style>
-    <title>Benchmarks</title>
+    <title>mskql &mdash; Benchmarks</title>
   </head>
 
   <body>
+
+    <h1>mskql</h1>
+    <span class="subtitle">Benchmark History</span>
+    <p class="byline">
+      <a href="../../index.html">&larr; Back to documentation</a>
+      &ensp;&middot;&ensp;
+      <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
+    </p>
+    <hr class="title-rule">
+
     <header id="header">
       <div class="header-item">
         <strong class="header-label">Last Update:</strong>
@@ -97,8 +182,16 @@
         <a id="repository-link" rel="noopener"></a>
       </div>
     </header>
+
+    <p>
+      Wall-clock time for core operations: bulk insert, full-table scan, filtered select,
+      aggregation, ordering, joins, update, delete, parsing, index lookup, and transactions.
+      Results are tracked continuously via CI.
+    </p>
+
     <main id="main"></main>
-    <footer>
+
+    <footer class="site-footer">
       <button id="dl-button">Download data as JSON</button>
       <div class="spacer"></div>
       <div class="small">Powered by <a rel="noopener" href="https://github.com/marketplace/actions/continuous-benchmark">github-action-benchmark</a></div>
@@ -175,7 +268,7 @@
             canvas.className = 'benchmark-chart';
             parent.appendChild(canvas);
 
-            const color = toolColors[dataset.length > 0 ? dataset[0].tool : '_'];
+            const color = '#aa0000'; // match --accent
             const data = {
               labels: dataset.map(d => d.commit.id.slice(0, 7)),
               datasets: [
@@ -254,7 +347,7 @@
             setElem.className = 'benchmark-set';
             main.appendChild(setElem);
 
-            const nameElem = document.createElement('h1');
+            const nameElem = document.createElement('h2');
             nameElem.className = 'benchmark-title';
             nameElem.textContent = name;
             setElem.appendChild(nameElem);
