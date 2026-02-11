@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Tutorial: Schema Evolution</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --fg: #111;
+            --fg-dim: #555;
+            --bg: #fffff8;
+            --accent: #a00;
+            --rule: #ccc;
+            --code-bg: #f3f1eb;
+            --nav-width: 200px;
+        }
+
+        html { font-size: 15px; }
+
+        body {
+            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+            background: var(--bg);
+            color: var(--fg);
+            display: flex;
+            min-height: 100vh;
+        }
+
+        .sidebar { width: var(--nav-width); min-width: var(--nav-width); padding: 2rem 1.2rem 2rem 1.5rem; border-right: 1px solid var(--rule); position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+        .sidebar-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.3rem; }
+        .sidebar-title a { color: var(--fg); text-decoration: none; background: none; }
+        .sidebar-title a:hover { color: var(--accent); }
+        .sidebar-subtitle { font-size: 0.8rem; color: var(--fg-dim); font-style: italic; margin-bottom: 1.2rem; }
+        .sidebar-subtitle a { color: var(--fg-dim); text-decoration: none; background: none; }
+        .sidebar-subtitle a:hover { color: var(--accent); }
+        .sidebar nav ul { list-style: none; padding: 0; }
+        .sidebar nav li { margin-bottom: 0.15rem; }
+        .sidebar nav a { font-size: 0.82rem; color: var(--fg-dim); text-decoration: none; background: none; display: block; padding: 0.2rem 0.5rem; border-radius: 3px; line-height: 1.4; }
+        .sidebar nav a:hover { color: var(--accent); background: var(--code-bg); }
+        .sidebar nav a.active { color: var(--accent); font-weight: 600; background: var(--code-bg); }
+        .sidebar nav .nav-label { font-family: 'Menlo', 'Consolas', monospace; font-size: 0.6rem; font-weight: 700; color: var(--fg-dim); letter-spacing: 0.06em; text-transform: uppercase; padding: 0.6rem 0.5rem 0.2rem; }
+
+        .content { flex: 1; max-width: 720px; margin: 0 auto; padding: 3rem 2rem 5rem 2rem; }
+
+        p, ol, ul { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+        li { margin-bottom: 0.3rem; }
+        ol, ul { padding-left: 1.6rem; }
+
+        a { color: var(--fg); text-decoration: none; background-image: linear-gradient(var(--accent), var(--accent)); background-size: 1px 1px; background-repeat: repeat-x; background-position: 0 1.15em; }
+        a:hover { color: var(--accent); }
+
+        strong { font-weight: 600; }
+
+        h1 { font-weight: 400; font-size: 2.2rem; line-height: 1.15; margin-bottom: 0.4rem; }
+        .subtitle { font-style: italic; font-size: 1.15rem; color: var(--fg-dim); display: block; margin-bottom: 0.6rem; line-height: 1.4; }
+        .byline { font-size: 0.95rem; color: var(--fg-dim); margin-bottom: 2rem; }
+        .byline a { font-size: 0.95rem; }
+        .title-rule { border: none; height: 3px; background: var(--accent); width: 60px; margin: 0 0 2rem 0; }
+
+        h2 { font-weight: 400; font-style: italic; font-size: 1.5rem; margin-top: 2.8rem; margin-bottom: 0.6rem; }
+        h3 { font-weight: 600; font-style: normal; font-size: 1.15rem; margin-top: 1.6rem; margin-bottom: 0.4rem; }
+
+        code { font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace; font-size: 0.82rem; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 2px; }
+        pre { background: var(--code-bg); border-left: 3px solid var(--accent); padding: 1rem 1.2rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.55; margin: 1rem 0 1.4rem 0; }
+        pre code { background: none; padding: 0; border-radius: 0; }
+        pre code.hljs { background: var(--code-bg); padding: 0; }
+        .hljs { background: var(--code-bg); }
+
+        .result-table { font-family: 'EB Garamond', Georgia, serif; font-size: 0.92rem; border-collapse: collapse; margin: 0.6rem 0 1.2rem 0; width: 100%; border-top: 2px solid var(--fg); border-bottom: 2px solid var(--fg); }
+        .result-table th { font-weight: 400; font-size: 0.78rem; font-variant: small-caps; text-transform: lowercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--fg); padding: 0.3rem 0.6rem 0.25rem; text-align: left; color: var(--fg); }
+        .result-table td { padding: 0.22rem 0.6rem; border: none; white-space: nowrap; }
+        .result-table .null-val { color: #999; font-style: italic; }
+        .result-table .num-val { text-align: right; font-variant-numeric: tabular-nums; }
+        .result-label { font-size: 0.8rem; font-style: italic; color: var(--fg-dim); margin: 0 0 0.3rem 0; }
+        .query-pair { display: flex; gap: 1.2rem; align-items: stretch; margin: 0.8rem 0 1.4rem 0; }
+        .query-pair pre { flex: 1 1 50%; min-width: 0; margin: 0; }
+        .query-pair .result-wrap { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+        .query-pair .result-table { margin: 0; }
+
+        .tutorial-nav { display: flex; justify-content: space-between; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.95rem; }
+        .tutorial-nav a { background: none; }
+        .tutorial-nav .prev::before { content: '\2190\00a0'; }
+        .tutorial-nav .next::after { content: '\00a0\2192'; }
+
+        footer.site-footer { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.85rem; color: var(--fg-dim); }
+        footer.site-footer a { font-size: 0.85rem; }
+
+        hr { border: none; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+
+        @media (max-width: 900px) {
+            .sidebar { display: none; }
+            .content { padding: 2rem 1.2rem 3rem 1.2rem; }
+            .query-pair { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-title"><a href="../index.html">mskql</a></div>
+    <div class="sidebar-subtitle"><a href="index.html">Tutorials</a></div>
+    <nav>
+        <ul>
+            <li><a href="task-tracker.html">1. Task Tracker</a></li>
+            <li><a href="reporting-dashboard.html">2. Reporting Dashboard</a></li>
+            <li><a href="time-series.html">3. Time-Series Analytics</a></li>
+            <li><a href="multi-table-joins.html">4. Multi-Table Joins</a></li>
+            <li><a href="schema-evolution.html" class="active">5. Schema Evolution</a></li>
+        </ul>
+        <div class="nav-label">Reference</div>
+        <ul>
+            <li><a href="../grammar.html">SQL Grammar</a></li>
+            <li><a href="../bench-vs-pg.html">vs PostgreSQL</a></li>
+        </ul>
+    </nav>
+</aside>
+
+<main class="content">
+
+<h1>Schema Evolution</h1>
+<span class="subtitle">ALTER TABLE, CAST, and transactional migrations</span>
+<p class="byline">Tutorial 5 of 5</p>
+<hr class="title-rule">
+
+<p>
+    This tutorial starts with a simple v1 schema and evolves it through
+    several migrations: adding columns, renaming fields, changing types
+    with <code>CAST</code>/<code>::</code>, and wrapping everything in
+    transactions. This is the &ldquo;my schema needs to change&rdquo;
+    workflow.
+</p>
+
+<!-- ─── v1 schema ───────────────────────────────────────────── -->
+
+<h2>1. The v1 schema</h2>
+
+<p>A minimal user table to start with.</p>
+
+<pre><code class="language-sql">CREATE TABLE users (
+    id     SERIAL PRIMARY KEY,
+    name   TEXT NOT NULL,
+    email  TEXT NOT NULL UNIQUE,
+    active INT DEFAULT 1
+);
+
+INSERT INTO users (name, email, active) VALUES
+    ('Alice',  'alice@example.com',  1),
+    ('Bob',    'bob@example.com',    1),
+    ('Carol',  'carol@example.com',  0),
+    ('Dave',   'dave@example.com',   1);</code></pre>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT * FROM users
+ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>name</th><th>email</th><th>active</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>Alice</td><td>alice@example.com</td><td class="num-val">1</td></tr>
+<tr><td class="num-val">2</td><td>Bob</td><td>bob@example.com</td><td class="num-val">1</td></tr>
+<tr><td class="num-val">3</td><td>Carol</td><td>carol@example.com</td><td class="num-val">0</td></tr>
+<tr><td class="num-val">4</td><td>Dave</td><td>dave@example.com</td><td class="num-val">1</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Add column ──────────────────────────────────────────── -->
+
+<h2>2. Migration: add a column</h2>
+
+<p>
+    Add a <code>created_at</code> column. Existing rows get <code>NULL</code>
+    since there is no default.
+</p>
+
+<pre><code class="language-sql">ALTER TABLE users ADD COLUMN created_at DATE;</code></pre>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT id, name, created_at
+FROM users ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>name</th><th>created_at</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>Alice</td><td class="null-val">NULL</td></tr>
+<tr><td class="num-val">2</td><td>Bob</td><td class="null-val">NULL</td></tr>
+<tr><td class="num-val">3</td><td>Carol</td><td class="null-val">NULL</td></tr>
+<tr><td class="num-val">4</td><td>Dave</td><td class="null-val">NULL</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p>Backfill the new column with a default date.</p>
+
+<pre><code class="language-sql">UPDATE users SET created_at = '2025-01-01';</code></pre>
+
+<!-- ─── Rename column ───────────────────────────────────────── -->
+
+<h2>3. Migration: rename a column</h2>
+
+<p>Rename <code>name</code> to <code>display_name</code> for clarity.</p>
+
+<pre><code class="language-sql">ALTER TABLE users RENAME COLUMN name TO display_name;</code></pre>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT id, display_name, email
+FROM users ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>display_name</th><th>email</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>Alice</td><td>alice@example.com</td></tr>
+<tr><td class="num-val">2</td><td>Bob</td><td>bob@example.com</td></tr>
+<tr><td class="num-val">3</td><td>Carol</td><td>carol@example.com</td></tr>
+<tr><td class="num-val">4</td><td>Dave</td><td>dave@example.com</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Change column type ──────────────────────────────────── -->
+
+<h2>4. Migration: change a column type</h2>
+
+<p>
+    The <code>active</code> column is an <code>INT</code> but should be
+    <code>BOOLEAN</code>. Use <code>ALTER COLUMN TYPE</code> to convert it.
+</p>
+
+<pre><code class="language-sql">ALTER TABLE users ALTER COLUMN active TYPE BOOLEAN;</code></pre>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT id, display_name,
+       active
+FROM users ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>display_name</th><th>active</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>Alice</td><td>true</td></tr>
+<tr><td class="num-val">2</td><td>Bob</td><td>true</td></tr>
+<tr><td class="num-val">3</td><td>Carol</td><td>false</td></tr>
+<tr><td class="num-val">4</td><td>Dave</td><td>true</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── CAST / :: ───────────────────────────────────────────── -->
+
+<h2>5. Using CAST and :: in queries</h2>
+
+<p>
+    The <code>CAST()</code> function and the <code>::</code> postfix operator
+    both convert between types. They are interchangeable.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT display_name,
+       active::INT AS active_int,
+       CAST(id AS TEXT)
+         || '-' || display_name
+         AS code
+FROM users
+ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>display_name</th><th>active_int</th><th>code</th></tr></thead>
+<tbody>
+<tr><td>Alice</td><td class="num-val">1</td><td>1-Alice</td></tr>
+<tr><td>Bob</td><td class="num-val">1</td><td>2-Bob</td></tr>
+<tr><td>Carol</td><td class="num-val">0</td><td>3-Carol</td></tr>
+<tr><td>Dave</td><td class="num-val">1</td><td>4-Dave</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Transactional migration ─────────────────────────────── -->
+
+<h2>6. Transactional migration</h2>
+
+<p>
+    Wrap a multi-step migration in a transaction. If any step fails, all
+    changes are rolled back.
+</p>
+
+<pre><code class="language-sql">BEGIN;
+
+ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user';
+
+UPDATE users SET role = 'admin'
+WHERE display_name = 'Alice';
+
+COMMIT;</code></pre>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT display_name, role
+FROM users ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>display_name</th><th>role</th></tr></thead>
+<tbody>
+<tr><td>Alice</td><td>admin</td></tr>
+<tr><td>Bob</td><td>user</td></tr>
+<tr><td>Carol</td><td>user</td></tr>
+<tr><td>Dave</td><td>user</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Nested transactions ─────────────────────────────────── -->
+
+<h2>7. Nested transactions</h2>
+
+<p>
+    mskql supports nested <code>BEGIN</code> blocks. The inner transaction
+    can be rolled back independently while the outer one continues.
+</p>
+
+<pre><code class="language-sql">BEGIN;
+
+UPDATE users SET role = 'moderator'
+WHERE display_name = 'Bob';
+
+BEGIN;
+UPDATE users SET role = 'moderator'
+WHERE display_name = 'Carol';
+ROLLBACK;
+
+COMMIT;</code></pre>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT display_name, role
+FROM users ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>display_name</th><th>role</th></tr></thead>
+<tbody>
+<tr><td>Alice</td><td>admin</td></tr>
+<tr><td>Bob</td><td>moderator</td></tr>
+<tr><td>Carol</td><td>user</td></tr>
+<tr><td>Dave</td><td>user</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p>
+    Bob&rsquo;s role was updated in the outer transaction (committed).
+    Carol&rsquo;s update was in the inner transaction (rolled back), so
+    she stays as &ldquo;user&rdquo;.
+</p>
+
+<!-- ─── Drop column ─────────────────────────────────────────── -->
+
+<h2>8. Drop a column</h2>
+
+<p>Remove the old <code>active</code> column now that we have <code>role</code>.</p>
+
+<pre><code class="language-sql">ALTER TABLE users DROP COLUMN active;</code></pre>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT * FROM users
+ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>display_name</th><th>email</th><th>created_at</th><th>role</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>Alice</td><td>alice@example.com</td><td>2025-01-01</td><td>admin</td></tr>
+<tr><td class="num-val">2</td><td>Bob</td><td>bob@example.com</td><td>2025-01-01</td><td>moderator</td></tr>
+<tr><td class="num-val">3</td><td>Carol</td><td>carol@example.com</td><td>2025-01-01</td><td>user</td></tr>
+<tr><td class="num-val">4</td><td>Dave</td><td>dave@example.com</td><td>2025-01-01</td><td>user</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Wrap-up ─────────────────────────────────────────────── -->
+
+<h2>What you learned</h2>
+
+<ul>
+    <li><strong><code>ALTER TABLE ADD COLUMN</code></strong> to extend a table</li>
+    <li><strong><code>ALTER TABLE RENAME COLUMN</code></strong> to rename fields</li>
+    <li><strong><code>ALTER TABLE ALTER COLUMN TYPE</code></strong> to change column types</li>
+    <li><strong><code>ALTER TABLE DROP COLUMN</code></strong> to remove columns</li>
+    <li><strong><code>CAST()</code></strong> and <strong><code>::</code></strong> for type conversions in queries</li>
+    <li><strong><code>BEGIN</code> / <code>COMMIT</code> / <code>ROLLBACK</code></strong> for transactional migrations</li>
+    <li><strong>Nested <code>BEGIN</code></strong> for partial rollback within a larger transaction</li>
+</ul>
+
+<div class="tutorial-nav">
+    <a class="prev" href="multi-table-joins.html">Multi-Table Joins</a>
+    <span></span>
+</div>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+</footer>
+
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

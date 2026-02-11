@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Tutorial: Time-Series Analytics</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --fg: #111;
+            --fg-dim: #555;
+            --bg: #fffff8;
+            --accent: #a00;
+            --rule: #ccc;
+            --code-bg: #f3f1eb;
+            --nav-width: 200px;
+        }
+
+        html { font-size: 15px; }
+
+        body {
+            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+            background: var(--bg);
+            color: var(--fg);
+            display: flex;
+            min-height: 100vh;
+        }
+
+        .sidebar {
+            width: var(--nav-width);
+            min-width: var(--nav-width);
+            padding: 2rem 1.2rem 2rem 1.5rem;
+            border-right: 1px solid var(--rule);
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            overflow-y: auto;
+        }
+        .sidebar-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.3rem; }
+        .sidebar-title a { color: var(--fg); text-decoration: none; background: none; }
+        .sidebar-title a:hover { color: var(--accent); }
+        .sidebar-subtitle { font-size: 0.8rem; color: var(--fg-dim); font-style: italic; margin-bottom: 1.2rem; }
+        .sidebar-subtitle a { color: var(--fg-dim); text-decoration: none; background: none; }
+        .sidebar-subtitle a:hover { color: var(--accent); }
+        .sidebar nav ul { list-style: none; padding: 0; }
+        .sidebar nav li { margin-bottom: 0.15rem; }
+        .sidebar nav a { font-size: 0.82rem; color: var(--fg-dim); text-decoration: none; background: none; display: block; padding: 0.2rem 0.5rem; border-radius: 3px; line-height: 1.4; }
+        .sidebar nav a:hover { color: var(--accent); background: var(--code-bg); }
+        .sidebar nav a.active { color: var(--accent); font-weight: 600; background: var(--code-bg); }
+        .sidebar nav .nav-label { font-family: 'Menlo', 'Consolas', monospace; font-size: 0.6rem; font-weight: 700; color: var(--fg-dim); letter-spacing: 0.06em; text-transform: uppercase; padding: 0.6rem 0.5rem 0.2rem; }
+
+        .content { flex: 1; max-width: 720px; margin: 0 auto; padding: 3rem 2rem 5rem 2rem; }
+
+        p, ol, ul { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+        li { margin-bottom: 0.3rem; }
+        ol, ul { padding-left: 1.6rem; }
+
+        a { color: var(--fg); text-decoration: none; background-image: linear-gradient(var(--accent), var(--accent)); background-size: 1px 1px; background-repeat: repeat-x; background-position: 0 1.15em; }
+        a:hover { color: var(--accent); }
+
+        strong { font-weight: 600; }
+
+        h1 { font-weight: 400; font-size: 2.2rem; line-height: 1.15; margin-bottom: 0.4rem; }
+        .subtitle { font-style: italic; font-size: 1.15rem; color: var(--fg-dim); display: block; margin-bottom: 0.6rem; line-height: 1.4; }
+        .byline { font-size: 0.95rem; color: var(--fg-dim); margin-bottom: 2rem; }
+        .byline a { font-size: 0.95rem; }
+        .title-rule { border: none; height: 3px; background: var(--accent); width: 60px; margin: 0 0 2rem 0; }
+
+        h2 { font-weight: 400; font-style: italic; font-size: 1.5rem; margin-top: 2.8rem; margin-bottom: 0.6rem; }
+        h3 { font-weight: 600; font-style: normal; font-size: 1.15rem; margin-top: 1.6rem; margin-bottom: 0.4rem; }
+
+        code { font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace; font-size: 0.82rem; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 2px; }
+        pre { background: var(--code-bg); border-left: 3px solid var(--accent); padding: 1rem 1.2rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.55; margin: 1rem 0 1.4rem 0; }
+        pre code { background: none; padding: 0; border-radius: 0; }
+        pre code.hljs { background: var(--code-bg); padding: 0; }
+        .hljs { background: var(--code-bg); }
+
+        .result-table { font-family: 'EB Garamond', Georgia, serif; font-size: 0.92rem; border-collapse: collapse; margin: 0.6rem 0 1.2rem 0; width: 100%; border-top: 2px solid var(--fg); border-bottom: 2px solid var(--fg); }
+        .result-table th { font-weight: 400; font-size: 0.78rem; font-variant: small-caps; text-transform: lowercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--fg); padding: 0.3rem 0.6rem 0.25rem; text-align: left; color: var(--fg); }
+        .result-table td { padding: 0.22rem 0.6rem; border: none; white-space: nowrap; }
+        .result-table .null-val { color: #999; font-style: italic; }
+        .result-table .num-val { text-align: right; font-variant-numeric: tabular-nums; }
+        .result-label { font-size: 0.8rem; font-style: italic; color: var(--fg-dim); margin: 0 0 0.3rem 0; }
+        .query-pair { display: flex; gap: 1.2rem; align-items: stretch; margin: 0.8rem 0 1.4rem 0; }
+        .query-pair pre { flex: 1 1 50%; min-width: 0; margin: 0; }
+        .query-pair .result-wrap { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+        .query-pair .result-table { margin: 0; }
+
+        .tutorial-nav { display: flex; justify-content: space-between; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.95rem; }
+        .tutorial-nav a { background: none; }
+        .tutorial-nav .prev::before { content: '\2190\00a0'; }
+        .tutorial-nav .next::after { content: '\00a0\2192'; }
+
+        footer.site-footer { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.85rem; color: var(--fg-dim); }
+        footer.site-footer a { font-size: 0.85rem; }
+
+        hr { border: none; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+
+        @media (max-width: 900px) {
+            .sidebar { display: none; }
+            .content { padding: 2rem 1.2rem 3rem 1.2rem; }
+            .query-pair { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-title"><a href="../index.html">mskql</a></div>
+    <div class="sidebar-subtitle"><a href="index.html">Tutorials</a></div>
+    <nav>
+        <ul>
+            <li><a href="task-tracker.html">1. Task Tracker</a></li>
+            <li><a href="reporting-dashboard.html">2. Reporting Dashboard</a></li>
+            <li><a href="time-series.html" class="active">3. Time-Series Analytics</a></li>
+            <li><a href="multi-table-joins.html">4. Multi-Table Joins</a></li>
+            <li><a href="schema-evolution.html">5. Schema Evolution</a></li>
+        </ul>
+        <div class="nav-label">Reference</div>
+        <ul>
+            <li><a href="../grammar.html">SQL Grammar</a></li>
+            <li><a href="../bench-vs-pg.html">vs PostgreSQL</a></li>
+        </ul>
+    </nav>
+</aside>
+
+<main class="content">
+
+<h1>Time-Series Analytics</h1>
+<span class="subtitle">Date/time functions, intervals, CTEs, and moving averages</span>
+<p class="byline">Tutorial 3 of 5</p>
+<hr class="title-rule">
+
+<p>
+    This tutorial models sensor readings with timestamps and intervals.
+    You will use <code>DATE_TRUNC</code>, <code>EXTRACT</code>,
+    <code>AGE</code>, <code>TO_CHAR</code>, recursive CTEs to fill date
+    gaps, and window frames for moving averages&mdash;showcasing the
+    temporal SQL that mskql supports natively.
+</p>
+
+<!-- ─── Schema ──────────────────────────────────────────────── -->
+
+<h2>1. Schema and seed data</h2>
+
+<pre><code class="language-sql">CREATE TABLE sensors (
+    id        SERIAL PRIMARY KEY,
+    name      TEXT NOT NULL,
+    location  TEXT NOT NULL
+);
+
+CREATE TABLE readings (
+    id         SERIAL PRIMARY KEY,
+    sensor_id  INT NOT NULL REFERENCES sensors(id),
+    recorded   TIMESTAMP NOT NULL,
+    temp_c     INT NOT NULL,
+    humidity   INT
+);
+
+INSERT INTO sensors (name, location) VALUES
+    ('TH-01', 'Warehouse A'),
+    ('TH-02', 'Warehouse B'),
+    ('TH-03', 'Office');
+
+INSERT INTO readings (sensor_id, recorded, temp_c, humidity) VALUES
+    (1, '2025-01-10 08:00:00', 18, 45),
+    (1, '2025-01-10 12:00:00', 22, 40),
+    (1, '2025-01-10 18:00:00', 20, 42),
+    (1, '2025-01-11 08:00:00', 17, 48),
+    (1, '2025-01-11 12:00:00', 23, 38),
+    (1, '2025-01-11 18:00:00', 21, 41),
+    (1, '2025-01-12 08:00:00', 19, 44),
+    (1, '2025-01-12 12:00:00', 24, 36),
+    (2, '2025-01-10 08:00:00', 15, 55),
+    (2, '2025-01-10 12:00:00', 19, 50),
+    (2, '2025-01-10 18:00:00', 16, 53),
+    (2, '2025-01-11 08:00:00', 14, 58),
+    (2, '2025-01-11 12:00:00', 20, 48),
+    (3, '2025-01-10 09:00:00', 21, 35),
+    (3, '2025-01-10 14:00:00', 23, 33),
+    (3, '2025-01-11 09:00:00', 22, 34),
+    (3, '2025-01-11 14:00:00', 24, 32);</code></pre>
+
+<!-- ─── DATE_TRUNC ──────────────────────────────────────────── -->
+
+<h2>2. Daily averages with DATE_TRUNC</h2>
+
+<p>Truncate timestamps to the day and compute daily averages per sensor.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT s.name,
+       DATE_TRUNC('day', r.recorded)
+         AS day,
+       AVG(r.temp_c) AS avg_temp,
+       AVG(r.humidity) AS avg_hum
+FROM readings r
+JOIN sensors s
+  ON r.sensor_id = s.id
+WHERE s.name = 'TH-01'
+GROUP BY s.name,
+  DATE_TRUNC('day', r.recorded)
+ORDER BY day;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>day</th><th>avg_temp</th><th>avg_hum</th></tr></thead>
+<tbody>
+<tr><td>TH-01</td><td>2025-01-10 00:00:00</td><td class="num-val">20</td><td class="num-val">42</td></tr>
+<tr><td>TH-01</td><td>2025-01-11 00:00:00</td><td class="num-val">20</td><td class="num-val">42</td></tr>
+<tr><td>TH-01</td><td>2025-01-12 00:00:00</td><td class="num-val">21</td><td class="num-val">40</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── EXTRACT ─────────────────────────────────────────────── -->
+
+<h2>3. Hourly breakdown with EXTRACT</h2>
+
+<p>Pull the hour from each reading to see temperature patterns across the day.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT
+  EXTRACT(HOUR FROM r.recorded)
+    AS hour,
+  AVG(r.temp_c) AS avg_temp,
+  COUNT(*) AS readings
+FROM readings r
+JOIN sensors s
+  ON r.sensor_id = s.id
+WHERE s.location = 'Warehouse A'
+GROUP BY
+  EXTRACT(HOUR FROM r.recorded)
+ORDER BY hour;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>hour</th><th>avg_temp</th><th>readings</th></tr></thead>
+<tbody>
+<tr><td class="num-val">8</td><td class="num-val">18</td><td class="num-val">3</td></tr>
+<tr><td class="num-val">12</td><td class="num-val">23</td><td class="num-val">3</td></tr>
+<tr><td class="num-val">18</td><td class="num-val">20</td><td class="num-val">2</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── AGE ─────────────────────────────────────────────────── -->
+
+<h2>4. Time since last reading with AGE</h2>
+
+<p>
+    Use <code>AGE</code> to compute the interval between the latest reading
+    per sensor and a reference timestamp.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT s.name,
+       MAX(r.recorded) AS last_read,
+       AGE('2025-01-13 00:00:00',
+           MAX(r.recorded))
+         AS time_since
+FROM readings r
+JOIN sensors s
+  ON r.sensor_id = s.id
+GROUP BY s.name
+ORDER BY s.name;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>last_read</th><th>time_since</th></tr></thead>
+<tbody>
+<tr><td>TH-01</td><td>2025-01-12 12:00:00</td><td>0 years 0 mons 0 days 12 hours 0 mins 0 secs</td></tr>
+<tr><td>TH-02</td><td>2025-01-11 12:00:00</td><td>0 years 0 mons 1 days 12 hours 0 mins 0 secs</td></tr>
+<tr><td>TH-03</td><td>2025-01-11 14:00:00</td><td>0 years 0 mons 1 days 10 hours 0 mins 0 secs</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── TO_CHAR ─────────────────────────────────────────────── -->
+
+<h2>5. Formatted output with TO_CHAR</h2>
+
+<p>Format timestamps for human-readable display.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT s.name,
+       TO_CHAR(r.recorded,
+         'YYYY-MM-DD HH24:MI')
+         AS time,
+       r.temp_c
+FROM readings r
+JOIN sensors s
+  ON r.sensor_id = s.id
+WHERE s.name = 'TH-03'
+ORDER BY r.recorded;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>time</th><th>temp_c</th></tr></thead>
+<tbody>
+<tr><td>TH-03</td><td>2025-01-10 09:00</td><td class="num-val">21</td></tr>
+<tr><td>TH-03</td><td>2025-01-10 14:00</td><td class="num-val">23</td></tr>
+<tr><td>TH-03</td><td>2025-01-11 09:00</td><td class="num-val">22</td></tr>
+<tr><td>TH-03</td><td>2025-01-11 14:00</td><td class="num-val">24</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Moving average ──────────────────────────────────────── -->
+
+<h2>6. Moving average with window frames</h2>
+
+<p>
+    Compute a 3-reading moving average of temperature for sensor TH-01,
+    using a window frame.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT r.recorded,
+       r.temp_c,
+       AVG(r.temp_c) OVER (
+         ORDER BY r.recorded
+         ROWS BETWEEN 2 PRECEDING
+           AND CURRENT ROW
+       ) AS moving_avg
+FROM readings r
+WHERE r.sensor_id = 1
+ORDER BY r.recorded;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>recorded</th><th>temp_c</th><th>moving_avg</th></tr></thead>
+<tbody>
+<tr><td>2025-01-10 08:00:00</td><td class="num-val">18</td><td class="num-val">18</td></tr>
+<tr><td>2025-01-10 12:00:00</td><td class="num-val">22</td><td class="num-val">20</td></tr>
+<tr><td>2025-01-10 18:00:00</td><td class="num-val">20</td><td class="num-val">20</td></tr>
+<tr><td>2025-01-11 08:00:00</td><td class="num-val">17</td><td class="num-val">19</td></tr>
+<tr><td>2025-01-11 12:00:00</td><td class="num-val">23</td><td class="num-val">20</td></tr>
+<tr><td>2025-01-11 18:00:00</td><td class="num-val">21</td><td class="num-val">20</td></tr>
+<tr><td>2025-01-12 08:00:00</td><td class="num-val">19</td><td class="num-val">21</td></tr>
+<tr><td>2025-01-12 12:00:00</td><td class="num-val">24</td><td class="num-val">21</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Recursive CTE ───────────────────────────────────────── -->
+
+<h2>7. Fill date gaps with a recursive CTE</h2>
+
+<p>
+    Generate a continuous date series and LEFT JOIN readings to it, exposing
+    days with no data.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">WITH RECURSIVE dates AS (
+  SELECT '2025-01-10'::DATE AS dt
+  UNION ALL
+  SELECT (dt + 1)::DATE
+  FROM dates
+  WHERE dt < '2025-01-14'::DATE
+)
+SELECT d.dt AS day,
+  COALESCE(
+    (SELECT AVG(r.temp_c)
+     FROM readings r
+     WHERE r.sensor_id = 2
+       AND DATE_TRUNC('day',
+           r.recorded) = d.dt
+           ::TIMESTAMP),
+    0) AS avg_temp
+FROM dates d
+ORDER BY d.dt;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>day</th><th>avg_temp</th></tr></thead>
+<tbody>
+<tr><td>2025-01-10</td><td class="num-val">16</td></tr>
+<tr><td>2025-01-11</td><td class="num-val">17</td></tr>
+<tr><td>2025-01-12</td><td class="num-val">0</td></tr>
+<tr><td>2025-01-13</td><td class="num-val">0</td></tr>
+<tr><td>2025-01-14</td><td class="num-val">0</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p>
+    Days with no readings for sensor TH-02 show <code>0</code> thanks to
+    <code>COALESCE</code>. In a real dashboard you might display these as
+    &ldquo;no data&rdquo; or interpolate.
+</p>
+
+<!-- ─── Wrap-up ─────────────────────────────────────────────── -->
+
+<h2>What you learned</h2>
+
+<ul>
+    <li><strong><code>DATE_TRUNC</code></strong> to bucket timestamps by day, hour, or month</li>
+    <li><strong><code>EXTRACT</code></strong> to pull individual fields (hour, day, month) from timestamps</li>
+    <li><strong><code>AGE</code></strong> to compute intervals between timestamps</li>
+    <li><strong><code>TO_CHAR</code></strong> for formatted timestamp display</li>
+    <li><strong><code>::</code> cast operator</strong> for type conversions (e.g. <code>'2025-01-10'::DATE</code>)</li>
+    <li><strong>Recursive CTEs</strong> to generate date series and fill gaps</li>
+    <li><strong>Window frames</strong> (<code>ROWS BETWEEN n PRECEDING AND CURRENT ROW</code>) for moving averages</li>
+</ul>
+
+<div class="tutorial-nav">
+    <a class="prev" href="reporting-dashboard.html">Reporting Dashboard</a>
+    <a class="next" href="multi-table-joins.html">Multi-Table Joins</a>
+</div>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+</footer>
+
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

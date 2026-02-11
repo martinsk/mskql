@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Tutorial: Build a Task Tracker</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --fg: #111;
+            --fg-dim: #555;
+            --bg: #fffff8;
+            --accent: #a00;
+            --rule: #ccc;
+            --code-bg: #f3f1eb;
+            --nav-width: 200px;
+        }
+
+        html { font-size: 15px; }
+
+        body {
+            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+            background: var(--bg);
+            color: var(--fg);
+            display: flex;
+            min-height: 100vh;
+        }
+
+        /* ── Sidebar nav ────────────────────────────────────────── */
+        .sidebar {
+            width: var(--nav-width);
+            min-width: var(--nav-width);
+            padding: 2rem 1.2rem 2rem 1.5rem;
+            border-right: 1px solid var(--rule);
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            overflow-y: auto;
+        }
+        .sidebar-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 0.3rem;
+        }
+        .sidebar-title a {
+            color: var(--fg);
+            text-decoration: none;
+            background: none;
+        }
+        .sidebar-title a:hover { color: var(--accent); }
+        .sidebar-subtitle {
+            font-size: 0.8rem;
+            color: var(--fg-dim);
+            font-style: italic;
+            margin-bottom: 1.2rem;
+        }
+        .sidebar-subtitle a {
+            color: var(--fg-dim);
+            text-decoration: none;
+            background: none;
+        }
+        .sidebar-subtitle a:hover { color: var(--accent); }
+        .sidebar nav ul {
+            list-style: none;
+            padding: 0;
+        }
+        .sidebar nav li {
+            margin-bottom: 0.15rem;
+        }
+        .sidebar nav a {
+            font-size: 0.82rem;
+            color: var(--fg-dim);
+            text-decoration: none;
+            background: none;
+            display: block;
+            padding: 0.2rem 0.5rem;
+            border-radius: 3px;
+            line-height: 1.4;
+        }
+        .sidebar nav a:hover {
+            color: var(--accent);
+            background: var(--code-bg);
+        }
+        .sidebar nav a.active {
+            color: var(--accent);
+            font-weight: 600;
+            background: var(--code-bg);
+        }
+        .sidebar nav .nav-label {
+            font-family: 'Menlo', 'Consolas', monospace;
+            font-size: 0.6rem;
+            font-weight: 700;
+            color: var(--fg-dim);
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            padding: 0.6rem 0.5rem 0.2rem;
+        }
+
+        /* ── Main content ───────────────────────────────────────── */
+        .content {
+            flex: 1;
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 3rem 2rem 5rem 2rem;
+        }
+
+        p, ol, ul { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+        li { margin-bottom: 0.3rem; }
+        ol, ul { padding-left: 1.6rem; }
+
+        a {
+            color: var(--fg);
+            text-decoration: none;
+            background-image: linear-gradient(var(--accent), var(--accent));
+            background-size: 1px 1px;
+            background-repeat: repeat-x;
+            background-position: 0 1.15em;
+        }
+        a:hover { color: var(--accent); }
+
+        strong { font-weight: 600; }
+
+        h1 {
+            font-weight: 400;
+            font-size: 2.2rem;
+            line-height: 1.15;
+            margin-bottom: 0.4rem;
+        }
+
+        .subtitle {
+            font-style: italic;
+            font-size: 1.15rem;
+            color: var(--fg-dim);
+            display: block;
+            margin-bottom: 0.6rem;
+            line-height: 1.4;
+        }
+
+        .byline {
+            font-size: 0.95rem;
+            color: var(--fg-dim);
+            margin-bottom: 2rem;
+        }
+        .byline a { font-size: 0.95rem; }
+
+        .title-rule {
+            border: none;
+            height: 3px;
+            background: var(--accent);
+            width: 60px;
+            margin: 0 0 2rem 0;
+        }
+
+        h2 {
+            font-weight: 400;
+            font-style: italic;
+            font-size: 1.5rem;
+            margin-top: 2.8rem;
+            margin-bottom: 0.6rem;
+        }
+
+        h3 {
+            font-weight: 600;
+            font-style: normal;
+            font-size: 1.15rem;
+            margin-top: 1.6rem;
+            margin-bottom: 0.4rem;
+        }
+
+        code {
+            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+            font-size: 0.82rem;
+            background: var(--code-bg);
+            padding: 0.1em 0.35em;
+            border-radius: 2px;
+        }
+        pre {
+            background: var(--code-bg);
+            border-left: 3px solid var(--accent);
+            padding: 1rem 1.2rem;
+            overflow-x: auto;
+            font-size: 0.82rem;
+            line-height: 1.55;
+            margin: 1rem 0 1.4rem 0;
+        }
+        pre code { background: none; padding: 0; border-radius: 0; }
+        pre code.hljs { background: var(--code-bg); padding: 0; }
+        .hljs { background: var(--code-bg); }
+
+        /* ── Result tables ──────────────────────────────────────── */
+        .result-table {
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 0.92rem;
+            border-collapse: collapse;
+            margin: 0.6rem 0 1.2rem 0;
+            width: 100%;
+            border-top: 2px solid var(--fg);
+            border-bottom: 2px solid var(--fg);
+        }
+        .result-table th {
+            font-weight: 400;
+            font-size: 0.78rem;
+            font-variant: small-caps;
+            text-transform: lowercase;
+            letter-spacing: 0.05em;
+            border-bottom: 1px solid var(--fg);
+            padding: 0.3rem 0.6rem 0.25rem;
+            text-align: left;
+            color: var(--fg);
+        }
+        .result-table td {
+            padding: 0.22rem 0.6rem;
+            border: none;
+            white-space: nowrap;
+        }
+        .result-table .null-val { color: #999; font-style: italic; }
+        .result-table .num-val {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+        .result-label {
+            font-size: 0.8rem;
+            font-style: italic;
+            color: var(--fg-dim);
+            margin: 0 0 0.3rem 0;
+        }
+        .query-pair {
+            display: flex;
+            gap: 1.2rem;
+            align-items: stretch;
+            margin: 0.8rem 0 1.4rem 0;
+        }
+        .query-pair pre {
+            flex: 1 1 50%;
+            min-width: 0;
+            margin: 0;
+        }
+        .query-pair .result-wrap {
+            flex: 1 1 50%;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .query-pair .result-table { margin: 0; }
+
+        /* ── Prev/Next nav ──────────────────────────────────────── */
+        .tutorial-nav {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 3rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--rule);
+            font-size: 0.95rem;
+        }
+        .tutorial-nav a {
+            background: none;
+        }
+        .tutorial-nav .prev::before { content: '\2190\00a0'; }
+        .tutorial-nav .next::after { content: '\00a0\2192'; }
+
+        /* ── Footer ─────────────────────────────────────────────── */
+        footer.site-footer {
+            margin-top: 2rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--rule);
+            font-size: 0.85rem;
+            color: var(--fg-dim);
+        }
+        footer.site-footer a { font-size: 0.85rem; }
+
+        hr {
+            border: none;
+            border-top: 1px solid var(--rule);
+            margin: 2.5rem 0;
+        }
+
+        @media (max-width: 900px) {
+            .sidebar { display: none; }
+            .content { padding: 2rem 1.2rem 3rem 1.2rem; }
+            .query-pair { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-title"><a href="../index.html">mskql</a></div>
+    <div class="sidebar-subtitle"><a href="index.html">Tutorials</a></div>
+    <nav>
+        <ul>
+            <li><a href="task-tracker.html" class="active">1. Task Tracker</a></li>
+            <li><a href="reporting-dashboard.html">2. Reporting Dashboard</a></li>
+            <li><a href="time-series.html">3. Time-Series Analytics</a></li>
+            <li><a href="multi-table-joins.html">4. Multi-Table Joins</a></li>
+            <li><a href="schema-evolution.html">5. Schema Evolution</a></li>
+        </ul>
+        <div class="nav-label">Reference</div>
+        <ul>
+            <li><a href="../grammar.html">SQL Grammar</a></li>
+            <li><a href="../bench-vs-pg.html">vs PostgreSQL</a></li>
+        </ul>
+    </nav>
+</aside>
+
+<main class="content">
+
+<h1>Build a Task Tracker</h1>
+<span class="subtitle">CRUD, constraints, upserts, and RETURNING</span>
+<p class="byline">Tutorial 1 of 5</p>
+<hr class="title-rule">
+
+<p>
+    This tutorial builds a small project-management database from scratch:
+    projects, tasks, labels, and assignments. By the end you will have used
+    <code>SERIAL</code> primary keys, foreign keys, <code>CHECK</code>
+    constraints, <code>ON&nbsp;CONFLICT</code> upserts, <code>RETURNING</code>,
+    and basic CRUD operations&mdash;all through a standard <code>psql</code>
+    connection.
+</p>
+
+<!-- ─── Schema ──────────────────────────────────────────────── -->
+
+<h2>1. Design the schema</h2>
+
+<p>
+    Three tables: <strong>projects</strong> to group work,
+    <strong>tasks</strong> with a status constraint, and
+    <strong>labels</strong> that can be attached to tasks.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE projects (
+    id    SERIAL PRIMARY KEY,
+    name  TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE tasks (
+    id          SERIAL PRIMARY KEY,
+    project_id  INT NOT NULL REFERENCES projects(id),
+    title       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'todo'
+                CHECK (status IN ('todo', 'in_progress', 'done')),
+    priority    INT DEFAULT 0,
+    created_at  DATE DEFAULT '2025-01-15'
+);
+
+CREATE TABLE labels (
+    id    SERIAL PRIMARY KEY,
+    name  TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE task_labels (
+    task_id   INT NOT NULL REFERENCES tasks(id),
+    label_id  INT NOT NULL REFERENCES labels(id)
+);</code></pre>
+
+<p>
+    The <code>CHECK</code> constraint on <code>status</code> limits values to
+    exactly three strings. The foreign key on <code>project_id</code> ensures
+    every task belongs to a real project.
+</p>
+
+<!-- ─── Seed data ───────────────────────────────────────────── -->
+
+<h2>2. Seed the data</h2>
+
+<pre><code class="language-sql">INSERT INTO projects (name) VALUES
+    ('Website Redesign'),
+    ('Mobile App'),
+    ('API Platform');
+
+INSERT INTO labels (name) VALUES
+    ('bug'), ('feature'), ('urgent'), ('backend'), ('frontend');
+
+INSERT INTO tasks (project_id, title, status, priority, created_at) VALUES
+    (1, 'Update landing page',    'in_progress', 2, '2025-01-10'),
+    (1, 'Fix nav overflow',       'todo',        3, '2025-01-12'),
+    (1, 'Add dark mode',          'todo',        1, '2025-01-14'),
+    (2, 'Login screen',           'done',        2, '2025-01-05'),
+    (2, 'Push notifications',     'in_progress', 3, '2025-01-08'),
+    (2, 'Offline sync',           'todo',        1, '2025-01-15'),
+    (3, 'Rate limiting',          'todo',        3, '2025-01-11'),
+    (3, 'OAuth2 integration',     'in_progress', 2, '2025-01-09'),
+    (3, 'Batch endpoint',         'done',        1, '2025-01-06');
+
+INSERT INTO task_labels (task_id, label_id) VALUES
+    (1, 5), (2, 1), (2, 5), (2, 3),
+    (3, 2), (4, 2), (5, 2), (5, 4),
+    (6, 2), (6, 4), (7, 4), (7, 3),
+    (8, 4), (9, 4);</code></pre>
+
+<!-- ─── Basic queries ───────────────────────────────────────── -->
+
+<h2>3. Query tasks by project</h2>
+
+<p>List all tasks for the &ldquo;Website Redesign&rdquo; project, ordered by priority.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT t.title, t.status,
+       t.priority
+FROM tasks t
+JOIN projects p
+  ON t.project_id = p.id
+WHERE p.name = 'Website Redesign'
+ORDER BY t.priority DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>title</th><th>status</th><th>priority</th></tr></thead>
+<tbody>
+<tr><td>Fix nav overflow</td><td>todo</td><td class="num-val">3</td></tr>
+<tr><td>Update landing page</td><td>in_progress</td><td class="num-val">2</td></tr>
+<tr><td>Add dark mode</td><td>todo</td><td class="num-val">1</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Labels join ─────────────────────────────────────────── -->
+
+<h2>4. Tasks with their labels</h2>
+
+<p>Join through the many-to-many table to show each task&rsquo;s labels.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT t.title,
+       l.name AS label
+FROM tasks t
+JOIN task_labels tl
+  ON t.id = tl.task_id
+JOIN labels l
+  ON tl.label_id = l.id
+WHERE t.status = 'todo'
+ORDER BY t.priority DESC,
+         t.title;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>title</th><th>label</th></tr></thead>
+<tbody>
+<tr><td>Fix nav overflow</td><td>bug</td></tr>
+<tr><td>Fix nav overflow</td><td>frontend</td></tr>
+<tr><td>Fix nav overflow</td><td>urgent</td></tr>
+<tr><td>Rate limiting</td><td>backend</td></tr>
+<tr><td>Rate limiting</td><td>urgent</td></tr>
+<tr><td>Add dark mode</td><td>feature</td></tr>
+<tr><td>Offline sync</td><td>feature</td></tr>
+<tr><td>Offline sync</td><td>backend</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Update with RETURNING ───────────────────────────────── -->
+
+<h2>5. Update status with RETURNING</h2>
+
+<p>
+    Mark a task as done and get the updated row back in one round-trip.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">UPDATE tasks
+SET status = 'done'
+WHERE title = 'Fix nav overflow'
+RETURNING id, title, status;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>title</th><th>status</th></tr></thead>
+<tbody>
+<tr><td class="num-val">2</td><td>Fix nav overflow</td><td>done</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Upsert ──────────────────────────────────────────────── -->
+
+<h2>6. Upsert a label</h2>
+
+<p>
+    Insert a label, or if it already exists, do nothing. Then insert one that
+    does not exist yet.
+</p>
+
+<pre><code class="language-sql">INSERT INTO labels (name) VALUES ('bug')
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO labels (name) VALUES ('design')
+ON CONFLICT (name) DO NOTHING;</code></pre>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT * FROM labels
+ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>name</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>bug</td></tr>
+<tr><td class="num-val">2</td><td>feature</td></tr>
+<tr><td class="num-val">3</td><td>urgent</td></tr>
+<tr><td class="num-val">4</td><td>backend</td></tr>
+<tr><td class="num-val">5</td><td>frontend</td></tr>
+<tr><td class="num-val">6</td><td>design</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p>
+    The &ldquo;bug&rdquo; row was silently skipped (it already existed with
+    <code>id=1</code>). The &ldquo;design&rdquo; row was inserted as
+    <code>id=6</code>.
+</p>
+
+<!-- ─── ON CONFLICT DO UPDATE ───────────────────────────────── -->
+
+<h2>7. Upsert with DO UPDATE</h2>
+
+<p>
+    Bump a task&rsquo;s priority if it already exists, using
+    <code>ON&nbsp;CONFLICT&nbsp;DO&nbsp;UPDATE</code>.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">INSERT INTO tasks
+  (id, project_id, title,
+   status, priority)
+VALUES
+  (7, 3, 'Rate limiting',
+   'todo', 5)
+ON CONFLICT (id) DO UPDATE
+  SET priority = 5;
+
+SELECT id, title, priority
+FROM tasks
+WHERE id = 7;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>title</th><th>priority</th></tr></thead>
+<tbody>
+<tr><td class="num-val">7</td><td>Rate limiting</td><td class="num-val">5</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Delete ──────────────────────────────────────────────── -->
+
+<h2>8. Delete with RETURNING</h2>
+
+<p>Remove completed tasks and see what was deleted.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">DELETE FROM task_labels
+WHERE task_id IN (
+  SELECT id FROM tasks
+  WHERE status = 'done'
+);
+
+DELETE FROM tasks
+WHERE status = 'done'
+RETURNING id, title;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>title</th></tr></thead>
+<tbody>
+<tr><td class="num-val">2</td><td>Fix nav overflow</td></tr>
+<tr><td class="num-val">4</td><td>Login screen</td></tr>
+<tr><td class="num-val">9</td><td>Batch endpoint</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Summary query ───────────────────────────────────────── -->
+
+<h2>9. Project summary</h2>
+
+<p>Count remaining tasks per project and status.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT p.name AS project,
+       t.status,
+       COUNT(*) AS tasks
+FROM tasks t
+JOIN projects p
+  ON t.project_id = p.id
+GROUP BY p.name, t.status
+ORDER BY p.name, t.status;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>project</th><th>status</th><th>tasks</th></tr></thead>
+<tbody>
+<tr><td>API Platform</td><td>in_progress</td><td class="num-val">1</td></tr>
+<tr><td>API Platform</td><td>todo</td><td class="num-val">1</td></tr>
+<tr><td>Mobile App</td><td>in_progress</td><td class="num-val">1</td></tr>
+<tr><td>Mobile App</td><td>todo</td><td class="num-val">1</td></tr>
+<tr><td>Website Redesign</td><td>in_progress</td><td class="num-val">1</td></tr>
+<tr><td>Website Redesign</td><td>todo</td><td class="num-val">1</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Wrap-up ─────────────────────────────────────────────── -->
+
+<h2>What you learned</h2>
+
+<p>
+    In this tutorial you built a task tracker with four tables and exercised
+    the core CRUD workflow:
+</p>
+
+<ul>
+    <li><strong><code>SERIAL</code> + <code>PRIMARY KEY</code></strong> for auto-incrementing IDs</li>
+    <li><strong><code>REFERENCES</code></strong> for foreign-key integrity</li>
+    <li><strong><code>CHECK</code></strong> constraints to limit column values</li>
+    <li><strong><code>ON CONFLICT DO NOTHING</code></strong> for idempotent inserts</li>
+    <li><strong><code>ON CONFLICT DO UPDATE</code></strong> for true upserts</li>
+    <li><strong><code>RETURNING</code></strong> to get affected rows in one round-trip</li>
+    <li><strong>Multi-table JOINs</strong> through a many-to-many relationship</li>
+</ul>
+
+<div class="tutorial-nav">
+    <span></span>
+    <a class="next" href="reporting-dashboard.html">Reporting Dashboard</a>
+</div>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+</footer>
+
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Tutorial: Reporting Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --fg: #111;
+            --fg-dim: #555;
+            --bg: #fffff8;
+            --accent: #a00;
+            --rule: #ccc;
+            --code-bg: #f3f1eb;
+            --nav-width: 200px;
+        }
+
+        html { font-size: 15px; }
+
+        body {
+            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+            background: var(--bg);
+            color: var(--fg);
+            display: flex;
+            min-height: 100vh;
+        }
+
+        /* ── Sidebar nav ────────────────────────────────────────── */
+        .sidebar {
+            width: var(--nav-width);
+            min-width: var(--nav-width);
+            padding: 2rem 1.2rem 2rem 1.5rem;
+            border-right: 1px solid var(--rule);
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            overflow-y: auto;
+        }
+        .sidebar-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 0.3rem;
+        }
+        .sidebar-title a { color: var(--fg); text-decoration: none; background: none; }
+        .sidebar-title a:hover { color: var(--accent); }
+        .sidebar-subtitle {
+            font-size: 0.8rem;
+            color: var(--fg-dim);
+            font-style: italic;
+            margin-bottom: 1.2rem;
+        }
+        .sidebar-subtitle a { color: var(--fg-dim); text-decoration: none; background: none; }
+        .sidebar-subtitle a:hover { color: var(--accent); }
+        .sidebar nav ul { list-style: none; padding: 0; }
+        .sidebar nav li { margin-bottom: 0.15rem; }
+        .sidebar nav a {
+            font-size: 0.82rem;
+            color: var(--fg-dim);
+            text-decoration: none;
+            background: none;
+            display: block;
+            padding: 0.2rem 0.5rem;
+            border-radius: 3px;
+            line-height: 1.4;
+        }
+        .sidebar nav a:hover { color: var(--accent); background: var(--code-bg); }
+        .sidebar nav a.active { color: var(--accent); font-weight: 600; background: var(--code-bg); }
+        .sidebar nav .nav-label {
+            font-family: 'Menlo', 'Consolas', monospace;
+            font-size: 0.6rem;
+            font-weight: 700;
+            color: var(--fg-dim);
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            padding: 0.6rem 0.5rem 0.2rem;
+        }
+
+        /* ── Main content ───────────────────────────────────────── */
+        .content {
+            flex: 1;
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 3rem 2rem 5rem 2rem;
+        }
+
+        p, ol, ul { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+        li { margin-bottom: 0.3rem; }
+        ol, ul { padding-left: 1.6rem; }
+
+        a { color: var(--fg); text-decoration: none; background-image: linear-gradient(var(--accent), var(--accent)); background-size: 1px 1px; background-repeat: repeat-x; background-position: 0 1.15em; }
+        a:hover { color: var(--accent); }
+
+        strong { font-weight: 600; }
+
+        h1 { font-weight: 400; font-size: 2.2rem; line-height: 1.15; margin-bottom: 0.4rem; }
+        .subtitle { font-style: italic; font-size: 1.15rem; color: var(--fg-dim); display: block; margin-bottom: 0.6rem; line-height: 1.4; }
+        .byline { font-size: 0.95rem; color: var(--fg-dim); margin-bottom: 2rem; }
+        .byline a { font-size: 0.95rem; }
+        .title-rule { border: none; height: 3px; background: var(--accent); width: 60px; margin: 0 0 2rem 0; }
+
+        h2 { font-weight: 400; font-style: italic; font-size: 1.5rem; margin-top: 2.8rem; margin-bottom: 0.6rem; }
+        h3 { font-weight: 600; font-style: normal; font-size: 1.15rem; margin-top: 1.6rem; margin-bottom: 0.4rem; }
+
+        code { font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace; font-size: 0.82rem; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 2px; }
+        pre { background: var(--code-bg); border-left: 3px solid var(--accent); padding: 1rem 1.2rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.55; margin: 1rem 0 1.4rem 0; }
+        pre code { background: none; padding: 0; border-radius: 0; }
+        pre code.hljs { background: var(--code-bg); padding: 0; }
+        .hljs { background: var(--code-bg); }
+
+        .result-table { font-family: 'EB Garamond', Georgia, serif; font-size: 0.92rem; border-collapse: collapse; margin: 0.6rem 0 1.2rem 0; width: 100%; border-top: 2px solid var(--fg); border-bottom: 2px solid var(--fg); }
+        .result-table th { font-weight: 400; font-size: 0.78rem; font-variant: small-caps; text-transform: lowercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--fg); padding: 0.3rem 0.6rem 0.25rem; text-align: left; color: var(--fg); }
+        .result-table td { padding: 0.22rem 0.6rem; border: none; white-space: nowrap; }
+        .result-table .null-val { color: #999; font-style: italic; }
+        .result-table .num-val { text-align: right; font-variant-numeric: tabular-nums; }
+        .result-label { font-size: 0.8rem; font-style: italic; color: var(--fg-dim); margin: 0 0 0.3rem 0; }
+        .query-pair { display: flex; gap: 1.2rem; align-items: stretch; margin: 0.8rem 0 1.4rem 0; }
+        .query-pair pre { flex: 1 1 50%; min-width: 0; margin: 0; }
+        .query-pair .result-wrap { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+        .query-pair .result-table { margin: 0; }
+
+        .tutorial-nav { display: flex; justify-content: space-between; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.95rem; }
+        .tutorial-nav a { background: none; }
+        .tutorial-nav .prev::before { content: '\2190\00a0'; }
+        .tutorial-nav .next::after { content: '\00a0\2192'; }
+
+        footer.site-footer { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.85rem; color: var(--fg-dim); }
+        footer.site-footer a { font-size: 0.85rem; }
+
+        hr { border: none; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+
+        @media (max-width: 900px) {
+            .sidebar { display: none; }
+            .content { padding: 2rem 1.2rem 3rem 1.2rem; }
+            .query-pair { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-title"><a href="../index.html">mskql</a></div>
+    <div class="sidebar-subtitle"><a href="index.html">Tutorials</a></div>
+    <nav>
+        <ul>
+            <li><a href="task-tracker.html">1. Task Tracker</a></li>
+            <li><a href="reporting-dashboard.html" class="active">2. Reporting Dashboard</a></li>
+            <li><a href="time-series.html">3. Time-Series Analytics</a></li>
+            <li><a href="multi-table-joins.html">4. Multi-Table Joins</a></li>
+            <li><a href="schema-evolution.html">5. Schema Evolution</a></li>
+        </ul>
+        <div class="nav-label">Reference</div>
+        <ul>
+            <li><a href="../grammar.html">SQL Grammar</a></li>
+            <li><a href="../bench-vs-pg.html">vs PostgreSQL</a></li>
+        </ul>
+    </nav>
+</aside>
+
+<main class="content">
+
+<h1>Reporting Dashboard</h1>
+<span class="subtitle">Aggregation, window functions, ROLLUP, and views</span>
+<p class="byline">Tutorial 2 of 5</p>
+<hr class="title-rule">
+
+<p>
+    This tutorial builds a sales pipeline and slices it with aggregation,
+    window functions, <code>ROLLUP</code>/<code>CUBE</code> for subtotals,
+    and reusable views. You will rank reps, compute running totals, and
+    generate summary rows&mdash;all in pure SQL.
+</p>
+
+<!-- ─── Schema ──────────────────────────────────────────────── -->
+
+<h2>1. Schema and seed data</h2>
+
+<pre><code class="language-sql">CREATE TABLE reps (
+    id    SERIAL PRIMARY KEY,
+    name  TEXT NOT NULL,
+    region TEXT NOT NULL
+);
+
+CREATE TABLE deals (
+    id       SERIAL PRIMARY KEY,
+    rep_id   INT NOT NULL REFERENCES reps(id),
+    customer TEXT NOT NULL,
+    amount   INT NOT NULL,
+    stage    TEXT NOT NULL DEFAULT 'prospect',
+    closed   DATE
+);
+
+INSERT INTO reps (name, region) VALUES
+    ('Alice',  'West'),
+    ('Bob',    'East'),
+    ('Carol',  'West'),
+    ('Dave',   'East'),
+    ('Eve',    'Central');
+
+INSERT INTO deals (rep_id, customer, amount, stage, closed) VALUES
+    (1, 'Acme Corp',       45000,  'won',      '2025-01-10'),
+    (1, 'Globex',          30000,  'won',      '2025-01-18'),
+    (1, 'Initech',         20000,  'prospect',  NULL),
+    (2, 'Umbrella',        55000,  'won',      '2025-01-05'),
+    (2, 'Stark Ind',       40000,  'lost',      NULL),
+    (3, 'Wayne Ent',       60000,  'won',      '2025-01-22'),
+    (3, 'Oscorp',          35000,  'prospect',  NULL),
+    (4, 'LexCorp',         25000,  'won',      '2025-01-15'),
+    (4, 'Cyberdyne',       70000,  'won',      '2025-01-28'),
+    (5, 'Aperture',        50000,  'won',      '2025-01-12'),
+    (5, 'Weyland-Yutani',  15000,  'lost',      NULL);</code></pre>
+
+<!-- ─── Basic aggregation ───────────────────────────────────── -->
+
+<h2>2. Revenue by rep</h2>
+
+<p>Total closed revenue per rep, filtering to won deals only.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT r.name,
+       COUNT(*) AS deals_won,
+       SUM(d.amount) AS revenue
+FROM deals d
+JOIN reps r ON d.rep_id = r.id
+WHERE d.stage = 'won'
+GROUP BY r.name
+ORDER BY revenue DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>deals_won</th><th>revenue</th></tr></thead>
+<tbody>
+<tr><td>Dave</td><td class="num-val">2</td><td class="num-val">95000</td></tr>
+<tr><td>Alice</td><td class="num-val">2</td><td class="num-val">75000</td></tr>
+<tr><td>Carol</td><td class="num-val">1</td><td class="num-val">60000</td></tr>
+<tr><td>Bob</td><td class="num-val">1</td><td class="num-val">55000</td></tr>
+<tr><td>Eve</td><td class="num-val">1</td><td class="num-val">50000</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── HAVING ──────────────────────────────────────────────── -->
+
+<h2>3. Filter with HAVING</h2>
+
+<p>Only show reps with total pipeline (all stages) above 60k.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT r.name,
+       SUM(d.amount) AS pipeline
+FROM deals d
+JOIN reps r ON d.rep_id = r.id
+GROUP BY r.name
+HAVING SUM(d.amount) > 60000
+ORDER BY pipeline DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>pipeline</th></tr></thead>
+<tbody>
+<tr><td>Carol</td><td class="num-val">95000</td></tr>
+<tr><td>Dave</td><td class="num-val">95000</td></tr>
+<tr><td>Alice</td><td class="num-val">95000</td></tr>
+<tr><td>Bob</td><td class="num-val">95000</td></tr>
+<tr><td>Eve</td><td class="num-val">65000</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Window: RANK ────────────────────────────────────────── -->
+
+<h2>4. Rank reps by revenue</h2>
+
+<p>Use <code>RANK()</code> to rank reps within each region by closed revenue.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT r.name, r.region,
+       SUM(d.amount) AS revenue,
+       RANK() OVER (
+         PARTITION BY r.region
+         ORDER BY SUM(d.amount) DESC
+       ) AS rnk
+FROM deals d
+JOIN reps r ON d.rep_id = r.id
+WHERE d.stage = 'won'
+GROUP BY r.name, r.region;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>region</th><th>revenue</th><th>rnk</th></tr></thead>
+<tbody>
+<tr><td>Eve</td><td>Central</td><td class="num-val">50000</td><td class="num-val">1</td></tr>
+<tr><td>Dave</td><td>East</td><td class="num-val">95000</td><td class="num-val">1</td></tr>
+<tr><td>Bob</td><td>East</td><td class="num-val">55000</td><td class="num-val">2</td></tr>
+<tr><td>Alice</td><td>West</td><td class="num-val">75000</td><td class="num-val">1</td></tr>
+<tr><td>Carol</td><td>West</td><td class="num-val">60000</td><td class="num-val">2</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Window: running total ───────────────────────────────── -->
+
+<h2>5. Running revenue total</h2>
+
+<p>
+    Compute a running total of closed deals ordered by close date, using a
+    window frame.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT d.closed,
+       r.name,
+       d.amount,
+       SUM(d.amount) OVER (
+         ORDER BY d.closed
+         ROWS BETWEEN UNBOUNDED
+           PRECEDING AND CURRENT ROW
+       ) AS running_total
+FROM deals d
+JOIN reps r ON d.rep_id = r.id
+WHERE d.stage = 'won'
+ORDER BY d.closed;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>closed</th><th>name</th><th>amount</th><th>running_total</th></tr></thead>
+<tbody>
+<tr><td>2025-01-05</td><td>Bob</td><td class="num-val">55000</td><td class="num-val">55000</td></tr>
+<tr><td>2025-01-10</td><td>Alice</td><td class="num-val">45000</td><td class="num-val">100000</td></tr>
+<tr><td>2025-01-12</td><td>Eve</td><td class="num-val">50000</td><td class="num-val">150000</td></tr>
+<tr><td>2025-01-15</td><td>Dave</td><td class="num-val">25000</td><td class="num-val">175000</td></tr>
+<tr><td>2025-01-18</td><td>Alice</td><td class="num-val">30000</td><td class="num-val">205000</td></tr>
+<tr><td>2025-01-22</td><td>Carol</td><td class="num-val">60000</td><td class="num-val">265000</td></tr>
+<tr><td>2025-01-28</td><td>Dave</td><td class="num-val">70000</td><td class="num-val">335000</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── ROLLUP ──────────────────────────────────────────────── -->
+
+<h2>6. Subtotals with ROLLUP</h2>
+
+<p>
+    <code>GROUP BY ROLLUP</code> generates subtotal rows automatically&mdash;one
+    per region, plus a grand total.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT COALESCE(r.region, 'TOTAL')
+         AS region,
+       COALESCE(r.name, 'Subtotal')
+         AS rep,
+       SUM(d.amount) AS revenue
+FROM deals d
+JOIN reps r ON d.rep_id = r.id
+WHERE d.stage = 'won'
+GROUP BY ROLLUP(r.region, r.name)
+ORDER BY r.region, r.name;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>region</th><th>rep</th><th>revenue</th></tr></thead>
+<tbody>
+<tr><td>Central</td><td>Eve</td><td class="num-val">50000</td></tr>
+<tr><td>Central</td><td>Subtotal</td><td class="num-val">50000</td></tr>
+<tr><td>East</td><td>Bob</td><td class="num-val">55000</td></tr>
+<tr><td>East</td><td>Dave</td><td class="num-val">95000</td></tr>
+<tr><td>East</td><td>Subtotal</td><td class="num-val">150000</td></tr>
+<tr><td>West</td><td>Alice</td><td class="num-val">75000</td></tr>
+<tr><td>West</td><td>Carol</td><td class="num-val">60000</td></tr>
+<tr><td>West</td><td>Subtotal</td><td class="num-val">135000</td></tr>
+<tr><td>TOTAL</td><td>Subtotal</td><td class="num-val">335000</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── View ────────────────────────────────────────────────── -->
+
+<h2>7. Wrap it in a view</h2>
+
+<p>
+    Create a reusable view for the pipeline summary so any dashboard query
+    can reference it directly.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">CREATE VIEW pipeline_summary AS
+SELECT r.name AS rep,
+       r.region,
+       COUNT(*) FILTER (
+         WHERE d.stage = 'won'
+       ) AS won,
+       SUM(d.amount) AS pipeline,
+       SUM(CASE WHEN d.stage = 'won'
+           THEN d.amount ELSE 0
+       END) AS revenue
+FROM deals d
+JOIN reps r ON d.rep_id = r.id
+GROUP BY r.name, r.region;
+
+SELECT * FROM pipeline_summary
+ORDER BY revenue DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>rep</th><th>region</th><th>won</th><th>pipeline</th><th>revenue</th></tr></thead>
+<tbody>
+<tr><td>Dave</td><td>East</td><td class="num-val">2</td><td class="num-val">95000</td><td class="num-val">95000</td></tr>
+<tr><td>Alice</td><td>West</td><td class="num-val">2</td><td class="num-val">95000</td><td class="num-val">75000</td></tr>
+<tr><td>Carol</td><td>West</td><td class="num-val">1</td><td class="num-val">95000</td><td class="num-val">60000</td></tr>
+<tr><td>Bob</td><td>East</td><td class="num-val">1</td><td class="num-val">95000</td><td class="num-val">55000</td></tr>
+<tr><td>Eve</td><td>Central</td><td class="num-val">1</td><td class="num-val">65000</td><td class="num-val">50000</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Wrap-up ─────────────────────────────────────────────── -->
+
+<h2>What you learned</h2>
+
+<ul>
+    <li><strong><code>GROUP BY</code> + <code>HAVING</code></strong> for filtered aggregation</li>
+    <li><strong><code>RANK() OVER (PARTITION BY ...)</code></strong> for per-group rankings</li>
+    <li><strong>Window frames</strong> (<code>ROWS BETWEEN</code>) for running totals</li>
+    <li><strong><code>ROLLUP</code></strong> for automatic subtotal and grand-total rows</li>
+    <li><strong><code>CASE WHEN</code></strong> inside aggregates for conditional sums</li>
+    <li><strong><code>CREATE VIEW</code></strong> to encapsulate complex queries</li>
+</ul>
+
+<div class="tutorial-nav">
+    <a class="prev" href="task-tracker.html">Task Tracker</a>
+    <a class="next" href="time-series.html">Time-Series Analytics</a>
+</div>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+</footer>
+
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>
