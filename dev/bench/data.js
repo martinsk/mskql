@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770772499727,
+  "lastUpdate": 1770786676350,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -710,6 +710,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.412,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "85ad54ecdcf61163cb077adbe00ecb70e861d108",
+          "message": "add benchmark script comparing mskql vs PostgreSQL and implement hash join optimization for equi-joins\n\nAdd bench/bench_vs_pg.py Python script and bench/bench_vs_pg.sh wrapper to run identical SQL workloads against both mskql and PostgreSQL via psql. Script generates 8 benchmarks (insert_bulk, select_full_scan, select_where, aggregate, order_by, join, update, index_lookup) with setup and execution phases, times both systems, and reports ratio.\n\nReplace nested-loop join with hash join for equality",
+          "timestamp": "2026-02-10T21:10:55-08:00",
+          "tree_id": "0d9b9cdce4ced6e33d892771e2f256d8c58653d8",
+          "url": "https://github.com/martinsk/mskql/commit/85ad54ecdcf61163cb077adbe00ecb70e861d108"
+        },
+        "date": 1770786675906,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 12.67,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 81.488,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 114.318,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 168.666,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 119.53,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 31.476,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 22.63,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 103.334,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 206.854,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 4.969,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.028,
             "unit": "ms"
           }
         ]
