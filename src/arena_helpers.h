@@ -111,7 +111,8 @@ static inline void arena_free_result_rows(struct query_arena *a)
 }
 
 /* Free per-row cells arrays in arena.rows (INSERT tuples).
- * The cell text is in the bump slab, but each row's cells.items is da_push'd. */
+ * Cell text is in the bump slab (bump_strndup in parse_value_tuple),
+ * so only the DA backing array needs freeing. */
 static inline void arena_free_row_cell_arrays(struct query_arena *a)
 {
     for (size_t i = 0; i < a->rows.count; i++)
@@ -120,8 +121,8 @@ static inline void arena_free_row_cell_arrays(struct query_arena *a)
 
 /* Reset the arena: set all counts to 0, reset bump slabs.
  * Keeps all backing memory allocated for reuse.
- * Strings, cell text in exprs/conditions/cells are in the bump slab
- * and don't need individual freeing. */
+ * All text (parser strings, cell text, subquery-resolved values) lives in
+ * the bump slab and is released by bump_reset — no per-item free needed. */
 static inline void query_arena_reset(struct query_arena *a)
 {
     arena_free_column_defaults(a);
@@ -144,12 +145,14 @@ static inline void query_arena_reset(struct query_arena *a)
     da_reset(&a->svs);
     da_reset(&a->columns);
     da_reset(&a->arg_indices);
+    da_reset(&a->plan_nodes);
     bump_reset(&a->bump);
     bump_reset(&a->scratch);
 }
 
 /* destroy the arena: free all backing memory.
- * Strings and cell text live in the bump slab — no per-item free needed.
+ * All text (parser strings, cell text, subquery-resolved values) lives in
+ * the bump slab — no per-item free needed.
  * Column default_value and row cell arrays still need individual cleanup. */
 static inline void query_arena_destroy(struct query_arena *a)
 {
@@ -172,6 +175,7 @@ static inline void query_arena_destroy(struct query_arena *a)
     da_free(&a->aggregates);
     da_free(&a->svs);
     da_free(&a->arg_indices);
+    da_free(&a->plan_nodes);
     bump_destroy(&a->bump);
     bump_destroy(&a->scratch);
 

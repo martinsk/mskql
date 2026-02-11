@@ -1,6 +1,7 @@
 #include "query.h"
 #include "database.h"
 #include "parser.h"
+#include "plan.h"
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
@@ -2002,14 +2003,14 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
     }
 
     /* collect rows matching WHERE (or all rows if no WHERE) */
-    DYNAMIC_ARRAY(size_t) match_idx;
-    da_init(&match_idx);
+    size_t *win_match_items = (size_t *)bump_alloc(&arena->scratch,
+                               (nrows ? nrows : 1) * sizeof(size_t));
+    size_t nmatch = 0;
     for (size_t i = 0; i < nrows; i++) {
         if (!row_matches(t, &s->where, arena, &t->rows.items[i], NULL))
             continue;
-        da_push(&match_idx, i);
+        win_match_items[nmatch++] = i;
     }
-    size_t nmatch = match_idx.count;
 
     /* build sorted row index (by first ORDER BY we find, or original order) */
     struct sort_entry *sorted = bump_calloc(&arena->scratch, nmatch ? nmatch : 1, sizeof(struct sort_entry));
@@ -2021,9 +2022,9 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
         }
     }
     for (size_t i = 0; i < nmatch; i++) {
-        sorted[i].idx = match_idx.items[i];
+        sorted[i].idx = win_match_items[i];
         if (global_ord >= 0)
-            sorted[i].key = &t->rows.items[match_idx.items[i]].cells.items[global_ord];
+            sorted[i].key = &t->rows.items[win_match_items[i]].cells.items[global_ord];
         else
             sorted[i].key = NULL;
     }
@@ -2350,8 +2351,6 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
         rows_push(result, dst);
     }
 
-    da_free(&match_idx);
-
     /* apply outer ORDER BY if present */
     if (s->has_order_by && result->count > 1) {
         /* build a temporary table descriptor from the result for sorting */
@@ -2455,26 +2454,27 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
     }
     if (ngrp > 32) ngrp = 32;
 
-    /* collect matching rows */
-    DYNAMIC_ARRAY(size_t) matching;
-    da_init(&matching);
+    /* collect matching rows (scratch-allocated) */
+    size_t max_rows = t->rows.count ? t->rows.count : 1;
+    size_t *matching = (size_t *)bump_alloc(&arena->scratch, max_rows * sizeof(size_t));
+    size_t matching_count = 0;
     for (size_t i = 0; i < t->rows.count; i++) {
         if (s->where.has_where && s->where.where_cond != IDX_NONE) {
             if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
                 continue;
         }
-        da_push(&matching, i);
+        matching[matching_count++] = i;
     }
 
     /* find distinct group keys (compare all group columns as a tuple) */
-    DYNAMIC_ARRAY(size_t) group_starts;
-    da_init(&group_starts);
+    size_t *group_starts = (size_t *)bump_alloc(&arena->scratch, max_rows * sizeof(size_t));
+    size_t group_starts_count = 0;
 
-    for (size_t m = 0; m < matching.count; m++) {
-        size_t ri = matching.items[m];
+    for (size_t m = 0; m < matching_count; m++) {
+        size_t ri = matching[m];
         int found = 0;
-        for (size_t g = 0; g < group_starts.count; g++) {
-            size_t gi = matching.items[group_starts.items[g]];
+        for (size_t g = 0; g < group_starts_count; g++) {
+            size_t gi = matching[group_starts[g]];
             int eq = 1;
             for (size_t k = 0; k < ngrp; k++) {
                 if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
@@ -2484,7 +2484,7 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             }
             if (eq) { found = 1; break; }
         }
-        if (!found) da_push(&group_starts, m);
+        if (!found) group_starts[group_starts_count++] = m;
     }
 
     /* pre-allocate aggregate accumulators in a single allocation */
@@ -2569,8 +2569,8 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
     }
 
     /* for each group, compute aggregates */
-    for (size_t g = 0; g < group_starts.count; g++) {
-        size_t first_ri = matching.items[group_starts.items[g]];
+    for (size_t g = 0; g < group_starts_count; g++) {
+        size_t first_ri = matching[group_starts[g]];
 
         /* reset accumulators */
         size_t grp_count = 0;
@@ -2580,8 +2580,8 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             memset(gnonnull, 0, agg_n * sizeof(size_t));
         }
 
-        for (size_t m = 0; m < matching.count; m++) {
-            size_t ri = matching.items[m];
+        for (size_t m = 0; m < matching_count; m++) {
+            size_t ri = matching[m];
             /* check if this row belongs to the current group */
             int eq = 1;
             for (size_t k = 0; k < ngrp; k++) {
@@ -2700,8 +2700,7 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
         rows_push(result, dst);
     }
 
-    da_free(&matching);
-    da_free(&group_starts);
+    /* matching and group_starts are scratch-allocated — no free needed */
     if (has_having_t) {
         for (size_t i = 0; i < having_t.columns.count; i++)
             column_free(&having_t.columns.items[i]);
@@ -2930,13 +2929,24 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
         }
     }
 
-    /* full scan — collect matching row indices */
-    DYNAMIC_ARRAY(size_t) match_idx;
-    da_init(&match_idx);
+    /* try block-oriented plan executor for simple queries */
+    {
+        uint32_t plan_root = plan_build_select(t, s, arena, db);
+        if (plan_root != IDX_NONE) {
+            struct plan_exec_ctx ctx;
+            plan_exec_init(&ctx, arena, db, plan_root);
+            return plan_exec_to_rows(&ctx, plan_root, result);
+        }
+    }
+
+    /* full scan — collect matching row indices (scratch-allocated) */
+    size_t *match_items = (size_t *)bump_alloc(&arena->scratch,
+                           (t->rows.count ? t->rows.count : 1) * sizeof(size_t));
+    size_t match_count = 0;
     for (size_t i = 0; i < t->rows.count; i++) {
         if (!row_matches(t, &s->where, arena, &t->rows.items[i], db))
             continue;
-        da_push(&match_idx, i);
+        match_items[match_count++] = i;
     }
 
     /* ORDER BY — sort indices using the original table data (multi-column) */
@@ -2994,16 +3004,15 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
         } else if (all_resolved) {
             _sort_ctx = (struct sort_ctx){ .cols = ord_cols, .descs = ord_descs,
                                            .ncols = nord, .table = t };
-            qsort(match_idx.items, match_idx.count, sizeof(size_t), cmp_indices_multi);
+            qsort(match_items, match_count, sizeof(size_t), cmp_indices_multi);
         }
     }
 
     /* project into result rows */
     struct rows tmp = {0};
-    for (size_t i = 0; i < match_idx.count; i++) {
-        emit_row(t, s, arena, &t->rows.items[match_idx.items[i]], &tmp, select_all, db);
+    for (size_t i = 0; i < match_count; i++) {
+        emit_row(t, s, arena, &t->rows.items[match_items[i]], &tmp, select_all, db);
     }
-    da_free(&match_idx);
 
     /* sort projected result rows if ORDER BY references a SELECT alias */
     if (order_on_result && result_nord > 0 && tmp.count > 1) {

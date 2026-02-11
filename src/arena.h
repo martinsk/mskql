@@ -9,53 +9,103 @@
 
 #define IDX_NONE ((uint32_t)0xFFFFFFFF)
 
-/* Bump allocator: a single contiguous slab that grows as needed.
- * On reset, just set used=0 — no per-allocation free. */
+/* Bump allocator: a chain of fixed-size slabs.
+ * New slabs are malloc'd — old slabs are never moved or freed until
+ * bump_destroy, so pointers into any slab remain valid.
+ * On reset, rewind to the first slab (keep all memory). */
+
+struct bump_slab {
+    char             *buf;
+    size_t            used;
+    size_t            capacity;
+    struct bump_slab *next;  /* newer slab, or NULL */
+};
+
 struct bump_alloc {
-    char  *buf;
-    size_t used;
-    size_t capacity;
+    struct bump_slab *head;    /* first (oldest) slab */
+    struct bump_slab *current; /* slab currently being allocated from */
 };
 
 static inline void bump_init(struct bump_alloc *b)
 {
-    b->buf = NULL;
-    b->used = 0;
-    b->capacity = 0;
+    b->head = NULL;
+    b->current = NULL;
 }
 
 static inline void bump_reset(struct bump_alloc *b)
 {
-    b->used = 0; /* keep buf and capacity */
+    /* Rewind all slabs to used=0, keep memory allocated. */
+    for (struct bump_slab *s = b->head; s; s = s->next)
+        s->used = 0;
+    b->current = b->head;
 }
 
 static inline void bump_destroy(struct bump_alloc *b)
 {
-    free(b->buf);
-    b->buf = NULL;
-    b->used = 0;
-    b->capacity = 0;
+    struct bump_slab *s = b->head;
+    while (s) {
+        struct bump_slab *next = s->next;
+        free(s->buf);
+        free(s);
+        s = next;
+    }
+    b->head = NULL;
+    b->current = NULL;
 }
 
-/* Allocate n bytes from the bump slab (8-byte aligned). */
+/* Allocate n bytes from the bump slab chain (8-byte aligned).
+ * Never moves existing allocations. */
 static inline void *bump_alloc(struct bump_alloc *b, size_t n)
 {
-    /* align to 8 bytes */
     size_t aligned = (n + 7) & ~(size_t)7;
-    if (b->used + aligned > b->capacity) {
-        size_t newcap = b->capacity == 0 ? 4096 : b->capacity * 2;
-        while (newcap < b->used + aligned) newcap *= 2;
-        void *tmp = realloc(b->buf, newcap);
-        if (!tmp) { fprintf(stderr, "bump_alloc: OOM\n"); abort(); }
-        b->buf = tmp;
-        b->capacity = newcap;
+
+    /* Try current slab */
+    if (b->current && b->current->used + aligned <= b->current->capacity) {
+        void *ptr = b->current->buf + b->current->used;
+        b->current->used += aligned;
+        return ptr;
     }
-    void *ptr = b->buf + b->used;
-    b->used += aligned;
-    return ptr;
+
+    /* Try next existing slab (from a previous reset cycle) */
+    if (b->current && b->current->next) {
+        struct bump_slab *ns = b->current->next;
+        if (ns->capacity >= aligned) {
+            b->current = ns;
+            void *ptr = ns->buf + ns->used;
+            ns->used += aligned;
+            return ptr;
+        }
+    }
+
+    /* Allocate a new slab */
+    size_t slab_cap = 4096;
+    if (b->current) slab_cap = b->current->capacity * 2;
+    if (slab_cap < aligned) slab_cap = aligned;
+
+    struct bump_slab *ns = (struct bump_slab *)malloc(sizeof(struct bump_slab));
+    if (!ns) { fprintf(stderr, "bump_alloc: OOM\n"); abort(); }
+    ns->buf = (char *)malloc(slab_cap);
+    if (!ns->buf) { fprintf(stderr, "bump_alloc: OOM\n"); abort(); }
+    ns->capacity = slab_cap;
+    ns->used = aligned;
+    ns->next = NULL;
+
+    if (b->current) {
+        /* Insert after current, before current->next */
+        ns->next = b->current->next;
+        b->current->next = ns;
+    } else if (b->head) {
+        /* Shouldn't happen, but handle gracefully */
+        ns->next = b->head;
+        b->head = ns;
+    } else {
+        b->head = ns;
+    }
+    b->current = ns;
+    return ns->buf;
 }
 
-/* Allocate n zero-initialized bytes from the bump slab. */
+/* Allocate n zero-initialized bytes from the bump slab chain. */
 static inline void *bump_calloc(struct bump_alloc *b, size_t count, size_t size)
 {
     size_t total = count * size;
@@ -90,6 +140,7 @@ struct agg_expr;
 struct order_by_item;
 struct join_info;
 struct cte_def;
+struct plan_node;
 
 /* Pool-based arena: each parsed type gets its own flat dynamic array.
  * Structures reference items by uint32_t index instead of pointers.
@@ -113,6 +164,7 @@ struct query_arena {
     DYNAMIC_ARRAY(sv)                      svs;         /* sv values (multi_columns, group_by) */
     DYNAMIC_ARRAY(struct column)           columns;     /* CREATE TABLE columns */
     DYNAMIC_ARRAY(uint32_t)                arg_indices; /* func call arg expr indices */
+    DYNAMIC_ARRAY(struct plan_node)         plan_nodes;  /* query plan tree nodes */
     /* bump slab for strings, scratch buffers, result row cells */
     struct bump_alloc bump;
     /* result rows: bump-allocated cells, reset with arena */
@@ -139,6 +191,7 @@ static inline void query_arena_init(struct query_arena *a)
     da_init(&a->svs);
     da_init(&a->columns);
     da_init(&a->arg_indices);
+    da_init(&a->plan_nodes);
     bump_init(&a->bump);
     a->result.data = NULL;
     a->result.count = 0;
@@ -197,5 +250,6 @@ static inline uint32_t arena_push_column(struct query_arena *a, struct column co
 #define ABRANCH(arena, idx)   ((arena)->branches.items[(idx)])
 #define ASV(arena, idx)       ((arena)->svs.items[(idx)])
 #define FUNC_ARG(arena, start, i) ((arena)->arg_indices.items[(start) + (i)])
+#define PLAN_NODE(arena, idx)  ((arena)->plan_nodes.items[(idx)])
 
 #endif

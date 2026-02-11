@@ -2614,10 +2614,8 @@ static int parse_value_tuple(struct lexer *l, struct row *r, struct query_arena 
                 }
             }
         } else if (tok.type == TOK_STRING) {
-            // TODO: sv_to_cstr heap-allocates per string value in every INSERT row;
-            // for bulk inserts this is many small allocations that could be batched
             c.type = COLUMN_TYPE_TEXT;
-            c.value.as_text = sv_to_cstr(tok.value);
+            c.value.as_text = bump_strndup(&a->bump, tok.value.data, tok.value.len);
         } else if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "NULL")) {
             c.type = COLUMN_TYPE_TEXT;
             c.value.as_text = NULL;

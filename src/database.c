@@ -271,6 +271,9 @@ static int do_single_join(struct table *t1, const char *alias1,
     /* build merged column metadata first (needed for condition evaluation) */
     build_merged_columns_ex(t1, alias1, t2, alias2, out_meta);
 
+    // TODO: JPL CONSISTENCY: calloc here (freed at end of this function) is
+    // correct for JPL but inconsistent with the arena scratch pattern used in
+    // query.c. Could use bump_calloc(&arena->scratch, ...) to avoid free().
     int *t1_matched = calloc(t1->rows.count, sizeof(int));
     int *t2_matched = calloc(t2->rows.count, sizeof(int));
 
@@ -814,7 +817,7 @@ static void resolve_subqueries(struct database *db, struct query_arena *arena, u
                         v.type = src->type;
                         v.is_null = src->is_null;
                         if (column_type_is_text(src->type) && src->value.as_text)
-                            v.value.as_text = strdup(src->value.as_text);
+                            v.value.as_text = bump_strdup(&arena->bump, src->value.as_text);
                         else
                             v.value = src->value;
                         arena_push_cell(arena, v);
@@ -838,13 +841,13 @@ static void resolve_subqueries(struct database *db, struct query_arena *arena, u
             struct rows sq_result = {0};
             if (db_exec(db, &sq, &sq_result) == 0) {
                 if (sq_result.count > 0 && sq_result.data[0].cells.count > 0) {
-                    /* free old value before overwriting */
-                    cell_free_text(&c->value);
+                    /* Don't call cell_free_text — the old value's text (if any)
+                     * lives in the bump slab and must not be free()'d. */
                     struct cell *src = &sq_result.data[0].cells.items[0];
                     c->value.type = src->type;
                     c->value.is_null = src->is_null;
                     if (column_type_is_text(src->type) && src->value.as_text)
-                        c->value.value.as_text = strdup(src->value.as_text);
+                        c->value.value.as_text = bump_strdup(&arena->bump, src->value.as_text);
                     else
                         c->value.value = src->value;
                 }
@@ -1665,8 +1668,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                                         free(dst->value.as_text);
                                     *dst = val;
                                 }
-                                /* remove this insert row — it was handled as update */
-                                row_free(&ir_items[ri]);
+                                /* remove this insert row — it was handled as update.
+                                 * Cell text is bump-allocated, so only free the DA
+                                 * backing array (not per-cell text). */
+                                da_free(&ir_items[ri].cells);
                                 for (uint32_t j = ri; j + 1 < ir_count; j++)
                                     ir_items[j] = ir_items[j + 1];
                                 ir_count--;
@@ -1715,9 +1720,11 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
                                 }
                             }
                             if (conflict) {
-                                /* skip this row — free cells and shift remaining.
+                                /* skip this row — free cells DA and shift remaining.
+                                 * Cell text is bump-allocated, so only free the DA
+                                 * backing array (not per-cell text).
                                  * Zero the vacated slot so arena_destroy won't double-free. */
-                                row_free(&ir_items[ri]);
+                                da_free(&ir_items[ri].cells);
                                 for (uint32_t j = ri; j + 1 < ir_count; j++)
                                     ir_items[j] = ir_items[j + 1];
                                 ir_count--;
@@ -1820,6 +1827,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result)
 
                     /* evaluate all SET expressions against merged row */
                     uint32_t nsc = u->set_clauses_count;
+                    // TODO: JPL CONSISTENCY: calloc here (freed at end of this
+                    // loop body) is correct for JPL but inconsistent with the
+                    // arena scratch pattern. Could use bump_calloc.
                     struct cell *new_vals = calloc(nsc, sizeof(struct cell));
                     int *col_idxs = calloc(nsc, sizeof(int));
                     for (uint32_t sc = 0; sc < nsc; sc++) {
