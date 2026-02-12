@@ -11,10 +11,10 @@ BENCH    = $(BUILDDIR)/mskql_bench
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 bench: $(LIB_OBJS) $(BUILDDIR)/bench.o
-	$(CC) $(CFLAGS) -o $(BENCH) $^
+	$(CC) $(CFLAGS) -o $(BENCH) $^ -lm
 
 $(BUILDDIR)/bench.o: ../bench/bench.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<

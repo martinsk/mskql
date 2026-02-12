@@ -564,6 +564,7 @@ static enum cmp_op cmp_from_token(enum token_type t)
         case TOK_UNKNOWN:
             return CMP_EQ;
     }
+    return CMP_EQ; /* unreachable — silences -Wreturn-type */
 }
 
 /* ---------------------------------------------------------------------------
