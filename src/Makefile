@@ -53,7 +53,7 @@ wasm: wasm-stubs $(WASM_TARGET)
 
 wasm-stubs: | $(BUILDDIR)
 	@mkdir -p $(WASM_INCDIR)
-	@for h in stdio.h stdlib.h string.h strings.h stddef.h stdint.h stdbool.h ctype.h math.h time.h signal.h; do \
+	@for h in stdio.h stdlib.h string.h strings.h stddef.h stdint.h stdbool.h stdarg.h ctype.h math.h time.h signal.h; do \
 		echo '/* stub */' > $(WASM_INCDIR)/$$h; \
 	done
 
