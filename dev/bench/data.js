@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770914323730,
+  "lastUpdate": 1770914929144,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1974,6 +1974,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.615,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "041ebf2f0844d585202ec43ddb182d3279f74034",
+          "message": "add project website, simplify README to quick-start guide with link to full documentation\n\nReplace detailed feature list and build instructions with brief introduction and link to martinsk.github.io/mskql for documentation, benchmarks, supported SQL, and tutorials. Condense README to quick-start commands and test runner invocation.",
+          "timestamp": "2026-02-12T08:48:23-08:00",
+          "tree_id": "0eca24c5f509f6830bf88c05c18ceebdbf8a9306",
+          "url": "https://github.com/martinsk/mskql/commit/041ebf2f0844d585202ec43ddb182d3279f74034"
+        },
+        "date": 1770914928613,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 14.266,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 80.562,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 102.843,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 188.678,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 116.048,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 32.743,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 23.891,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 118.746,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 256.207,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.707,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.314,
             "unit": "ms"
           }
         ]
