@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770859803047,
+  "lastUpdate": 1770870250634,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1658,6 +1658,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.489,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "08a554df6428f03550fc864b9dfc2e51b400a381",
+          "message": "Add freestanding WASM build: wasm_libc.h/c (minimal libc with JS bridge), wasm_api.c (C shim), Makefile wasm target, and CI workflow to build and deploy mskql.wasm to gh-pages",
+          "timestamp": "2026-02-11T20:23:38-08:00",
+          "tree_id": "f66e9e5f5368835850232ed91578a6bdaa90fa3a",
+          "url": "https://github.com/martinsk/mskql/commit/08a554df6428f03550fc864b9dfc2e51b400a381"
+        },
+        "date": 1770870249933,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 14.566,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 80.588,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 107.493,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 196.423,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 115.873,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 32.75,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 24.119,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 128.492,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 270.672,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.714,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.318,
             "unit": "ms"
           }
         ]
