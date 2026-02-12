@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770913935714,
+  "lastUpdate": 1770914323730,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1895,6 +1895,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.266,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "247c334697cec1cbecdb3e2e81f38c83047b424d",
+          "message": "fix wasm build: add stdarg.h to stub headers list",
+          "timestamp": "2026-02-12T08:38:08-08:00",
+          "tree_id": "0734f765998ccae1df5d02ad126c403832843164",
+          "url": "https://github.com/martinsk/mskql/commit/247c334697cec1cbecdb3e2e81f38c83047b424d"
+        },
+        "date": 1770914323314,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 14.406,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 80.714,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 103.688,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 189.671,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 117.249,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.028,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 24.147,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 121.386,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 256.725,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.723,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.615,
             "unit": "ms"
           }
         ]
