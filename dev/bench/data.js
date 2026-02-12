@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770921809117,
+  "lastUpdate": 1770925643459,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -2290,6 +2290,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.142,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "5b57baeb832bf3824bc383bfdb032504f8601bfd",
+          "message": "add 60 test cases covering aggregate expressions, type casts, date/time functions, set operations, window functions, and CTEs\n\nNew tests: expression-based aggregates (COUNT/MIN/MAX DISTINCT expr, GROUP BY), type casts (::BIGINT/TEXT/DATE/TIMESTAMP/BOOLEAN/NUMERIC), date/time functions (AGE, DATE_PART, DATE_TRUNC, EXTRACT with DOW/DOY/WEEK/EPOCH/INTERVAL, NOW, CURRENT_TIMESTAMP, RANDOM), set operations (EXCEPT ALL, INTERSECT ALL, UNION ALL), window functions (RANK, DENSE_RANK, ROW_NUMBER, LAG, LEAD",
+          "timestamp": "2026-02-12T11:46:10-08:00",
+          "tree_id": "d04f61600d17be69f5232d55747ade8a0bff2e63",
+          "url": "https://github.com/martinsk/mskql/commit/5b57baeb832bf3824bc383bfdb032504f8601bfd"
+        },
+        "date": 1770925642908,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 11.373,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 72.296,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 91.276,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 168.023,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 129.906,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 29.949,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 20.412,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 90.333,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 200.131,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 4.421,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 17.178,
             "unit": "ms"
           }
         ]
