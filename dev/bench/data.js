@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770872072846,
+  "lastUpdate": 1770913935714,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1816,6 +1816,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.558,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "2de894600aaa4a07d4717dbc8705dbc9ceffefa4",
+          "message": "add arena-based error reporting with SQLSTATE codes to replace fprintf(stderr) error messages throughout database.c and parser.c\n\nIntroduce errmsg[256] and sqlstate[6] fields to struct query_arena with arena_set_error() helper implementing first-error-wins semantics. Initialize and reset error fields in query_arena_init() and query_arena_reset(). Replace all fprintf(stderr) error messages in database.c and parser.c with arena_set_error() calls using appropriate SQLSTATE codes: 42P01 (undefined_table",
+          "timestamp": "2026-02-12T08:31:48-08:00",
+          "tree_id": "2904f9d518992ae22d9af84e9d664e45d8c48219",
+          "url": "https://github.com/martinsk/mskql/commit/2de894600aaa4a07d4717dbc8705dbc9ceffefa4"
+        },
+        "date": 1770913935364,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 14.384,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 81.45,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 103.867,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 204.567,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 135.108,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.089,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 23.906,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 117.052,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 256.752,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.642,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.266,
             "unit": "ms"
           }
         ]
