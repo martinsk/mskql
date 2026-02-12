@@ -325,7 +325,7 @@
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
     &ensp;&middot;&ensp;
     <a href="tutorials/index.html">Tutorials</a>
-    &ensp;&middot;&ensp; ~17,300 lines of C11 &ensp;&middot;&ensp; 679 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~17,500 lines of C11 &ensp;&middot;&ensp; 689 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -348,7 +348,7 @@
 <p>
     <strong>Understanding database internals.</strong>&ensp;Production databases are
     millions of lines of code. mskql distills the core ideas&mdash;wire protocol, parser,
-    query executor, storage engine, arena allocator, plan executor&mdash;into ~17,300
+    query executor, storage engine, arena allocator, plan executor&mdash;into ~17,500
     readable lines of C11 with zero dependencies. Every layer is visible and
     modifiable: from how a <code>SELECT</code> is parsed into an AST, to how a hash join
     probes its build table, to how a bump allocator recycles memory across
@@ -364,7 +364,7 @@
     It demonstrates that adversarial AI collaboration can produce non-trivial systems
     software: a hand-written recursive-descent parser, a block-oriented vectorized
     executor, arena-based memory management, and a PostgreSQL-compatible wire protocol.
-    The key enabler is a tight feedback loop&mdash;write code, run 679 tests, fix
+    The key enabler is a tight feedback loop&mdash;write code, run 689 tests, fix
     failures, repeat&mdash;that mirrors how experienced engineers ship production
     systems.<span class="sidenote">The adversarial model (one agent writes code, another
     writes tests to break it, a third reviews the source and leaves actionable comments) drove the
@@ -437,8 +437,8 @@
 
   <!-- Result box -->
   <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">679 tests pass</text>
-  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~17,300 lines of C &middot; zero human code</text>
+  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">689 tests pass</text>
+  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~17,500 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
@@ -481,12 +481,13 @@
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
-                4,029 lines the parser is the largest single file (with <code>plan.c</code>
+                4,105 lines the parser is the largest single file (with <code>plan.c</code>
                 adding another 1,843 lines for the block-oriented executor). It includes a
                 recursive-descent expression parser with proper operator precedence
                 (<code>||</code>&nbsp;&lt;&nbsp;<code>+-</code>&nbsp;&lt;&nbsp;<code>*/%</code>)
                 and handles the full grammar including CTEs, window functions, views,
-                sequences, set operations, and <code>ORDER&nbsp;BY</code> expressions.</span></td>
+                sequences, set operations, <code>ORDER&nbsp;BY</code> expressions,
+                and <code>generate_series()</code> table functions.</span></td>
         </tr>
         <tr>
             <td><strong>Query executor</strong></td>
@@ -511,7 +512,9 @@
                 window functions (with frame clauses), set operations, CTEs,
                 correlated subqueries (including scalar subqueries), views,
                 sequences, foreign keys, upserts, <code>TRUNCATE&nbsp;TABLE</code>,
-                <code>IS&nbsp;[NOT]&nbsp;DISTINCT&nbsp;FROM</code>, and transactions</td>
+                <code>IS&nbsp;[NOT]&nbsp;DISTINCT&nbsp;FROM</code>,
+                <code>generate_series()</code> table functions (integer and
+                timestamp sequences with optional step), and transactions</td>
         </tr>
         <tr>
             <td><strong>Storage</strong></td>
@@ -1012,7 +1015,7 @@ ORDER BY dt;</code></pre>
 <h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes 679 test cases: 654 SQL tests covering DDL, DML, joins,
+    The project includes 689 test cases: 664 SQL tests covering DDL, DML, joins,
     aggregation, window functions (including frames), set operations, CTEs,
     transactions (including nested <code>BEGIN</code>), NULL handling,
     type coercion, <code>CAST</code>/<code>::</code> conversions, constraint enforcement,
@@ -1023,6 +1026,7 @@ ORDER BY dt;</code></pre>
     expression evaluation, <code>TRUNCATE&nbsp;TABLE</code>,
     <code>IS&nbsp;[NOT]&nbsp;DISTINCT&nbsp;FROM</code>,
     <code>ORDER&nbsp;BY</code> expressions, <code>INSERT...SELECT</code> with CTEs,
+    <code>generate_series()</code> (integer, timestamp, step, aliases),
     upserts, correlated subqueries (including scalar subqueries),
     and various edge cases; plus C-based test suites for the Extended Query
     Protocol (prepared statements, portals, parameter binding) and multi-client

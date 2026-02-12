@@ -333,6 +333,10 @@
 <span class="nt">from_clause</span> <span class="op">::=</span><br>
 &ensp;&ensp;  <span class="nt">table_name</span> [ [ <span class="kw">AS</span> ] <span class="nt">alias</span> ]<br>
 &ensp;&ensp;| <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> [ <span class="kw">AS</span> ] <span class="nt">alias</span> <span class="comment">&ensp;-- derived table</span><br>
+&ensp;&ensp;| <span class="kw">generate_series</span> <span class="kw">(</span> <span class="nt">start</span> <span class="kw">,</span> <span class="nt">stop</span> [ <span class="kw">,</span> <span class="nt">step</span> ] <span class="kw">)</span> [ <span class="kw">AS</span> <span class="nt">alias</span> <span class="kw">(</span> <span class="nt">col_alias</span> <span class="kw">)</span> ] <span class="badge badge-yes">IMPLEMENTED</span><br>
+<span class="comment">&ensp;&ensp;-- integer series: generate_series(1, 100)</span><br>
+<span class="comment">&ensp;&ensp;-- integer with step: generate_series(0, 100, 10)</span><br>
+<span class="comment">&ensp;&ensp;-- timestamp series: generate_series('2024-01-01'::date, '2024-12-31'::date, '1 month')</span><br>
 </div>
 
 <h3>JOIN clause</h3>
