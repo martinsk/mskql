@@ -1,0 +1,46 @@
+name: Build WASM & Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify clang wasm32 target
+        run: clang --print-targets | grep wasm32
+
+      - name: Install wasm-ld
+        run: sudo apt-get install -y lld
+
+      - name: Build WASM
+        run: make -C src wasm WASM_CC=clang
+
+      - name: Verify WASM artifact
+        run: |
+          ls -la build/mskql.wasm
+          file build/mskql.wasm
+
+      - name: Deploy to gh-pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+          mkdir -p wasm
+          cp $GITHUB_WORKSPACE/build/mskql.wasm wasm/mskql.wasm
+          git add wasm/mskql.wasm
+          if git diff --cached --quiet; then
+            echo "No changes to deploy"
+          else
+            git commit -m "Update mskql.wasm from ${GITHUB_SHA::8}"
+            git push origin gh-pages
+          fi

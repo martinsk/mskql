@@ -28,4 +28,36 @@ $(BUILDDIR):
 clean:
 	rm -rf $(BUILDDIR)
 
-.PHONY: all clean bench
+# ── WASM freestanding build ──────────────────────────────────────
+WASM_CC     ?= clang
+WASM_INCDIR  = $(BUILDDIR)/wasm-include
+WASM_CFLAGS  = --target=wasm32-unknown-unknown -ffreestanding -nostdlib -nostdinc \
+               -isystem $(WASM_INCDIR) \
+               -std=c11 -O2 -flto -DNDEBUG -DMSKQL_WASM \
+               -include wasm_libc.h \
+               -Wno-builtin-requires-header
+WASM_LDFLAGS = -Wl,--no-entry \
+               -Wl,--allow-undefined \
+               -Wl,--export=mskql_open \
+               -Wl,--export=mskql_exec \
+               -Wl,--export=mskql_close \
+               -Wl,--export=mskql_alloc \
+               -Wl,--export=mskql_dealloc \
+               -Wl,--initial-memory=16777216 \
+               -Wl,--max-memory=268435456
+WASM_SRCS    = wasm_api.c wasm_libc.c database.c table.c query.c row.c \
+               parser.c index.c column.c plan.c
+WASM_TARGET  = $(BUILDDIR)/mskql.wasm
+
+wasm: wasm-stubs $(WASM_TARGET)
+
+wasm-stubs: | $(BUILDDIR)
+	@mkdir -p $(WASM_INCDIR)
+	@for h in stdio.h stdlib.h string.h strings.h stddef.h stdint.h stdbool.h ctype.h math.h time.h signal.h; do \
+		echo '/* stub */' > $(WASM_INCDIR)/$$h; \
+	done
+
+$(WASM_TARGET): $(WASM_SRCS) | $(BUILDDIR)
+	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $(WASM_SRCS)
+
+.PHONY: all clean bench wasm
