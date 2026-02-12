@@ -184,6 +184,163 @@ static int like_match(const char *pattern, const char *text, int case_insensitiv
 static int row_matches(struct table *t, struct where_clause *w, struct query_arena *arena, struct row *row, struct database *db);
 static double cell_to_double(const struct cell *c);
 
+/* Replace all occurrences of `ref` in sql_buf with `lit`, respecting word
+ * boundaries (the character after the match must not be alnum or '_'). */
+static void subst_ref(char *sql_buf, size_t bufsize,
+                       const char *ref, size_t rlen,
+                       const char *lit, size_t llen)
+{
+    char *pos;
+    while ((pos = strstr(sql_buf, ref)) != NULL) {
+        /* check word boundary after match */
+        char after = pos[rlen];
+        if (isalnum((unsigned char)after) || after == '_') break;
+        /* also check word boundary before match (must be start or non-ident) */
+        if (pos > sql_buf) {
+            char before = pos[-1];
+            if (isalnum((unsigned char)before) || before == '_') {
+                break;
+            }
+        }
+        size_t cur_len = strlen(sql_buf);
+        if (cur_len - rlen + llen >= bufsize - 1) break;
+        memmove(pos + llen, pos + rlen,
+                cur_len - (size_t)(pos - sql_buf) - rlen + 1);
+        memcpy(pos, lit, llen);
+    }
+}
+
+/* Format a cell value as a SQL literal string into buf. Returns 0 on success. */
+static int cell_to_sql_literal(const struct cell *cv, char *buf, size_t bufsize)
+{
+    if (cell_is_null(cv)) {
+        snprintf(buf, bufsize, "NULL");
+    } else if (cv->type == COLUMN_TYPE_INT) {
+        snprintf(buf, bufsize, "%d", cv->value.as_int);
+    } else if (cv->type == COLUMN_TYPE_BIGINT) {
+        snprintf(buf, bufsize, "%lld", cv->value.as_bigint);
+    } else if (cv->type == COLUMN_TYPE_FLOAT || cv->type == COLUMN_TYPE_NUMERIC) {
+        snprintf(buf, bufsize, "%g", cv->value.as_float);
+    } else if (cv->type == COLUMN_TYPE_BOOLEAN) {
+        snprintf(buf, bufsize, "%s", cv->value.as_bool ? "TRUE" : "FALSE");
+    } else if (column_type_is_text(cv->type) && cv->value.as_text) {
+        snprintf(buf, bufsize, "'%s'", cv->value.as_text);
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+/* Check if identifier of length id_len at id_start appears as a table name
+ * in the subquery SQL (after FROM or JOIN keywords). */
+static int is_inner_table_name(const char *sql_buf, const char *id_start,
+                               size_t id_len)
+{
+    /* scan for FROM/JOIN keywords and check the identifier that follows */
+    const char *p = sql_buf;
+    while (*p) {
+        /* skip non-alpha */
+        if (!isalpha((unsigned char)*p)) { p++; continue; }
+        /* read a word */
+        const char *ws = p;
+        while (isalnum((unsigned char)*p) || *p == '_') p++;
+        size_t wlen = (size_t)(p - ws);
+        int is_from = (wlen == 4 && strncasecmp(ws, "FROM", 4) == 0);
+        int is_join = (wlen == 4 && strncasecmp(ws, "JOIN", 4) == 0);
+        if (!is_from && !is_join) continue;
+        /* skip whitespace after FROM/JOIN */
+        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        /* skip optional quote */
+        char quote = 0;
+        if (*p == '"') { quote = '"'; p++; }
+        /* read the table name */
+        const char *ts = p;
+        while (isalnum((unsigned char)*p) || *p == '_') p++;
+        size_t tlen = (size_t)(p - ts);
+        if (quote && *p == '"') p++;
+        /* check if this table name matches the identifier */
+        if (tlen == id_len && strncasecmp(ts, id_start, id_len) == 0)
+            return 1;
+        /* also check if the table has an alias: FROM tablename alias */
+        const char *after_tbl = p;
+        while (*after_tbl == ' ' || *after_tbl == '\t') after_tbl++;
+        /* skip optional AS */
+        if (strncasecmp(after_tbl, "AS", 2) == 0 &&
+            !isalnum((unsigned char)after_tbl[2]) && after_tbl[2] != '_') {
+            after_tbl += 2;
+            while (*after_tbl == ' ' || *after_tbl == '\t') after_tbl++;
+        }
+        /* read alias */
+        if (isalpha((unsigned char)*after_tbl) || *after_tbl == '_') {
+            const char *as = after_tbl;
+            while (isalnum((unsigned char)*after_tbl) || *after_tbl == '_') after_tbl++;
+            size_t alen = (size_t)(after_tbl - as);
+            if (alen == id_len && strncasecmp(as, id_start, id_len) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* Substitute correlated outer column references in a subquery SQL string.
+ * Replaces both "tablename.col" and any "X.col" patterns where X is an
+ * unknown prefix (table alias) and col matches an outer table column,
+ * but only if X is not a table name or alias referenced inside the subquery. */
+static void subst_correlated_refs(char *sql_buf, size_t bufsize,
+                                  struct table *t, struct row *row)
+{
+    for (size_t ci = 0; ci < t->columns.count && ci < row->cells.count; ci++) {
+        const char *cname = t->columns.items[ci].name;
+        size_t cname_len = strlen(cname);
+        char lit[256];
+        if (cell_to_sql_literal(&row->cells.items[ci], lit, sizeof(lit)) != 0)
+            continue;
+        size_t llen = strlen(lit);
+
+        /* 1) substitute "tablename.col" */
+        char ref[256];
+        snprintf(ref, sizeof(ref), "%s.%s", t->name, cname);
+        subst_ref(sql_buf, bufsize, ref, strlen(ref), lit, llen);
+
+        /* 2) substitute any "X.col" where X is an alias we don't know —
+         * scan for ".colname" preceded by an identifier */
+        char dot_col[256];
+        snprintf(dot_col, sizeof(dot_col), ".%s", cname);
+        size_t dc_len = 1 + cname_len;
+        char *pos = sql_buf;
+        while ((pos = strstr(pos, dot_col)) != NULL) {
+            /* check word boundary after */
+            char after = pos[dc_len];
+            if (isalnum((unsigned char)after) || after == '_') { pos++; continue; }
+            /* find start of the identifier before the dot */
+            char *dot = pos;
+            if (dot <= sql_buf) { pos++; continue; }
+            char *id_start = dot - 1;
+            while (id_start > sql_buf && (isalnum((unsigned char)id_start[-1]) || id_start[-1] == '_'))
+                id_start--;
+            if (id_start == dot) { pos++; continue; } /* no identifier before dot */
+            size_t id_len = (size_t)(dot - id_start);
+            /* skip if it's the outer table name (already handled above) */
+            if (id_len == strlen(t->name) && strncasecmp(id_start, t->name, id_len) == 0) { pos++; continue; }
+            /* skip if the identifier is a table name or alias inside the subquery */
+            if (is_inner_table_name(sql_buf, id_start, id_len)) { pos++; continue; }
+            /* check word boundary before the identifier */
+            if (id_start > sql_buf) {
+                char before = id_start[-1];
+                if (isalnum((unsigned char)before) || before == '_') { pos++; continue; }
+            }
+            /* replace "alias.col" with literal */
+            size_t full_ref_len = id_len + dc_len;
+            size_t cur_len = strlen(sql_buf);
+            if (cur_len - full_ref_len + llen >= bufsize - 1) { pos++; continue; }
+            memmove(id_start + llen, id_start + full_ref_len,
+                    cur_len - (size_t)(id_start - sql_buf) - full_ref_len + 1);
+            memcpy(id_start, lit, llen);
+            pos = id_start + llen; /* continue after replacement */
+        }
+    }
+}
+
 int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                    struct row *row, struct table *t,
                    struct database *db)
@@ -233,38 +390,11 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                 /* correlated: subquery_sql still set → execute per-row */
                 if (cond->subquery_sql != IDX_NONE && db) {
                     const char *sql_tmpl = ASTRING(arena, cond->subquery_sql);
-                    /* substitute outer table.col references with literal values */
                     char sql_buf[4096];
                     strncpy(sql_buf, sql_tmpl, sizeof(sql_buf) - 1);
                     sql_buf[sizeof(sql_buf) - 1] = '\0';
-                    for (size_t ci = 0; ci < t->columns.count; ci++) {
-                        const char *cname = t->columns.items[ci].name;
-                        char ref[256];
-                        snprintf(ref, sizeof(ref), "%s.%s", t->name, cname);
-                        size_t rlen = strlen(ref);
-                        char lit[256];
-                        struct cell *cv = &row->cells.items[ci];
-                        if (cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text))
-                            snprintf(lit, sizeof(lit), "NULL");
-                        else if (cv->type == COLUMN_TYPE_INT)
-                            snprintf(lit, sizeof(lit), "%d", cv->value.as_int);
-                        else if (cv->type == COLUMN_TYPE_FLOAT)
-                            snprintf(lit, sizeof(lit), "%g", cv->value.as_float);
-                        else if (column_type_is_text(cv->type) && cv->value.as_text)
-                            snprintf(lit, sizeof(lit), "'%s'", cv->value.as_text);
-                        else
-                            continue;
-                        size_t llen = strlen(lit);
-                        char *pos;
-                        while ((pos = strstr(sql_buf, ref)) != NULL) {
-                            char after = pos[rlen];
-                            if (isalnum((unsigned char)after) || after == '_') break;
-                            size_t cur_len = strlen(sql_buf);
-                            if (cur_len - rlen + llen >= sizeof(sql_buf) - 1) break;
-                            memmove(pos + llen, pos + rlen, cur_len - (size_t)(pos - sql_buf) - rlen + 1);
-                            memcpy(pos, lit, llen);
-                        }
-                    }
+                    if (t && row)
+                        subst_correlated_refs(sql_buf, sizeof(sql_buf), t, row);
                     struct query sq = {0};
                     int has_rows = 0;
                     if (query_parse(sql_buf, &sq) == 0) {
@@ -287,7 +417,7 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
             struct cell lhs_tmp = {0};
             struct cell *c;
             if (cond->lhs_expr != IDX_NONE) {
-                lhs_tmp = eval_expr(cond->lhs_expr, arena, t, row, NULL, NULL);
+                lhs_tmp = eval_expr(cond->lhs_expr, arena, t, row, db, NULL);
                 c = &lhs_tmp;
             } else {
                 int col_idx = table_find_column_sv(t, cond->column);
@@ -427,36 +557,8 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                 char sql_buf[4096];
                 strncpy(sql_buf, sql_tmpl, sizeof(sql_buf) - 1);
                 sql_buf[sizeof(sql_buf) - 1] = '\0';
-                for (size_t ci = 0; ci < t->columns.count; ci++) {
-                    const char *cname = t->columns.items[ci].name;
-                    char ref[256];
-                    snprintf(ref, sizeof(ref), "%s.%s", t->name, cname);
-                    size_t rlen = strlen(ref);
-                    char lit[256];
-                    struct cell *cv = &row->cells.items[ci];
-                    if (cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text))
-                        snprintf(lit, sizeof(lit), "NULL");
-                    else if (cv->type == COLUMN_TYPE_INT)
-                        snprintf(lit, sizeof(lit), "%d", cv->value.as_int);
-                    else if (cv->type == COLUMN_TYPE_BIGINT)
-                        snprintf(lit, sizeof(lit), "%lld", cv->value.as_bigint);
-                    else if (cv->type == COLUMN_TYPE_FLOAT)
-                        snprintf(lit, sizeof(lit), "%g", cv->value.as_float);
-                    else if (column_type_is_text(cv->type) && cv->value.as_text)
-                        snprintf(lit, sizeof(lit), "'%s'", cv->value.as_text);
-                    else
-                        continue;
-                    size_t llen = strlen(lit);
-                    char *pos;
-                    while ((pos = strstr(sql_buf, ref)) != NULL) {
-                        char after = pos[rlen];
-                        if (isalnum((unsigned char)after) || after == '_') break;
-                        size_t cur_len = strlen(sql_buf);
-                        if (cur_len - rlen + llen >= sizeof(sql_buf) - 1) break;
-                        memmove(pos + llen, pos + rlen, cur_len - (size_t)(pos - sql_buf) - rlen + 1);
-                        memcpy(pos, lit, llen);
-                    }
-                }
+                if (t && row)
+                    subst_correlated_refs(sql_buf, sizeof(sql_buf), t, row);
                 struct query sq = {0};
                 if (query_parse(sql_buf, &sq) == 0) {
                     struct rows sq_result = {0};
@@ -2455,7 +2557,7 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
     case EXPR_CASE_WHEN: {
         for (uint32_t i = 0; i < e->case_when.branches_count; i++) {
             struct case_when_branch *b = &ABRANCH(arena, e->case_when.branches_start + i);
-            if (eval_condition(b->cond_idx, arena, row, t, NULL))
+            if (eval_condition(b->cond_idx, arena, row, t, db))
                 return eval_expr(b->then_expr_idx, arena, t, row, db, rb);
         }
         if (e->case_when.else_expr != IDX_NONE)
@@ -2473,38 +2575,8 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         memcpy(sql_buf, orig_sql, sql_len);
         sql_buf[sql_len] = '\0';
 
-        if (t && row) {
-            for (size_t ci = 0; ci < t->columns.count; ci++) {
-                const char *cname = t->columns.items[ci].name;
-                char ref[256];
-                snprintf(ref, sizeof(ref), "%s.%s", t->name, cname);
-                size_t rlen = strlen(ref);
-                char lit[256];
-                struct cell *cv = &row->cells.items[ci];
-                if (cell_is_null(cv)) {
-                    snprintf(lit, sizeof(lit), "NULL");
-                } else if (cv->type == COLUMN_TYPE_INT) {
-                    snprintf(lit, sizeof(lit), "%d", cv->value.as_int);
-                } else if (cv->type == COLUMN_TYPE_FLOAT) {
-                    snprintf(lit, sizeof(lit), "%g", cv->value.as_float);
-                } else if (column_type_is_text(cv->type) && cv->value.as_text) {
-                    snprintf(lit, sizeof(lit), "'%s'", cv->value.as_text);
-                } else {
-                    continue;
-                }
-                size_t llen = strlen(lit);
-                char *pos;
-                while ((pos = strstr(sql_buf, ref)) != NULL) {
-                    char after = pos[rlen];
-                    if (isalnum((unsigned char)after) || after == '_') break;
-                    size_t cur_len = strlen(sql_buf);
-                    if (cur_len - rlen + llen >= sizeof(sql_buf) - 1) break;
-                    memmove(pos + llen, pos + rlen,
-                            cur_len - (size_t)(pos - sql_buf) - rlen + 1);
-                    memcpy(pos, lit, llen);
-                }
-            }
-        }
+        if (t && row)
+            subst_correlated_refs(sql_buf, sizeof(sql_buf), t, row);
 
         struct query sub_q = {0};
         if (query_parse(sql_buf, &sub_q) == 0) {
@@ -2656,6 +2728,40 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         return r;
     }
 
+    case EXPR_EXISTS: {
+        if (!db || e->exists.sql_idx == IDX_NONE) {
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_BOOLEAN;
+            r.value.as_bool = e->exists.negate ? 1 : 0;
+            return r;
+        }
+        const char *orig_sql = ASTRING(arena, e->exists.sql_idx);
+        char sql_buf[2048];
+        size_t sql_len = strlen(orig_sql);
+        if (sql_len >= sizeof(sql_buf)) sql_len = sizeof(sql_buf) - 1;
+        memcpy(sql_buf, orig_sql, sql_len);
+        sql_buf[sql_len] = '\0';
+
+        if (t && row)
+            subst_correlated_refs(sql_buf, sizeof(sql_buf), t, row);
+
+        int has_rows = 0;
+        struct query sub_q = {0};
+        if (query_parse(sql_buf, &sub_q) == 0) {
+            struct rows sub_rows = {0};
+            if (db_exec(db, &sub_q, &sub_rows, NULL) == 0 && sub_rows.count > 0)
+                has_rows = 1;
+            for (size_t ri = 0; ri < sub_rows.count; ri++)
+                row_free(&sub_rows.data[ri]);
+            free(sub_rows.data);
+        }
+        query_free(&sub_q);
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_BOOLEAN;
+        r.value.as_bool = e->exists.negate ? !has_rows : has_rows;
+        return r;
+    }
+
     }
     return cell_make_null();
 }
@@ -2770,39 +2876,7 @@ static void emit_row(struct table *t, struct query_select *s, struct query_arena
                     memcpy(sql_buf, one.data + sql_start, sql_len);
                     sql_buf[sql_len] = '\0';
                     /* correlated subquery: substitute outer column refs with literals */
-                    for (size_t ci = 0; ci < t->columns.count; ci++) {
-                        const char *cname = t->columns.items[ci].name;
-                        /* build "table.col" reference pattern using the table name */
-                        char ref[256];
-                        snprintf(ref, sizeof(ref), "%s.%s", t->name, cname);
-                        size_t rlen = strlen(ref);
-                        /* build literal replacement */
-                        char lit[256];
-                        struct cell *cv = &src->cells.items[ci];
-                        if (cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text)) {
-                            snprintf(lit, sizeof(lit), "NULL");
-                        } else if (cv->type == COLUMN_TYPE_INT) {
-                            snprintf(lit, sizeof(lit), "%d", cv->value.as_int);
-                        } else if (cv->type == COLUMN_TYPE_FLOAT) {
-                            snprintf(lit, sizeof(lit), "%g", cv->value.as_float);
-                        } else if (column_type_is_text(cv->type) && cv->value.as_text) {
-                            snprintf(lit, sizeof(lit), "'%s'", cv->value.as_text);
-                        } else {
-                            continue;
-                        }
-                        size_t llen = strlen(lit);
-                        /* replace all occurrences of ref in sql_buf */
-                        char *pos;
-                        while ((pos = strstr(sql_buf, ref)) != NULL) {
-                            /* ensure it's a word boundary */
-                            char after = pos[rlen];
-                            if (isalnum((unsigned char)after) || after == '_') break;
-                            size_t cur_len = strlen(sql_buf);
-                            if (cur_len - rlen + llen >= sizeof(sql_buf) - 1) break;
-                            memmove(pos + llen, pos + rlen, cur_len - (size_t)(pos - sql_buf) - rlen + 1);
-                            memcpy(pos, lit, llen);
-                        }
-                    }
+                    subst_correlated_refs(sql_buf, sizeof(sql_buf), t, src);
                     struct query sub_q = {0};
                     if (query_parse(sql_buf, &sub_q) == 0) {
                         struct rows sub_rows = {0};

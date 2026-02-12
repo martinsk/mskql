@@ -166,7 +166,8 @@ enum expr_type {
     EXPR_CASE_WHEN,     /* CASE WHEN ... THEN ... ELSE ... END */
     EXPR_SUBQUERY,      /* (SELECT ...) */
     EXPR_CAST,          /* CAST(expr AS type) or expr::type */
-    EXPR_IS_NULL        /* expr IS NULL / expr IS NOT NULL */
+    EXPR_IS_NULL,       /* expr IS NULL / expr IS NOT NULL */
+    EXPR_EXISTS         /* EXISTS(SELECT ...) / NOT EXISTS(SELECT ...) */
 };
 
 enum expr_op {
@@ -285,6 +286,12 @@ struct expr {
             uint32_t operand;          /* index into arena.exprs */
             enum column_type target;   /* target type */
         } cast;
+
+        /* EXPR_EXISTS */
+        struct {
+            uint32_t sql_idx;          /* index into arena.strings */
+            int negate;                /* 1 for NOT EXISTS */
+        } exists;
     };
 
     sv alias; /* optional AS alias */

@@ -849,6 +849,71 @@ static uint32_t parse_expr_atom(struct lexer *l, struct query_arena *a)
         /* fall through to column ref handling */
     }
 
+    /* EXISTS(SELECT ...) */
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "EXISTS")) {
+        lexer_next(l); /* consume EXISTS */
+        struct token lp = lexer_next(l); /* consume ( */
+        if (lp.type != TOK_LPAREN) {
+            arena_set_error(a, "42601", "expected '(' after EXISTS");
+            return IDX_NONE;
+        }
+        const char *sq_start = l->input + l->pos;
+        int depth = 1;
+        struct token st;
+        while (depth > 0) {
+            st = lexer_next(l);
+            if (st.type == TOK_LPAREN) depth++;
+            else if (st.type == TOK_RPAREN) depth--;
+            else if (st.type == TOK_EOF) {
+                arena_set_error(a, "42601", "unterminated subquery in EXISTS");
+                return IDX_NONE;
+            }
+        }
+        const char *sq_end = st.value.data;
+        while (sq_end > sq_start && (sq_end[-1] == ' ' || sq_end[-1] == '\n')) sq_end--;
+        size_t sq_len = (size_t)(sq_end - sq_start);
+        uint32_t ei = expr_alloc(a, EXPR_EXISTS);
+        EXPR(a, ei).exists.sql_idx = arena_store_string(a, sq_start, sq_len);
+        EXPR(a, ei).exists.negate = 0;
+        return ei;
+    }
+
+    /* NOT EXISTS(SELECT ...) */
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "NOT")) {
+        size_t saved = l->pos;
+        lexer_next(l); /* consume NOT */
+        struct token next = lexer_peek(l);
+        if (next.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(next.value, "EXISTS")) {
+            lexer_next(l); /* consume EXISTS */
+            struct token lp = lexer_next(l); /* consume ( */
+            if (lp.type != TOK_LPAREN) {
+                arena_set_error(a, "42601", "expected '(' after NOT EXISTS");
+                return IDX_NONE;
+            }
+            const char *sq_start = l->input + l->pos;
+            int depth = 1;
+            struct token st;
+            while (depth > 0) {
+                st = lexer_next(l);
+                if (st.type == TOK_LPAREN) depth++;
+                else if (st.type == TOK_RPAREN) depth--;
+                else if (st.type == TOK_EOF) {
+                    arena_set_error(a, "42601", "unterminated subquery in NOT EXISTS");
+                    return IDX_NONE;
+                }
+            }
+            const char *sq_end = st.value.data;
+            while (sq_end > sq_start && (sq_end[-1] == ' ' || sq_end[-1] == '\n')) sq_end--;
+            size_t sq_len = (size_t)(sq_end - sq_start);
+            uint32_t ei = expr_alloc(a, EXPR_EXISTS);
+            EXPR(a, ei).exists.sql_idx = arena_store_string(a, sq_start, sq_len);
+            EXPR(a, ei).exists.negate = 1;
+            return ei;
+        }
+        /* not NOT EXISTS — restore lexer */
+        l->pos = saved;
+    }
+
     /* unary minus */
     if (tok.type == TOK_MINUS) {
         lexer_next(l);
@@ -1412,8 +1477,52 @@ static uint32_t parse_single_cond(struct lexer *l, struct query_arena *a)
             COND(a, ci).multi_values_count = mv_count;
             return ci;
         }
-        /* not multi-column IN — restore and parse as parenthesized sub-expression */
+        /* not multi-column IN — check if this is (expr) op value (e.g. (SELECT ...) > 0) */
         l->pos = saved;
+        {
+            /* peek: is the first token inside the paren SELECT? If so, it's a subquery expr LHS */
+            struct token inner_peek = lexer_peek(l);
+            int is_expr_lhs = 0;
+            if (inner_peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(inner_peek.value, "SELECT"))
+                is_expr_lhs = 1;
+            if (is_expr_lhs) {
+                /* back up to before the '(' and parse as expression */
+                l->pos = saved - 1; /* re-position before '(' */
+                /* find the actual '(' position */
+                while (l->pos > 0 && l->input[l->pos] != '(') l->pos--;
+                uint32_t lhs_expr = parse_expr(l, a);
+                if (lhs_expr != IDX_NONE) {
+                    struct token maybe_op = lexer_peek(l);
+                    if (is_cmp_token(maybe_op.type)) {
+                        uint32_t eci = arena_alloc_cond(a);
+                        COND(a, eci).type = COND_COMPARE;
+                        COND(a, eci).lhs_expr = lhs_expr;
+                        COND(a, eci).left = IDX_NONE;
+                        COND(a, eci).right = IDX_NONE;
+                        COND(a, eci).subquery_sql = IDX_NONE;
+                        COND(a, eci).scalar_subquery_sql = IDX_NONE;
+                        COND(a, eci).in_values_start = 0;
+                        COND(a, eci).in_values_count = 0;
+                        COND(a, eci).array_values_start = 0;
+                        COND(a, eci).array_values_count = 0;
+                        COND(a, eci).multi_columns_start = 0;
+                        COND(a, eci).multi_columns_count = 0;
+                        COND(a, eci).multi_values_start = 0;
+                        COND(a, eci).multi_values_count = 0;
+                        COND(a, eci).column = sv_from(NULL, 0);
+                        struct token eop = lexer_next(l);
+                        /* parse RHS value */
+                        struct token rhs_tok = lexer_next(l);
+                        COND(a, eci).value = parse_literal_value_arena(rhs_tok, a);
+                        COND(a, eci).op = cmp_from_token(eop.type);
+                        return eci;
+                    }
+                }
+                /* failed — restore */
+                l->pos = saved;
+            }
+        }
+        /* grouped condition fallback */
         uint32_t inner = parse_or_cond(l, a);
         if (inner == IDX_NONE) return IDX_NONE;
         tok = lexer_next(l);
