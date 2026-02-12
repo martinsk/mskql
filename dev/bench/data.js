@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770914929144,
+  "lastUpdate": 1770918460739,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -2053,6 +2053,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.314,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "fcb3c37adea47bfba3684dac92e3962d0cb4a027",
+          "message": "Correlated subquery with table alias",
+          "timestamp": "2026-02-12T09:46:21-08:00",
+          "tree_id": "5e5b31f34b791047dfb07860cb6ce3501f55544d",
+          "url": "https://github.com/martinsk/mskql/commit/fcb3c37adea47bfba3684dac92e3962d0cb4a027"
+        },
+        "date": 1770918460006,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 14.56,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 81.339,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 104.113,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 191.389,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 110.918,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.658,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 24.078,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 119.748,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 256.462,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.681,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.396,
             "unit": "ms"
           }
         ]
