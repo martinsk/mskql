@@ -1082,6 +1082,9 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
         case QUERY_TYPE_DROP_VIEW:
             snprintf(tag, sizeof(tag), "DROP VIEW");
             break;
+        case QUERY_TYPE_TRUNCATE:
+            snprintf(tag, sizeof(tag), "TRUNCATE TABLE");
+            break;
         case QUERY_TYPE_BEGIN:
             snprintf(tag, sizeof(tag), "BEGIN");
             break;

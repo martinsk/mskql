@@ -911,17 +911,17 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
  * Subquery SQL strings are stored in the arena; after consumption we set
  * the index to IDX_NONE so they won't be re-resolved.
  * New in_values are pushed into the arena cells pool. */
-static void resolve_subqueries(struct database *db, struct query_arena *arena, uint32_t cond_idx)
+static void resolve_subqueries(struct database *db, struct query_arena *arena, uint32_t cond_idx, const char *outer_table)
 {
     if (cond_idx == IDX_NONE) return;
     struct condition *c = &COND(arena, cond_idx);
     if (c->type == COND_AND || c->type == COND_OR) {
-        resolve_subqueries(db, arena, c->left);
-        resolve_subqueries(db, arena, c->right);
+        resolve_subqueries(db, arena, c->left, outer_table);
+        resolve_subqueries(db, arena, c->right, outer_table);
         return;
     }
     if (c->type == COND_NOT) {
-        resolve_subqueries(db, arena, c->left);
+        resolve_subqueries(db, arena, c->left, outer_table);
         return;
     }
     /* EXISTS / NOT EXISTS: defer to eval_condition for per-row evaluation
@@ -965,28 +965,40 @@ static void resolve_subqueries(struct database *db, struct query_arena *arena, u
     }
     /* scalar subquery: WHERE col > (SELECT ...) */
     if (c->type == COND_COMPARE && c->scalar_subquery_sql != IDX_NONE) {
-        struct query sq = {0};
-        if (query_parse(ASTRING(arena, c->scalar_subquery_sql), &sq) == 0) {
-            struct rows sq_result = {0};
-            if (db_exec(db, &sq, &sq_result, NULL) == 0) {
-                if (sq_result.count > 0 && sq_result.data[0].cells.count > 0) {
-                    /* Don't call cell_free_text — the old value's text (if any)
-                     * lives in the bump slab and must not be free()'d. */
-                    struct cell *src = &sq_result.data[0].cells.items[0];
-                    c->value.type = src->type;
-                    c->value.is_null = src->is_null;
-                    if (column_type_is_text(src->type) && src->value.as_text)
-                        c->value.value.as_text = bump_strdup(&arena->bump, src->value.as_text);
-                    else
-                        c->value.value = src->value;
-                }
-                for (size_t i = 0; i < sq_result.count; i++)
-                    row_free(&sq_result.data[i]);
-                free(sq_result.data);
-            }
+        /* check if this is a correlated subquery (references outer table columns) */
+        const char *sq_sql = ASTRING(arena, c->scalar_subquery_sql);
+        int is_correlated = 0;
+        if (outer_table) {
+            char ref_prefix[256];
+            snprintf(ref_prefix, sizeof(ref_prefix), "%s.", outer_table);
+            if (strstr(sq_sql, ref_prefix)) is_correlated = 1;
         }
-        query_free(&sq);
-        c->scalar_subquery_sql = IDX_NONE;
+        if (!is_correlated) {
+            /* non-correlated: resolve once */
+            struct query sq = {0};
+            if (query_parse(sq_sql, &sq) == 0) {
+                struct rows sq_result = {0};
+                if (db_exec(db, &sq, &sq_result, NULL) == 0) {
+                    if (sq_result.count > 0 && sq_result.data[0].cells.count > 0) {
+                        /* Don't call cell_free_text — the old value's text (if any)
+                         * lives in the bump slab and must not be free()'d. */
+                        struct cell *src = &sq_result.data[0].cells.items[0];
+                        c->value.type = src->type;
+                        c->value.is_null = src->is_null;
+                        if (column_type_is_text(src->type) && src->value.as_text)
+                            c->value.value.as_text = bump_strdup(&arena->bump, src->value.as_text);
+                        else
+                            c->value.value = src->value;
+                    }
+                    for (size_t i = 0; i < sq_result.count; i++)
+                        row_free(&sq_result.data[i]);
+                    free(sq_result.data);
+                }
+            }
+            query_free(&sq);
+            c->scalar_subquery_sql = IDX_NONE;
+        }
+        /* correlated: leave scalar_subquery_sql set for per-row eval in eval_condition */
     }
 }
 
@@ -1339,6 +1351,27 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             fprintf(stderr, "view '" SV_FMT "' not found\n", SV_ARG(vn));
             return -1;
         }
+        case QUERY_TYPE_TRUNCATE: {
+            struct table *t = db_find_table_sv(db, q->del.table);
+            if (!t) {
+                fprintf(stderr, "truncate error: table '" SV_FMT "' not found\n", SV_ARG(q->del.table));
+                return -1;
+            }
+            /* free all rows */
+            for (size_t i = 0; i < t->rows.count; i++)
+                row_free(&t->rows.items[i]);
+            t->rows.count = 0;
+            t->generation++;
+            /* reset SERIAL counters */
+            for (size_t i = 0; i < t->columns.count; i++) {
+                if (t->columns.items[i].is_serial)
+                    t->columns.items[i].serial_next = 1;
+            }
+            /* clear indexes */
+            for (size_t i = 0; i < t->indexes.count; i++)
+                index_reset(&t->indexes.items[i]);
+            return 0;
+        }
         case QUERY_TYPE_CREATE_INDEX: {
             struct query_create_index *ci = &q->create_index;
             struct table *t = db_find_table_sv(db, ci->table);
@@ -1555,8 +1588,14 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             }
 
             /* resolve any IN (SELECT ...) / EXISTS subqueries */
-            if (s->where.has_where && s->where.where_cond != IDX_NONE)
-                resolve_subqueries(db, &q->arena, s->where.where_cond);
+            if (s->where.has_where && s->where.where_cond != IDX_NONE) {
+                char outer_tbl[256] = {0};
+                if (s->table.len > 0 && s->table.len < sizeof(outer_tbl)) {
+                    memcpy(outer_tbl, s->table.data, s->table.len);
+                    outer_tbl[s->table.len] = '\0';
+                }
+                resolve_subqueries(db, &q->arena, s->where.where_cond, outer_tbl[0] ? outer_tbl : NULL);
+            }
             int sel_rc;
             if (s->table.len == 0 && s->parsed_columns_count > 0 && result) {
                 /* SELECT <expr>, ... — no table, evaluate expression ASTs */
@@ -1753,22 +1792,43 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             /* INSERT ... SELECT */
             if (ins->insert_select_sql != IDX_NONE) {
                 struct query sel_q = {0};
-                if (query_parse(ASTRING(&q->arena, ins->insert_select_sql), &sel_q) != 0) {
+                const char *sel_sql = ASTRING(&q->arena, ins->insert_select_sql);
+                char *cte_sql = NULL;
+                if (ins->cte_name != IDX_NONE && ins->cte_sql != IDX_NONE) {
+                    /* prepend WITH cte_name AS (cte_sql) to the SELECT */
+                    const char *cn = ASTRING(&q->arena, ins->cte_name);
+                    const char *cs = ASTRING(&q->arena, ins->cte_sql);
+                    size_t needed = 5 + strlen(cn) + 5 + strlen(cs) + 2 + strlen(sel_sql) + 1;
+                    cte_sql = malloc(needed);
+                    snprintf(cte_sql, needed, "WITH %s AS (%s) %s", cn, cs, sel_sql);
+                    sel_sql = cte_sql;
+                }
+                /* save table name before db_exec may invalidate ins pointer */
+                char target_name[256];
+                size_t tlen = ins->table.len < 255 ? ins->table.len : 255;
+                memcpy(target_name, ins->table.data, tlen);
+                target_name[tlen] = '\0';
+                sv target_table = sv_from(target_name, tlen);
+                if (query_parse(sel_sql, &sel_q) != 0) {
+                    free(cte_sql);
                     query_free(&sel_q);
                     return -1;
                 }
+                /* NOTE: do NOT free cte_sql yet — sel_q has sv pointers into it */
                 struct rows sel_rows = {0};
                 if (db_exec(db, &sel_q, &sel_rows, NULL) != 0) {
                     query_free(&sel_q);
+                    free(cte_sql);
                     return -1;
                 }
+                query_free(&sel_q);
+                free(cte_sql);
                 /* insert each result row into the target table */
-                struct table *t = db_find_table_sv(db, ins->table);
+                struct table *t = db_find_table_sv(db, target_table);
                 if (!t) {
-                    fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(ins->table));
+                    fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(target_table));
                     for (size_t i = 0; i < sel_rows.count; i++) row_free(&sel_rows.data[i]);
                     free(sel_rows.data);
-                    query_free(&sel_q);
                     return -1;
                 }
                 for (size_t i = 0; i < sel_rows.count; i++) {
@@ -1911,13 +1971,13 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
         case QUERY_TYPE_DELETE:
             /* resolve subqueries in WHERE */
             if (q->del.where.has_where && q->del.where.where_cond != IDX_NONE)
-                resolve_subqueries(db, &q->arena, q->del.where.where_cond);
+                resolve_subqueries(db, &q->arena, q->del.where.where_cond, NULL);
             return db_table_exec_query(db, q->del.table, q, result, NULL);
         case QUERY_TYPE_UPDATE: {
             struct query_update *u = &q->update;
             /* resolve subqueries in WHERE */
             if (u->where.has_where && u->where.where_cond != IDX_NONE)
-                resolve_subqueries(db, &q->arena, u->where.where_cond);
+                resolve_subqueries(db, &q->arena, u->where.where_cond, NULL);
             /* UPDATE ... FROM — use parsed join columns */
             if (u->has_update_from) {
                 struct table *t = db_find_table_sv(db, u->table);

@@ -77,6 +77,7 @@ struct select_expr {
     enum select_expr_kind kind;
     sv column;           /* for SEL_COLUMN */
     struct win_expr win; /* for SEL_WINDOW */
+    sv alias;            /* optional AS alias */
 };
 
 /* A parsed SELECT column: expression + optional alias. */
@@ -163,7 +164,8 @@ enum expr_type {
     EXPR_FUNC_CALL,     /* UPPER(x), COALESCE(a,b), etc. */
     EXPR_CASE_WHEN,     /* CASE WHEN ... THEN ... ELSE ... END */
     EXPR_SUBQUERY,      /* (SELECT ...) */
-    EXPR_CAST           /* CAST(expr AS type) or expr::type */
+    EXPR_CAST,          /* CAST(expr AS type) or expr::type */
+    EXPR_IS_NULL        /* expr IS NULL / expr IS NOT NULL */
 };
 
 enum expr_op {
@@ -196,7 +198,30 @@ enum expr_func {
     FUNC_DATE_TRUNC,
     FUNC_DATE_PART,
     FUNC_AGE,
-    FUNC_TO_CHAR
+    FUNC_TO_CHAR,
+    /* math functions */
+    FUNC_ABS,
+    FUNC_CEIL,
+    FUNC_FLOOR,
+    FUNC_ROUND,
+    FUNC_POWER,
+    FUNC_SQRT,
+    FUNC_MOD,
+    FUNC_SIGN,
+    FUNC_RANDOM,
+    /* string functions */
+    FUNC_REPLACE,
+    FUNC_LPAD,
+    FUNC_RPAD,
+    FUNC_CONCAT,
+    FUNC_CONCAT_WS,
+    FUNC_POSITION,
+    FUNC_SPLIT_PART,
+    FUNC_LEFT,
+    FUNC_RIGHT,
+    FUNC_REPEAT,
+    FUNC_REVERSE,
+    FUNC_INITCAP
 };
 
 struct case_when_branch {
@@ -248,6 +273,12 @@ struct expr {
             uint32_t sql_idx; /* index into arena.strings */
         } subquery;
 
+        /* EXPR_IS_NULL */
+        struct {
+            uint32_t operand_is;       /* index into arena.exprs */
+            int negate;                /* 1 for IS NOT NULL */
+        } is_null;
+
         /* EXPR_CAST */
         struct {
             uint32_t operand;          /* index into arena.exprs */
@@ -286,7 +317,8 @@ enum query_type {
     QUERY_TYPE_CREATE_SEQUENCE,
     QUERY_TYPE_DROP_SEQUENCE,
     QUERY_TYPE_CREATE_VIEW,
-    QUERY_TYPE_DROP_VIEW
+    QUERY_TYPE_DROP_VIEW,
+    QUERY_TYPE_TRUNCATE
 };
 
 enum alter_action {
@@ -320,6 +352,7 @@ struct cte_def {
 struct order_by_item {
     sv column;
     int desc;
+    uint32_t expr_idx;  /* index into arena.exprs, or IDX_NONE for simple column */
 };
 
 /* WHERE clause fields shared by SELECT, UPDATE, DELETE */
@@ -419,6 +452,11 @@ struct query_insert {
     int on_conflict_do_update;
     uint32_t conflict_set_start; /* index into arena.set_clauses (consecutive) */
     uint32_t conflict_set_count;
+    /* CTE support for WITH ... INSERT INTO ... SELECT */
+    uint32_t cte_name;      /* index into arena.strings, or IDX_NONE */
+    uint32_t cte_sql;       /* index into arena.strings, or IDX_NONE */
+    uint32_t ctes_start;    /* index into arena.ctes (consecutive) */
+    uint32_t ctes_count;
 };
 
 struct query_update {
