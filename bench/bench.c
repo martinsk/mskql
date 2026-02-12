@@ -32,6 +32,26 @@ static double now_sec(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+#define MAX_ITERS 100000
+static double g_iter_ms[MAX_ITERS];
+static int    g_niter;
+
+static int dbl_cmp(const void *a, const void *b)
+{
+    double da = *(const double *)a, db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+
+static double percentile(double *sorted, int n, double p)
+{
+    if (n <= 0) return 0.0;
+    double idx = p / 100.0 * (n - 1);
+    int lo = (int)idx;
+    if (lo >= n - 1) return sorted[n - 1];
+    double frac = idx - lo;
+    return sorted[lo] * (1.0 - frac) + sorted[lo + 1] * frac;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Helper: execute SQL, discard result, abort on error                */
 /* ------------------------------------------------------------------ */
@@ -60,12 +80,15 @@ static double bench_insert_bulk(void)
 
     const int N = 10000;
     char sql[256];
+    g_niter = N;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
         snprintf(sql, sizeof(sql),
                  "INSERT INTO t VALUES (%d, 'user_%d', %d.%d)",
                  i, i, i % 100, i % 10);
         exec(&db, sql);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
@@ -91,11 +114,14 @@ static double bench_select_full_scan(void)
     }
 
     const int N = 200;
+    g_niter = N;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
         struct rows r = {0};
         db_exec_sql(&db, "SELECT * FROM t", &r);
         rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
@@ -122,11 +148,14 @@ static double bench_select_where(void)
     }
 
     const int N = 500;
+    g_niter = N;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
         struct rows r = {0};
         db_exec_sql(&db, "SELECT * FROM t WHERE amount > 2500", &r);
         rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
@@ -154,12 +183,15 @@ static double bench_aggregate(void)
     }
 
     const int N = 500;
+    g_niter = N;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
         struct rows r = {0};
         db_exec_sql(&db,
             "SELECT region, SUM(amount) FROM sales GROUP BY region", &r);
         rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
@@ -185,11 +217,14 @@ static double bench_order_by(void)
     }
 
     const int N = 200;
+    g_niter = N;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
         struct rows r = {0};
         db_exec_sql(&db, "SELECT * FROM t ORDER BY val DESC", &r);
         rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
@@ -223,13 +258,16 @@ static double bench_join(void)
     }
 
     const int N = 50;
+    g_niter = N;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
         struct rows r = {0};
         db_exec_sql(&db,
             "SELECT users.name, orders.total FROM users "
             "JOIN orders ON users.id = orders.user_id", &r);
         rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
@@ -254,9 +292,12 @@ static double bench_update(void)
     }
 
     const int N = 200;
+    g_niter = N;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
         exec(&db, "UPDATE t SET val = 0 WHERE id < 1000");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
@@ -275,8 +316,10 @@ static double bench_delete(void)
     exec(&db, "CREATE TABLE t (id INT, val INT)");
 
     const int N = 50;
+    g_niter = N;
     double t0 = now_sec();
     for (int iter = 0; iter < N; iter++) {
+        double it0 = now_sec();
         exec(&db, "DROP TABLE t");
         exec(&db, "CREATE TABLE t (id INT, val INT)");
         for (int i = 0; i < 2000; i++) {
@@ -285,6 +328,7 @@ static double bench_delete(void)
             exec(&db, sql);
         }
         exec(&db, "DELETE FROM t WHERE id >= 1000");
+        g_iter_ms[iter] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
@@ -311,11 +355,14 @@ static double bench_parser(void)
     int nq = (int)(sizeof(queries) / sizeof(queries[0]));
 
     const int N = 50000;
+    g_niter = N;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
         struct query q = {0};
         if (query_parse(queries[i % nq], &q) == 0)
             query_free(&q);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
     return elapsed_ms;
@@ -341,13 +388,16 @@ static double bench_index_lookup(void)
 
     const int N = 2000;
     char sql[128];
+    g_niter = N;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
         struct rows r = {0};
         snprintf(sql, sizeof(sql),
                  "SELECT * FROM t WHERE id = %d", i % 10000);
         db_exec_sql(&db, sql, &r);
         rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
@@ -372,8 +422,10 @@ static double bench_transaction(void)
     }
 
     const int N = 100;
+    g_niter = N;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
         exec(&db, "BEGIN");
         for (int j = 0; j < 50; j++) {
             char sql[128];
@@ -382,6 +434,321 @@ static double bench_transaction(void)
             exec(&db, sql);
         }
         exec(&db, "COMMIT");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: window functions                                        */
+/* ------------------------------------------------------------------ */
+
+static double bench_window_functions(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t (id INT, grp INT, val INT)");
+
+    for (int i = 0; i < 5000; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES (%d, %d, %d)",
+                 i, i % 20, (i * 7) % 1000);
+        exec(&db, sql);
+    }
+
+    const int N = 20;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT id, grp, val, "
+            "ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) FROM t", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: DISTINCT                                                */
+/* ------------------------------------------------------------------ */
+
+static double bench_distinct(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t (id INT, category TEXT, val INT)");
+
+    for (int i = 0; i < 5000; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES (%d, 'cat_%d', %d)",
+                 i, i % 100, i);
+        exec(&db, sql);
+    }
+
+    const int N = 500;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db, "SELECT DISTINCT category FROM t", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: subquery (WHERE IN)                                     */
+/* ------------------------------------------------------------------ */
+
+static double bench_subquery(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t1 (id INT, val INT)");
+    exec(&db, "CREATE TABLE t2 (id INT, flag INT)");
+
+    for (int i = 0; i < 5000; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t1 VALUES (%d, %d)", i, i * 3);
+        exec(&db, sql);
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t2 VALUES (%d, %d)", i, i % 1000);
+        exec(&db, sql);
+    }
+
+    const int N = 50;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT * FROM t1 WHERE id IN "
+            "(SELECT id FROM t2 WHERE flag > 500)", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: CTE                                                     */
+/* ------------------------------------------------------------------ */
+
+static double bench_cte(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t (id INT, val INT, category TEXT)");
+
+    for (int i = 0; i < 5000; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES (%d, %d, 'cat_%d')",
+                 i, i * 3, i % 10);
+        exec(&db, sql);
+    }
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "WITH filtered AS (SELECT * FROM t WHERE val > 500) "
+            "SELECT * FROM filtered WHERE category = 'cat_3'", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: generate_series                                         */
+/* ------------------------------------------------------------------ */
+
+static double bench_generate_series(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db, "SELECT * FROM generate_series(1, 10000)", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: scalar functions                                        */
+/* ------------------------------------------------------------------ */
+
+static double bench_scalar_functions(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t (id INT, name TEXT, score FLOAT)");
+
+    for (int i = 0; i < 5000; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES (%d, 'user_%d', %d.%d)",
+                 i, i, i % 100, i % 10);
+        exec(&db, sql);
+    }
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT UPPER(name), LENGTH(name), ABS(score), "
+            "ROUND(score, 2) FROM t", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: expression-based aggregate                              */
+/* ------------------------------------------------------------------ */
+
+static double bench_expression_agg(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t (id INT, category TEXT, price INT, quantity INT)");
+
+    const char *cats[] = {"electronics", "clothing", "food", "books", "toys"};
+    for (int i = 0; i < 5000; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES (%d, '%s', %d, %d)",
+                 i, cats[i % 5], (i * 17) % 500, (i * 7) % 100);
+        exec(&db, sql);
+    }
+
+    const int N = 500;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT category, SUM(price * quantity) FROM t GROUP BY category", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: multi-column ORDER BY                                   */
+/* ------------------------------------------------------------------ */
+
+static double bench_multi_sort(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t (id INT, a INT, b INT)");
+
+    for (int i = 0; i < 5000; i++) {
+        char sql[128];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES (%d, %d, %d)",
+                 i, (i * 31337) % 1000, (i * 7919) % 1000);
+        exec(&db, sql);
+    }
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db, "SELECT * FROM t ORDER BY a DESC, b ASC", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: set operations (UNION)                                  */
+/* ------------------------------------------------------------------ */
+
+static double bench_set_ops(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t1 (id INT, val TEXT)");
+    exec(&db, "CREATE TABLE t2 (id INT, val TEXT)");
+
+    for (int i = 0; i < 2000; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t1 VALUES (%d, 'a_%d')", i, i);
+        exec(&db, sql);
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t2 VALUES (%d, 'b_%d')", i + 1000, i + 1000);
+        exec(&db, sql);
+    }
+
+    const int N = 50;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT id, val FROM t1 UNION SELECT id, val FROM t2", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
 
@@ -410,6 +777,15 @@ static struct bench_entry benchmarks[] = {
     { "parser",               bench_parser },
     { "index_lookup",         bench_index_lookup },
     { "transaction",          bench_transaction },
+    { "window_functions",     bench_window_functions },
+    { "distinct",             bench_distinct },
+    { "subquery",             bench_subquery },
+    { "cte",                  bench_cte },
+    { "generate_series",      bench_generate_series },
+    { "scalar_functions",     bench_scalar_functions },
+    { "expression_agg",       bench_expression_agg },
+    { "multi_sort",           bench_multi_sort },
+    { "set_ops",              bench_set_ops },
 };
 
 static int nbench = (int)(sizeof(benchmarks) / sizeof(benchmarks[0]));
@@ -417,6 +793,8 @@ static int nbench = (int)(sizeof(benchmarks) / sizeof(benchmarks[0]));
 struct bench_result {
     const char *name;
     double ms;
+    double p_min, p50, p95, p99, p_max;
+    int niter;
 };
 
 static void write_json(const char *path, struct bench_result *results, int n)
@@ -425,8 +803,11 @@ static void write_json(const char *path, struct bench_result *results, int n)
     if (!f) { perror(path); return; }
     fprintf(f, "[\n");
     for (int i = 0; i < n; i++) {
-        fprintf(f, "  { \"name\": \"%s\", \"unit\": \"ms\", \"value\": %.3f }",
-                results[i].name, results[i].ms);
+        fprintf(f, "  { \"name\": \"%s\", \"unit\": \"ms\", \"value\": %.3f, "
+                "\"extra\": \"iters=%d  min=%.3f  p50=%.3f  p95=%.3f  p99=%.3f  max=%.3f\" }",
+                results[i].name, results[i].ms, results[i].niter,
+                results[i].p_min, results[i].p50, results[i].p95,
+                results[i].p99, results[i].p_max);
         fprintf(f, "%s\n", i + 1 < n ? "," : "");
     }
     fprintf(f, "]\n");
@@ -451,18 +832,32 @@ int main(int argc, char **argv)
     printf("=========================================="
            "======================================\n");
 
-    struct bench_result results[32];
+    struct bench_result results[64];
     int ran = 0;
     for (int i = 0; i < nbench; i++) {
         if (filter && strcmp(filter, benchmarks[i].name) != 0)
             continue;
         printf("  running %-30s ...", benchmarks[i].name);
         fflush(stdout);
+        g_niter = 0;
         double ms = benchmarks[i].fn();
-        printf("  %9.3f ms\n", ms);
-        fflush(stdout);
         results[ran].name = benchmarks[i].name;
         results[ran].ms = ms;
+        results[ran].niter = g_niter;
+        if (g_niter > 0) {
+            qsort(g_iter_ms, (size_t)g_niter, sizeof(double), dbl_cmp);
+            results[ran].p_min = g_iter_ms[0];
+            results[ran].p50   = percentile(g_iter_ms, g_niter, 50);
+            results[ran].p95   = percentile(g_iter_ms, g_niter, 95);
+            results[ran].p99   = percentile(g_iter_ms, g_niter, 99);
+            results[ran].p_max = g_iter_ms[g_niter - 1];
+        }
+        printf("  %9.3f ms", ms);
+        if (g_niter > 0)
+            printf("  [p50=%.3f p95=%.3f p99=%.3f]",
+                   results[ran].p50, results[ran].p95, results[ran].p99);
+        printf("\n");
+        fflush(stdout);
         ran++;
     }
 

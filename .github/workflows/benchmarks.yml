@@ -31,7 +31,7 @@ jobs:
           output-file-path: bench_results.json
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: true
-          alert-threshold: "130%"
+          alert-threshold: "120%"
           comment-on-alert: true
-          fail-on-alert: false
+          fail-on-alert: ${{ github.event_name == 'push' }}
           benchmark-data-dir-path: dev/bench
