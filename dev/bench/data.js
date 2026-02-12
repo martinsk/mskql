@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770857686772,
+  "lastUpdate": 1770859803047,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1579,6 +1579,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.296,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "1e0422f43e8e9d1bdb509b4e9ceb9a6796f1d194",
+          "message": "add generate_series() table function for integer and timestamp sequences with optional step parameter and AS alias(col_alias) syntax\n\nImplement FROM generate_series(start, stop [, step]) [AS alias [(col_alias)]] by parsing function call in parse_select(), evaluating start/stop/step expressions in db_exec(), and materializing results as temporary table. Support integer series with BIGINT/INT type selection based on range, and timestamp/date series with interval step parsing via parse_interval_to_seconds(",
+          "timestamp": "2026-02-11T17:29:40-08:00",
+          "tree_id": "d666588634dce3a28a4258095b46230e7be53dd9",
+          "url": "https://github.com/martinsk/mskql/commit/1e0422f43e8e9d1bdb509b4e9ceb9a6796f1d194"
+        },
+        "date": 1770859802696,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 14.35,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 80.317,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 102.675,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 216.816,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 116.711,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.084,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 24.172,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 121.327,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 258.067,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.687,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.489,
             "unit": "ms"
           }
         ]
