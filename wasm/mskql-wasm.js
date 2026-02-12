@@ -116,9 +116,10 @@ class MskqlDB {
             if (rc < 0) {
                 lastOutput = this._readString(outPtr, BUF_SIZE);
                 lastOk = false;
-                break;
+            } else {
+                lastOutput = this._readString(outPtr, rc > 0 ? rc : BUF_SIZE);
+                lastOk = true;
             }
-            lastOutput = this._readString(outPtr, rc > 0 ? rc : BUF_SIZE);
         }
 
         this.instance.exports.mskql_dealloc(outPtr);
