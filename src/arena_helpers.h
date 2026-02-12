@@ -158,6 +158,8 @@ static inline void query_arena_reset(struct query_arena *a)
     bump_reset(&a->bump);
     bump_reset(&a->result_text);
     bump_reset(&a->scratch);
+    a->errmsg[0] = '\0';
+    a->sqlstate[0] = '\0';
 }
 
 /* destroy the arena: free all backing memory.

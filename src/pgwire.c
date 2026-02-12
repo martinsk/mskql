@@ -961,7 +961,9 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
 
     struct query q = {0};
     if (query_parse_into(sql, &q, conn_arena) != 0) {
-        send_error(fd, m, "ERROR", "42601", "syntax error or unsupported statement");
+        const char *code = conn_arena->sqlstate[0] ? conn_arena->sqlstate : "42601";
+        const char *msg  = conn_arena->errmsg[0]   ? conn_arena->errmsg   : "syntax error or unsupported statement";
+        send_error(fd, m, "ERROR", code, msg);
         return -1;
     }
 
@@ -993,9 +995,13 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     conn_arena->plan_nodes = q.arena.plan_nodes;
     conn_arena->cells = q.arena.cells;
     conn_arena->svs = q.arena.svs;
+    memcpy(conn_arena->errmsg, q.arena.errmsg, sizeof(conn_arena->errmsg));
+    memcpy(conn_arena->sqlstate, q.arena.sqlstate, sizeof(conn_arena->sqlstate));
 
     if (rc < 0) {
-        send_error(fd, m, "ERROR", "42000", "query execution failed");
+        const char *code = conn_arena->sqlstate[0] ? conn_arena->sqlstate : "42000";
+        const char *msg  = conn_arena->errmsg[0]   ? conn_arena->errmsg   : "query execution failed";
+        send_error(fd, m, "ERROR", code, msg);
         arena_free_result_rows(conn_arena);
         return -1;
     }

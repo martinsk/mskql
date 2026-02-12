@@ -71,7 +71,7 @@ int db_table_exec_query(struct database *db, sv table_name,
 {
     struct table *t = db_find_table_sv(db, table_name);
     if (!t) {
-        fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(table_name));
+        arena_set_error(&q->arena, "42P01", "table '%.*s' not found", (int)table_name.len, table_name.data);
         return -1;
     }
     return query_exec(t, q, result, db, rb);
@@ -367,7 +367,7 @@ static int do_single_join(struct table *t1, const char *alias1,
         if (hj_t1_col >= 0 && hj_t2_col >= 0)
             use_hash_join = 1;
         else {
-            fprintf(stderr, "join error: could not resolve ON columns\n");
+            arena_set_error(arena, "42703", "join error: could not resolve ON columns");
             return -1;
         }
     }
@@ -442,7 +442,7 @@ static int do_single_join(struct table *t1, const char *alias1,
         int t2_join_col = left_in_t1 ? table_find_column(t2, right_col) : table_find_column(t2, left_col);
 
         if (t1_join_col < 0 || t2_join_col < 0) {
-            fprintf(stderr, "join error: could not resolve ON columns\n");
+            arena_set_error(arena, "42703", "join error: could not resolve ON columns");
             return -1;
         }
 
@@ -522,7 +522,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
 {
     struct query_select *s = &q->select;
     struct table *t1 = db_find_table_sv(db, s->table);
-    if (!t1) { fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(s->table)); return -1; }
+    if (!t1) { arena_set_error(&q->arena, "42P01", "table '%.*s' not found", (int)s->table.len, s->table.data); return -1; }
 
     /* build merged table through successive joins */
     struct table merged_t = {0};
@@ -684,7 +684,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
     } else {
         struct table *t2 = db_find_table_sv(db, ji->join_table);
         if (!t2) {
-            fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(ji->join_table));
+            arena_set_error(&q->arena, "42P01", "table '%.*s' not found", (int)ji->join_table.len, ji->join_table.data);
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
             return -1;
@@ -710,7 +710,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
         ji = &a->joins.items[s->joins_start + jn];
         struct table *tn = db_find_table_sv(db, ji->join_table);
         if (!tn) {
-            fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(ji->join_table));
+            arena_set_error(&q->arena, "42P01", "table '%.*s' not found", (int)ji->join_table.len, ji->join_table.data);
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
             return -1;
@@ -1189,7 +1189,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
     /* handle transaction statements first */
     if (q->query_type == QUERY_TYPE_BEGIN) {
         if (db->in_transaction) {
-            fprintf(stderr, "WARNING: already in a transaction\n");
+            arena_set_error(&q->arena, "25001", "WARNING: already in a transaction");
             return 0;
         }
         db->in_transaction = 1;
@@ -1198,7 +1198,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
     }
     if (q->query_type == QUERY_TYPE_COMMIT) {
         if (!db->in_transaction) {
-            fprintf(stderr, "WARNING: no transaction in progress\n");
+            arena_set_error(&q->arena, "25P01", "WARNING: no transaction in progress");
             return 0;
         }
         db->in_transaction = 0;
@@ -1208,7 +1208,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
     }
     if (q->query_type == QUERY_TYPE_ROLLBACK) {
         if (!db->in_transaction) {
-            fprintf(stderr, "WARNING: no transaction in progress\n");
+            arena_set_error(&q->arena, "25P01", "WARNING: no transaction in progress");
             return 0;
         }
         snapshot_restore(db, db->snapshot);
@@ -1243,7 +1243,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 }
             }
             if (q->drop_table.if_exists) return 0;
-            fprintf(stderr, "drop error: table '" SV_FMT "' not found\n", SV_ARG(drop_tbl));
+            arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)drop_tbl.len, drop_tbl.data);
             return -1;
         }
         case QUERY_TYPE_CREATE_TYPE: {
@@ -1254,7 +1254,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
              * when the type is dropped. */
             struct query_create_type *ct = &q->create_type;
             if (db_find_type_sv(db, ct->type_name)) {
-                fprintf(stderr, "type '" SV_FMT "' already exists\n", SV_ARG(ct->type_name));
+                arena_set_error(&q->arena, "42710", "type '%.*s' already exists", (int)ct->type_name.len, ct->type_name.data);
                 return -1;
             }
             struct enum_type et;
@@ -1278,7 +1278,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                     return 0;
                 }
             }
-            fprintf(stderr, "type '" SV_FMT "' not found\n", SV_ARG(dtn));
+            arena_set_error(&q->arena, "42704", "type '%.*s' does not exist", (int)dtn.len, dtn.data);
             return -1;
         }
         case QUERY_TYPE_CREATE_SEQUENCE: {
@@ -1286,7 +1286,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             /* check for duplicate */
             for (size_t i = 0; i < db->sequences.count; i++) {
                 if (sv_eq_cstr(cs->name, db->sequences.items[i].name)) {
-                    fprintf(stderr, "sequence '" SV_FMT "' already exists\n", SV_ARG(cs->name));
+                    arena_set_error(&q->arena, "42P07", "sequence '%.*s' already exists", (int)cs->name.len, cs->name.data);
                     return -1;
                 }
             }
@@ -1311,13 +1311,13 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                     return 0;
                 }
             }
-            fprintf(stderr, "sequence '" SV_FMT "' not found\n", SV_ARG(sn));
+            arena_set_error(&q->arena, "42P01", "sequence '%.*s' does not exist", (int)sn.len, sn.data);
             return -1;
         }
         case QUERY_TYPE_CREATE_VIEW: {
             struct query_create_view *cv = &q->create_view;
             if (cv->sql_idx == IDX_NONE) {
-                fprintf(stderr, "CREATE VIEW: missing SELECT body\n");
+                arena_set_error(&q->arena, "42601", "CREATE VIEW: missing SELECT body");
                 return -1;
             }
             /* store view as a table with zero columns and the SQL in the name
@@ -1325,7 +1325,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             const char *sql = ASTRING(&q->arena, cv->sql_idx);
             /* check for existing view/table */
             if (db_find_table_sv(db, cv->name)) {
-                fprintf(stderr, "relation '" SV_FMT "' already exists\n", SV_ARG(cv->name));
+                arena_set_error(&q->arena, "42P07", "relation '%.*s' already exists", (int)cv->name.len, cv->name.data);
                 return -1;
             }
             struct table vt;
@@ -1349,13 +1349,13 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                     return 0;
                 }
             }
-            fprintf(stderr, "view '" SV_FMT "' not found\n", SV_ARG(vn));
+            arena_set_error(&q->arena, "42P01", "view '%.*s' does not exist", (int)vn.len, vn.data);
             return -1;
         }
         case QUERY_TYPE_TRUNCATE: {
             struct table *t = db_find_table_sv(db, q->del.table);
             if (!t) {
-                fprintf(stderr, "truncate error: table '" SV_FMT "' not found\n", SV_ARG(q->del.table));
+                arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)q->del.table.len, q->del.table.data);
                 return -1;
             }
             /* free all rows */
@@ -1377,13 +1377,12 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             struct query_create_index *ci = &q->create_index;
             struct table *t = db_find_table_sv(db, ci->table);
             if (!t) {
-                fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(ci->table));
+                arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)ci->table.len, ci->table.data);
                 return -1;
             }
             int col_idx = table_find_column_sv(t, ci->index_column);
             if (col_idx < 0) {
-                fprintf(stderr, "column '" SV_FMT "' not found in table '" SV_FMT "'\n",
-                        SV_ARG(ci->index_column), SV_ARG(ci->table));
+                arena_set_error(&q->arena, "42703", "column '%.*s' not found in table '%.*s'", (int)ci->index_column.len, ci->index_column.data, (int)ci->table.len, ci->table.data);
                 return -1;
             }
             struct index idx;
@@ -1411,7 +1410,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                     }
                 }
             }
-            fprintf(stderr, "index '" SV_FMT "' not found\n", SV_ARG(q->drop_index.index_name));
+            arena_set_error(&q->arena, "42704", "index '%.*s' does not exist", (int)q->drop_index.index_name.len, q->drop_index.index_name.data);
             return -1;
         }
         case QUERY_TYPE_SELECT: {
@@ -1968,7 +1967,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 /* insert each result row into the target table */
                 struct table *t = db_find_table_sv(db, target_table);
                 if (!t) {
-                    fprintf(stderr, "table '" SV_FMT "' not found\n", SV_ARG(target_table));
+                    arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)target_table.len, target_table.data);
                     for (size_t i = 0; i < sel_rows.count; i++) row_free(&sel_rows.data[i]);
                     free(sel_rows.data);
                     return -1;
@@ -2125,7 +2124,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 struct table *t = db_find_table_sv(db, u->table);
                 struct table *ft = db_find_table_sv(db, u->update_from_table);
                 if (!t || !ft) {
-                    fprintf(stderr, "update from: table not found\n");
+                    arena_set_error(&q->arena, "42P01", "UPDATE FROM: table not found");
                     return -1;
                 }
                 /* resolve join columns from the parsed WHERE t1.col = t2.col */
@@ -2238,7 +2237,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             struct query_alter *a = &q->alter;
             struct table *t = db_find_table_sv(db, a->table);
             if (!t) {
-                fprintf(stderr, "alter error: table '" SV_FMT "' not found\n", SV_ARG(a->table));
+                arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)a->table.len, a->table.data);
                 return -1;
             }
             switch (a->alter_action) {
@@ -2257,7 +2256,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 case ALTER_DROP_COLUMN: {
                     int col_idx = table_find_column_sv(t, a->alter_column);
                     if (col_idx < 0) {
-                        fprintf(stderr, "alter error: column '" SV_FMT "' not found\n", SV_ARG(a->alter_column));
+                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
                         return -1;
                     }
                     /* remove column from schema */
@@ -2287,7 +2286,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 case ALTER_RENAME_COLUMN: {
                     int col_idx = table_find_column_sv(t, a->alter_column);
                     if (col_idx < 0) {
-                        fprintf(stderr, "alter error: column '" SV_FMT "' not found\n", SV_ARG(a->alter_column));
+                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
                         return -1;
                     }
                     free(t->columns.items[col_idx].name);
@@ -2297,7 +2296,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 case ALTER_COLUMN_TYPE: {
                     int col_idx = table_find_column_sv(t, a->alter_column);
                     if (col_idx < 0) {
-                        fprintf(stderr, "alter error: column '" SV_FMT "' not found\n", SV_ARG(a->alter_column));
+                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
                         return -1;
                     }
                     t->columns.items[col_idx].type = a->alter_new_col.type;

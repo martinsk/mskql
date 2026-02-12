@@ -1719,7 +1719,7 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             }
             cell_release_rb(&arg, rb);
             if (!seq) {
-                fprintf(stderr, "sequence '%s' not found\n", seq_name);
+                arena_set_error(arena, "42P01", "sequence '%s' not found", seq_name);
                 return cell_make_null();
             }
             if (fn == FUNC_NEXTVAL) {
@@ -1738,7 +1738,7 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             } else {
                 /* currval */
                 if (!seq->has_been_called) {
-                    fprintf(stderr, "currval: sequence '%s' not yet called\n", seq_name);
+                    arena_set_error(arena, "55000", "currval: sequence '%s' not yet called", seq_name);
                     return cell_make_null();
                 }
                 struct cell r = {0};
@@ -2886,8 +2886,7 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
             }
         }
         if (where_col < 0) {
-            fprintf(stderr, "WHERE column '" SV_FMT "' not found\n",
-                    SV_ARG(s->where.where_column));
+            arena_set_error(arena, "42703", "column '%.*s' not found", (int)s->where.where_column.len, s->where.where_column.data);
             return -1;
         }
     }
@@ -2908,8 +2907,7 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                 }
             }
             if (agg_col[a] < 0) {
-                fprintf(stderr, "aggregate column '" SV_FMT "' not found\n",
-                        SV_ARG(ae->column));
+                arena_set_error(arena, "42703", "column '%.*s' not found", (int)ae->column.len, ae->column.data);
                 return -1;
             }
         }
@@ -3154,31 +3152,28 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
         if (se->kind == SEL_COLUMN) {
             col_idx[e] = table_find_column_sv(t, se->column);
             if (col_idx[e] < 0) {
-                fprintf(stderr, "column '" SV_FMT "' not found\n", SV_ARG(se->column));
+                arena_set_error(arena, "42703", "column '%.*s' not found", (int)se->column.len, se->column.data);
                 return -1;
             }
         } else {
             if (se->win.has_partition) {
                 part_idx[e] = table_find_column_sv(t, se->win.partition_col);
                 if (part_idx[e] < 0) {
-                    fprintf(stderr, "partition column '" SV_FMT "' not found\n",
-                            SV_ARG(se->win.partition_col));
+                    arena_set_error(arena, "42703", "partition column '%.*s' not found", (int)se->win.partition_col.len, se->win.partition_col.data);
                     return -1;
                 }
             }
             if (se->win.has_order) {
                 ord_idx[e] = table_find_column_sv(t, se->win.order_col);
                 if (ord_idx[e] < 0) {
-                    fprintf(stderr, "order column '" SV_FMT "' not found\n",
-                            SV_ARG(se->win.order_col));
+                    arena_set_error(arena, "42703", "order column '%.*s' not found", (int)se->win.order_col.len, se->win.order_col.data);
                     return -1;
                 }
             }
             if (se->win.arg_column.len > 0 && !sv_eq_cstr(se->win.arg_column, "*")) {
                 arg_idx[e] = table_find_column_sv(t, se->win.arg_column);
                 if (arg_idx[e] < 0) {
-                    fprintf(stderr, "window arg column '" SV_FMT "' not found\n",
-                            SV_ARG(se->win.arg_column));
+                    arena_set_error(arena, "42703", "window arg column '%.*s' not found", (int)se->win.arg_column.len, se->win.arg_column.data);
                     return -1;
                 }
             }
@@ -3622,16 +3617,14 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             sv gbcol = ASV(arena, s->group_by_start + (uint32_t)k);
             grp_cols[k] = table_find_column_sv(t, gbcol);
             if (grp_cols[k] < 0) {
-                fprintf(stderr, "GROUP BY column '" SV_FMT "' not found\n",
-                        SV_ARG(gbcol));
+                arena_set_error(arena, "42703", "GROUP BY column '%.*s' not found", (int)gbcol.len, gbcol.data);
                 return -1;
             }
         }
     } else {
         grp_cols[0] = table_find_column_sv(t, s->group_by_col);
         if (grp_cols[0] < 0) {
-            fprintf(stderr, "GROUP BY column '" SV_FMT "' not found\n",
-                    SV_ARG(s->group_by_col));
+            arena_set_error(arena, "42703", "GROUP BY column '%.*s' not found", (int)s->group_by_col.len, s->group_by_col.data);
             return -1;
         }
     }
@@ -4614,8 +4607,7 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                 struct cell *c = &copy.cells.items[i];
                 int is_null = c->is_null || (column_type_is_text(c->type) && !c->value.as_text);
                 if (is_null) {
-                    fprintf(stderr, "NOT NULL constraint violated for column '%s'\n",
-                            t->columns.items[i].name);
+                    arena_set_error(arena, "23502", "NOT NULL constraint violated for column '%s'", t->columns.items[i].name);
                     row_free(&copy);
                     return -1;
                 }
@@ -4631,8 +4623,7 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                 for (size_t ri = 0; ri < t->rows.count; ri++) {
                     struct cell *existing = &t->rows.items[ri].cells.items[i];
                     if (cell_compare(new_c, existing) == 0) {
-                        fprintf(stderr, "UNIQUE constraint violated for column '%s'\n",
-                                t->columns.items[i].name);
+                        arena_set_error(arena, "23505", "UNIQUE constraint violated for column '%s'", t->columns.items[i].name);
                         row_free(&copy);
                         return -1;
                     }

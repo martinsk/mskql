@@ -239,9 +239,13 @@ int mskql_exec(void *db_ptr, const char *sql, char *out_buf, int buf_len) {
     /* parse the query so we can extract column names */
     struct query q = {0};
     if (query_parse(sql, &q) != 0) {
-        query_free(&q);
-        int pos = buf_puts(out_buf, buf_len, 0, "ERROR: parse error");
+        int pos = buf_puts(out_buf, buf_len, 0, "ERROR: ");
+        if (q.arena.errmsg[0])
+            pos = buf_puts(out_buf, buf_len, pos, q.arena.errmsg);
+        else
+            pos = buf_puts(out_buf, buf_len, pos, "parse error");
         out_buf[pos] = '\0';
+        query_free(&q);
         return -1;
     }
 
@@ -251,7 +255,11 @@ int mskql_exec(void *db_ptr, const char *sql, char *out_buf, int buf_len) {
     int pos = 0;
 
     if (rc != 0) {
-        pos = buf_puts(out_buf, buf_len, 0, "ERROR: query execution failed");
+        pos = buf_puts(out_buf, buf_len, 0, "ERROR: ");
+        if (q.arena.errmsg[0])
+            pos = buf_puts(out_buf, buf_len, pos, q.arena.errmsg);
+        else
+            pos = buf_puts(out_buf, buf_len, pos, "query execution failed");
         out_buf[pos] = '\0';
         rows_free(&result);
         query_free(&q);

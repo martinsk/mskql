@@ -2,6 +2,8 @@
 #define ARENA_H
 
 #include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include "dynamic_array.h"
 #include "row.h"
 #include "column.h"
@@ -173,7 +175,27 @@ struct query_arena {
     struct bump_alloc result_text;
     /* scratch area for temporary per-query allocations */
     struct bump_alloc scratch;
+    /* error reporting: first-error-wins */
+    char errmsg[256];
+    char sqlstate[6]; /* 5-char SQLSTATE + NUL */
 };
+
+/* Set an error message on the arena (first-error-wins: only the first
+ * call actually writes, so the root cause is preserved). */
+static inline void arena_set_error(struct query_arena *a,
+                                   const char *state,
+                                   const char *fmt, ...)
+{
+    if (a->errmsg[0] != '\0') return; /* first error wins */
+    if (state) {
+        memcpy(a->sqlstate, state, 5);
+        a->sqlstate[5] = '\0';
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(a->errmsg, sizeof(a->errmsg), fmt, ap);
+    va_end(ap);
+}
 
 static inline void query_arena_init(struct query_arena *a)
 {
@@ -201,6 +223,8 @@ static inline void query_arena_init(struct query_arena *a)
     a->result.arena_owns_text = 0;
     bump_init(&a->result_text);
     bump_init(&a->scratch);
+    a->errmsg[0] = '\0';
+    a->sqlstate[0] = '\0';
 }
 
 /* helpers that only need cell / char* / sv / row / column (complete here) */

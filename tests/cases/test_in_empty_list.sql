@@ -5,5 +5,5 @@ INSERT INTO t1 (id) VALUES (1), (2);
 -- input:
 SELECT id FROM t1 WHERE id IN ();
 -- expected output:
-ERROR:  syntax error or unsupported statement
+ERROR:  expected ',' or ')' in IN list
 -- expected status: 1
