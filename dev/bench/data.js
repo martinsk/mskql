@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770850449889,
+  "lastUpdate": 1770857686772,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -1500,6 +1500,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 19.194,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "07423d9ed5c9178d2b0811d81d04256ea330ff57",
+          "message": "add -lm linker flag to Makefile for math library functions and silence -Wreturn-type warning in cmp_from_token() with unreachable return statement",
+          "timestamp": "2026-02-11T16:54:20-08:00",
+          "tree_id": "bc296e235c599e67f4ce239cd7d29e95a3259336",
+          "url": "https://github.com/martinsk/mskql/commit/07423d9ed5c9178d2b0811d81d04256ea330ff57"
+        },
+        "date": 1770857685778,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 14.704,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 80.859,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 103.103,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 211.032,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 110.034,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 32.897,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 24.325,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 120.261,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 257.113,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.814,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.296,
             "unit": "ms"
           }
         ]
