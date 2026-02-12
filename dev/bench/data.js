@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770925643459,
+  "lastUpdate": 1770927810068,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -2369,6 +2369,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 17.178,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "cb5685906ce413058bdc2f7017f82a520cc98c08",
+          "message": "refactor parse_expr_atom: extract helper functions for CAST, EXTRACT, EXISTS, CASE, function calls, and number literals\n\nSplit 200-line parse_expr_atom() into focused helpers: parse_cast_expr(), parse_extract_expr(), parse_exists_expr() (with negate param for NOT EXISTS), parse_case_expr(), parse_func_call_expr(), and parse_number_literal(). Main function now delegates to helpers and falls through to column refs/string literals. No functional changes.",
+          "timestamp": "2026-02-12T12:23:05-08:00",
+          "tree_id": "02190965f4f19f0731892541ca00d5a32202b97f",
+          "url": "https://github.com/martinsk/mskql/commit/cb5685906ce413058bdc2f7017f82a520cc98c08"
+        },
+        "date": 1770927809250,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 12.258,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 71.915,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 91.104,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 169.711,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 113.559,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 29.268,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 19.767,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 91.196,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 201,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 4.418,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 17.123,
             "unit": "ms"
           }
         ]
