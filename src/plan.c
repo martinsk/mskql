@@ -1,9 +1,11 @@
 #include "plan.h"
 #include "query.h"
+#include "parser.h"
 #include "arena_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* ---- Scan cache: build/invalidate flat columnar arrays on the table ---- */
 
@@ -225,6 +227,14 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
         return plan_node_ncols(arena, pn->left);
     if (pn->op == PLAN_WINDOW)
         return pn->window.out_ncols;
+    if (pn->op == PLAN_HASH_SEMI_JOIN)
+        return plan_node_ncols(arena, pn->left);
+    if (pn->op == PLAN_DISTINCT)
+        return plan_node_ncols(arena, pn->left);
+    if (pn->op == PLAN_SET_OP)
+        return pn->set_op.ncols;
+    if (pn->op == PLAN_GENERATE_SERIES)
+        return 1;
     /* For pass-through nodes, recurse to child */
     return plan_node_ncols(arena, pn->left);
 }
@@ -1937,6 +1947,808 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* ---- Hash semi-join (for WHERE col IN (SELECT ...)) ---- */
+
+/* Hash a value from flat arrays at index i */
+static inline uint32_t semi_hash_flat(enum column_type type, const void *data, uint32_t i)
+{
+    switch (type) {
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+            return block_hash_i32(((const int32_t *)data)[i]);
+        case COLUMN_TYPE_BIGINT:
+            return block_hash_i64(((const int64_t *)data)[i]);
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:
+            return block_hash_f64(((const double *)data)[i]);
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+            return block_hash_str(((const char **)data)[i]);
+    }
+    return 0;
+}
+
+/* Compare a col_block value at oi with a flat array value at fi */
+static inline int semi_eq_cb_flat(const struct col_block *cb, uint16_t oi,
+                                  enum column_type type, const void *data, uint32_t fi)
+{
+    if (cb->nulls[oi]) return 0;
+    switch (type) {
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+            return cb->data.i32[oi] == ((const int32_t *)data)[fi];
+        case COLUMN_TYPE_BIGINT:
+            return cb->data.i64[oi] == ((const int64_t *)data)[fi];
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:
+            return cb->data.f64[oi] == ((const double *)data)[fi];
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID: {
+            const char *a = cb->data.str[oi];
+            const char *b = ((const char **)data)[fi];
+            if (!a || !b) return a == b;
+            return strcmp(a, b) == 0;
+        }
+    }
+    return 0;
+}
+
+static size_t semi_elem_size(enum column_type type)
+{
+    switch (type) {
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+            return sizeof(int32_t);
+        case COLUMN_TYPE_BIGINT:
+            return sizeof(int64_t);
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:
+            return sizeof(double);
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+            return sizeof(char *);
+    }
+    return sizeof(char *);
+}
+
+static void hash_semi_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct hash_semi_join_state *st = (struct hash_semi_join_state *)ctx->node_states[node_idx];
+
+    uint16_t inner_ncols = plan_node_ncols(ctx->arena, pn->right);
+    if (inner_ncols == 0) inner_ncols = 1;
+
+    int key_col = pn->hash_semi_join.inner_key_col;
+
+    /* Initial capacity for flat key arrays */
+    uint32_t cap = 4096;
+    st->build_count = 0;
+    st->build_cap = cap;
+    st->key_type = COLUMN_TYPE_INT; /* will be set from first block */
+
+    /* Collect all key values from inner side into flat bump-allocated arrays */
+    struct row_block inner_block;
+    row_block_alloc(&inner_block, inner_ncols, &ctx->arena->scratch);
+
+    int type_set = 0;
+    size_t elem_sz = sizeof(int32_t);
+
+    /* Pre-allocate flat arrays */
+    st->key_data = bump_alloc(&ctx->arena->scratch, cap * sizeof(double)); /* max elem size */
+    st->key_nulls = (uint8_t *)bump_calloc(&ctx->arena->scratch, cap, 1);
+
+    while (plan_next_block(ctx, pn->right, &inner_block) == 0) {
+        uint16_t active = row_block_active_count(&inner_block);
+        struct col_block *src_key = &inner_block.cols[key_col];
+
+        if (!type_set) {
+            st->key_type = src_key->type;
+            elem_sz = semi_elem_size(src_key->type);
+            type_set = 1;
+        }
+
+        for (uint16_t i = 0; i < active; i++) {
+            uint16_t ri = row_block_row_idx(&inner_block, i);
+            if (src_key->nulls[ri]) continue; /* skip NULLs — IN ignores them */
+
+            /* Grow if needed */
+            if (st->build_count >= st->build_cap) {
+                uint32_t new_cap = st->build_cap * 2;
+                void *new_data = bump_alloc(&ctx->arena->scratch, new_cap * elem_sz);
+                memcpy(new_data, st->key_data, st->build_count * elem_sz);
+                uint8_t *new_nulls = (uint8_t *)bump_calloc(&ctx->arena->scratch, new_cap, 1);
+                memcpy(new_nulls, st->key_nulls, st->build_count);
+                st->key_data = new_data;
+                st->key_nulls = new_nulls;
+                st->build_cap = new_cap;
+            }
+
+            uint32_t di = st->build_count;
+            st->key_nulls[di] = 0;
+            switch (st->key_type) {
+                case COLUMN_TYPE_INT:
+                case COLUMN_TYPE_BOOLEAN:
+                    ((int32_t *)st->key_data)[di] = src_key->data.i32[ri];
+                    break;
+                case COLUMN_TYPE_BIGINT:
+                    ((int64_t *)st->key_data)[di] = src_key->data.i64[ri];
+                    break;
+                case COLUMN_TYPE_FLOAT:
+                case COLUMN_TYPE_NUMERIC:
+                    ((double *)st->key_data)[di] = src_key->data.f64[ri];
+                    break;
+                case COLUMN_TYPE_TEXT:
+                case COLUMN_TYPE_ENUM:
+                case COLUMN_TYPE_DATE:
+                case COLUMN_TYPE_TIME:
+                case COLUMN_TYPE_TIMESTAMP:
+                case COLUMN_TYPE_TIMESTAMPTZ:
+                case COLUMN_TYPE_INTERVAL:
+                case COLUMN_TYPE_UUID:
+                    ((char **)st->key_data)[di] = src_key->data.str[ri];
+                    break;
+            }
+            st->build_count++;
+        }
+        row_block_reset(&inner_block);
+    }
+
+    /* Build hash table on collected keys */
+    uint32_t n = st->build_count;
+    block_ht_init(&st->ht, n > 0 ? n * 2 : 1, &ctx->arena->scratch);
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t h = semi_hash_flat(st->key_type, st->key_data, i);
+        uint32_t bucket = h & (st->ht.nbuckets - 1);
+        st->ht.hashes[i] = h;
+        st->ht.nexts[i] = st->ht.buckets[bucket];
+        st->ht.buckets[bucket] = i;
+        st->ht.count++;
+    }
+
+    st->build_done = 1;
+}
+
+static int hash_semi_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                               struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct hash_semi_join_state *st = (struct hash_semi_join_state *)ctx->node_states[node_idx];
+    if (!st) {
+        st = (struct hash_semi_join_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        ctx->node_states[node_idx] = st;
+    }
+
+    if (!st->build_done)
+        hash_semi_join_build(ctx, node_idx);
+
+    /* Empty build side → no matches possible */
+    if (st->build_count == 0) return -1;
+
+    uint16_t outer_ncols = plan_node_ncols(ctx->arena, pn->left);
+
+    struct row_block outer_block;
+    row_block_alloc(&outer_block, outer_ncols, &ctx->arena->scratch);
+
+    /* Keep pulling outer blocks until we find matches or exhaust input */
+    for (;;) {
+        int rc = plan_next_block(ctx, pn->left, &outer_block);
+        if (rc != 0) return -1;
+
+        int outer_key = pn->hash_semi_join.outer_key_col;
+        struct col_block *outer_key_cb = &outer_block.cols[outer_key];
+
+        row_block_reset(out);
+        uint16_t out_count = 0;
+        uint16_t active = row_block_active_count(&outer_block);
+
+        for (uint16_t i = 0; i < active && out_count < BLOCK_CAPACITY; i++) {
+            uint16_t oi = row_block_row_idx(&outer_block, i);
+            if (outer_key_cb->nulls[oi]) continue;
+
+            uint32_t h = block_hash_cell(outer_key_cb, oi);
+            uint32_t bucket = h & (st->ht.nbuckets - 1);
+            uint32_t entry = st->ht.buckets[bucket];
+
+            int found = 0;
+            while (entry != IDX_NONE && entry != 0xFFFFFFFF) {
+                if (st->ht.hashes[entry] == h &&
+                    semi_eq_cb_flat(outer_key_cb, oi, st->key_type, st->key_data, entry)) {
+                    found = 1;
+                    break;
+                }
+                entry = st->ht.nexts[entry];
+            }
+
+            if (found) {
+                for (uint16_t c = 0; c < outer_ncols; c++) {
+                    out->cols[c].type = outer_block.cols[c].type;
+                    cb_copy_value(&out->cols[c], out_count, &outer_block.cols[c], oi);
+                }
+                out_count++;
+            }
+        }
+
+        if (out_count > 0) {
+            out->count = out_count;
+            for (uint16_t c = 0; c < outer_ncols; c++)
+                out->cols[c].count = out_count;
+            return 0;
+        }
+
+        row_block_reset(&outer_block);
+    }
+}
+
+/* ---- Set operations (UNION / INTERSECT / EXCEPT) ---- */
+
+/* Hash a full row across all columns in flat arrays */
+static inline uint32_t set_op_hash_row(void **col_data, uint8_t **col_nulls,
+                                        enum column_type *col_types, uint16_t ncols,
+                                        uint32_t row_idx)
+{
+    uint32_t h = 2166136261u;
+    for (uint16_t c = 0; c < ncols; c++) {
+        if (col_nulls[c][row_idx]) {
+            h ^= 0x9e3779b9u;
+            h *= 16777619u;
+            continue;
+        }
+        uint32_t ch;
+        enum column_type ct = col_types[c];
+        if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+            ch = block_hash_i32(((int32_t *)col_data[c])[row_idx]);
+        else if (ct == COLUMN_TYPE_BIGINT)
+            ch = block_hash_i64(((int64_t *)col_data[c])[row_idx]);
+        else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+            ch = block_hash_f64(((double *)col_data[c])[row_idx]);
+        else
+            ch = block_hash_str(((char **)col_data[c])[row_idx]);
+        h ^= ch;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* Compare row at idx_a in flat arrays A with row at idx_b in flat arrays B */
+static inline int set_op_rows_eq(void **da, uint8_t **na, enum column_type *ta,
+                                  void **db, uint8_t **nb,
+                                  uint16_t ncols, uint32_t idx_a, uint32_t idx_b)
+{
+    for (uint16_t c = 0; c < ncols; c++) {
+        int an = na[c][idx_a], bn = nb[c][idx_b];
+        if (an && bn) continue;       /* both NULL — equal for set ops */
+        if (an || bn) return 0;       /* one NULL — not equal */
+        enum column_type ct = ta[c];
+        if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN) {
+            if (((int32_t *)da[c])[idx_a] != ((int32_t *)db[c])[idx_b]) return 0;
+        } else if (ct == COLUMN_TYPE_BIGINT) {
+            if (((int64_t *)da[c])[idx_a] != ((int64_t *)db[c])[idx_b]) return 0;
+        } else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) {
+            if (((double *)da[c])[idx_a] != ((double *)db[c])[idx_b]) return 0;
+        } else {
+            const char *sa = ((char **)da[c])[idx_a];
+            const char *sb = ((char **)db[c])[idx_b];
+            if (!sa && !sb) continue;
+            if (!sa || !sb) return 0;
+            if (strcmp(sa, sb) != 0) return 0;
+        }
+    }
+    return 1;
+}
+
+static size_t set_op_elem_size(enum column_type ct)
+{
+    if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN) return sizeof(int32_t);
+    if (ct == COLUMN_TYPE_BIGINT) return sizeof(int64_t);
+    if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) return sizeof(double);
+    return sizeof(char *);
+}
+
+/* Grow flat arrays to new_cap */
+static void set_op_grow(struct set_op_state *st, struct bump_alloc *scratch)
+{
+    uint32_t new_cap = st->row_cap * 2;
+    for (uint16_t c = 0; c < st->ncols; c++) {
+        size_t esz = set_op_elem_size(st->col_types[c]);
+        void *new_data = bump_alloc(scratch, new_cap * esz);
+        memcpy(new_data, st->col_data[c], st->row_count * esz);
+        st->col_data[c] = new_data;
+        uint8_t *new_nulls = (uint8_t *)bump_calloc(scratch, new_cap, 1);
+        memcpy(new_nulls, st->col_nulls[c], st->row_count);
+        st->col_nulls[c] = new_nulls;
+    }
+    if (st->matched) {
+        uint8_t *new_matched = (uint8_t *)bump_calloc(scratch, new_cap, 1);
+        memcpy(new_matched, st->matched, st->row_count);
+        st->matched = new_matched;
+    }
+    /* Rebuild hash table with new capacity */
+    block_ht_init(&st->ht, new_cap, scratch);
+    for (uint32_t i = 0; i < st->row_count; i++) {
+        uint32_t h = set_op_hash_row(st->col_data, st->col_nulls, st->col_types, st->ncols, i);
+        uint32_t bucket = h & (st->ht.nbuckets - 1);
+        st->ht.hashes[i] = h;
+        st->ht.nexts[i] = st->ht.buckets[bucket];
+        st->ht.buckets[bucket] = i;
+        st->ht.count++;
+    }
+    st->row_cap = new_cap;
+}
+
+/* Copy a row from col_block (respecting selection vector) into flat arrays */
+static inline void set_op_copy_from_block(struct set_op_state *st, struct row_block *blk,
+                                           uint16_t ri, uint32_t dst_idx)
+{
+    for (uint16_t c = 0; c < st->ncols; c++) {
+        struct col_block *cb = &blk->cols[c];
+        st->col_nulls[c][dst_idx] = cb->nulls[ri];
+        if (dst_idx == 0 && st->col_types[c] == COLUMN_TYPE_INT)
+            st->col_types[c] = cb->type; /* set type from first block */
+        enum column_type ct = st->col_types[c];
+        if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+            ((int32_t *)st->col_data[c])[dst_idx] = cb->data.i32[ri];
+        else if (ct == COLUMN_TYPE_BIGINT)
+            ((int64_t *)st->col_data[c])[dst_idx] = cb->data.i64[ri];
+        else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+            ((double *)st->col_data[c])[dst_idx] = cb->data.f64[ri];
+        else
+            ((char **)st->col_data[c])[dst_idx] = cb->data.str[ri];
+    }
+}
+
+/* Force-insert a row into the hash table without dedup check (for INTERSECT/EXCEPT ALL). */
+static void set_op_ht_insert_force(struct set_op_state *st, uint32_t row_idx)
+{
+    uint32_t h = set_op_hash_row(st->col_data, st->col_nulls, st->col_types, st->ncols, row_idx);
+    uint32_t bucket = h & (st->ht.nbuckets - 1);
+    st->ht.hashes[row_idx] = h;
+    st->ht.nexts[row_idx] = st->ht.buckets[bucket];
+    st->ht.buckets[bucket] = row_idx;
+    st->ht.count++;
+}
+
+/* Try to insert a row into the hash table. Returns 1 if inserted (new), 0 if duplicate found. */
+static int set_op_ht_insert(struct set_op_state *st, uint32_t row_idx)
+{
+    uint32_t h = set_op_hash_row(st->col_data, st->col_nulls, st->col_types, st->ncols, row_idx);
+    uint32_t bucket = h & (st->ht.nbuckets - 1);
+    uint32_t entry = st->ht.buckets[bucket];
+    while (entry != IDX_NONE && entry != 0xFFFFFFFF) {
+        if (st->ht.hashes[entry] == h &&
+            set_op_rows_eq(st->col_data, st->col_nulls, st->col_types,
+                           st->col_data, st->col_nulls,
+                           st->ncols, entry, row_idx))
+            return 0; /* duplicate */
+        entry = st->ht.nexts[entry];
+    }
+    st->ht.hashes[row_idx] = h;
+    st->ht.nexts[row_idx] = st->ht.buckets[bucket];
+    st->ht.buckets[bucket] = row_idx;
+    st->ht.count++;
+    return 1;
+}
+
+static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                       struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct set_op_state *st = (struct set_op_state *)ctx->node_states[node_idx];
+    if (!st) {
+        st = (struct set_op_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        st->ncols = pn->set_op.ncols;
+        st->row_cap = 4096;
+        st->row_count = 0;
+        st->phase = 0;
+        st->emit_cursor = 0;
+
+        /* Allocate flat arrays */
+        st->col_data = (void **)bump_alloc(&ctx->arena->scratch, st->ncols * sizeof(void *));
+        st->col_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch, st->ncols * sizeof(uint8_t *));
+        st->col_types = (enum column_type *)bump_alloc(&ctx->arena->scratch, st->ncols * sizeof(enum column_type));
+        for (uint16_t c = 0; c < st->ncols; c++) {
+            st->col_types[c] = COLUMN_TYPE_INT; /* will be set from first block */
+            st->col_data[c] = bump_calloc(&ctx->arena->scratch, st->row_cap, sizeof(double));
+            st->col_nulls[c] = (uint8_t *)bump_calloc(&ctx->arena->scratch, st->row_cap, 1);
+        }
+
+        /* For INTERSECT/EXCEPT, allocate matched flags */
+        if (pn->set_op.set_op == 1 || pn->set_op.set_op == 2)
+            st->matched = (uint8_t *)bump_calloc(&ctx->arena->scratch, st->row_cap, 1);
+
+        block_ht_init(&st->ht, st->row_cap, &ctx->arena->scratch);
+        ctx->node_states[node_idx] = st;
+    }
+
+    /* Phase 0: collect all LHS rows */
+    if (st->phase == 0) {
+        uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
+        struct row_block lhs_block;
+        row_block_alloc(&lhs_block, child_ncols, &ctx->arena->scratch);
+
+        while (plan_next_block(ctx, pn->left, &lhs_block) == 0) {
+            uint16_t active = row_block_active_count(&lhs_block);
+            for (uint16_t i = 0; i < active; i++) {
+                uint16_t ri = row_block_row_idx(&lhs_block, i);
+
+                /* Grow if needed */
+                if (st->row_count >= st->row_cap)
+                    set_op_grow(st, &ctx->arena->scratch);
+
+                /* Set types from first row */
+                if (st->row_count == 0) {
+                    for (uint16_t c = 0; c < st->ncols; c++)
+                        st->col_types[c] = lhs_block.cols[c].type;
+                }
+
+                uint32_t di = st->row_count;
+                set_op_copy_from_block(st, &lhs_block, ri, di);
+
+                if (pn->set_op.set_op == 0 && !pn->set_op.set_all) {
+                    /* UNION (not ALL): dedup LHS rows */
+                    st->row_count++;
+                    if (!set_op_ht_insert(st, di))
+                        st->row_count--;
+                } else if (pn->set_op.set_op == 0) {
+                    /* UNION ALL: just collect, no hash table needed */
+                    st->row_count++;
+                } else {
+                    /* INTERSECT/EXCEPT (ALL or not): keep all LHS rows,
+                     * force-insert into hash table for RHS probing */
+                    st->row_count++;
+                    set_op_ht_insert_force(st, di);
+                }
+            }
+            row_block_reset(&lhs_block);
+        }
+        st->phase = 1;
+    }
+
+    /* Phase 1: process RHS rows */
+    if (st->phase == 1) {
+        uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->right);
+        struct row_block rhs_block;
+        row_block_alloc(&rhs_block, child_ncols, &ctx->arena->scratch);
+
+        int op = pn->set_op.set_op;
+
+        while (plan_next_block(ctx, pn->right, &rhs_block) == 0) {
+            uint16_t active = row_block_active_count(&rhs_block);
+            for (uint16_t i = 0; i < active; i++) {
+                uint16_t ri = row_block_row_idx(&rhs_block, i);
+
+                if (op == 0) {
+                    /* UNION / UNION ALL */
+                    if (st->row_count >= st->row_cap)
+                        set_op_grow(st, &ctx->arena->scratch);
+
+                    uint32_t di = st->row_count;
+                    set_op_copy_from_block(st, &rhs_block, ri, di);
+
+                    if (pn->set_op.set_all) {
+                        st->row_count++;
+                    } else {
+                        st->row_count++;
+                        if (!set_op_ht_insert(st, di))
+                            st->row_count--;
+                    }
+                } else if (op == 1) {
+                    /* INTERSECT / INTERSECT ALL: mark ALL LHS rows that match this RHS row.
+                     * Legacy behavior: keeps all LHS rows with any match in RHS. */
+                    uint32_t h = 2166136261u;
+                    for (uint16_t c2 = 0; c2 < st->ncols; c2++) {
+                        struct col_block *cb = &rhs_block.cols[c2];
+                        if (cb->nulls[ri]) { h ^= 0x9e3779b9u; h *= 16777619u; continue; }
+                        h ^= block_hash_cell(cb, ri); h *= 16777619u;
+                    }
+                    uint32_t bucket = h & (st->ht.nbuckets - 1);
+                    uint32_t entry = st->ht.buckets[bucket];
+                    while (entry != IDX_NONE && entry != 0xFFFFFFFF) {
+                        if (st->ht.hashes[entry] == h) {
+                            int eq = 1;
+                            for (uint16_t c2 = 0; c2 < st->ncols; c2++) {
+                                struct col_block *cb = &rhs_block.cols[c2];
+                                int an = st->col_nulls[c2][entry], bn = cb->nulls[ri];
+                                if (an && bn) continue;
+                                if (an || bn) { eq = 0; break; }
+                                enum column_type ct = st->col_types[c2];
+                                if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN) {
+                                    if (((int32_t *)st->col_data[c2])[entry] != cb->data.i32[ri]) { eq = 0; break; }
+                                } else if (ct == COLUMN_TYPE_BIGINT) {
+                                    if (((int64_t *)st->col_data[c2])[entry] != cb->data.i64[ri]) { eq = 0; break; }
+                                } else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) {
+                                    if (((double *)st->col_data[c2])[entry] != cb->data.f64[ri]) { eq = 0; break; }
+                                } else {
+                                    const char *sa = ((char **)st->col_data[c2])[entry];
+                                    const char *sb = cb->data.str[ri];
+                                    if (!sa && !sb) continue;
+                                    if (!sa || !sb) { eq = 0; break; }
+                                    if (strcmp(sa, sb) != 0) { eq = 0; break; }
+                                }
+                            }
+                            if (eq) st->matched[entry] = 1;
+                        }
+                        entry = st->ht.nexts[entry];
+                    }
+                } else {
+                    /* EXCEPT / EXCEPT ALL: mark ALL matching LHS rows to remove.
+                     * Legacy behavior: removes all LHS rows with any match in RHS. */
+                    uint32_t h = 2166136261u;
+                    for (uint16_t c2 = 0; c2 < st->ncols; c2++) {
+                        struct col_block *cb = &rhs_block.cols[c2];
+                        if (cb->nulls[ri]) { h ^= 0x9e3779b9u; h *= 16777619u; continue; }
+                        h ^= block_hash_cell(cb, ri); h *= 16777619u;
+                    }
+                    uint32_t bucket = h & (st->ht.nbuckets - 1);
+                    uint32_t entry = st->ht.buckets[bucket];
+                    while (entry != IDX_NONE && entry != 0xFFFFFFFF) {
+                        if (st->ht.hashes[entry] == h) {
+                            int eq = 1;
+                            for (uint16_t c2 = 0; c2 < st->ncols; c2++) {
+                                struct col_block *cb = &rhs_block.cols[c2];
+                                int an = st->col_nulls[c2][entry], bn = cb->nulls[ri];
+                                if (an && bn) continue;
+                                if (an || bn) { eq = 0; break; }
+                                enum column_type ct = st->col_types[c2];
+                                if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN) {
+                                    if (((int32_t *)st->col_data[c2])[entry] != cb->data.i32[ri]) { eq = 0; break; }
+                                } else if (ct == COLUMN_TYPE_BIGINT) {
+                                    if (((int64_t *)st->col_data[c2])[entry] != cb->data.i64[ri]) { eq = 0; break; }
+                                } else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) {
+                                    if (((double *)st->col_data[c2])[entry] != cb->data.f64[ri]) { eq = 0; break; }
+                                } else {
+                                    const char *sa = ((char **)st->col_data[c2])[entry];
+                                    const char *sb = cb->data.str[ri];
+                                    if (!sa && !sb) continue;
+                                    if (!sa || !sb) { eq = 0; break; }
+                                    if (strcmp(sa, sb) != 0) { eq = 0; break; }
+                                }
+                            }
+                            if (eq) st->matched[entry] = 1;
+                        }
+                        entry = st->ht.nexts[entry];
+                    }
+                }
+            }
+            row_block_reset(&rhs_block);
+        }
+        st->phase = 2;
+        st->emit_cursor = 0;
+    }
+
+    /* Phase 2: emit results */
+    if (st->emit_cursor >= st->row_count) return -1;
+
+    int op = pn->set_op.set_op;
+    row_block_reset(out);
+    uint16_t out_count = 0;
+
+    /* Set column types */
+    for (uint16_t c = 0; c < st->ncols; c++)
+        out->cols[c].type = st->col_types[c];
+
+    while (st->emit_cursor < st->row_count && out_count < BLOCK_CAPACITY) {
+        uint32_t fi = st->emit_cursor++;
+
+        /* For INTERSECT: only emit matched rows */
+        if (op == 1 && !st->matched[fi]) continue;
+        /* For EXCEPT: only emit unmatched rows */
+        if (op == 2 && st->matched[fi]) continue;
+
+        for (uint16_t c = 0; c < st->ncols; c++) {
+            out->cols[c].nulls[out_count] = st->col_nulls[c][fi];
+            enum column_type ct = st->col_types[c];
+            if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+                out->cols[c].data.i32[out_count] = ((int32_t *)st->col_data[c])[fi];
+            else if (ct == COLUMN_TYPE_BIGINT)
+                out->cols[c].data.i64[out_count] = ((int64_t *)st->col_data[c])[fi];
+            else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+                out->cols[c].data.f64[out_count] = ((double *)st->col_data[c])[fi];
+            else
+                out->cols[c].data.str[out_count] = ((char **)st->col_data[c])[fi];
+        }
+        out_count++;
+    }
+
+    if (out_count == 0) return -1;
+
+    out->count = out_count;
+    for (uint16_t c = 0; c < st->ncols; c++)
+        out->cols[c].count = out_count;
+
+    return 0;
+}
+
+/* ---- Hash-based DISTINCT ---- */
+
+static int distinct_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                         struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct set_op_state *st = (struct set_op_state *)ctx->node_states[node_idx];
+    if (!st) {
+        uint16_t ncols = plan_node_ncols(ctx->arena, pn->left);
+        st = (struct set_op_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        st->ncols = ncols;
+        st->row_cap = 4096;
+        st->row_count = 0;
+        st->phase = 0;
+        st->emit_cursor = 0;
+
+        st->col_data = (void **)bump_alloc(&ctx->arena->scratch, ncols * sizeof(void *));
+        st->col_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch, ncols * sizeof(uint8_t *));
+        st->col_types = (enum column_type *)bump_alloc(&ctx->arena->scratch, ncols * sizeof(enum column_type));
+        for (uint16_t c = 0; c < ncols; c++) {
+            st->col_types[c] = COLUMN_TYPE_INT;
+            st->col_data[c] = bump_calloc(&ctx->arena->scratch, st->row_cap, sizeof(double));
+            st->col_nulls[c] = (uint8_t *)bump_calloc(&ctx->arena->scratch, st->row_cap, 1);
+        }
+
+        block_ht_init(&st->ht, st->row_cap, &ctx->arena->scratch);
+        ctx->node_states[node_idx] = st;
+    }
+
+    /* Phase 0: collect all input rows, dedup via hash table */
+    if (st->phase == 0) {
+        struct row_block input;
+        row_block_alloc(&input, st->ncols, &ctx->arena->scratch);
+
+        while (plan_next_block(ctx, pn->left, &input) == 0) {
+            uint16_t active = row_block_active_count(&input);
+            for (uint16_t i = 0; i < active; i++) {
+                uint16_t ri = row_block_row_idx(&input, i);
+
+                if (st->row_count >= st->row_cap)
+                    set_op_grow(st, &ctx->arena->scratch);
+
+                if (st->row_count == 0) {
+                    for (uint16_t c = 0; c < st->ncols; c++)
+                        st->col_types[c] = input.cols[c].type;
+                }
+
+                uint32_t di = st->row_count;
+                set_op_copy_from_block(st, &input, ri, di);
+
+                st->row_count++;
+                if (!set_op_ht_insert(st, di))
+                    st->row_count--;
+            }
+            row_block_reset(&input);
+        }
+        st->phase = 1;
+        st->emit_cursor = 0;
+    }
+
+    /* Phase 1: emit unique rows */
+    if (st->emit_cursor >= st->row_count) return -1;
+
+    row_block_reset(out);
+    uint16_t out_count = 0;
+
+    for (uint16_t c = 0; c < st->ncols; c++)
+        out->cols[c].type = st->col_types[c];
+
+    while (st->emit_cursor < st->row_count && out_count < BLOCK_CAPACITY) {
+        uint32_t fi = st->emit_cursor++;
+
+        for (uint16_t c = 0; c < st->ncols; c++) {
+            out->cols[c].nulls[out_count] = st->col_nulls[c][fi];
+            enum column_type ct = st->col_types[c];
+            if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+                out->cols[c].data.i32[out_count] = ((int32_t *)st->col_data[c])[fi];
+            else if (ct == COLUMN_TYPE_BIGINT)
+                out->cols[c].data.i64[out_count] = ((int64_t *)st->col_data[c])[fi];
+            else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+                out->cols[c].data.f64[out_count] = ((double *)st->col_data[c])[fi];
+            else
+                out->cols[c].data.str[out_count] = ((char **)st->col_data[c])[fi];
+        }
+        out_count++;
+    }
+
+    if (out_count == 0) return -1;
+
+    out->count = out_count;
+    for (uint16_t c = 0; c < st->ncols; c++)
+        out->cols[c].count = out_count;
+
+    return 0;
+}
+
+/* ---- Generate Series ---- */
+
+static int gen_series_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                           struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct gen_series_state *st = (struct gen_series_state *)ctx->node_states[node_idx];
+    if (!st) {
+        st = (struct gen_series_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        ctx->node_states[node_idx] = st;
+        st->current = pn->gen_series.start;
+        st->done = 0;
+    }
+    if (st->done) return -1;
+
+    long long stop = pn->gen_series.stop;
+    long long step = pn->gen_series.step;
+    int use_bigint = pn->gen_series.use_bigint;
+
+    row_block_reset(out);
+    out->cols[0].type = use_bigint ? COLUMN_TYPE_BIGINT : COLUMN_TYPE_INT;
+
+    uint16_t count = 0;
+    long long v = st->current;
+
+    if (use_bigint) {
+        int64_t *dst = out->cols[0].data.i64;
+        uint8_t *nul = out->cols[0].nulls;
+        if (step > 0) {
+            while (v <= stop && count < BLOCK_CAPACITY) {
+                dst[count] = (int64_t)v;
+                nul[count] = 0;
+                count++;
+                v += step;
+            }
+        } else {
+            while (v >= stop && count < BLOCK_CAPACITY) {
+                dst[count] = (int64_t)v;
+                nul[count] = 0;
+                count++;
+                v += step;
+            }
+        }
+    } else {
+        int32_t *dst = out->cols[0].data.i32;
+        uint8_t *nul = out->cols[0].nulls;
+        if (step > 0) {
+            while (v <= stop && count < BLOCK_CAPACITY) {
+                dst[count] = (int32_t)v;
+                nul[count] = 0;
+                count++;
+                v += step;
+            }
+        } else {
+            while (v >= stop && count < BLOCK_CAPACITY) {
+                dst[count] = (int32_t)v;
+                nul[count] = 0;
+                count++;
+                v += step;
+            }
+        }
+    }
+
+    st->current = v;
+    if (count == 0) { st->done = 1; return -1; }
+
+    /* Check if we've exhausted the series */
+    if (step > 0 && v > stop) st->done = 1;
+    if (step < 0 && v < stop) st->done = 1;
+
+    out->count = count;
+    out->cols[0].count = count;
+    return 0;
+}
+
 /* ---- Dispatcher ---- */
 
 int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -1954,6 +2766,10 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     if (pn->op == PLAN_HASH_AGG)     return hash_agg_next(ctx, node_idx, out);
     if (pn->op == PLAN_SORT)         return sort_next(ctx, node_idx, out);
     if (pn->op == PLAN_WINDOW)       return window_next(ctx, node_idx, out);
+    if (pn->op == PLAN_HASH_SEMI_JOIN) return hash_semi_join_next(ctx, node_idx, out);
+    if (pn->op == PLAN_SET_OP)       return set_op_next(ctx, node_idx, out);
+    if (pn->op == PLAN_DISTINCT)     return distinct_next(ctx, node_idx, out);
+    if (pn->op == PLAN_GENERATE_SERIES) return gen_series_next(ctx, node_idx, out);
     /* Not yet implemented */
     return -1;
 }
@@ -1996,6 +2812,71 @@ int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
 uint32_t plan_build_select(struct table *t, struct query_select *s,
                            struct query_arena *arena, struct database *db)
 {
+    /* ---- Generate series fast path ---- */
+    if (s->has_generate_series && s->gs_start_expr != IDX_NONE &&
+        s->gs_stop_expr != IDX_NONE) {
+        /* Only handle simple SELECT * integer series via plan executor */
+        if (s->has_join || s->has_group_by || s->aggregates_count > 0 ||
+            s->has_set_op || s->ctes_count > 0 || s->has_distinct ||
+            s->select_exprs_count > 0 || s->where.has_where ||
+            s->has_order_by || s->parsed_columns_count > 0)
+            return IDX_NONE;
+        if (!sv_eq_cstr(s->columns, "*"))
+            return IDX_NONE;
+
+        struct cell c_start = eval_expr(s->gs_start_expr, arena, NULL, NULL, db, NULL);
+        struct cell c_stop  = eval_expr(s->gs_stop_expr, arena, NULL, NULL, db, NULL);
+
+        /* Bail out for timestamp/date series — keep on legacy path */
+        if (c_start.type == COLUMN_TYPE_DATE || c_start.type == COLUMN_TYPE_TIMESTAMP ||
+            c_start.type == COLUMN_TYPE_TIMESTAMPTZ)
+            return IDX_NONE;
+        if (c_start.type == COLUMN_TYPE_INTERVAL || c_stop.type == COLUMN_TYPE_INTERVAL)
+            return IDX_NONE;
+
+        long long gs_start = (c_start.type == COLUMN_TYPE_BIGINT) ? c_start.value.as_bigint
+                           : (c_start.type == COLUMN_TYPE_FLOAT)  ? (long long)c_start.value.as_float
+                           : c_start.value.as_int;
+        long long gs_stop  = (c_stop.type == COLUMN_TYPE_BIGINT) ? c_stop.value.as_bigint
+                           : (c_stop.type == COLUMN_TYPE_FLOAT)  ? (long long)c_stop.value.as_float
+                           : c_stop.value.as_int;
+        long long gs_step  = 1;
+        if (s->gs_step_expr != IDX_NONE) {
+            struct cell c_step = eval_expr(s->gs_step_expr, arena, NULL, NULL, db, NULL);
+            if (c_step.type == COLUMN_TYPE_INTERVAL || column_type_is_text(c_step.type))
+                return IDX_NONE; /* timestamp step — bail to legacy */
+            gs_step = (c_step.type == COLUMN_TYPE_BIGINT) ? c_step.value.as_bigint
+                    : (c_step.type == COLUMN_TYPE_FLOAT)  ? (long long)c_step.value.as_float
+                    : c_step.value.as_int;
+        }
+        if (gs_step == 0) gs_step = 1;
+
+        int use_bigint = (c_start.type == COLUMN_TYPE_BIGINT ||
+                          c_stop.type == COLUMN_TYPE_BIGINT ||
+                          gs_start > 2147483647LL || gs_start < -2147483648LL ||
+                          gs_stop > 2147483647LL || gs_stop < -2147483648LL);
+
+        uint32_t gs_idx = plan_alloc_node(arena, PLAN_GENERATE_SERIES);
+        PLAN_NODE(arena, gs_idx).gen_series.start = gs_start;
+        PLAN_NODE(arena, gs_idx).gen_series.stop = gs_stop;
+        PLAN_NODE(arena, gs_idx).gen_series.step = gs_step;
+        PLAN_NODE(arena, gs_idx).gen_series.use_bigint = use_bigint;
+        uint32_t current = gs_idx;
+
+        /* Add LIMIT/OFFSET if present */
+        if (s->has_limit || s->has_offset) {
+            uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
+            PLAN_NODE(arena, limit_idx).left = current;
+            PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
+            PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
+            PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
+            PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
+            current = limit_idx;
+        }
+
+        return current;
+    }
+
     /* ---- Single equi-join fast path ---- */
     if (s->has_join && s->joins_count == 1 && db) {
         struct join_info *ji = &arena->joins.items[s->joins_start];
@@ -2378,6 +3259,321 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         return current;
     }
 
+    /* ---- Set operations fast path (UNION / INTERSECT / EXCEPT) ---- */
+    if (s->has_set_op && s->set_rhs_sql != IDX_NONE && !s->has_join &&
+        !s->has_group_by && s->aggregates_count == 0 && s->ctes_count == 0 &&
+        s->cte_sql == IDX_NONE && s->from_subquery_sql == IDX_NONE &&
+        !s->has_recursive_cte && s->select_exprs_count == 0 &&
+        t && db && s->insert_rows_count == 0) {
+
+        /* Parse the RHS SQL */
+        const char *rhs_sql = ASTRING(arena, s->set_rhs_sql);
+        struct query rhs_q = {0};
+        if (query_parse(rhs_sql, &rhs_q) != 0) return IDX_NONE;
+        if (rhs_q.query_type != QUERY_TYPE_SELECT) { query_free(&rhs_q); return IDX_NONE; }
+
+        struct query_select *rs = &rhs_q.select;
+        /* Only handle simple single-table RHS SELECTs */
+        if (rs->has_join || rs->has_group_by || rs->aggregates_count > 0 ||
+            rs->has_set_op || rs->ctes_count > 0 || rs->has_distinct ||
+            rs->from_subquery_sql != IDX_NONE || rs->has_generate_series ||
+            rs->select_exprs_count > 0) {
+            query_free(&rhs_q);
+            return IDX_NONE;
+        }
+
+        struct table *t2 = db_find_table_sv(db, rs->table);
+        if (!t2 || t2->view_sql) { query_free(&rhs_q); return IDX_NONE; }
+
+        /* Resolve LHS columns */
+        int select_all_lhs = sv_eq_cstr(s->columns, "*");
+        uint16_t lhs_ncols;
+        int *lhs_col_map;
+        if (select_all_lhs) {
+            lhs_ncols = (uint16_t)t->columns.count;
+            lhs_col_map = (int *)bump_alloc(&arena->scratch, lhs_ncols * sizeof(int));
+            for (uint16_t i = 0; i < lhs_ncols; i++) lhs_col_map[i] = (int)i;
+        } else if (s->parsed_columns_count > 0) {
+            lhs_ncols = (uint16_t)s->parsed_columns_count;
+            lhs_col_map = (int *)bump_alloc(&arena->scratch, lhs_ncols * sizeof(int));
+            for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+                struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
+                if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return IDX_NONE; }
+                struct expr *e = &EXPR(arena, sc->expr_idx);
+                if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return IDX_NONE; }
+                int ci = table_find_column_sv(t, e->column_ref.column);
+                if (ci < 0) { query_free(&rhs_q); return IDX_NONE; }
+                lhs_col_map[i] = ci;
+            }
+        } else {
+            query_free(&rhs_q);
+            return IDX_NONE;
+        }
+
+        /* Resolve RHS columns */
+        int select_all_rhs = sv_eq_cstr(rs->columns, "*");
+        uint16_t rhs_ncols;
+        int *rhs_col_map;
+        if (select_all_rhs) {
+            rhs_ncols = (uint16_t)t2->columns.count;
+            rhs_col_map = (int *)bump_alloc(&arena->scratch, rhs_ncols * sizeof(int));
+            for (uint16_t i = 0; i < rhs_ncols; i++) rhs_col_map[i] = (int)i;
+        } else if (rs->parsed_columns_count > 0) {
+            rhs_ncols = (uint16_t)rs->parsed_columns_count;
+            rhs_col_map = (int *)bump_alloc(&arena->scratch, rhs_ncols * sizeof(int));
+            for (uint32_t i = 0; i < rs->parsed_columns_count; i++) {
+                struct select_column *sc = &rhs_q.arena.select_cols.items[rs->parsed_columns_start + i];
+                if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return IDX_NONE; }
+                struct expr *e = &EXPR(&rhs_q.arena, sc->expr_idx);
+                if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return IDX_NONE; }
+                int ci = table_find_column_sv(t2, e->column_ref.column);
+                if (ci < 0) { query_free(&rhs_q); return IDX_NONE; }
+                rhs_col_map[i] = ci;
+            }
+        } else {
+            /* Try legacy text-based column resolution */
+            if (rs->columns.len > 0 && !sv_eq_cstr(rs->columns, "*")) {
+                /* Parse comma-separated column list from raw text */
+                query_free(&rhs_q);
+                return IDX_NONE;
+            }
+            query_free(&rhs_q);
+            return IDX_NONE;
+        }
+
+        /* Column counts must match */
+        if (lhs_ncols != rhs_ncols) { query_free(&rhs_q); return IDX_NONE; }
+
+        /* Check column type compatibility between LHS and RHS */
+        for (uint16_t i = 0; i < lhs_ncols; i++) {
+            enum column_type lt = t->columns.items[lhs_col_map[i]].type;
+            enum column_type rt = t2->columns.items[rhs_col_map[i]].type;
+            if (lt != rt) { query_free(&rhs_q); return IDX_NONE; }
+        }
+
+        /* Check for mixed cell types in both tables */
+        if (t->rows.count > 0) {
+            struct row *first = &t->rows.items[0];
+            for (size_t c = 0; c < first->cells.count && c < t->columns.count; c++) {
+                if (!first->cells.items[c].is_null &&
+                    first->cells.items[c].type != t->columns.items[c].type) {
+                    query_free(&rhs_q);
+                    return IDX_NONE;
+                }
+            }
+        }
+        if (t2->rows.count > 0) {
+            struct row *first = &t2->rows.items[0];
+            for (size_t c = 0; c < first->cells.count && c < t2->columns.count; c++) {
+                if (!first->cells.items[c].is_null &&
+                    first->cells.items[c].type != t2->columns.items[c].type) {
+                    query_free(&rhs_q);
+                    return IDX_NONE;
+                }
+            }
+        }
+
+        /* Build LHS plan: SEQ_SCAN (→ PROJECT if not SELECT *) */
+        uint16_t lhs_scan_ncols = (uint16_t)t->columns.count;
+        int *lhs_scan_map = (int *)bump_alloc(&arena->scratch, lhs_scan_ncols * sizeof(int));
+        for (uint16_t i = 0; i < lhs_scan_ncols; i++) lhs_scan_map[i] = (int)i;
+
+        uint32_t lhs_scan = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+        PLAN_NODE(arena, lhs_scan).seq_scan.table = t;
+        PLAN_NODE(arena, lhs_scan).seq_scan.ncols = lhs_scan_ncols;
+        PLAN_NODE(arena, lhs_scan).seq_scan.col_map = lhs_scan_map;
+        PLAN_NODE(arena, lhs_scan).est_rows = (double)t->rows.count;
+        uint32_t lhs_current = lhs_scan;
+
+        if (!select_all_lhs) {
+            uint32_t lhs_proj = plan_alloc_node(arena, PLAN_PROJECT);
+            PLAN_NODE(arena, lhs_proj).left = lhs_current;
+            PLAN_NODE(arena, lhs_proj).project.ncols = lhs_ncols;
+            PLAN_NODE(arena, lhs_proj).project.col_map = lhs_col_map;
+            lhs_current = lhs_proj;
+        }
+
+        /* Build RHS plan: SEQ_SCAN (→ FILTER) (→ PROJECT if not SELECT *) */
+        uint16_t rhs_scan_ncols = (uint16_t)t2->columns.count;
+        int *rhs_scan_map = (int *)bump_alloc(&arena->scratch, rhs_scan_ncols * sizeof(int));
+        for (uint16_t i = 0; i < rhs_scan_ncols; i++) rhs_scan_map[i] = (int)i;
+
+        uint32_t rhs_scan = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+        PLAN_NODE(arena, rhs_scan).seq_scan.table = t2;
+        PLAN_NODE(arena, rhs_scan).seq_scan.ncols = rhs_scan_ncols;
+        PLAN_NODE(arena, rhs_scan).seq_scan.col_map = rhs_scan_map;
+        PLAN_NODE(arena, rhs_scan).est_rows = (double)t2->rows.count;
+        uint32_t rhs_current = rhs_scan;
+
+        /* Add filter on RHS if it has a simple WHERE */
+        if (rs->where.has_where && rs->where.where_cond != IDX_NONE) {
+            struct condition *rcond = &COND(&rhs_q.arena, rs->where.where_cond);
+            if (rcond->type == COND_COMPARE && rcond->lhs_expr == IDX_NONE &&
+                rcond->rhs_column.len == 0 && rcond->subquery_sql == IDX_NONE &&
+                rcond->scalar_subquery_sql == IDX_NONE &&
+                rcond->in_values_count == 0 && rcond->array_values_count == 0 &&
+                !rcond->is_any && !rcond->is_all && rcond->op <= CMP_GE) {
+                int fc = table_find_column_sv(t2, rcond->column);
+                if (fc >= 0) {
+                    enum column_type fct = t2->columns.items[fc].type;
+                    if (fct == COLUMN_TYPE_INT || fct == COLUMN_TYPE_BIGINT ||
+                        fct == COLUMN_TYPE_FLOAT || fct == COLUMN_TYPE_NUMERIC ||
+                        fct == COLUMN_TYPE_BOOLEAN) {
+                        uint32_t rhs_filter = plan_alloc_node(arena, PLAN_FILTER);
+                        PLAN_NODE(arena, rhs_filter).left = rhs_current;
+                        PLAN_NODE(arena, rhs_filter).filter.col_idx = fc;
+                        PLAN_NODE(arena, rhs_filter).filter.cmp_op = (int)rcond->op;
+                        PLAN_NODE(arena, rhs_filter).filter.cmp_val = rcond->value;
+                        rhs_current = rhs_filter;
+                    }
+                }
+            }
+        }
+
+        if (!select_all_rhs) {
+            uint32_t rhs_proj = plan_alloc_node(arena, PLAN_PROJECT);
+            PLAN_NODE(arena, rhs_proj).left = rhs_current;
+            PLAN_NODE(arena, rhs_proj).project.ncols = rhs_ncols;
+            PLAN_NODE(arena, rhs_proj).project.col_map = rhs_col_map;
+            rhs_current = rhs_proj;
+        }
+
+        /* Build SET_OP node */
+        uint32_t set_idx = plan_alloc_node(arena, PLAN_SET_OP);
+        PLAN_NODE(arena, set_idx).left = lhs_current;
+        PLAN_NODE(arena, set_idx).right = rhs_current;
+        PLAN_NODE(arena, set_idx).set_op.set_op = s->set_op;
+        PLAN_NODE(arena, set_idx).set_op.set_all = s->set_all;
+        PLAN_NODE(arena, set_idx).set_op.ncols = lhs_ncols;
+        uint32_t current = set_idx;
+
+        /* Add SORT node if set_order_by is present */
+        if (s->set_order_by != IDX_NONE) {
+            const char *ob_sql = ASTRING(arena, s->set_order_by);
+            /* Skip "ORDER BY" prefix */
+            const char *p = ob_sql;
+            while (*p == ' ') p++;
+            if (strncasecmp(p, "ORDER", 5) == 0) p += 5;
+            while (*p == ' ') p++;
+            if (strncasecmp(p, "BY", 2) == 0) p += 2;
+            while (*p == ' ') p++;
+
+            int sort_cols_buf[32];
+            int sort_descs_buf[32];
+            uint16_t sort_nord = 0;
+            int sort_ok = 1;
+
+            while (*p && sort_nord < 32) {
+                while (*p == ' ') p++;
+                if (!*p) break;
+
+                /* Extract column name */
+                const char *start = p;
+                while (*p && *p != ' ' && *p != ',' && *p != '\t' && *p != '\n') p++;
+                sv col_name = sv_from(start, (size_t)(p - start));
+
+                /* Find column index in LHS output */
+                int sci = -1;
+                if (select_all_lhs) {
+                    sci = table_find_column_sv(t, col_name);
+                } else {
+                    for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                        struct select_column *scp = &arena->select_cols.items[s->parsed_columns_start + pc];
+                        if (scp->alias.len > 0 && sv_eq_ignorecase(col_name, scp->alias)) { sci = (int)pc; break; }
+                        if (scp->expr_idx != IDX_NONE) {
+                            struct expr *e = &EXPR(arena, scp->expr_idx);
+                            if (e->type == EXPR_COLUMN_REF && sv_eq_ignorecase(col_name, e->column_ref.column)) { sci = (int)pc; break; }
+                        }
+                    }
+                }
+                if (sci < 0) { sort_ok = 0; break; }
+
+                sort_cols_buf[sort_nord] = sci;
+                sort_descs_buf[sort_nord] = 0;
+
+                /* Check for ASC/DESC */
+                while (*p == ' ') p++;
+                if (strncasecmp(p, "DESC", 4) == 0 && (!p[4] || p[4] == ' ' || p[4] == ',')) {
+                    sort_descs_buf[sort_nord] = 1;
+                    p += 4;
+                } else if (strncasecmp(p, "ASC", 3) == 0 && (!p[3] || p[3] == ' ' || p[3] == ',')) {
+                    p += 3;
+                }
+                sort_nord++;
+
+                /* Skip comma */
+                while (*p == ' ') p++;
+                if (*p == ',') { p++; continue; }
+                break;
+            }
+
+            if (sort_ok && sort_nord > 0) {
+                int *sort_cols = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
+                int *sort_descs = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
+                memcpy(sort_cols, sort_cols_buf, sort_nord * sizeof(int));
+                memcpy(sort_descs, sort_descs_buf, sort_nord * sizeof(int));
+                uint32_t sort_idx = plan_alloc_node(arena, PLAN_SORT);
+                PLAN_NODE(arena, sort_idx).left = current;
+                PLAN_NODE(arena, sort_idx).sort.sort_cols = sort_cols;
+                PLAN_NODE(arena, sort_idx).sort.sort_descs = sort_descs;
+                PLAN_NODE(arena, sort_idx).sort.nsort_cols = sort_nord;
+                current = sort_idx;
+            }
+        }
+
+        /* Also handle ORDER BY from the main query (s->has_order_by) */
+        if (s->has_order_by && s->order_by_count > 0) {
+            uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+            int sort_cols_buf2[32];
+            int sort_descs_buf2[32];
+            int sort_ok = 1;
+            for (uint16_t k = 0; k < sort_nord; k++) {
+                struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
+                sort_descs_buf2[k] = obi->desc;
+                sort_cols_buf2[k] = -1;
+                if (select_all_lhs) {
+                    sort_cols_buf2[k] = table_find_column_sv(t, obi->column);
+                } else {
+                    for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                        struct select_column *scp = &arena->select_cols.items[s->parsed_columns_start + pc];
+                        if (scp->alias.len > 0 && sv_eq_ignorecase(obi->column, scp->alias)) { sort_cols_buf2[k] = (int)pc; break; }
+                        if (scp->expr_idx != IDX_NONE) {
+                            struct expr *e = &EXPR(arena, scp->expr_idx);
+                            if (e->type == EXPR_COLUMN_REF && sv_eq_ignorecase(obi->column, e->column_ref.column)) { sort_cols_buf2[k] = (int)pc; break; }
+                        }
+                    }
+                }
+                if (sort_cols_buf2[k] < 0) { sort_ok = 0; break; }
+            }
+            if (sort_ok && sort_nord > 0) {
+                int *sort_cols = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
+                int *sort_descs = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
+                memcpy(sort_cols, sort_cols_buf2, sort_nord * sizeof(int));
+                memcpy(sort_descs, sort_descs_buf2, sort_nord * sizeof(int));
+                uint32_t sort_idx = plan_alloc_node(arena, PLAN_SORT);
+                PLAN_NODE(arena, sort_idx).left = current;
+                PLAN_NODE(arena, sort_idx).sort.sort_cols = sort_cols;
+                PLAN_NODE(arena, sort_idx).sort.sort_descs = sort_descs;
+                PLAN_NODE(arena, sort_idx).sort.nsort_cols = sort_nord;
+                current = sort_idx;
+            }
+        }
+
+        /* Add LIMIT/OFFSET if present */
+        if (s->has_limit || s->has_offset) {
+            uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
+            PLAN_NODE(arena, limit_idx).left = current;
+            PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
+            PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
+            PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
+            PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
+            current = limit_idx;
+        }
+
+        query_free(&rhs_q);
+        return current;
+    }
+
     /* ---- Single-table path (original) ---- */
 
     /* Bail out for queries we don't handle yet */
@@ -2390,7 +3586,6 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
     if (s->cte_sql != IDX_NONE) return IDX_NONE;
     if (s->from_subquery_sql != IDX_NONE) return IDX_NONE;
     if (s->has_recursive_cte)   return IDX_NONE;
-    if (s->has_distinct)        return IDX_NONE;
     if (s->has_distinct_on)     return IDX_NONE;
     if (!t)                     return IDX_NONE;
     if (s->insert_rows_count > 0) return IDX_NONE; /* literal SELECT */
@@ -2450,14 +3645,117 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
     /* Pre-validate WHERE clause BEFORE allocating plan nodes */
     int filter_col = -1;
     int filter_ok = 0;
+    int semi_join_ok = 0;       /* set to 1 if we can use hash semi-join */
+    int semi_outer_key = -1;    /* outer table column index for semi-join key */
+    struct table *semi_inner_t = NULL;
+    int semi_inner_key = -1;    /* inner table column index for semi-join key */
+    int semi_inner_filter_col = -1;
+    int semi_inner_filter_op = -1;
+    struct cell semi_inner_filter_val = {0};
+    struct query semi_sq = {0}; /* parsed subquery — freed after plan build */
+
     if (s->where.has_where) {
         if (s->where.where_cond == IDX_NONE)
             return IDX_NONE;
         struct condition *cond = &COND(arena, s->where.where_cond);
-        if (cond->type != COND_COMPARE || cond->lhs_expr != IDX_NONE
-            || cond->rhs_column.len != 0)
+        if (cond->type != COND_COMPARE)
             return IDX_NONE;
-        /* Reject subqueries, IN lists, ANY/ALL arrays — plan executor can't handle */
+
+        /* ---- IN-subquery → hash semi-join ---- */
+        if ((cond->op == CMP_IN || cond->op == CMP_NOT_IN) &&
+            cond->subquery_sql != IDX_NONE && db &&
+            cond->op == CMP_IN /* NOT IN is more complex — skip for now */) {
+
+            /* Find outer key column */
+            semi_outer_key = table_find_column_sv(t, cond->column);
+            if (semi_outer_key < 0) goto semi_bail;
+
+            /* Parse the subquery */
+            const char *sq_sql = ASTRING(arena, cond->subquery_sql);
+            if (query_parse(sq_sql, &semi_sq) != 0) goto semi_bail;
+            if (semi_sq.query_type != QUERY_TYPE_SELECT) goto semi_bail;
+
+            struct query_select *isq = &semi_sq.select;
+            /* Must be a simple single-table SELECT with one column */
+            if (isq->has_join || isq->has_group_by || isq->aggregates_count > 0 ||
+                isq->has_set_op || isq->ctes_count > 0 || isq->has_distinct ||
+                isq->from_subquery_sql != IDX_NONE || isq->has_generate_series)
+                goto semi_bail;
+
+            /* Find inner table */
+            semi_inner_t = db_find_table_sv(db, isq->table);
+            if (!semi_inner_t) goto semi_bail;
+            if (semi_inner_t->view_sql) goto semi_bail;
+
+            /* Resolve inner SELECT column — must be a single column ref */
+            if (isq->parsed_columns_count == 1) {
+                struct select_column *sc = &semi_sq.arena.select_cols.items[isq->parsed_columns_start];
+                if (sc->expr_idx != IDX_NONE) {
+                    struct expr *e = &EXPR(&semi_sq.arena, sc->expr_idx);
+                    if (e->type == EXPR_COLUMN_REF) {
+                        semi_inner_key = table_find_column_sv(semi_inner_t, e->column_ref.column);
+                    }
+                }
+            } else if (sv_eq_cstr(isq->columns, "*") && semi_inner_t->columns.count == 1) {
+                semi_inner_key = 0;
+            } else {
+                /* Try legacy column name resolution */
+                if (isq->columns.len > 0 && !sv_eq_cstr(isq->columns, "*")) {
+                    semi_inner_key = table_find_column_sv(semi_inner_t, isq->columns);
+                }
+            }
+            if (semi_inner_key < 0) goto semi_bail;
+
+            /* Validate inner WHERE (optional simple numeric filter) */
+            if (isq->where.has_where && isq->where.where_cond != IDX_NONE) {
+                struct condition *icond = &COND(&semi_sq.arena, isq->where.where_cond);
+                if (icond->type == COND_COMPARE && icond->lhs_expr == IDX_NONE &&
+                    icond->rhs_column.len == 0 && icond->subquery_sql == IDX_NONE &&
+                    icond->scalar_subquery_sql == IDX_NONE &&
+                    icond->in_values_count == 0 && !icond->is_any && !icond->is_all) {
+                    int fc = table_find_column_sv(semi_inner_t, icond->column);
+                    if (fc >= 0 && icond->op <= CMP_GE) {
+                        enum column_type fct = semi_inner_t->columns.items[fc].type;
+                        if (fct == COLUMN_TYPE_INT || fct == COLUMN_TYPE_BIGINT ||
+                            fct == COLUMN_TYPE_FLOAT || fct == COLUMN_TYPE_NUMERIC ||
+                            fct == COLUMN_TYPE_BOOLEAN) {
+                            semi_inner_filter_col = fc;
+                            semi_inner_filter_op = (int)icond->op;
+                            semi_inner_filter_val = icond->value;
+                        } else {
+                            goto semi_bail; /* text WHERE — can't handle */
+                        }
+                    } else {
+                        goto semi_bail;
+                    }
+                } else {
+                    goto semi_bail; /* complex inner WHERE */
+                }
+            }
+
+            /* Check for mixed cell types in inner table */
+            if (semi_inner_t->rows.count > 0) {
+                struct row *first = &semi_inner_t->rows.items[0];
+                for (size_t c = 0; c < first->cells.count && c < semi_inner_t->columns.count; c++) {
+                    if (!first->cells.items[c].is_null &&
+                        first->cells.items[c].type != semi_inner_t->columns.items[c].type)
+                        goto semi_bail;
+                }
+            }
+
+            semi_join_ok = 1;
+            goto where_done;
+
+        semi_bail:
+            query_free(&semi_sq);
+            memset(&semi_sq, 0, sizeof(semi_sq));
+            semi_join_ok = 0;
+            return IDX_NONE; /* fall back to legacy */
+        }
+
+        /* ---- Standard simple comparison filter ---- */
+        if (cond->lhs_expr != IDX_NONE || cond->rhs_column.len != 0)
+            return IDX_NONE;
         if (cond->scalar_subquery_sql != IDX_NONE) return IDX_NONE;
         if (cond->subquery_sql != IDX_NONE) return IDX_NONE;
         if (cond->in_values_count > 0) return IDX_NONE;
@@ -2481,14 +3779,17 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
             return IDX_NONE;
         filter_ok = 1;
     }
+where_done:
 
-    /* Bail out if table has mixed cell types (e.g. after ALTER COLUMN TYPE) */
+    /* Bail out if outer table has mixed cell types (e.g. after ALTER COLUMN TYPE) */
     if (t->rows.count > 0) {
         struct row *first = &t->rows.items[0];
         for (size_t c = 0; c < first->cells.count && c < t->columns.count; c++) {
             if (!first->cells.items[c].is_null &&
-                first->cells.items[c].type != t->columns.items[c].type)
+                first->cells.items[c].type != t->columns.items[c].type) {
+                if (semi_join_ok) query_free(&semi_sq);
                 return IDX_NONE;
+            }
         }
     }
 
@@ -2500,6 +3801,64 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         col_map[i] = (int)i;
 
     uint32_t current;
+
+    /* ---- Hash semi-join path ---- */
+    if (semi_join_ok) {
+        /* Build outer scan (left / probe side) */
+        uint32_t outer_scan = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+        PLAN_NODE(arena, outer_scan).seq_scan.table = t;
+        PLAN_NODE(arena, outer_scan).seq_scan.ncols = scan_ncols;
+        PLAN_NODE(arena, outer_scan).seq_scan.col_map = col_map;
+        PLAN_NODE(arena, outer_scan).est_rows = (double)t->rows.count;
+
+        /* Build inner scan (right / build side) */
+        uint16_t inner_ncols = (uint16_t)semi_inner_t->columns.count;
+        int *inner_col_map = (int *)bump_alloc(&arena->scratch, inner_ncols * sizeof(int));
+        for (uint16_t i = 0; i < inner_ncols; i++) inner_col_map[i] = (int)i;
+
+        uint32_t inner_scan = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+        PLAN_NODE(arena, inner_scan).seq_scan.table = semi_inner_t;
+        PLAN_NODE(arena, inner_scan).seq_scan.ncols = inner_ncols;
+        PLAN_NODE(arena, inner_scan).seq_scan.col_map = inner_col_map;
+        PLAN_NODE(arena, inner_scan).est_rows = (double)semi_inner_t->rows.count;
+
+        uint32_t inner_current = inner_scan;
+
+        /* Add filter on inner side if subquery has WHERE */
+        if (semi_inner_filter_col >= 0) {
+            uint32_t inner_filter = plan_alloc_node(arena, PLAN_FILTER);
+            PLAN_NODE(arena, inner_filter).left = inner_current;
+            PLAN_NODE(arena, inner_filter).filter.col_idx = semi_inner_filter_col;
+            PLAN_NODE(arena, inner_filter).filter.cmp_op = semi_inner_filter_op;
+            PLAN_NODE(arena, inner_filter).filter.cmp_val = semi_inner_filter_val;
+            inner_current = inner_filter;
+        }
+
+        /* If inner SELECT is a single column (not SELECT *), add projection */
+        if (semi_inner_key != 0 || inner_ncols > 1) {
+            /* Project to just the key column */
+            int *inner_proj = (int *)bump_alloc(&arena->scratch, sizeof(int));
+            inner_proj[0] = semi_inner_key;
+            uint32_t inner_proj_node = plan_alloc_node(arena, PLAN_PROJECT);
+            PLAN_NODE(arena, inner_proj_node).left = inner_current;
+            PLAN_NODE(arena, inner_proj_node).project.ncols = 1;
+            PLAN_NODE(arena, inner_proj_node).project.col_map = inner_proj;
+            inner_current = inner_proj_node;
+            semi_inner_key = 0; /* after projection, key is column 0 */
+        }
+
+        /* Build HASH_SEMI_JOIN node */
+        uint32_t semi_idx = plan_alloc_node(arena, PLAN_HASH_SEMI_JOIN);
+        PLAN_NODE(arena, semi_idx).left = outer_scan;
+        PLAN_NODE(arena, semi_idx).right = inner_current;
+        PLAN_NODE(arena, semi_idx).hash_semi_join.outer_key_col = semi_outer_key;
+        PLAN_NODE(arena, semi_idx).hash_semi_join.inner_key_col = semi_inner_key;
+
+        current = semi_idx;
+
+        query_free(&semi_sq);
+        goto append_sort_project_limit;
+    }
 
     /* Try index scan for equality WHERE on an indexed column */
     int used_index = 0;
@@ -2545,6 +3904,8 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         }
     }
 
+append_sort_project_limit:
+
     /* Add SORT node if ORDER BY was validated */
     if (sort_nord > 0) {
         int *sort_cols = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
@@ -2567,6 +3928,13 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         PLAN_NODE(arena, proj_idx).project.ncols = proj_ncols;
         PLAN_NODE(arena, proj_idx).project.col_map = proj_map;
         current = proj_idx;
+    }
+
+    /* Add DISTINCT node if present (after sort+project, before limit) */
+    if (s->has_distinct) {
+        uint32_t dist_idx = plan_alloc_node(arena, PLAN_DISTINCT);
+        PLAN_NODE(arena, dist_idx).left = current;
+        current = dist_idx;
     }
 
     /* Add LIMIT/OFFSET node if present */

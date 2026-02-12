@@ -799,6 +799,16 @@ static int send_row_desc_plan(int fd, struct table *t, struct table *t2,
                 se_col_buf[clen] = '\0';
                 colname = se_col_buf;
             }
+        } else if (select_all && !t && q->select.has_generate_series && i == 0) {
+            if (q->select.gs_col_alias.len > 0) {
+                static __thread char gs_col_buf[256];
+                size_t clen = q->select.gs_col_alias.len < 255 ? q->select.gs_col_alias.len : 255;
+                memcpy(gs_col_buf, q->select.gs_col_alias.data, clen);
+                gs_col_buf[clen] = '\0';
+                colname = gs_col_buf;
+            } else {
+                colname = "generate_series";
+            }
         } else if (select_all && t && (size_t)i < t->columns.count) {
             colname = t->columns.items[i].name;
         } else if (select_all && t2 && i >= t1_ncols &&
@@ -857,7 +867,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     struct table *t = NULL;
     if (s->table.len > 0)
         t = db_find_table_sv(db, s->table);
-    if (!t) return -1;
+    if (!t && !s->has_generate_series) return -1;
 
     /* For JOINs, find the second table */
     struct table *t2 = NULL;
@@ -884,7 +894,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         /* No rows — send empty RowDescription + zero data rows */
         enum column_type types[64];
         for (uint16_t i = 0; i < ncols && i < 64; i++)
-            types[i] = (i < t->columns.count) ? t->columns.items[i].type : COLUMN_TYPE_TEXT;
+            types[i] = (t && i < t->columns.count) ? t->columns.items[i].type : COLUMN_TYPE_INT;
         send_row_desc_plan(fd, t, t2, q, ncols, types);
         return 0;
     }

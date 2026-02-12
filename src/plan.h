@@ -22,6 +22,8 @@ enum plan_op {
     PLAN_DISTINCT,       /* hash-based dedup */
     PLAN_SET_OP,         /* UNION/INTERSECT/EXCEPT via hashing */
     PLAN_WINDOW,         /* window functions */
+    PLAN_HASH_SEMI_JOIN, /* hash semi-join for IN (SELECT ...) */
+    PLAN_GENERATE_SERIES, /* virtual table: generate_series(start, stop, step) */
 };
 
 /* Plan node: arena-allocated in query_arena.plan_nodes DA.
@@ -86,6 +88,21 @@ struct plan_node {
             int    has_offset;
             int    has_limit;
         } limit;
+        struct {
+            int inner_key_col;       /* join key column index in inner (right child) */
+            int outer_key_col;       /* join key column index in outer (left child) */
+        } hash_semi_join;
+        struct {
+            int      set_op;         /* 0=UNION, 1=INTERSECT, 2=EXCEPT */
+            int      set_all;        /* 1 for UNION ALL etc. */
+            uint16_t ncols;          /* number of output columns */
+        } set_op;
+        struct {
+            long long start;
+            long long stop;
+            long long step;
+            int       use_bigint;    /* 1 = BIGINT, 0 = INT */
+        } gen_series;
         struct {
             uint16_t out_ncols;       /* total output columns (passthrough + window) */
             uint16_t n_pass;          /* number of passthrough columns */
@@ -181,9 +198,40 @@ struct window_state {
     int      *win_is_dbl;       /* bump: [n_win] — 1 if result is double */
 };
 
+struct hash_semi_join_state {
+    struct block_hash_table ht;
+    /* build-side key values — flat bump-allocated arrays (no BLOCK_CAPACITY limit) */
+    enum column_type       key_type;
+    void                  *key_data;     /* bump: int32_t[] / int64_t[] / double[] / char*[] */
+    uint8_t               *key_nulls;    /* bump: [build_count] */
+    uint32_t               build_count;
+    uint32_t               build_cap;
+    int                    build_done;
+};
+
+struct set_op_state {
+    struct block_hash_table ht;
+    /* flat columnar arrays for collected unique rows */
+    void    **col_data;        /* bump: [ncols] typed arrays */
+    uint8_t **col_nulls;       /* bump: [ncols] null bitmaps */
+    enum column_type *col_types; /* bump: [ncols] */
+    uint32_t  row_count;       /* total rows collected */
+    uint32_t  row_cap;         /* capacity of flat arrays */
+    uint16_t  ncols;
+    int       phase;           /* 0=collect-left, 1=collect-right, 2=emit */
+    uint32_t  emit_cursor;
+    /* for INTERSECT: per-row flag indicating if matched by RHS */
+    uint8_t  *matched;         /* bump: [row_cap] */
+};
+
 struct limit_state {
     size_t emitted;
     size_t skipped;
+};
+
+struct gen_series_state {
+    long long current;   /* next value to emit */
+    int       done;      /* 1 = exhausted */
 };
 
 /* Execution context: holds arena, database, and per-node state. */
