@@ -2206,6 +2206,9 @@ static int parse_select(struct lexer *l, struct query *out, struct query_arena *
     s->from_subquery_sql = IDX_NONE;
     s->cte_name = IDX_NONE;
     s->cte_sql = IDX_NONE;
+    s->gs_start_expr = IDX_NONE;
+    s->gs_stop_expr = IDX_NONE;
+    s->gs_step_expr = IDX_NONE;
 
     /* optional DISTINCT [ON (expr, ...)] */
     struct token peek_dist = lexer_peek(l);
@@ -2559,6 +2562,76 @@ parse_table_name:
             // here, so query_select_free will free it). All current callers do this.
             return -1;
         }
+    } else if ((tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) &&
+               sv_eq_ignorecase_cstr(tok.value, "generate_series")) {
+        /* FROM generate_series(start, stop [, step]) [AS alias [(col_alias)]] */
+        struct token lp = lexer_next(l);
+        if (lp.type != TOK_LPAREN) {
+            fprintf(stderr, "parse error: expected '(' after generate_series\n");
+            return -1;
+        }
+        s->has_generate_series = 1;
+        s->gs_start_expr = parse_expr(l, a);
+        if (s->gs_start_expr == IDX_NONE) {
+            fprintf(stderr, "parse error: expected start expression in generate_series\n");
+            return -1;
+        }
+        struct token comma1 = lexer_next(l);
+        if (comma1.type != TOK_COMMA) {
+            fprintf(stderr, "parse error: expected ',' after start in generate_series\n");
+            return -1;
+        }
+        s->gs_stop_expr = parse_expr(l, a);
+        if (s->gs_stop_expr == IDX_NONE) {
+            fprintf(stderr, "parse error: expected stop expression in generate_series\n");
+            return -1;
+        }
+        /* optional step argument */
+        struct token maybe_comma = lexer_peek(l);
+        if (maybe_comma.type == TOK_COMMA) {
+            lexer_next(l); /* consume comma */
+            s->gs_step_expr = parse_expr(l, a);
+            if (s->gs_step_expr == IDX_NONE) {
+                fprintf(stderr, "parse error: expected step expression in generate_series\n");
+                return -1;
+            }
+        }
+        struct token rp = lexer_next(l);
+        if (rp.type != TOK_RPAREN) {
+            fprintf(stderr, "parse error: expected ')' after generate_series arguments\n");
+            return -1;
+        }
+        /* use a synthetic table name so downstream code has something */
+        s->table = sv_from("generate_series", 15);
+        /* optional AS alias [(col_alias)] */
+        struct token pa = lexer_peek(l);
+        if (pa.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(pa.value, "AS")) {
+            lexer_next(l); /* consume AS */
+            tok = lexer_next(l); /* alias name */
+            s->gs_alias = tok.value;
+            s->table = tok.value;
+            /* optional (col_alias) */
+            struct token lp2 = lexer_peek(l);
+            if (lp2.type == TOK_LPAREN) {
+                lexer_next(l); /* consume ( */
+                struct token col_alias_tok = lexer_next(l);
+                s->gs_col_alias = col_alias_tok.value;
+                lexer_next(l); /* consume ) */
+            }
+        } else if (pa.type == TOK_IDENTIFIER) {
+            /* bare alias */
+            if (!sv_eq_ignorecase_cstr(pa.value, "WHERE") &&
+                !sv_eq_ignorecase_cstr(pa.value, "ORDER") &&
+                !sv_eq_ignorecase_cstr(pa.value, "GROUP") &&
+                !sv_eq_ignorecase_cstr(pa.value, "LIMIT") &&
+                !sv_eq_ignorecase_cstr(pa.value, "JOIN") &&
+                !sv_eq_ignorecase_cstr(pa.value, "CROSS")) {
+                tok = lexer_next(l);
+                s->gs_alias = tok.value;
+                s->table = tok.value;
+            }
+        }
+        goto after_table_alias;
     } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_STRING) {
         s->table = tok.value;
     } else {
@@ -2596,6 +2669,8 @@ parse_table_name:
         }
     }
 
+after_table_alias:
+    ; /* empty statement — C11 requires a statement after a label, not a declaration */
     /* optional: one or more [INNER|LEFT|RIGHT|FULL|CROSS|NATURAL] [OUTER] JOIN table ... */
     uint32_t joins_start = (uint32_t)a->joins.count;
     uint32_t joins_count = 0;

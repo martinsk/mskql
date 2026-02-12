@@ -13,7 +13,7 @@
 /* ---- date/time helpers ---- */
 
 /* parse "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" into struct tm, return 1 on success */
-static int parse_datetime(const char *s, struct tm *out)
+int parse_datetime(const char *s, struct tm *out)
 {
     memset(out, 0, sizeof(*out));
     if (!s) return 0;
@@ -47,7 +47,7 @@ static void format_date(const struct tm *t, char *buf, size_t bufsz)
 
 /* parse an interval string like "1 year 2 months 3 days 04:05:06"
  * returns total seconds (approximate: 1 year=365.25 days, 1 month=30 days) */
-static double parse_interval_to_seconds(const char *s)
+double parse_interval_to_seconds(const char *s)
 {
     if (!s) return 0.0;
     double total = 0.0;

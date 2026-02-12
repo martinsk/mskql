@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 void db_init(struct database *db, const char *name)
 {
@@ -1571,6 +1572,143 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 from_sub_table = materialize_subquery(db, ASTRING(&q->arena, s->from_subquery_sql), alias_buf);
             }
 
+            /* generate_series: materialize as temp table */
+            struct table *gs_temp = NULL;
+            if (s->has_generate_series) {
+                /* evaluate start, stop, step expressions */
+                struct cell c_start = eval_expr(s->gs_start_expr, &q->arena, NULL, NULL, db, NULL);
+                struct cell c_stop  = eval_expr(s->gs_stop_expr, &q->arena, NULL, NULL, db, NULL);
+                long long gs_step_val = 1;
+                int is_ts = 0; /* 1 if timestamp/date series */
+                double ts_step_sec = 0.0;
+                if (s->gs_step_expr != IDX_NONE) {
+                    struct cell c_step = eval_expr(s->gs_step_expr, &q->arena, NULL, NULL, db, NULL);
+                    if (c_step.type == COLUMN_TYPE_INTERVAL ||
+                        (column_type_is_text(c_step.type) && c_step.value.as_text)) {
+                        is_ts = 1;
+                        if (c_step.type == COLUMN_TYPE_INTERVAL || column_type_is_text(c_step.type))
+                            ts_step_sec = parse_interval_to_seconds(c_step.value.as_text);
+                    } else {
+                        gs_step_val = (c_step.type == COLUMN_TYPE_BIGINT) ? c_step.value.as_bigint
+                                    : (c_step.type == COLUMN_TYPE_FLOAT)  ? (long long)c_step.value.as_float
+                                    : c_step.value.as_int;
+                    }
+                }
+                /* detect timestamp/date series from start value */
+                if (!is_ts && (c_start.type == COLUMN_TYPE_DATE ||
+                               c_start.type == COLUMN_TYPE_TIMESTAMP ||
+                               c_start.type == COLUMN_TYPE_TIMESTAMPTZ)) {
+                    is_ts = 1;
+                    if (ts_step_sec == 0.0) ts_step_sec = 86400.0; /* default 1 day */
+                }
+
+                /* determine column name */
+                const char *col_name = "generate_series";
+                char col_name_buf[256];
+                if (s->gs_col_alias.len > 0) {
+                    snprintf(col_name_buf, sizeof(col_name_buf), "%.*s",
+                             (int)s->gs_col_alias.len, s->gs_col_alias.data);
+                    col_name = col_name_buf;
+                }
+
+                /* determine table name */
+                char gs_tbl_name[256];
+                if (s->gs_alias.len > 0) {
+                    snprintf(gs_tbl_name, sizeof(gs_tbl_name), "%.*s",
+                             (int)s->gs_alias.len, s->gs_alias.data);
+                } else {
+                    snprintf(gs_tbl_name, sizeof(gs_tbl_name), "generate_series");
+                }
+
+                /* build temp table */
+                struct table gt = {0};
+                gt.name = strdup(gs_tbl_name);
+                da_init(&gt.columns);
+                da_init(&gt.rows);
+                da_init(&gt.indexes);
+
+                if (is_ts) {
+                    /* timestamp/date series */
+                    struct column col = {0};
+                    col.name = strdup(col_name);
+                    col.type = c_start.type;
+                    da_push(&gt.columns, col);
+
+                    struct tm tm_start, tm_stop;
+                    const char *s_start = c_start.value.as_text ? c_start.value.as_text : "";
+                    const char *s_stop  = c_stop.value.as_text  ? c_stop.value.as_text  : "";
+                    parse_datetime(s_start, &tm_start);
+                    parse_datetime(s_stop, &tm_stop);
+                    time_t t_cur = mktime(&tm_start);
+                    time_t t_end = mktime(&tm_stop);
+                    long long step_sec = (long long)ts_step_sec;
+                    if (step_sec == 0) step_sec = 86400;
+                    int max_rows = 10000000;
+                    while ((step_sec > 0 && t_cur <= t_end) ||
+                           (step_sec < 0 && t_cur >= t_end)) {
+                        if (--max_rows < 0) break;
+                        struct tm *cur_tm = localtime(&t_cur);
+                        char buf[32];
+                        if (c_start.type == COLUMN_TYPE_DATE)
+                            snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
+                                     cur_tm->tm_year + 1900, cur_tm->tm_mon + 1, cur_tm->tm_mday);
+                        else
+                            snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+                                     cur_tm->tm_year + 1900, cur_tm->tm_mon + 1, cur_tm->tm_mday,
+                                     cur_tm->tm_hour, cur_tm->tm_min, cur_tm->tm_sec);
+                        struct row r = {0};
+                        da_init(&r.cells);
+                        struct cell c = {0};
+                        c.type = c_start.type;
+                        c.value.as_text = strdup(buf);
+                        da_push(&r.cells, c);
+                        da_push(&gt.rows, r);
+                        t_cur += step_sec;
+                    }
+                } else {
+                    /* integer series */
+                    long long gs_start = (c_start.type == COLUMN_TYPE_BIGINT) ? c_start.value.as_bigint
+                                       : (c_start.type == COLUMN_TYPE_FLOAT)  ? (long long)c_start.value.as_float
+                                       : c_start.value.as_int;
+                    long long gs_stop  = (c_stop.type == COLUMN_TYPE_BIGINT) ? c_stop.value.as_bigint
+                                       : (c_stop.type == COLUMN_TYPE_FLOAT)  ? (long long)c_stop.value.as_float
+                                       : c_stop.value.as_int;
+                    if (gs_step_val == 0) gs_step_val = 1;
+
+                    int use_bigint = (c_start.type == COLUMN_TYPE_BIGINT ||
+                                      c_stop.type == COLUMN_TYPE_BIGINT ||
+                                      gs_start > 2147483647LL || gs_start < -2147483648LL ||
+                                      gs_stop > 2147483647LL || gs_stop < -2147483648LL);
+                    struct column col = {0};
+                    col.name = strdup(col_name);
+                    col.type = use_bigint ? COLUMN_TYPE_BIGINT : COLUMN_TYPE_INT;
+                    da_push(&gt.columns, col);
+
+                    int max_rows = 10000000;
+                    for (long long v = gs_start;
+                         (gs_step_val > 0 && v <= gs_stop) || (gs_step_val < 0 && v >= gs_stop);
+                         v += gs_step_val) {
+                        if (--max_rows < 0) break;
+                        struct row r = {0};
+                        da_init(&r.cells);
+                        struct cell c = {0};
+                        if (use_bigint) {
+                            c.type = COLUMN_TYPE_BIGINT;
+                            c.value.as_bigint = v;
+                        } else {
+                            c.type = COLUMN_TYPE_INT;
+                            c.value.as_int = (int)v;
+                        }
+                        da_push(&r.cells, c);
+                        da_push(&gt.rows, r);
+                    }
+                }
+                da_push(&db->tables, gt);
+                gs_temp = &db->tables.items[db->tables.count - 1];
+                /* rewrite table reference to point to the temp table */
+                s->table = sv_from(gs_temp->name, strlen(gs_temp->name));
+            }
+
             /* view expansion: if the table is a view, materialize it */
             struct table *view_temp = NULL;
             char view_temp_name[256] = {0};
@@ -1774,6 +1912,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             /* clean up FROM subquery temp table */
             if (from_sub_table)
                 remove_temp_table(db, from_sub_table);
+
+            /* clean up generate_series temp table */
+            if (gs_temp)
+                remove_temp_table(db, gs_temp);
 
             /* clean up view temp table */
             if (view_temp)

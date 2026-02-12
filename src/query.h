@@ -2,6 +2,7 @@
 #define QUERY_H
 
 #include <stdint.h>
+#include <time.h>
 #include "row.h"
 #include "table.h"
 #include "stringview.h"
@@ -427,6 +428,13 @@ struct query_select {
     /* FROM subquery: SELECT * FROM (SELECT ...) AS alias */
     uint32_t from_subquery_sql; /* index into arena.strings, or IDX_NONE */
     sv from_subquery_alias;
+    /* FROM generate_series(start, stop [, step]) [AS alias(col_alias)] */
+    int has_generate_series;
+    uint32_t gs_start_expr;  /* index into arena.exprs, or IDX_NONE */
+    uint32_t gs_stop_expr;   /* index into arena.exprs, or IDX_NONE */
+    uint32_t gs_step_expr;   /* index into arena.exprs, or IDX_NONE */
+    sv gs_alias;             /* table alias (e.g. "g") */
+    sv gs_col_alias;         /* column alias (e.g. "n") */
     /* literal SELECT (no table): rows in arena.rows */
     uint32_t insert_rows_start; /* index into arena.rows (consecutive) */
     uint32_t insert_rows_count;
@@ -567,6 +575,8 @@ struct query {
 };
 
 int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db, struct bump_alloc *rb);
+int parse_datetime(const char *s, struct tm *out);
+double parse_interval_to_seconds(const char *s);
 int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result);
 int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result);
 
