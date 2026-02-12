@@ -24,6 +24,7 @@ struct agg_expr {
     sv column;
     sv alias; /* optional AS alias name */
     int has_distinct; /* COUNT(DISTINCT col) */
+    uint32_t expr_idx; /* index into arena.exprs, or IDX_NONE — when set, evaluate expression instead of bare column */
 };
 
 enum win_func {
@@ -397,6 +398,7 @@ struct query_select {
     sv group_by_col;
     uint32_t group_by_start; /* index into arena.svs (consecutive) */
     uint32_t group_by_count;
+    uint32_t group_by_exprs_start; /* index into arena.arg_indices (consecutive expr indices, IDX_NONE = use sv) */
     int group_by_rollup;  /* 1 if GROUP BY ROLLUP(...) */
     int group_by_cube;    /* 1 if GROUP BY CUBE(...) */
     /* HAVING */

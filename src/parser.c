@@ -1990,17 +1990,78 @@ static void parse_order_limit(struct lexer *l, struct query_arena *a, struct que
                     }
                 }
             } else {
+                uint32_t gb_expr_start = (uint32_t)a->arg_indices.count;
                 for (;;) {
-                    struct token col = lexer_next(l);
-                    if (col.type == TOK_IDENTIFIER || col.type == TOK_KEYWORD) {
-                        sv colsv = consume_identifier(l, col);
-                        arena_push_sv(a, colsv);
+                    struct token col = lexer_peek(l);
+                    if (col.type == TOK_NUMBER) {
+                        /* positional GROUP BY: GROUP BY 1, 2 */
+                        lexer_next(l); /* consume number */
+                        long long pos = 0;
+                        for (size_t k = 0; k < col.value.len; k++)
+                            pos = pos * 10 + (col.value.data[k] - '0');
+                        int resolved = 0;
+                        /* try parsed_columns first */
+                        if (pos >= 1 && s->parsed_columns_count > 0 &&
+                            (uint32_t)pos <= s->parsed_columns_count) {
+                            struct select_column *sc = &a->select_cols.items[s->parsed_columns_start + (uint32_t)(pos - 1)];
+                            if (sc->expr_idx != IDX_NONE) {
+                                struct expr *e = &EXPR(a, sc->expr_idx);
+                                if (e->type == EXPR_COLUMN_REF && e->column_ref.table.len == 0) {
+                                    arena_push_sv(a, e->column_ref.column);
+                                    da_push(&a->arg_indices, IDX_NONE);
+                                } else {
+                                    sv placeholder = sv_from("?", 1);
+                                    arena_push_sv(a, placeholder);
+                                    da_push(&a->arg_indices, sc->expr_idx);
+                                }
+                            } else if (sc->alias.len > 0) {
+                                arena_push_sv(a, sc->alias);
+                                da_push(&a->arg_indices, IDX_NONE);
+                            } else {
+                                arena_push_sv(a, col.value);
+                                da_push(&a->arg_indices, IDX_NONE);
+                            }
+                            resolved = 1;
+                        }
+                        /* fallback: resolve from legacy s->columns (comma-separated) */
+                        if (!resolved && pos >= 1 && s->columns.len > 0) {
+                            sv cols = s->columns;
+                            long long cur = 1;
+                            const char *p = cols.data;
+                            const char *end = cols.data + cols.len;
+                            while (p < end && cur < pos) {
+                                if (*p == ',') cur++;
+                                p++;
+                            }
+                            /* skip whitespace */
+                            while (p < end && (*p == ' ' || *p == '\t')) p++;
+                            const char *cstart = p;
+                            while (p < end && *p != ',' && *p != ' ' && *p != '\t') p++;
+                            if (cur == pos && cstart < p) {
+                                arena_push_sv(a, sv_from(cstart, (size_t)(p - cstart)));
+                                da_push(&a->arg_indices, IDX_NONE);
+                                resolved = 1;
+                            }
+                        }
+                        if (!resolved) {
+                            arena_push_sv(a, col.value);
+                            da_push(&a->arg_indices, IDX_NONE);
+                        }
                         gb_count++;
+                    } else {
+                        col = lexer_next(l);
+                        if (col.type == TOK_IDENTIFIER || col.type == TOK_KEYWORD) {
+                            sv colsv = consume_identifier(l, col);
+                            arena_push_sv(a, colsv);
+                            da_push(&a->arg_indices, IDX_NONE);
+                            gb_count++;
+                        }
                     }
                     peek = lexer_peek(l);
                     if (peek.type != TOK_COMMA) break;
                     lexer_next(l); /* consume comma */
                 }
+                s->group_by_exprs_start = gb_expr_start;
             }
             s->group_by_start = gb_start;
             s->group_by_count = gb_count;
@@ -2114,31 +2175,51 @@ static int peek_has_over(struct lexer *l)
     return after.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(after.value, "OVER");
 }
 
-/* parse a single aggregate: FUNC(col) or FUNC(*), returns 0 on success */
+/* parse a single aggregate: FUNC(col) or FUNC(expr) or FUNC(*), returns 0 on success */
 static int parse_single_agg(struct lexer *l, struct query_arena *a, sv func_name, struct agg_expr *agg)
 {
     agg->func = agg_from_keyword(func_name);
+    agg->expr_idx = IDX_NONE;
     struct token tok = lexer_next(l); /* ( */
     if (tok.type != TOK_LPAREN) {
         arena_set_error(a, "42601", "expected '(' after aggregate function");
         return -1;
     }
-    tok = lexer_next(l);
+    tok = lexer_peek(l);
     if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "DISTINCT")) {
+        lexer_next(l); /* consume DISTINCT */
         agg->has_distinct = 1;
-        tok = lexer_next(l);
+        tok = lexer_peek(l);
     }
     if (tok.type == TOK_STAR) {
+        lexer_next(l); /* consume * */
         agg->column = tok.value;
-    } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
-        agg->column = consume_identifier(l, tok);
     } else {
-        arena_set_error(a, "42601", "expected column or * in aggregate");
-        return -1;
+        /* parse a full expression — may be a simple column or a complex expr */
+        uint32_t eidx = parse_expr(l, a);
+        if (eidx == IDX_NONE) {
+            arena_set_error(a, "42601", "expected expression in aggregate");
+            return -1;
+        }
+        /* if it's a simple column ref, set column sv for backward compat */
+        struct expr *e = &EXPR(a, eidx);
+        if (e->type == EXPR_COLUMN_REF) {
+            if (e->column_ref.table.len == 0) {
+                agg->column = e->column_ref.column;
+            } else {
+                /* qualified ref like t.col — reconstruct "t.col" sv spanning from table start to column end */
+                const char *start = e->column_ref.table.data;
+                const char *end = e->column_ref.column.data + e->column_ref.column.len;
+                agg->column = sv_from(start, (size_t)(end - start));
+            }
+        } else {
+            agg->expr_idx = eidx;
+            agg->column = sv_from("*", 1); /* placeholder — expr_idx takes precedence */
+        }
     }
     tok = lexer_next(l);
     if (tok.type != TOK_RPAREN) {
-        arena_set_error(a, "42601", "expected ')' after aggregate column");
+        arena_set_error(a, "42601", "expected ')' after aggregate expression");
         return -1;
     }
     return 0;
@@ -2223,31 +2304,8 @@ static int parse_agg_list(struct lexer *l, struct query_arena *a, struct query_s
     /* parse first aggregate: we already have the keyword token */
     struct agg_expr agg;
     memset(&agg, 0, sizeof(agg));
-    agg.func = agg_from_keyword(first.value);
-
-    struct token tok = lexer_next(l); /* ( */
-    if (tok.type != TOK_LPAREN) {
-        arena_set_error(a, "42601", "expected '(' after aggregate function");
-        return -1;
-    }
-    tok = lexer_next(l); /* column or * or DISTINCT */
-    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "DISTINCT")) {
-        agg.has_distinct = 1;
-        tok = lexer_next(l); /* column after DISTINCT */
-    }
-    if (tok.type == TOK_STAR) {
-        agg.column = tok.value;
-    } else if (tok.type == TOK_IDENTIFIER) {
-        agg.column = tok.value;
-    } else {
-        arena_set_error(a, "42601", "expected column name or * in aggregate");
-        return -1;
-    }
-    tok = lexer_next(l); /* ) */
-    if (tok.type != TOK_RPAREN) {
-        arena_set_error(a, "42601", "expected ')' after aggregate column");
-        return -1;
-    }
+    agg.expr_idx = IDX_NONE;
+    if (parse_single_agg(l, a, first.value, &agg) != 0) return -1;
     /* store optional AS alias */
     {
         struct token pa = lexer_peek(l);
@@ -2268,7 +2326,7 @@ static int parse_agg_list(struct lexer *l, struct query_arena *a, struct query_s
         if (peek.type != TOK_COMMA) break;
         lexer_next(l); /* consume comma */
 
-        tok = lexer_next(l);
+        struct token tok = lexer_next(l);
         if (tok.type == TOK_KEYWORD && is_agg_keyword(tok.value)) {
             struct agg_expr a2;
             memset(&a2, 0, sizeof(a2));
@@ -2317,6 +2375,7 @@ static int parse_select(struct lexer *l, struct query *out, struct query_arena *
     s->gs_start_expr = IDX_NONE;
     s->gs_stop_expr = IDX_NONE;
     s->gs_step_expr = IDX_NONE;
+    s->group_by_exprs_start = 0;
 
     /* optional DISTINCT [ON (expr, ...)] */
     struct token peek_dist = lexer_peek(l);

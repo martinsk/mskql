@@ -2966,11 +2966,13 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
     }
 
     uint32_t naggs = s->aggregates_count;
-    /* resolve column index for each aggregate */
+    /* resolve column index for each aggregate (expr-based aggs use agg_col=-2) */
     int *agg_col = bump_calloc(&arena->scratch, naggs, sizeof(int));
     for (uint32_t a = 0; a < naggs; a++) {
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
-        if (sv_eq_cstr(ae->column, "*")) {
+        if (ae->expr_idx != IDX_NONE) {
+            agg_col[a] = -2; /* expression-based aggregate */
+        } else if (sv_eq_cstr(ae->column, "*")) {
             agg_col[a] = -1; /* COUNT(*) doesn't need a column */
         } else {
             agg_col[a] = -1;
@@ -3012,8 +3014,18 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
         }
         row_count++;
         for (uint32_t a = 0; a < naggs; a++) {
-            if (agg_col[a] < 0) continue;
-            struct cell *c = &t->rows.items[i].cells.items[agg_col[a]];
+            struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+            struct cell cv;
+            struct cell *c;
+            if (agg_col[a] == -2) {
+                /* expression-based aggregate: evaluate expression for this row */
+                cv = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL);
+                c = &cv;
+            } else if (agg_col[a] >= 0) {
+                c = &t->rows.items[i].cells.items[agg_col[a]];
+            } else {
+                continue; /* COUNT(*) — no column value needed */
+            }
             /* skip NULL values (SQL standard) */
             if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
                 continue;
@@ -3044,10 +3056,19 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                              t->columns.items[agg_col[a]].type == COLUMN_TYPE_BIGINT);
         int col_is_text = (agg_col[a] >= 0 &&
                            column_type_is_text(t->columns.items[agg_col[a]].type));
+        /* expression-based aggregates: infer type from accumulated min_cells */
+        if (agg_col[a] == -2 && minmax_init[a]) {
+            if (min_cells[a].type == COLUMN_TYPE_FLOAT || min_cells[a].type == COLUMN_TYPE_NUMERIC)
+                col_is_float = 1;
+            else if (min_cells[a].type == COLUMN_TYPE_BIGINT)
+                col_is_bigint = 1;
+            else if (column_type_is_text(min_cells[a].type))
+                col_is_text = 1;
+        }
         switch (ae->func) {
             case AGG_COUNT:
                 c.type = COLUMN_TYPE_INT;
-                if (ae->has_distinct && agg_col[a] >= 0) {
+                if (ae->has_distinct && (agg_col[a] >= 0 || agg_col[a] == -2)) {
                     /* COUNT(DISTINCT col): count unique non-NULL values */
                     int distinct_count = 0;
                     struct cell *seen = NULL;
@@ -3063,7 +3084,14 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                                     continue;
                             }
                         }
-                        struct cell *cv = &t->rows.items[i].cells.items[agg_col[a]];
+                        struct cell ev;
+                        struct cell *cv;
+                        if (agg_col[a] == -2) {
+                            ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL);
+                            cv = &ev;
+                        } else {
+                            cv = &t->rows.items[i].cells.items[agg_col[a]];
+                        }
                         if (cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text))
                             continue;
                         int dup = 0;
@@ -3074,8 +3102,8 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                     }
                     c.value.as_int = distinct_count;
                 } else {
-                    /* COUNT(*) counts all rows; COUNT(col) counts non-NULL */
-                    c.value.as_int = (agg_col[a] < 0) ? (int)row_count : (int)nonnull_count[a];
+                    /* COUNT(*) counts all rows; COUNT(col/expr) counts non-NULL */
+                    c.value.as_int = (agg_col[a] == -1) ? (int)row_count : (int)nonnull_count[a];
                 }
                 break;
             case AGG_SUM:
@@ -3757,10 +3785,12 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
         gmax_cells    = gmin_cells + agg_n;
     }
 
-    /* resolve aggregate column indices once */
+    /* resolve aggregate column indices once (expr-based aggs use -2) */
     for (size_t a = 0; a < agg_n; a++) {
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
-        if (sv_eq_cstr(ae->column, "*"))
+        if (ae->expr_idx != IDX_NONE)
+            gagg_cols[a] = -2;
+        else if (sv_eq_cstr(ae->column, "*"))
             gagg_cols[a] = -1;
         else
             gagg_cols[a] = table_find_column_sv(t, ae->column);
@@ -3846,9 +3876,18 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             if (!eq) continue;
             grp_count++;
             for (size_t a = 0; a < agg_n; a++) {
+                struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
                 int ac = gagg_cols[a];
-                if (ac < 0) continue;
-                struct cell *gc = &t->rows.items[ri].cells.items[ac];
+                struct cell ev;
+                struct cell *gc;
+                if (ac == -2) {
+                    ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[ri], NULL, NULL);
+                    gc = &ev;
+                } else if (ac >= 0) {
+                    gc = &t->rows.items[ri].cells.items[ac];
+                } else {
+                    continue; /* COUNT(*) — no column value needed */
+                }
                 /* skip NULL values (SQL standard) */
                 if (gc->is_null || (column_type_is_text(gc->type) && !gc->value.as_text))
                     continue;
@@ -3891,11 +3930,20 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                                  t->columns.items[ac_idx].type == COLUMN_TYPE_BIGINT);
             int col_is_text = (ac_idx >= 0 &&
                                column_type_is_text(t->columns.items[ac_idx].type));
+            /* expression-based aggregates: infer type from accumulated min_cells */
+            if (ac_idx == -2 && gminmax_init[a]) {
+                if (gmin_cells[a].type == COLUMN_TYPE_FLOAT || gmin_cells[a].type == COLUMN_TYPE_NUMERIC)
+                    col_is_float = 1;
+                else if (gmin_cells[a].type == COLUMN_TYPE_BIGINT)
+                    col_is_bigint = 1;
+                else if (column_type_is_text(gmin_cells[a].type))
+                    col_is_text = 1;
+            }
             switch (ae->func) {
                 case AGG_COUNT:
                     c.type = COLUMN_TYPE_INT;
-                    /* COUNT(*) counts all rows; COUNT(col) counts non-NULL */
-                    c.value.as_int = (gagg_cols[a] < 0) ? (int)grp_count : (int)gnonnull[a];
+                    /* COUNT(*) counts all rows; COUNT(col/expr) counts non-NULL */
+                    c.value.as_int = (gagg_cols[a] == -1) ? (int)grp_count : (int)gnonnull[a];
                     break;
                 case AGG_SUM:
                     if (gnonnull[a] == 0) {
