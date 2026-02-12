@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql — Interactive SQL Playground</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --body-width: 55%;
+            --fg: #111;
+            --fg-dim: #555;
+            --bg: #fffff8;
+            --accent: #a00;
+            --rule: #ccc;
+            --code-bg: #f3f1eb;
+        }
+
+        html { font-size: 15px; }
+
+        body {
+            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+            background: var(--bg);
+            color: var(--fg);
+            width: var(--body-width);
+            margin-left: auto;
+            margin-right: auto;
+            padding: 3rem 0 5rem 0;
+        }
+
+        p { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+        a { color: var(--fg); text-decoration: none; background-image: linear-gradient(var(--accent), var(--accent)); background-size: 1px 1px; background-repeat: repeat-x; background-position: 0 1.15em; }
+        a:hover { color: var(--accent); }
+        strong { font-weight: 600; }
+        code {
+            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+            font-size: 0.82rem;
+            background: var(--code-bg);
+            padding: 0.1em 0.35em;
+            border-radius: 2px;
+        }
+
+        h1 {
+            font-weight: 400;
+            font-size: 2.6rem;
+            line-height: 1.15;
+            margin-bottom: 0.4rem;
+        }
+
+        .subtitle {
+            font-style: italic;
+            font-size: 1.3rem;
+            color: var(--fg-dim);
+            display: block;
+            margin-bottom: 0.6rem;
+            line-height: 1.4;
+        }
+
+        .byline {
+            font-size: 0.95rem;
+            color: var(--fg-dim);
+            margin-bottom: 2rem;
+        }
+        .byline a { font-size: 0.95rem; }
+
+        .title-rule {
+            border: none;
+            height: 3px;
+            background: var(--accent);
+            width: 60px;
+            margin: 0 0 2rem 0;
+        }
+
+        h2 {
+            font-weight: 400;
+            font-style: italic;
+            font-size: 1.6rem;
+            margin-top: 2.8rem;
+            margin-bottom: 0.6rem;
+        }
+
+        /* ── Playground ─────────────────────────────────────── */
+        .playground-controls {
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+            margin-bottom: 0.6rem;
+            flex-wrap: wrap;
+        }
+
+        .playground-controls select {
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 0.95rem;
+            padding: 0.3rem 0.5rem;
+            border: 1px solid var(--rule);
+            background: var(--bg);
+            color: var(--fg);
+            border-radius: 3px;
+            cursor: pointer;
+        }
+
+        .playground-controls button {
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 0.95rem;
+            padding: 0.35rem 1.2rem;
+            border: 1px solid var(--rule);
+            background: var(--bg);
+            color: var(--fg);
+            border-radius: 3px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .playground-controls button:hover {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent);
+        }
+        .playground-controls button.run-btn {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent);
+            font-weight: 600;
+        }
+        .playground-controls button.run-btn:hover {
+            background: #800;
+            border-color: #800;
+        }
+
+        #sql-input {
+            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+            font-size: 0.82rem;
+            line-height: 1.55;
+            width: 100%;
+            min-height: 180px;
+            padding: 1rem 1.2rem;
+            border: 1px solid var(--rule);
+            border-left: 3px solid var(--accent);
+            background: var(--code-bg);
+            color: var(--fg);
+            resize: vertical;
+            tab-size: 4;
+            border-radius: 0;
+            outline: none;
+        }
+        #sql-input:focus {
+            border-color: var(--accent);
+        }
+
+        .status-bar {
+            font-size: 0.85rem;
+            color: var(--fg-dim);
+            margin-top: 0.4rem;
+            margin-bottom: 1.5rem;
+            min-height: 1.2em;
+        }
+        .status-bar.error { color: var(--accent); }
+
+        /* ── Result table ───────────────────────────────────── */
+        .result-wrap {
+            overflow-x: auto;
+            margin-top: 0.5rem;
+        }
+
+        .result-table {
+            border-collapse: collapse;
+            font-size: 0.85rem;
+            width: 100%;
+            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+        }
+        .result-table th {
+            text-align: left;
+            font-weight: 600;
+            padding: 0.4rem 0.8rem;
+            border-bottom: 2px solid var(--fg);
+            white-space: nowrap;
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 0.95rem;
+        }
+        .result-table td {
+            padding: 0.3rem 0.8rem;
+            border-bottom: 1px solid var(--rule);
+            white-space: pre;
+        }
+        .result-table tr:last-child td { border-bottom: 2px solid var(--fg); }
+        .result-table .null-cell { color: var(--fg-dim); font-style: italic; }
+
+        .result-message {
+            font-size: 0.95rem;
+            color: var(--fg-dim);
+            padding: 0.8rem 0;
+            font-style: italic;
+        }
+        .result-message.error-msg {
+            color: var(--accent);
+            font-style: normal;
+            font-family: 'Menlo', 'Consolas', monospace;
+            font-size: 0.82rem;
+        }
+
+        /* ── Footer ─────────────────────────────────────────── */
+        .site-footer {
+            margin-top: 4rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--rule);
+            font-size: 0.85rem;
+            color: var(--fg-dim);
+        }
+
+        /* ── Responsive ─────────────────────────────────────── */
+        @media (max-width: 1100px) {
+            body { width: 80%; }
+        }
+        @media (max-width: 760px) {
+            body { width: 90%; padding: 1.5rem 0 3rem 0; }
+            h1 { font-size: 2rem; }
+            .playground-controls { flex-direction: column; align-items: stretch; }
+        }
+    </style>
+</head>
+<body>
+
+<h1>mskql</h1>
+<span class="subtitle">Interactive SQL Playground</span>
+<p class="byline">
+    <a href="index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="grammar.html">Grammar</a>
+    &ensp;&middot;&ensp;
+    <a href="tutorials/index.html">Tutorials</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">GitHub</a>
+</p>
+<hr class="title-rule">
+
+<p>
+    This is a fully functional mskql database running <strong>entirely in your browser</strong>
+    via WebAssembly&mdash;no server, no network requests. The database state persists across
+    queries, so you can <code>CREATE TABLE</code>, <code>INSERT</code> data, and then
+    <code>SELECT</code> it back. Choose an example below or write your own SQL.
+</p>
+
+<div class="playground-controls">
+    <select id="examples" aria-label="Example queries">
+        <option value="">— Choose an example —</option>
+        <option value="basics">Create, Insert &amp; Select</option>
+        <option value="joins">Joins</option>
+        <option value="aggregation">Aggregation &amp; GROUP BY</option>
+        <option value="window">Window Functions</option>
+        <option value="generate_series">generate_series()</option>
+        <option value="cte">Common Table Expressions</option>
+        <option value="upsert">Upsert (ON CONFLICT)</option>
+        <option value="datetime">Date/Time Arithmetic</option>
+    </select>
+    <button class="run-btn" id="run-btn" disabled>&#9654; Run</button>
+    <button id="reset-btn" disabled>Reset DB</button>
+</div>
+
+<textarea id="sql-input" spellcheck="false" placeholder="Enter SQL here...">CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT,
+    age INT
+);
+
+INSERT INTO users VALUES
+    (1, 'Alice',   'alice@example.com',   32),
+    (2, 'Bob',     'bob@example.com',     28),
+    (3, 'Charlie', 'charlie@example.com', 35),
+    (4, 'Diana',   'diana@example.com',   29);
+
+SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
+
+<div class="status-bar" id="status">Loading WebAssembly&hellip;</div>
+
+<h2>Result</h2>
+<div id="result">
+    <div class="result-message">Run a query to see results here.</div>
+</div>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Documentation</a>
+</footer>
+
+<script src="wasm/mskql-wasm.js"></script>
+<script>
+(function() {
+    const db = new MskqlDB();
+    const sqlInput   = document.getElementById('sql-input');
+    const runBtn     = document.getElementById('run-btn');
+    const resetBtn   = document.getElementById('reset-btn');
+    const statusEl   = document.getElementById('status');
+    const resultEl   = document.getElementById('result');
+    const examplesEl = document.getElementById('examples');
+
+    /* ── Examples ──────────────────────────────────────────── */
+    const examples = {
+        basics: `CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT,
+    age INT
+);
+
+INSERT INTO users VALUES
+    (1, 'Alice',   'alice@example.com',   32),
+    (2, 'Bob',     'bob@example.com',     28),
+    (3, 'Charlie', 'charlie@example.com', 35),
+    (4, 'Diana',   'diana@example.com',   29);
+
+SELECT * FROM users WHERE age > 30 ORDER BY name;`,
+
+        joins: `CREATE TABLE departments (id INT PRIMARY KEY, name TEXT);
+INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Marketing'), (3, 'Sales');
+
+CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT, salary INT);
+INSERT INTO employees VALUES
+    (1, 'Alice', 1, 95000), (2, 'Bob', 1, 88000),
+    (3, 'Charlie', 2, 72000), (4, 'Diana', 3, 81000),
+    (5, 'Eve', 2, 69000);
+
+SELECT e.name, d.name AS department, e.salary
+FROM employees e
+JOIN departments d ON e.dept_id = d.id
+ORDER BY e.salary DESC;`,
+
+        aggregation: `CREATE TABLE sales (
+    id INT PRIMARY KEY,
+    product TEXT,
+    region TEXT,
+    amount NUMERIC
+);
+
+INSERT INTO sales VALUES
+    (1, 'Widget', 'North', 150.00),
+    (2, 'Widget', 'South', 200.00),
+    (3, 'Gadget', 'North', 300.00),
+    (4, 'Gadget', 'South', 250.00),
+    (5, 'Widget', 'North', 175.00),
+    (6, 'Gadget', 'North', 325.00);
+
+SELECT product, region,
+       COUNT(*) AS num_sales,
+       SUM(amount) AS total,
+       AVG(amount) AS avg_sale
+FROM sales
+GROUP BY product, region
+ORDER BY product, region;`,
+
+        window: `CREATE TABLE scores (
+    student TEXT,
+    subject TEXT,
+    score INT
+);
+
+INSERT INTO scores VALUES
+    ('Alice', 'Math', 92), ('Alice', 'English', 88),
+    ('Bob', 'Math', 85), ('Bob', 'English', 91),
+    ('Charlie', 'Math', 96), ('Charlie', 'English', 79),
+    ('Diana', 'Math', 88), ('Diana', 'English', 94);
+
+SELECT student, subject, score,
+       RANK() OVER (PARTITION BY subject ORDER BY score DESC) AS rank,
+       AVG(score) OVER (PARTITION BY subject) AS subject_avg
+FROM scores
+ORDER BY subject, rank;`,
+
+        generate_series: `SELECT n, n * n AS square
+FROM generate_series(1, 10) AS g(n);`,
+
+        cte: `CREATE TABLE tree (id INT PRIMARY KEY, parent_id INT, name TEXT);
+INSERT INTO tree VALUES
+    (1, NULL, 'Root'),
+    (2, 1, 'Child A'), (3, 1, 'Child B'),
+    (4, 2, 'Grandchild A1'), (5, 2, 'Grandchild A2'),
+    (6, 3, 'Grandchild B1');
+
+WITH RECURSIVE descendants AS (
+    SELECT id, name, 0 AS depth FROM tree WHERE parent_id IS NULL
+    UNION ALL
+    SELECT t.id, t.name, d.depth + 1
+    FROM tree t JOIN descendants d ON t.parent_id = d.id
+)
+SELECT depth, name FROM descendants ORDER BY depth, name;`,
+
+        upsert: `CREATE TABLE kv (key TEXT PRIMARY KEY, value INT);
+
+INSERT INTO kv VALUES ('a', 1), ('b', 2), ('c', 3);
+
+INSERT INTO kv VALUES ('b', 20), ('d', 4)
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+
+SELECT * FROM kv ORDER BY key;`,
+
+        datetime: `SELECT
+    '2024-01-15'::date + 30 AS plus_30_days,
+    '2024-06-15 10:30:00'::timestamp - '2024-01-01 00:00:00'::timestamp AS diff,
+    EXTRACT(MONTH FROM '2024-03-15'::date) AS month,
+    DATE_TRUNC('month', '2024-03-15'::date) AS trunc_month;`
+    };
+
+    examplesEl.addEventListener('change', function() {
+        if (this.value && examples[this.value]) {
+            sqlInput.value = examples[this.value];
+            this.selectedIndex = 0;
+        }
+    });
+
+    /* ── Run query ────────────────────────────────────────── */
+    function runQuery() {
+        const sql = sqlInput.value.trim();
+        if (!sql) return;
+
+        statusEl.className = 'status-bar';
+        statusEl.textContent = 'Running…';
+
+        /* defer to let the UI update */
+        setTimeout(function() {
+            const t0 = performance.now();
+            const res = db.exec(sql);
+            const elapsed = (performance.now() - t0).toFixed(1);
+
+            if (!res.ok) {
+                statusEl.className = 'status-bar error';
+                statusEl.textContent = 'Error (' + elapsed + ' ms)';
+                resultEl.innerHTML = '<div class="result-message error-msg">' +
+                    escapeHtml(res.output) + '</div>';
+                return;
+            }
+
+            const output = res.output.trim();
+            if (output === 'OK' || output === '') {
+                statusEl.className = 'status-bar';
+                statusEl.textContent = 'OK (' + elapsed + ' ms)';
+                resultEl.innerHTML = '<div class="result-message">Statement executed successfully.</div>';
+                return;
+            }
+
+            /* parse tab-separated output into table */
+            const lines = output.split('\n').filter(function(l) { return l.length > 0; });
+            if (lines.length === 0) {
+                statusEl.className = 'status-bar';
+                statusEl.textContent = '0 rows (' + elapsed + ' ms)';
+                resultEl.innerHTML = '<div class="result-message">Query returned no rows.</div>';
+                return;
+            }
+
+            statusEl.className = 'status-bar';
+            statusEl.textContent = lines.length + ' row' + (lines.length !== 1 ? 's' : '') + ' (' + elapsed + ' ms)';
+
+            let html = '<div class="result-wrap"><table class="result-table"><tbody>';
+            for (let i = 0; i < lines.length; i++) {
+                const cells = lines[i].split('\t');
+                html += '<tr>';
+                for (let j = 0; j < cells.length; j++) {
+                    const val = cells[j];
+                    if (val === 'NULL') {
+                        html += '<td class="null-cell">NULL</td>';
+                    } else {
+                        html += '<td>' + escapeHtml(val) + '</td>';
+                    }
+                }
+                html += '</tr>';
+            }
+            html += '</tbody></table></div>';
+            resultEl.innerHTML = html;
+        }, 10);
+    }
+
+    function escapeHtml(s) {
+        return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    runBtn.addEventListener('click', runQuery);
+
+    sqlInput.addEventListener('keydown', function(e) {
+        /* Ctrl/Cmd + Enter to run */
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            runQuery();
+        }
+        /* Tab inserts spaces */
+        if (e.key === 'Tab') {
+            e.preventDefault();
+            const start = this.selectionStart;
+            const end = this.selectionEnd;
+            this.value = this.value.substring(0, start) + '    ' + this.value.substring(end);
+            this.selectionStart = this.selectionEnd = start + 4;
+        }
+    });
+
+    resetBtn.addEventListener('click', function() {
+        db.reset();
+        statusEl.className = 'status-bar';
+        statusEl.textContent = 'Database reset.';
+        resultEl.innerHTML = '<div class="result-message">Database has been reset. All tables dropped.</div>';
+    });
+
+    /* ── Init ─────────────────────────────────────────────── */
+    db.init('wasm/mskql.wasm').then(function() {
+        statusEl.textContent = 'Database ready. Press Run or Ctrl+Enter.';
+        runBtn.disabled = false;
+        resetBtn.disabled = false;
+    }).catch(function(err) {
+        statusEl.className = 'status-bar error';
+        statusEl.textContent = 'Failed to load: ' + err.message;
+        console.error(err);
+    });
+})();
+</script>
+
+</body>
+</html>
