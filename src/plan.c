@@ -1,4 +1,5 @@
 #include "plan.h"
+#include "query.h"
 #include "arena_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -222,6 +223,8 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
         return pn->hash_agg.ngroup_cols + (uint16_t)pn->hash_agg.agg_count;
     if (pn->op == PLAN_SORT)
         return plan_node_ncols(arena, pn->left);
+    if (pn->op == PLAN_WINDOW)
+        return pn->window.out_ncols;
     /* For pass-through nodes, recurse to child */
     return plan_node_ncols(arena, pn->left);
 }
@@ -1404,6 +1407,536 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* ---- Window function executor ---- */
+
+/* qsort comparator for window: sort by (partition_col, order_col) in flat arrays */
+static struct {
+    void    *part_data;
+    uint8_t *part_nulls;
+    enum column_type part_type;
+    void    *ord_data;
+    uint8_t *ord_nulls;
+    enum column_type ord_type;
+    int      ord_desc;
+    int      has_part;
+    int      has_ord;
+} _wsort_ctx;
+
+static int window_sort_cmp(const void *a, const void *b)
+{
+    uint32_t ia = *(const uint32_t *)a;
+    uint32_t ib = *(const uint32_t *)b;
+
+    if (_wsort_ctx.has_part) {
+        int an = _wsort_ctx.part_nulls[ia], bn = _wsort_ctx.part_nulls[ib];
+        if (an != bn) return an ? 1 : -1; /* NULLs last */
+        if (!an) {
+            int cmp = 0;
+            enum column_type pt = _wsort_ctx.part_type;
+            if (pt == COLUMN_TYPE_INT || pt == COLUMN_TYPE_BOOLEAN) {
+                int32_t va = ((int32_t *)_wsort_ctx.part_data)[ia];
+                int32_t vb = ((int32_t *)_wsort_ctx.part_data)[ib];
+                cmp = (va > vb) - (va < vb);
+            } else if (pt == COLUMN_TYPE_BIGINT) {
+                int64_t va = ((int64_t *)_wsort_ctx.part_data)[ia];
+                int64_t vb = ((int64_t *)_wsort_ctx.part_data)[ib];
+                cmp = (va > vb) - (va < vb);
+            } else if (pt == COLUMN_TYPE_FLOAT || pt == COLUMN_TYPE_NUMERIC) {
+                double va = ((double *)_wsort_ctx.part_data)[ia];
+                double vb = ((double *)_wsort_ctx.part_data)[ib];
+                cmp = (va > vb) - (va < vb);
+            } else {
+                const char *sa = ((char **)_wsort_ctx.part_data)[ia];
+                const char *sb = ((char **)_wsort_ctx.part_data)[ib];
+                if (sa && sb) cmp = strcmp(sa, sb);
+                else cmp = (sa ? 1 : 0) - (sb ? 1 : 0);
+            }
+            if (cmp != 0) return cmp;
+        }
+    }
+
+    if (_wsort_ctx.has_ord) {
+        int an = _wsort_ctx.ord_nulls[ia], bn = _wsort_ctx.ord_nulls[ib];
+        if (an != bn) return an ? 1 : -1;
+        if (!an) {
+            int cmp = 0;
+            enum column_type ot = _wsort_ctx.ord_type;
+            if (ot == COLUMN_TYPE_INT || ot == COLUMN_TYPE_BOOLEAN) {
+                int32_t va = ((int32_t *)_wsort_ctx.ord_data)[ia];
+                int32_t vb = ((int32_t *)_wsort_ctx.ord_data)[ib];
+                cmp = (va > vb) - (va < vb);
+            } else if (ot == COLUMN_TYPE_BIGINT) {
+                int64_t va = ((int64_t *)_wsort_ctx.ord_data)[ia];
+                int64_t vb = ((int64_t *)_wsort_ctx.ord_data)[ib];
+                cmp = (va > vb) - (va < vb);
+            } else if (ot == COLUMN_TYPE_FLOAT || ot == COLUMN_TYPE_NUMERIC) {
+                double va = ((double *)_wsort_ctx.ord_data)[ia];
+                double vb = ((double *)_wsort_ctx.ord_data)[ib];
+                cmp = (va > vb) - (va < vb);
+            } else {
+                const char *sa = ((char **)_wsort_ctx.ord_data)[ia];
+                const char *sb = ((char **)_wsort_ctx.ord_data)[ib];
+                if (sa && sb) cmp = strcmp(sa, sb);
+                else cmp = (sa ? 1 : 0) - (sb ? 1 : 0);
+            }
+            if (_wsort_ctx.ord_desc) cmp = -cmp;
+            if (cmp != 0) return cmp;
+        }
+    }
+
+    return 0;
+}
+
+static inline double flat_col_to_double(void *data, uint8_t *nulls, enum column_type ct, uint32_t idx)
+{
+    if (nulls[idx]) return 0.0;
+    if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN) return (double)((int32_t *)data)[idx];
+    if (ct == COLUMN_TYPE_BIGINT) return (double)((int64_t *)data)[idx];
+    if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) return ((double *)data)[idx];
+    return 0.0;
+}
+
+static inline int flat_col_ord_cmp(void *data, enum column_type ct, uint8_t *nulls, uint32_t a, uint32_t b)
+{
+    int an = nulls[a], bn = nulls[b];
+    if (an && bn) return 0;
+    if (an) return 1;
+    if (bn) return -1;
+    if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN) {
+        int32_t va = ((int32_t *)data)[a], vb = ((int32_t *)data)[b];
+        return (va > vb) - (va < vb);
+    }
+    if (ct == COLUMN_TYPE_BIGINT) {
+        int64_t va = ((int64_t *)data)[a], vb = ((int64_t *)data)[b];
+        return (va > vb) - (va < vb);
+    }
+    if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) {
+        double va = ((double *)data)[a], vb = ((double *)data)[b];
+        return (va > vb) - (va < vb);
+    }
+    /* TEXT types */
+    {
+        const char *sa = ((char **)data)[a];
+        const char *sb = ((char **)data)[b];
+        if (sa && sb) return strcmp(sa, sb);
+        return (sa ? 1 : 0) - (sb ? 1 : 0);
+    }
+}
+
+static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                       struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct window_state *st = (struct window_state *)ctx->node_states[node_idx];
+    if (!st) {
+        st = (struct window_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        ctx->node_states[node_idx] = st;
+    }
+
+    if (!st->input_done) {
+        uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
+        st->input_ncols = child_ncols;
+
+        /* Collect all input blocks into flat arrays */
+        struct row_block *collected = NULL;
+        uint32_t nblocks = 0, block_cap = 16;
+        collected = (struct row_block *)bump_calloc(&ctx->arena->scratch, block_cap, sizeof(struct row_block));
+
+        for (;;) {
+            if (nblocks >= block_cap) {
+                uint32_t new_cap = block_cap * 2;
+                struct row_block *na = (struct row_block *)bump_calloc(&ctx->arena->scratch, new_cap, sizeof(struct row_block));
+                memcpy(na, collected, nblocks * sizeof(struct row_block));
+                collected = na;
+                block_cap = new_cap;
+            }
+            struct row_block *blk = &collected[nblocks];
+            row_block_alloc(blk, child_ncols, &ctx->arena->scratch);
+            if (plan_next_block(ctx, pn->left, blk) != 0) break;
+            if (blk->sel) {
+                uint16_t active = blk->sel_count;
+                struct row_block compact;
+                row_block_alloc(&compact, child_ncols, &ctx->arena->scratch);
+                compact.count = active;
+                for (uint16_t c = 0; c < child_ncols; c++) {
+                    compact.cols[c].type = blk->cols[c].type;
+                    compact.cols[c].count = active;
+                    for (uint16_t i = 0; i < active; i++)
+                        cb_copy_value(&compact.cols[c], i, &blk->cols[c], (uint16_t)blk->sel[i]);
+                }
+                *blk = compact;
+            }
+            nblocks++;
+        }
+
+        uint32_t total = 0;
+        for (uint32_t b = 0; b < nblocks; b++) total += collected[b].count;
+        st->total_rows = total;
+
+        if (total == 0) { st->input_done = 1; return -1; }
+
+        /* Build flat columnar arrays for all input columns */
+        st->flat_data = (void **)bump_alloc(&ctx->arena->scratch, child_ncols * sizeof(void *));
+        st->flat_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch, child_ncols * sizeof(uint8_t *));
+        st->flat_types = (enum column_type *)bump_alloc(&ctx->arena->scratch, child_ncols * sizeof(enum column_type));
+
+        for (uint16_t ci = 0; ci < child_ncols; ci++) {
+            enum column_type kt = nblocks > 0 ? collected[0].cols[ci].type : COLUMN_TYPE_INT;
+            st->flat_types[ci] = kt;
+            size_t esz;
+            if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN) esz = sizeof(int32_t);
+            else if (kt == COLUMN_TYPE_BIGINT) esz = sizeof(int64_t);
+            else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC) esz = sizeof(double);
+            else esz = sizeof(char *);
+
+            st->flat_data[ci] = bump_alloc(&ctx->arena->scratch, total * esz);
+            st->flat_nulls[ci] = (uint8_t *)bump_alloc(&ctx->arena->scratch, total);
+
+            uint32_t fi = 0;
+            for (uint32_t b = 0; b < nblocks; b++) {
+                struct col_block *src = &collected[b].cols[ci];
+                uint16_t cnt = collected[b].count;
+                memcpy(st->flat_nulls[ci] + fi, src->nulls, cnt);
+                if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
+                    memcpy((int32_t *)st->flat_data[ci] + fi, src->data.i32, cnt * sizeof(int32_t));
+                else if (kt == COLUMN_TYPE_BIGINT)
+                    memcpy((int64_t *)st->flat_data[ci] + fi, src->data.i64, cnt * sizeof(int64_t));
+                else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC)
+                    memcpy((double *)st->flat_data[ci] + fi, src->data.f64, cnt * sizeof(double));
+                else
+                    memcpy((char **)st->flat_data[ci] + fi, src->data.str, cnt * sizeof(char *));
+                fi += cnt;
+            }
+        }
+
+        /* Build sorted index */
+        st->sorted = (uint32_t *)bump_alloc(&ctx->arena->scratch, total * sizeof(uint32_t));
+        for (uint32_t i = 0; i < total; i++) st->sorted[i] = i;
+
+        int spc = pn->window.sort_part_col;
+        int soc = pn->window.sort_ord_col;
+        _wsort_ctx.has_part = (spc >= 0);
+        _wsort_ctx.has_ord = (soc >= 0);
+        if (spc >= 0) {
+            _wsort_ctx.part_data = st->flat_data[spc];
+            _wsort_ctx.part_nulls = st->flat_nulls[spc];
+            _wsort_ctx.part_type = st->flat_types[spc];
+        }
+        if (soc >= 0) {
+            _wsort_ctx.ord_data = st->flat_data[soc];
+            _wsort_ctx.ord_nulls = st->flat_nulls[soc];
+            _wsort_ctx.ord_type = st->flat_types[soc];
+            _wsort_ctx.ord_desc = pn->window.sort_ord_desc;
+        }
+        if (_wsort_ctx.has_part || _wsort_ctx.has_ord)
+            qsort(st->sorted, total, sizeof(uint32_t), window_sort_cmp);
+
+        /* Build partition boundaries */
+        st->part_starts = (uint32_t *)bump_alloc(&ctx->arena->scratch, (total + 1) * sizeof(uint32_t));
+        st->nparts = 0;
+        st->part_starts[st->nparts++] = 0;
+        if (spc >= 0) {
+            for (uint32_t i = 1; i < total; i++) {
+                uint32_t a = st->sorted[i - 1], b = st->sorted[i];
+                int an = st->flat_nulls[spc][a], bn = st->flat_nulls[spc][b];
+                if (an != bn) { st->part_starts[st->nparts++] = i; continue; }
+                if (an) continue; /* both NULL — same partition */
+                if (flat_col_ord_cmp(st->flat_data[spc], st->flat_types[spc], st->flat_nulls[spc], a, b) != 0)
+                    st->part_starts[st->nparts++] = i;
+            }
+        }
+        st->part_starts[st->nparts] = total;
+
+        /* Compute window values */
+        uint16_t nw = pn->window.n_win;
+        st->win_i32 = (int32_t *)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(int32_t));
+        st->win_f64 = (double *)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(double));
+        st->win_null = (uint8_t *)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(uint8_t));
+        st->win_is_dbl = (int *)bump_calloc(&ctx->arena->scratch, nw, sizeof(int));
+
+        for (uint16_t w = 0; w < nw; w++) {
+            int wf = pn->window.win_func[w];
+            int oc = pn->window.win_ord_col[w];
+            int ac = pn->window.win_arg_col[w];
+
+            for (uint32_t p = 0; p < st->nparts; p++) {
+                uint32_t ps = st->part_starts[p];
+                uint32_t pe = st->part_starts[p + 1];
+                uint32_t psize = pe - ps;
+
+                switch (wf) {
+                case WIN_ROW_NUMBER:
+                    for (uint32_t i = ps; i < pe; i++)
+                        st->win_i32[i * nw + w] = (int32_t)(i - ps + 1);
+                    break;
+                case WIN_RANK: {
+                    int32_t rank = 1;
+                    for (uint32_t i = ps; i < pe; i++) {
+                        if (i > ps && oc >= 0 &&
+                            flat_col_ord_cmp(st->flat_data[oc], st->flat_types[oc], st->flat_nulls[oc],
+                                             st->sorted[i], st->sorted[i-1]) != 0)
+                            rank = (int32_t)(i - ps + 1);
+                        st->win_i32[i * nw + w] = rank;
+                    }
+                    break;
+                }
+                case WIN_DENSE_RANK: {
+                    int32_t rank = 1;
+                    for (uint32_t i = ps; i < pe; i++) {
+                        if (i > ps && oc >= 0 &&
+                            flat_col_ord_cmp(st->flat_data[oc], st->flat_types[oc], st->flat_nulls[oc],
+                                             st->sorted[i], st->sorted[i-1]) != 0)
+                            rank++;
+                        st->win_i32[i * nw + w] = rank;
+                    }
+                    break;
+                }
+                case WIN_NTILE: {
+                    int nb = pn->window.win_offset[w] > 0 ? pn->window.win_offset[w] : 1;
+                    for (uint32_t i = ps; i < pe; i++)
+                        st->win_i32[i * nw + w] = (int32_t)(((i - ps) * (uint32_t)nb) / psize) + 1;
+                    break;
+                }
+                case WIN_PERCENT_RANK: {
+                    st->win_is_dbl[w] = 1;
+                    if (psize <= 1) {
+                        for (uint32_t i = ps; i < pe; i++) st->win_f64[i * nw + w] = 0.0;
+                    } else {
+                        int32_t rank = 1;
+                        for (uint32_t i = ps; i < pe; i++) {
+                            if (i > ps && oc >= 0 &&
+                                flat_col_ord_cmp(st->flat_data[oc], st->flat_types[oc], st->flat_nulls[oc],
+                                                 st->sorted[i], st->sorted[i-1]) != 0)
+                                rank = (int32_t)(i - ps + 1);
+                            st->win_f64[i * nw + w] = (double)(rank - 1) / (double)(psize - 1);
+                        }
+                    }
+                    break;
+                }
+                case WIN_CUME_DIST: {
+                    st->win_is_dbl[w] = 1;
+                    if (oc >= 0) {
+                        uint32_t i = ps;
+                        while (i < pe) {
+                            uint32_t j = i + 1;
+                            while (j < pe && flat_col_ord_cmp(st->flat_data[oc], st->flat_types[oc],
+                                    st->flat_nulls[oc], st->sorted[j], st->sorted[i]) == 0)
+                                j++;
+                            double cd = (double)(j - ps) / (double)psize;
+                            for (uint32_t k = i; k < j; k++) st->win_f64[k * nw + w] = cd;
+                            i = j;
+                        }
+                    } else {
+                        for (uint32_t i = ps; i < pe; i++) st->win_f64[i * nw + w] = 1.0;
+                    }
+                    break;
+                }
+                case WIN_LAG:
+                case WIN_LEAD: {
+                    int offset = pn->window.win_offset[w];
+                    for (uint32_t i = ps; i < pe; i++) {
+                        uint32_t pos = i - ps;
+                        uint32_t target = 0;
+                        int in_range = 0;
+                        if (wf == WIN_LAG) {
+                            if (pos >= (uint32_t)offset) { target = i - (uint32_t)offset; in_range = 1; }
+                        } else {
+                            target = i + (uint32_t)offset;
+                            if (target < pe) in_range = 1;
+                        }
+                        if (in_range && ac >= 0) {
+                            uint32_t si = st->sorted[target];
+                            if (st->flat_nulls[ac][si]) {
+                                st->win_null[i * nw + w] = 1;
+                            } else {
+                                st->win_f64[i * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                st->win_is_dbl[w] = 1;
+                            }
+                        } else {
+                            st->win_null[i * nw + w] = 1;
+                        }
+                    }
+                    break;
+                }
+                case WIN_FIRST_VALUE:
+                case WIN_LAST_VALUE: {
+                    for (uint32_t i = ps; i < pe; i++) {
+                        uint32_t target = (wf == WIN_FIRST_VALUE) ? ps : (pe - 1);
+                        if (ac >= 0) {
+                            uint32_t si = st->sorted[target];
+                            if (st->flat_nulls[ac][si]) {
+                                st->win_null[i * nw + w] = 1;
+                            } else {
+                                st->win_f64[i * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                st->win_is_dbl[w] = 1;
+                            }
+                        } else {
+                            st->win_null[i * nw + w] = 1;
+                        }
+                    }
+                    break;
+                }
+                case WIN_NTH_VALUE: {
+                    int nth = pn->window.win_offset[w];
+                    for (uint32_t i = ps; i < pe; i++) {
+                        if (nth >= 1 && (uint32_t)nth <= psize && ac >= 0) {
+                            uint32_t si = st->sorted[ps + (uint32_t)(nth - 1)];
+                            if (st->flat_nulls[ac][si]) {
+                                st->win_null[i * nw + w] = 1;
+                            } else {
+                                st->win_f64[i * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                st->win_is_dbl[w] = 1;
+                            }
+                        } else {
+                            st->win_null[i * nw + w] = 1;
+                        }
+                    }
+                    break;
+                }
+                case WIN_SUM:
+                case WIN_COUNT:
+                case WIN_AVG: {
+                    if (!pn->window.win_has_frame[w]) {
+                        double part_sum = 0.0;
+                        int part_nn = 0;
+                        for (uint32_t i = ps; i < pe; i++) {
+                            if (ac >= 0) {
+                                uint32_t si = st->sorted[i];
+                                if (!st->flat_nulls[ac][si]) {
+                                    part_sum += flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                    part_nn++;
+                                }
+                            }
+                        }
+                        for (uint32_t i = ps; i < pe; i++) {
+                            if (wf == WIN_SUM) {
+                                if (ac >= 0 && (st->flat_types[ac] == COLUMN_TYPE_FLOAT || st->flat_types[ac] == COLUMN_TYPE_NUMERIC)) {
+                                    st->win_is_dbl[w] = 1;
+                                    st->win_f64[i * nw + w] = part_sum;
+                                } else {
+                                    st->win_i32[i * nw + w] = (int32_t)part_sum;
+                                }
+                            } else if (wf == WIN_COUNT) {
+                                st->win_i32[i * nw + w] = (ac >= 0) ? part_nn : (int32_t)psize;
+                            } else {
+                                st->win_is_dbl[w] = 1;
+                                if (part_nn > 0) st->win_f64[i * nw + w] = part_sum / (double)part_nn;
+                                else st->win_null[i * nw + w] = 1;
+                            }
+                        }
+                    } else {
+                        for (uint32_t i = ps; i < pe; i++) {
+                            uint32_t my_pos = i - ps;
+                            uint32_t fs = 0, fe = psize;
+                            switch (pn->window.win_frame_start[w]) {
+                                case FRAME_UNBOUNDED_PRECEDING: fs = 0; break;
+                                case FRAME_CURRENT_ROW: fs = my_pos; break;
+                                case FRAME_N_PRECEDING: fs = (my_pos >= (uint32_t)pn->window.win_frame_start_n[w]) ? my_pos - (uint32_t)pn->window.win_frame_start_n[w] : 0; break;
+                                case FRAME_N_FOLLOWING: fs = my_pos + (uint32_t)pn->window.win_frame_start_n[w]; break;
+                                case FRAME_UNBOUNDED_FOLLOWING: fs = psize; break;
+                            }
+                            switch (pn->window.win_frame_end[w]) {
+                                case FRAME_UNBOUNDED_FOLLOWING: fe = psize; break;
+                                case FRAME_CURRENT_ROW: fe = my_pos + 1; break;
+                                case FRAME_N_FOLLOWING: fe = my_pos + (uint32_t)pn->window.win_frame_end_n[w] + 1; if (fe > psize) fe = psize; break;
+                                case FRAME_N_PRECEDING: fe = (my_pos >= (uint32_t)pn->window.win_frame_end_n[w]) ? my_pos - (uint32_t)pn->window.win_frame_end_n[w] + 1 : 0; break;
+                                case FRAME_UNBOUNDED_PRECEDING: fe = 0; break;
+                            }
+                            if (fs > psize) fs = psize;
+                            double frame_sum = 0.0;
+                            int frame_nn = 0, frame_count = 0;
+                            for (uint32_t fi = fs; fi < fe; fi++) {
+                                uint32_t si = st->sorted[ps + fi];
+                                frame_count++;
+                                if (ac >= 0 && !st->flat_nulls[ac][si]) {
+                                    frame_sum += flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                    frame_nn++;
+                                }
+                            }
+                            if (wf == WIN_SUM) {
+                                if (ac >= 0 && (st->flat_types[ac] == COLUMN_TYPE_FLOAT || st->flat_types[ac] == COLUMN_TYPE_NUMERIC)) {
+                                    st->win_is_dbl[w] = 1; st->win_f64[i * nw + w] = frame_sum;
+                                } else st->win_i32[i * nw + w] = (int32_t)frame_sum;
+                            } else if (wf == WIN_COUNT) {
+                                st->win_i32[i * nw + w] = (ac >= 0) ? frame_nn : frame_count;
+                            } else {
+                                st->win_is_dbl[w] = 1;
+                                if (frame_nn > 0) st->win_f64[i * nw + w] = frame_sum / (double)frame_nn;
+                                else st->win_null[i * nw + w] = 1;
+                            }
+                        }
+                    }
+                    break;
+                }
+                } /* switch */
+            } /* partitions */
+        } /* window exprs */
+
+        st->input_done = 1;
+        st->emit_cursor = 0;
+    }
+
+    /* Emit phase: output blocks with passthrough + window columns */
+    if (st->emit_cursor >= st->total_rows) return -1;
+
+    uint16_t out_ncols = pn->window.out_ncols;
+    uint16_t n_pass = pn->window.n_pass;
+    uint16_t nw = pn->window.n_win;
+    row_block_reset(out);
+    uint16_t out_count = 0;
+
+    /* Set output column types */
+    for (uint16_t c = 0; c < n_pass; c++)
+        out->cols[c].type = st->flat_types[pn->window.pass_cols[c]];
+    for (uint16_t w = 0; w < nw; w++)
+        out->cols[n_pass + w].type = st->win_is_dbl[w] ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
+
+    while (st->emit_cursor < st->total_rows && out_count < BLOCK_CAPACITY) {
+        uint32_t fi = st->sorted[st->emit_cursor++];
+
+        /* Passthrough columns */
+        for (uint16_t c = 0; c < n_pass; c++) {
+            int sci = pn->window.pass_cols[c];
+            out->cols[c].nulls[out_count] = st->flat_nulls[sci][fi];
+            enum column_type ct = st->flat_types[sci];
+            if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+                out->cols[c].data.i32[out_count] = ((int32_t *)st->flat_data[sci])[fi];
+            else if (ct == COLUMN_TYPE_BIGINT)
+                out->cols[c].data.i64[out_count] = ((int64_t *)st->flat_data[sci])[fi];
+            else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+                out->cols[c].data.f64[out_count] = ((double *)st->flat_data[sci])[fi];
+            else
+                out->cols[c].data.str[out_count] = ((char **)st->flat_data[sci])[fi];
+        }
+
+        /* Window result columns */
+        uint32_t si = st->emit_cursor - 1; /* sorted position */
+        for (uint16_t w = 0; w < nw; w++) {
+            uint16_t oc = n_pass + w;
+            if (st->win_null[si * nw + w]) {
+                out->cols[oc].nulls[out_count] = 1;
+                if (st->win_is_dbl[w])
+                    out->cols[oc].data.f64[out_count] = 0.0;
+                else
+                    out->cols[oc].data.i32[out_count] = 0;
+            } else if (st->win_is_dbl[w]) {
+                out->cols[oc].nulls[out_count] = 0;
+                out->cols[oc].data.f64[out_count] = st->win_f64[si * nw + w];
+            } else {
+                out->cols[oc].nulls[out_count] = 0;
+                out->cols[oc].data.i32[out_count] = st->win_i32[si * nw + w];
+            }
+        }
+        out_count++;
+    }
+
+    out->count = out_count;
+    for (uint16_t c = 0; c < out_ncols; c++)
+        out->cols[c].count = out_count;
+
+    return 0;
+}
+
 /* ---- Dispatcher ---- */
 
 int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -1420,6 +1953,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     if (pn->op == PLAN_HASH_JOIN)    return hash_join_next(ctx, node_idx, out);
     if (pn->op == PLAN_HASH_AGG)     return hash_agg_next(ctx, node_idx, out);
     if (pn->op == PLAN_SORT)         return sort_next(ctx, node_idx, out);
+    if (pn->op == PLAN_WINDOW)       return window_next(ctx, node_idx, out);
     /* Not yet implemented */
     return -1;
 }
@@ -1637,11 +2171,218 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         return current;
     }
 
+    /* ---- Window function fast path ---- */
+    if (s->select_exprs_count > 0 && !s->has_join && !s->has_group_by &&
+        s->aggregates_count == 0 && !s->has_set_op && s->ctes_count == 0 &&
+        s->cte_sql == IDX_NONE && s->from_subquery_sql == IDX_NONE &&
+        !s->has_recursive_cte && !s->has_distinct && !s->has_distinct_on &&
+        t && s->insert_rows_count == 0) {
+
+        size_t nexprs = s->select_exprs_count;
+        /* Count passthrough and window expressions, resolve column indices */
+        uint16_t n_pass = 0, n_win = 0;
+        for (size_t e = 0; e < nexprs; e++) {
+            struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
+            if (se->kind == SEL_COLUMN) n_pass++;
+            else n_win++;
+        }
+        if (n_win == 0) return IDX_NONE; /* shouldn't happen */
+
+        /* Validate all columns exist and resolve indices */
+        int *pass_cols = (int *)bump_alloc(&arena->scratch, (n_pass ? n_pass : 1) * sizeof(int));
+        int *wpc = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+        int *woc = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+        int *wod = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+        int *wac = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+        int *wfn = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+        int *woff = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+        int *whf = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+        int *wfs = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+        int *wfe = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+        int *wfsn = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+        int *wfen = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+
+        uint16_t pi = 0, wi = 0;
+        int global_part = -1, global_ord = -1, global_ord_desc = 0;
+        for (size_t e = 0; e < nexprs; e++) {
+            struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
+            if (se->kind == SEL_COLUMN) {
+                int ci = table_find_column_sv(t, se->column);
+                if (ci < 0) return IDX_NONE;
+                pass_cols[pi++] = ci;
+            } else {
+                int pc = -1, oc = -1, ac = -1;
+                if (se->win.has_partition) {
+                    pc = table_find_column_sv(t, se->win.partition_col);
+                    if (pc < 0) return IDX_NONE;
+                    if (global_part < 0) global_part = pc;
+                }
+                if (se->win.has_order) {
+                    oc = table_find_column_sv(t, se->win.order_col);
+                    if (oc < 0) return IDX_NONE;
+                    if (global_ord < 0) { global_ord = oc; global_ord_desc = se->win.order_desc; }
+                }
+                if (se->win.arg_column.len > 0 && !sv_eq_cstr(se->win.arg_column, "*")) {
+                    ac = table_find_column_sv(t, se->win.arg_column);
+                    if (ac < 0) return IDX_NONE;
+                }
+                /* For LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE with text arg columns,
+                 * bail out — plan executor uses double arrays, can't handle text */
+                if (ac >= 0 && column_type_is_text(t->columns.items[ac].type) &&
+                    (se->win.func == WIN_LAG || se->win.func == WIN_LEAD ||
+                     se->win.func == WIN_FIRST_VALUE || se->win.func == WIN_LAST_VALUE ||
+                     se->win.func == WIN_NTH_VALUE))
+                    return IDX_NONE;
+                wpc[wi] = pc;
+                woc[wi] = oc;
+                wod[wi] = se->win.order_desc;
+                wac[wi] = ac;
+                wfn[wi] = (int)se->win.func;
+                woff[wi] = se->win.offset;
+                whf[wi] = se->win.has_frame;
+                wfs[wi] = (int)se->win.frame_start;
+                wfe[wi] = (int)se->win.frame_end;
+                wfsn[wi] = se->win.frame_start_n;
+                wfen[wi] = se->win.frame_end_n;
+                wi++;
+            }
+        }
+
+        /* Bail out if table has mixed cell types */
+        if (t->rows.count > 0) {
+            struct row *first = &t->rows.items[0];
+            for (size_t c = 0; c < first->cells.count && c < t->columns.count; c++) {
+                if (!first->cells.items[c].is_null &&
+                    first->cells.items[c].type != t->columns.items[c].type)
+                    return IDX_NONE;
+            }
+        }
+
+        /* Build scan → (filter →) window (→ sort) plan */
+        uint16_t scan_ncols = (uint16_t)t->columns.count;
+        int *col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
+        for (uint16_t i = 0; i < scan_ncols; i++) col_map[i] = (int)i;
+
+        uint32_t scan_idx = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+        PLAN_NODE(arena, scan_idx).seq_scan.table = t;
+        PLAN_NODE(arena, scan_idx).seq_scan.ncols = scan_ncols;
+        PLAN_NODE(arena, scan_idx).seq_scan.col_map = col_map;
+        PLAN_NODE(arena, scan_idx).est_rows = (double)t->rows.count;
+        uint32_t current = scan_idx;
+
+        /* Add filter if WHERE is simple enough */
+        if (s->where.has_where && s->where.where_cond != IDX_NONE) {
+            struct condition *cond = &COND(arena, s->where.where_cond);
+            if (cond->type == COND_COMPARE && cond->lhs_expr == IDX_NONE &&
+                cond->rhs_column.len == 0 &&
+                cond->scalar_subquery_sql == IDX_NONE &&
+                cond->subquery_sql == IDX_NONE &&
+                cond->in_values_count == 0 && cond->array_values_count == 0 &&
+                !cond->is_any && !cond->is_all && cond->op <= CMP_GE) {
+                int fc = table_find_column_sv(t, cond->column);
+                if (fc >= 0) {
+                    enum column_type ct = t->columns.items[fc].type;
+                    if ((ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN ||
+                         ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC ||
+                         ct == COLUMN_TYPE_BIGINT) &&
+                        (cond->value.is_null || cond->value.type == ct ||
+                         (ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT))) {
+                        if (!(ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)) {
+                            uint32_t filter_idx = plan_alloc_node(arena, PLAN_FILTER);
+                            PLAN_NODE(arena, filter_idx).left = current;
+                            PLAN_NODE(arena, filter_idx).filter.cond_idx = s->where.where_cond;
+                            PLAN_NODE(arena, filter_idx).filter.col_idx = fc;
+                            PLAN_NODE(arena, filter_idx).filter.cmp_op = (int)cond->op;
+                            PLAN_NODE(arena, filter_idx).filter.cmp_val = cond->value;
+                            current = filter_idx;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Add WINDOW node */
+        uint32_t win_idx = plan_alloc_node(arena, PLAN_WINDOW);
+        PLAN_NODE(arena, win_idx).left = current;
+        PLAN_NODE(arena, win_idx).window.out_ncols = n_pass + n_win;
+        PLAN_NODE(arena, win_idx).window.n_pass = n_pass;
+        PLAN_NODE(arena, win_idx).window.pass_cols = pass_cols;
+        PLAN_NODE(arena, win_idx).window.n_win = n_win;
+        PLAN_NODE(arena, win_idx).window.win_part_col = wpc;
+        PLAN_NODE(arena, win_idx).window.win_ord_col = woc;
+        PLAN_NODE(arena, win_idx).window.win_ord_desc = wod;
+        PLAN_NODE(arena, win_idx).window.win_arg_col = wac;
+        PLAN_NODE(arena, win_idx).window.win_func = wfn;
+        PLAN_NODE(arena, win_idx).window.win_offset = woff;
+        PLAN_NODE(arena, win_idx).window.win_has_frame = whf;
+        PLAN_NODE(arena, win_idx).window.win_frame_start = wfs;
+        PLAN_NODE(arena, win_idx).window.win_frame_end = wfe;
+        PLAN_NODE(arena, win_idx).window.win_frame_start_n = wfsn;
+        PLAN_NODE(arena, win_idx).window.win_frame_end_n = wfen;
+        PLAN_NODE(arena, win_idx).window.sort_part_col = global_part;
+        PLAN_NODE(arena, win_idx).window.sort_ord_col = global_ord;
+        PLAN_NODE(arena, win_idx).window.sort_ord_desc = global_ord_desc;
+        current = win_idx;
+
+        /* Add SORT node if outer ORDER BY is present */
+        if (s->has_order_by && s->order_by_count > 0) {
+            /* The output layout is: passthrough columns first (indices 0..n_pass-1),
+             * then window columns (indices n_pass..n_pass+n_win-1).
+             * We need to map ORDER BY column names to these output indices. */
+            int sort_cols_buf[32];
+            int sort_descs_buf[32];
+            uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+            int sort_ok = 1;
+            for (uint16_t k = 0; k < sort_nord; k++) {
+                struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
+                sort_cols_buf[k] = -1;
+                sort_descs_buf[k] = obi->desc;
+                /* Walk select_exprs to find the output column index */
+                uint16_t pass_i = 0, win_i = 0;
+                for (size_t e = 0; e < nexprs; e++) {
+                    struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
+                    if (se->kind == SEL_COLUMN) {
+                        sv col = se->column;
+                        sv bare_col = col, bare_ord = obi->column;
+                        for (size_t kk = 0; kk < col.len; kk++)
+                            if (col.data[kk] == '.') { bare_col = sv_from(col.data+kk+1, col.len-kk-1); break; }
+                        for (size_t kk = 0; kk < obi->column.len; kk++)
+                            if (obi->column.data[kk] == '.') { bare_ord = sv_from(obi->column.data+kk+1, obi->column.len-kk-1); break; }
+                        if (sv_eq_ignorecase(bare_col, bare_ord)) { sort_cols_buf[k] = (int)pass_i; break; }
+                        if (se->alias.len > 0 && sv_eq_ignorecase(se->alias, obi->column)) { sort_cols_buf[k] = (int)pass_i; break; }
+                        pass_i++;
+                    } else {
+                        if (se->alias.len > 0 && sv_eq_ignorecase(se->alias, obi->column)) {
+                            sort_cols_buf[k] = (int)(n_pass + win_i);
+                            break;
+                        }
+                        win_i++;
+                    }
+                }
+                if (sort_cols_buf[k] < 0) { sort_ok = 0; break; }
+            }
+            if (sort_ok && sort_nord > 0) {
+                int *sort_cols = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
+                int *sort_descs = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
+                memcpy(sort_cols, sort_cols_buf, sort_nord * sizeof(int));
+                memcpy(sort_descs, sort_descs_buf, sort_nord * sizeof(int));
+                uint32_t sort_idx = plan_alloc_node(arena, PLAN_SORT);
+                PLAN_NODE(arena, sort_idx).left = current;
+                PLAN_NODE(arena, sort_idx).sort.sort_cols = sort_cols;
+                PLAN_NODE(arena, sort_idx).sort.sort_descs = sort_descs;
+                PLAN_NODE(arena, sort_idx).sort.nsort_cols = sort_nord;
+                current = sort_idx;
+            }
+        }
+
+        return current;
+    }
+
     /* ---- Single-table path (original) ---- */
 
     /* Bail out for queries we don't handle yet */
     if (s->has_join)            return IDX_NONE;
-    if (s->select_exprs_count > 0) return IDX_NONE; /* window functions */
+    if (s->select_exprs_count > 0) return IDX_NONE; /* window functions — handled above */
     if (s->has_group_by)        return IDX_NONE;
     if (s->aggregates_count > 0) return IDX_NONE;
     if (s->has_set_op)          return IDX_NONE;

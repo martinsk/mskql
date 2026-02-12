@@ -9,8 +9,8 @@ Diana|English|94|1
 Bob|English|91|2
 Alice|English|88|3
 Charlie|English|79|4
+Charlie|Math|96|1
 Alice|Math|92|2
 Diana|Math|88|3
 Bob|Math|85|4
-Charlie|Math|96|1
 -- expected status: 0

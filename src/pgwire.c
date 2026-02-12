@@ -778,7 +778,28 @@ static int send_row_desc_plan(int fd, struct table *t, struct table *t2,
         const char *colname = "?";
         uint32_t type_oid = column_type_to_oid(col_types[i]);
 
-        if (select_all && t && (size_t)i < t->columns.count) {
+        if (q->select.select_exprs_count > 0 && (size_t)i < q->select.select_exprs_count) {
+            /* Window query: column names from select_exprs */
+            struct select_expr *se = &q->arena.select_exprs.items[q->select.select_exprs_start + i];
+            if (se->alias.len > 0) {
+                static __thread char se_alias_buf[256];
+                size_t alen = se->alias.len < 255 ? se->alias.len : 255;
+                memcpy(se_alias_buf, se->alias.data, alen);
+                se_alias_buf[alen] = '\0';
+                colname = se_alias_buf;
+            } else if (se->kind == SEL_COLUMN && se->column.len > 0) {
+                /* Strip table prefix from column name */
+                sv col = se->column;
+                for (size_t kk = 0; kk < col.len; kk++) {
+                    if (col.data[kk] == '.') { col = sv_from(col.data+kk+1, col.len-kk-1); break; }
+                }
+                static __thread char se_col_buf[256];
+                size_t clen = col.len < 255 ? col.len : 255;
+                memcpy(se_col_buf, col.data, clen);
+                se_col_buf[clen] = '\0';
+                colname = se_col_buf;
+            }
+        } else if (select_all && t && (size_t)i < t->columns.count) {
             colname = t->columns.items[i].name;
         } else if (select_all && t2 && i >= t1_ncols &&
                    (size_t)(i - t1_ncols) < t2->columns.count) {

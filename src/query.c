@@ -3221,17 +3221,6 @@ static double cell_to_double(const struct cell *c)
     return 0.0;
 }
 
-/* sort helper for window ORDER BY */
-struct sort_entry { size_t idx; const struct cell *key; };
-static int _sort_entry_desc; /* 0=ASC, 1=DESC */
-
-static int sort_entry_cmp(const void *a, const void *b)
-{
-    const struct sort_entry *sa = a, *sb = b;
-    int cmp = cell_compare(sa->key, sb->key);
-    return _sort_entry_desc ? -cmp : cmp;
-}
-
 static int query_window(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result)
 {
     size_t nrows = t->rows.count;
@@ -3283,46 +3272,338 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
     }
 
     /* collect rows matching WHERE (or all rows if no WHERE) */
-    size_t *win_match_items = (size_t *)bump_alloc(&arena->scratch,
+    size_t *sorted_idx = (size_t *)bump_alloc(&arena->scratch,
                                (nrows ? nrows : 1) * sizeof(size_t));
     size_t nmatch = 0;
     for (size_t i = 0; i < nrows; i++) {
         if (!row_matches(t, &s->where, arena, &t->rows.items[i], NULL))
             continue;
-        win_match_items[nmatch++] = i;
+        sorted_idx[nmatch++] = i;
     }
 
-    /* build sorted row index (by first ORDER BY we find, or original order) */
-    struct sort_entry *sorted = bump_calloc(&arena->scratch, nmatch ? nmatch : 1, sizeof(struct sort_entry));
-    int global_ord = -1;
+    if (nmatch == 0) return 0;
+
+    /* find the first window expression's partition and order columns */
+    int global_part = -1, global_ord = -1, global_ord_desc = 0;
     for (size_t e = 0; e < nexprs; e++) {
-        if (arena->select_exprs.items[s->select_exprs_start + e].kind == SEL_WINDOW && ord_idx[e] >= 0) {
-            global_ord = ord_idx[e];
-            break;
+        if (arena->select_exprs.items[s->select_exprs_start + e].kind == SEL_WINDOW) {
+            if (part_idx[e] >= 0 && global_part < 0) global_part = part_idx[e];
+            if (ord_idx[e] >= 0 && global_ord < 0) {
+                global_ord = ord_idx[e];
+                global_ord_desc = arena->select_exprs.items[s->select_exprs_start + e].win.order_desc;
+            }
         }
     }
-    for (size_t i = 0; i < nmatch; i++) {
-        sorted[i].idx = win_match_items[i];
-        if (global_ord >= 0)
-            sorted[i].key = &t->rows.items[win_match_items[i]].cells.items[global_ord];
-        else
-            sorted[i].key = NULL;
-    }
-    int global_ord_desc = 0;
-    for (size_t e = 0; e < nexprs; e++) {
-        if (arena->select_exprs.items[s->select_exprs_start + e].kind == SEL_WINDOW && ord_idx[e] >= 0) {
-            global_ord_desc = arena->select_exprs.items[s->select_exprs_start + e].win.order_desc;
-            break;
-        }
+
+    /* sort by (partition_col, order_col) using cmp_indices_multi */
+    int sort_cols[2];
+    int sort_descs[2];
+    size_t sort_ncols = 0;
+    if (global_part >= 0) {
+        sort_cols[sort_ncols] = global_part;
+        sort_descs[sort_ncols] = 0; /* partition always ASC for grouping */
+        sort_ncols++;
     }
     if (global_ord >= 0) {
-        _sort_entry_desc = global_ord_desc;
-        qsort(sorted, nmatch, sizeof(struct sort_entry), sort_entry_cmp);
+        sort_cols[sort_ncols] = global_ord;
+        sort_descs[sort_ncols] = global_ord_desc;
+        sort_ncols++;
+    }
+    if (sort_ncols > 0) {
+        _sort_ctx.table = t;
+        _sort_ctx.cols = sort_cols;
+        _sort_ctx.descs = sort_descs;
+        _sort_ctx.ncols = sort_ncols;
+        qsort(sorted_idx, nmatch, sizeof(size_t), cmp_indices_multi);
     }
 
-    /* for each row (in sorted order), compute all expressions */
+    /* build partition boundaries — O(N) linear scan */
+    size_t *part_starts = (size_t *)bump_alloc(&arena->scratch,
+                               (nmatch + 1) * sizeof(size_t));
+    size_t nparts = 0;
+    part_starts[nparts++] = 0;
+    for (size_t i = 1; i < nmatch; i++) {
+        if (global_part >= 0) {
+            struct cell *a = &t->rows.items[sorted_idx[i - 1]].cells.items[global_part];
+            struct cell *b = &t->rows.items[sorted_idx[i]].cells.items[global_part];
+            if (!cell_equal_nullsafe(a, b))
+                part_starts[nparts++] = i;
+        }
+    }
+    part_starts[nparts] = nmatch; /* sentinel */
+
+    /* pre-compute per-partition aggregate totals for SUM/COUNT/AVG without frames */
+    /* We store results indexed by sorted position, then emit in sorted order */
+    int *win_int_vals = (int *)bump_calloc(&arena->scratch, nmatch * nexprs, sizeof(int));
+    double *win_dbl_vals = (double *)bump_calloc(&arena->scratch, nmatch * nexprs, sizeof(double));
+    int *win_is_null = (int *)bump_calloc(&arena->scratch, nmatch * nexprs, sizeof(int));
+    int *win_is_dbl = (int *)bump_calloc(&arena->scratch, nexprs, sizeof(int));
+
+    /* process each window expression across all partitions */
+    for (size_t e = 0; e < nexprs; e++) {
+        struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
+        if (se->kind == SEL_COLUMN) continue;
+
+        for (size_t p = 0; p < nparts; p++) {
+            size_t ps = part_starts[p];
+            size_t pe = part_starts[p + 1];
+            size_t psize = pe - ps;
+
+            switch (se->win.func) {
+                case WIN_ROW_NUMBER:
+                    for (size_t i = ps; i < pe; i++)
+                        win_int_vals[i * nexprs + e] = (int)(i - ps + 1);
+                    break;
+
+                case WIN_RANK: {
+                    int rank = 1;
+                    for (size_t i = ps; i < pe; i++) {
+                        if (i > ps && ord_idx[e] >= 0) {
+                            int cmp = cell_compare(
+                                &t->rows.items[sorted_idx[i]].cells.items[ord_idx[e]],
+                                &t->rows.items[sorted_idx[i - 1]].cells.items[ord_idx[e]]);
+                            if (cmp != 0) rank = (int)(i - ps + 1);
+                        }
+                        win_int_vals[i * nexprs + e] = rank;
+                    }
+                    break;
+                }
+
+                case WIN_DENSE_RANK: {
+                    int rank = 1;
+                    for (size_t i = ps; i < pe; i++) {
+                        if (i > ps && ord_idx[e] >= 0) {
+                            int cmp = cell_compare(
+                                &t->rows.items[sorted_idx[i]].cells.items[ord_idx[e]],
+                                &t->rows.items[sorted_idx[i - 1]].cells.items[ord_idx[e]]);
+                            if (cmp != 0) rank++;
+                        }
+                        win_int_vals[i * nexprs + e] = rank;
+                    }
+                    break;
+                }
+
+                case WIN_NTILE: {
+                    int nbuckets = se->win.offset > 0 ? se->win.offset : 1;
+                    for (size_t i = ps; i < pe; i++) {
+                        size_t pos = i - ps; /* 0-based */
+                        int bucket = (int)((pos * (size_t)nbuckets) / psize) + 1;
+                        win_int_vals[i * nexprs + e] = bucket;
+                    }
+                    break;
+                }
+
+                case WIN_PERCENT_RANK: {
+                    win_is_dbl[e] = 1;
+                    if (psize <= 1) {
+                        for (size_t i = ps; i < pe; i++)
+                            win_dbl_vals[i * nexprs + e] = 0.0;
+                    } else {
+                        int rank = 1;
+                        for (size_t i = ps; i < pe; i++) {
+                            if (i > ps && ord_idx[e] >= 0) {
+                                int cmp = cell_compare(
+                                    &t->rows.items[sorted_idx[i]].cells.items[ord_idx[e]],
+                                    &t->rows.items[sorted_idx[i - 1]].cells.items[ord_idx[e]]);
+                                if (cmp != 0) rank = (int)(i - ps + 1);
+                            }
+                            win_dbl_vals[i * nexprs + e] = (double)(rank - 1) / (double)(psize - 1);
+                        }
+                    }
+                    break;
+                }
+
+                case WIN_CUME_DIST: {
+                    win_is_dbl[e] = 1;
+                    if (ord_idx[e] >= 0) {
+                        /* walk partition; for each group of tied values,
+                         * cume_dist = (last position of tie group + 1) / psize */
+                        size_t i = ps;
+                        while (i < pe) {
+                            /* find end of tie group */
+                            size_t j = i + 1;
+                            while (j < pe && cell_compare(
+                                &t->rows.items[sorted_idx[j]].cells.items[ord_idx[e]],
+                                &t->rows.items[sorted_idx[i]].cells.items[ord_idx[e]]) == 0)
+                                j++;
+                            double cd = (double)(j - ps) / (double)psize;
+                            for (size_t k = i; k < j; k++)
+                                win_dbl_vals[k * nexprs + e] = cd;
+                            i = j;
+                        }
+                    } else {
+                        for (size_t i = ps; i < pe; i++)
+                            win_dbl_vals[i * nexprs + e] = 1.0;
+                    }
+                    break;
+                }
+
+                case WIN_LAG:
+                case WIN_LEAD: {
+                    int offset = se->win.offset;
+                    for (size_t i = ps; i < pe; i++) {
+                        size_t pos = i - ps;
+                        size_t target;
+                        int in_range = 0;
+                        if (se->win.func == WIN_LAG) {
+                            if (pos >= (size_t)offset) { target = i - (size_t)offset; in_range = 1; }
+                        } else {
+                            target = i + (size_t)offset;
+                            if (target < pe) in_range = 1;
+                        }
+                        if (in_range && arg_idx[e] >= 0) {
+                            struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
+                            if (ac->is_null || (column_type_is_text(ac->type) && !ac->value.as_text)) {
+                                win_is_null[i * nexprs + e] = 1;
+                            } else {
+                                win_dbl_vals[i * nexprs + e] = cell_to_double(ac);
+                                win_is_dbl[e] = 1;
+                            }
+                        } else {
+                            win_is_null[i * nexprs + e] = 1;
+                        }
+                    }
+                    break;
+                }
+
+                case WIN_FIRST_VALUE:
+                case WIN_LAST_VALUE: {
+                    for (size_t i = ps; i < pe; i++) {
+                        size_t target = (se->win.func == WIN_FIRST_VALUE) ? ps : (pe - 1);
+                        if (arg_idx[e] >= 0) {
+                            struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
+                            if (ac->is_null || (column_type_is_text(ac->type) && !ac->value.as_text)) {
+                                win_is_null[i * nexprs + e] = 1;
+                            } else {
+                                win_dbl_vals[i * nexprs + e] = cell_to_double(ac);
+                                win_is_dbl[e] = 1;
+                            }
+                        } else {
+                            win_is_null[i * nexprs + e] = 1;
+                        }
+                    }
+                    break;
+                }
+
+                case WIN_NTH_VALUE: {
+                    int nth = se->win.offset; /* 1-based */
+                    for (size_t i = ps; i < pe; i++) {
+                        if (nth >= 1 && (size_t)nth <= psize && arg_idx[e] >= 0) {
+                            size_t target = ps + (size_t)(nth - 1);
+                            struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
+                            if (ac->is_null || (column_type_is_text(ac->type) && !ac->value.as_text)) {
+                                win_is_null[i * nexprs + e] = 1;
+                            } else {
+                                win_dbl_vals[i * nexprs + e] = cell_to_double(ac);
+                                win_is_dbl[e] = 1;
+                            }
+                        } else {
+                            win_is_null[i * nexprs + e] = 1;
+                        }
+                    }
+                    break;
+                }
+
+                case WIN_SUM:
+                case WIN_COUNT:
+                case WIN_AVG: {
+                    if (!se->win.has_frame) {
+                        /* no frame: compute partition total in one pass */
+                        double part_sum = 0.0;
+                        int part_nn = 0;
+                        int part_count = (int)psize;
+                        for (size_t i = ps; i < pe; i++) {
+                            if (arg_idx[e] >= 0) {
+                                struct cell *ac = &t->rows.items[sorted_idx[i]].cells.items[arg_idx[e]];
+                                if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text)) {
+                                    part_sum += cell_to_double(ac);
+                                    part_nn++;
+                                }
+                            }
+                        }
+                        for (size_t i = ps; i < pe; i++) {
+                            if (se->win.func == WIN_SUM) {
+                                if (arg_idx[e] >= 0 &&
+                                    t->columns.items[arg_idx[e]].type == COLUMN_TYPE_FLOAT) {
+                                    win_is_dbl[e] = 1;
+                                    win_dbl_vals[i * nexprs + e] = part_sum;
+                                } else {
+                                    win_int_vals[i * nexprs + e] = (int)part_sum;
+                                }
+                            } else if (se->win.func == WIN_COUNT) {
+                                win_int_vals[i * nexprs + e] = (arg_idx[e] >= 0) ? part_nn : part_count;
+                            } else { /* WIN_AVG */
+                                win_is_dbl[e] = 1;
+                                if (part_nn > 0) {
+                                    win_dbl_vals[i * nexprs + e] = part_sum / (double)part_nn;
+                                } else {
+                                    win_is_null[i * nexprs + e] = 1;
+                                }
+                            }
+                        }
+                    } else {
+                        /* with frame: compute per-row */
+                        for (size_t i = ps; i < pe; i++) {
+                            size_t my_pos = i - ps;
+                            size_t fs = 0, fe = psize;
+                            switch (se->win.frame_start) {
+                                case FRAME_UNBOUNDED_PRECEDING: fs = 0; break;
+                                case FRAME_CURRENT_ROW: fs = my_pos; break;
+                                case FRAME_N_PRECEDING: fs = (my_pos >= (size_t)se->win.frame_start_n) ? my_pos - (size_t)se->win.frame_start_n : 0; break;
+                                case FRAME_N_FOLLOWING: fs = my_pos + (size_t)se->win.frame_start_n; break;
+                                case FRAME_UNBOUNDED_FOLLOWING: fs = psize; break;
+                            }
+                            switch (se->win.frame_end) {
+                                case FRAME_UNBOUNDED_FOLLOWING: fe = psize; break;
+                                case FRAME_CURRENT_ROW: fe = my_pos + 1; break;
+                                case FRAME_N_FOLLOWING: fe = my_pos + (size_t)se->win.frame_end_n + 1; if (fe > psize) fe = psize; break;
+                                case FRAME_N_PRECEDING: fe = (my_pos >= (size_t)se->win.frame_end_n) ? my_pos - (size_t)se->win.frame_end_n + 1 : 0; break;
+                                case FRAME_UNBOUNDED_PRECEDING: fe = 0; break;
+                            }
+                            if (fs > psize) fs = psize;
+                            double frame_sum = 0.0;
+                            int frame_nn = 0;
+                            int frame_count = 0;
+                            for (size_t fi = fs; fi < fe; fi++) {
+                                size_t j = sorted_idx[ps + fi];
+                                frame_count++;
+                                if (arg_idx[e] >= 0) {
+                                    struct cell *ac = &t->rows.items[j].cells.items[arg_idx[e]];
+                                    if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text)) {
+                                        frame_sum += cell_to_double(ac);
+                                        frame_nn++;
+                                    }
+                                }
+                            }
+                            if (se->win.func == WIN_SUM) {
+                                if (arg_idx[e] >= 0 &&
+                                    t->columns.items[arg_idx[e]].type == COLUMN_TYPE_FLOAT) {
+                                    win_is_dbl[e] = 1;
+                                    win_dbl_vals[i * nexprs + e] = frame_sum;
+                                } else {
+                                    win_int_vals[i * nexprs + e] = (int)frame_sum;
+                                }
+                            } else if (se->win.func == WIN_COUNT) {
+                                win_int_vals[i * nexprs + e] = (arg_idx[e] >= 0) ? frame_nn : frame_count;
+                            } else { /* WIN_AVG */
+                                win_is_dbl[e] = 1;
+                                if (frame_nn > 0) {
+                                    win_dbl_vals[i * nexprs + e] = frame_sum / (double)frame_nn;
+                                } else {
+                                    win_is_null[i * nexprs + e] = 1;
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /* emit result rows in sorted order */
     for (size_t ri = 0; ri < nmatch; ri++) {
-        size_t row_i = sorted[ri].idx;
+        size_t row_i = sorted_idx[ri];
         struct row *src = &t->rows.items[row_i];
         struct row dst = {0};
         da_init(&dst.cells);
@@ -3333,319 +3614,72 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
 
             if (se->kind == SEL_COLUMN) {
                 cell_copy(&c, &src->cells.items[col_idx[e]]);
+            } else if (win_is_null[ri * nexprs + e]) {
+                c.type = (win_is_dbl[e]) ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
+                c.is_null = 1;
+            } else if (win_is_dbl[e]) {
+                c.type = COLUMN_TYPE_FLOAT;
+                c.value.as_float = win_dbl_vals[ri * nexprs + e];
             } else {
-                /* compute window value */
-                /* find partition peers: rows with same partition column value */
-                size_t part_count = 0;
-                size_t part_rank = 0;
-                int rank_set = 0;
+                c.type = COLUMN_TYPE_INT;
+                c.value.as_int = win_int_vals[ri * nexprs + e];
+            }
 
-                for (size_t rj = 0; rj < nmatch; rj++) {
-                    size_t j = sorted[rj].idx;
-                    struct row *peer = &t->rows.items[j];
-
-                    /* check partition match */
-                    if (se->win.has_partition && part_idx[e] >= 0) {
-                        if (!cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                        &peer->cells.items[part_idx[e]]))
-                            continue;
-                    }
-                    part_count++;
-
-                    /* for ROW_NUMBER/RANK, track position */
-                    if (j == row_i && !rank_set) {
-                        part_rank = part_count;
-                        rank_set = 1;
-                    }
+            /* LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE: copy actual cell for text types */
+            if (se->kind == SEL_WINDOW && !win_is_null[ri * nexprs + e] &&
+                (se->win.func == WIN_LAG || se->win.func == WIN_LEAD ||
+                 se->win.func == WIN_FIRST_VALUE || se->win.func == WIN_LAST_VALUE ||
+                 se->win.func == WIN_NTH_VALUE) && arg_idx[e] >= 0) {
+                /* re-derive the target row for text cell copy */
+                /* find which partition this row belongs to */
+                size_t p = 0;
+                for (size_t pp = 0; pp < nparts; pp++) {
+                    if (ri >= part_starts[pp] && ri < part_starts[pp + 1]) { p = pp; break; }
                 }
-
-                switch (se->win.func) {
-                    case WIN_ROW_NUMBER:
-                        c.type = COLUMN_TYPE_INT;
-                        c.value.as_int = (int)part_rank;
-                        break;
-                    case WIN_RANK:
-                        c.type = COLUMN_TYPE_INT;
-                        /* RANK: count peers with strictly better order key + 1 */
-                        if (se->win.has_order && ord_idx[e] >= 0) {
-                            int rank = 1;
-                            for (size_t rj = 0; rj < nmatch; rj++) {
-                                size_t j = sorted[rj].idx;
-                                if (se->win.has_partition && part_idx[e] >= 0) {
-                                    if (!cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                    &t->rows.items[j].cells.items[part_idx[e]]))
-                                        continue;
-                                }
-                                int cmp = cell_compare(&t->rows.items[j].cells.items[ord_idx[e]],
-                                                       &src->cells.items[ord_idx[e]]);
-                                /* ASC: count peers with smaller key; DESC: count peers with larger key */
-                                if (se->win.order_desc ? (cmp > 0) : (cmp < 0))
-                                    rank++;
-                            }
-                            c.value.as_int = rank;
-                        } else {
-                            c.value.as_int = (int)part_rank;
-                        }
-                        break;
-                    case WIN_SUM:
-                    case WIN_COUNT:
-                    case WIN_AVG: {
-                        /* build partition-local index for frame support */
-                        size_t pi[4096];
-                        size_t pn = 0;
-                        size_t my_pos = 0;
-                        for (size_t rj = 0; rj < nmatch && pn < 4096; rj++) {
-                            size_t j = sorted[rj].idx;
-                            if (se->win.has_partition && part_idx[e] >= 0 &&
-                                !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                &t->rows.items[j].cells.items[part_idx[e]]))
-                                continue;
-                            if (j == row_i) my_pos = pn;
-                            pi[pn++] = j;
-                        }
-                        /* compute frame bounds */
-                        size_t fs = 0, fe = pn; /* default: entire partition */
-                        if (se->win.has_frame) {
-                            switch (se->win.frame_start) {
-                                case FRAME_UNBOUNDED_PRECEDING: fs = 0; break;
-                                case FRAME_CURRENT_ROW: fs = my_pos; break;
-                                case FRAME_N_PRECEDING: fs = (my_pos >= (size_t)se->win.frame_start_n) ? my_pos - (size_t)se->win.frame_start_n : 0; break;
-                                case FRAME_N_FOLLOWING: fs = my_pos + (size_t)se->win.frame_start_n; break;
-                                case FRAME_UNBOUNDED_FOLLOWING: fs = pn; break;
-                            }
-                            switch (se->win.frame_end) {
-                                case FRAME_UNBOUNDED_FOLLOWING: fe = pn; break;
-                                case FRAME_CURRENT_ROW: fe = my_pos + 1; break;
-                                case FRAME_N_FOLLOWING: fe = my_pos + (size_t)se->win.frame_end_n + 1; if (fe > pn) fe = pn; break;
-                                case FRAME_N_PRECEDING: fe = (my_pos >= (size_t)se->win.frame_end_n) ? my_pos - (size_t)se->win.frame_end_n + 1 : 0; break;
-                                case FRAME_UNBOUNDED_PRECEDING: fe = 0; break;
-                            }
-                            if (fs > pn) fs = pn;
-                        }
-                        /* aggregate within frame */
-                        double frame_sum = 0.0;
-                        int frame_nn = 0;
-                        int frame_count = 0;
-                        for (size_t fi = fs; fi < fe; fi++) {
-                            size_t j = pi[fi];
-                            frame_count++;
-                            if (arg_idx[e] >= 0) {
-                                struct cell *ac = &t->rows.items[j].cells.items[arg_idx[e]];
-                                if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text)) {
-                                    frame_sum += cell_to_double(ac);
-                                    frame_nn++;
-                                }
-                            }
-                        }
-                        if (se->win.func == WIN_SUM) {
-                            if (arg_idx[e] >= 0 &&
-                                t->columns.items[arg_idx[e]].type == COLUMN_TYPE_FLOAT) {
-                                c.type = COLUMN_TYPE_FLOAT;
-                                c.value.as_float = frame_sum;
-                            } else {
-                                c.type = COLUMN_TYPE_INT;
-                                c.value.as_int = (int)frame_sum;
-                            }
-                        } else if (se->win.func == WIN_COUNT) {
-                            c.type = COLUMN_TYPE_INT;
-                            c.value.as_int = (arg_idx[e] >= 0) ? frame_nn : frame_count;
-                        } else { /* WIN_AVG */
-                            c.type = COLUMN_TYPE_FLOAT;
-                            if (frame_nn > 0) {
-                                c.value.as_float = frame_sum / (double)frame_nn;
-                            } else {
-                                c.is_null = 1;
-                            }
-                        }
-                        break;
-                    }
-                    case WIN_DENSE_RANK: {
-                        c.type = COLUMN_TYPE_INT;
-                        if (se->win.has_order && ord_idx[e] >= 0) {
-                            /* count distinct order key values that are strictly less */
-                            int rank = 1;
-                            /* collect unique order key values from partition peers */
-                            for (size_t rj = 0; rj < nmatch; rj++) {
-                                size_t j = sorted[rj].idx;
-                                if (se->win.has_partition && part_idx[e] >= 0 &&
-                                    !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                    &t->rows.items[j].cells.items[part_idx[e]]))
-                                    continue;
-                                int cmp = cell_compare(&t->rows.items[j].cells.items[ord_idx[e]],
-                                                       &src->cells.items[ord_idx[e]]);
-                                if (se->win.order_desc ? (cmp > 0) : (cmp < 0)) {
-                                    /* check if this value is distinct from all previously counted */
-                                    int is_dup = 0;
-                                    for (size_t rk = 0; rk < rj; rk++) {
-                                        size_t k = sorted[rk].idx;
-                                        if (se->win.has_partition && part_idx[e] >= 0 &&
-                                            !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                            &t->rows.items[k].cells.items[part_idx[e]]))
-                                            continue;
-                                        if (cell_equal_nullsafe(&t->rows.items[j].cells.items[ord_idx[e]],
-                                                                &t->rows.items[k].cells.items[ord_idx[e]])) {
-                                            is_dup = 1; break;
-                                        }
-                                    }
-                                    if (!is_dup) rank++;
-                                }
-                            }
-                            c.value.as_int = rank;
-                        } else {
-                            c.value.as_int = (int)part_rank;
-                        }
-                        break;
-                    }
-                    case WIN_NTILE: {
-                        c.type = COLUMN_TYPE_INT;
-                        int nbuckets = se->win.offset > 0 ? se->win.offset : 1;
-                        /* part_rank is 1-based position within partition */
-                        int bucket = (int)(((part_rank - 1) * (size_t)nbuckets) / part_count) + 1;
-                        c.value.as_int = bucket;
-                        break;
-                    }
-                    case WIN_PERCENT_RANK: {
-                        c.type = COLUMN_TYPE_FLOAT;
-                        if (part_count <= 1) {
-                            c.value.as_float = 0.0;
-                        } else if (se->win.has_order && ord_idx[e] >= 0) {
-                            /* rank - 1 / (partition_count - 1) */
-                            int rank = 1;
-                            for (size_t rj = 0; rj < nmatch; rj++) {
-                                size_t j = sorted[rj].idx;
-                                if (se->win.has_partition && part_idx[e] >= 0 &&
-                                    !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                    &t->rows.items[j].cells.items[part_idx[e]]))
-                                    continue;
-                                int cmp = cell_compare(&t->rows.items[j].cells.items[ord_idx[e]],
-                                                       &src->cells.items[ord_idx[e]]);
-                                if (se->win.order_desc ? (cmp > 0) : (cmp < 0))
-                                    rank++;
-                            }
-                            c.value.as_float = (double)(rank - 1) / (double)(part_count - 1);
-                        } else {
-                            c.value.as_float = 0.0;
-                        }
-                        break;
-                    }
-                    case WIN_CUME_DIST: {
-                        c.type = COLUMN_TYPE_FLOAT;
-                        if (se->win.has_order && ord_idx[e] >= 0) {
-                            /* count of peers with order key <= current / partition_count */
-                            int le_count = 0;
-                            for (size_t rj = 0; rj < nmatch; rj++) {
-                                size_t j = sorted[rj].idx;
-                                if (se->win.has_partition && part_idx[e] >= 0 &&
-                                    !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                    &t->rows.items[j].cells.items[part_idx[e]]))
-                                    continue;
-                                int cmp = cell_compare(&t->rows.items[j].cells.items[ord_idx[e]],
-                                                       &src->cells.items[ord_idx[e]]);
-                                if (se->win.order_desc ? (cmp >= 0) : (cmp <= 0))
-                                    le_count++;
-                            }
-                            c.value.as_float = (double)le_count / (double)part_count;
-                        } else {
-                            c.value.as_float = 1.0;
-                        }
-                        break;
-                    }
-                    case WIN_LAG:
-                    case WIN_LEAD: {
-                        /* find the row at offset positions before (LAG) or after (LEAD) */
-                        c.type = COLUMN_TYPE_INT;
-                        c.is_null = 1;
-                        int offset = se->win.offset;
-                        /* build partition-local sorted index */
-                        size_t part_pos = 0;
-                        size_t target_pos = 0;
-                        int found_self = 0;
-                        size_t part_indices[4096];
-                        size_t pn = 0;
-                        for (size_t rj = 0; rj < nmatch && pn < 4096; rj++) {
-                            size_t j = sorted[rj].idx;
-                            if (se->win.has_partition && part_idx[e] >= 0 &&
-                                !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                &t->rows.items[j].cells.items[part_idx[e]]))
-                                continue;
-                            if (j == row_i && !found_self) {
-                                part_pos = pn;
-                                found_self = 1;
-                            }
-                            part_indices[pn++] = j;
-                        }
-                        if (se->win.func == WIN_LAG)
-                            target_pos = (part_pos >= (size_t)offset) ? part_pos - (size_t)offset : pn; /* pn = out of range */
-                        else
-                            target_pos = part_pos + (size_t)offset;
-                        if (target_pos < pn && arg_idx[e] >= 0) {
-                            size_t tj = part_indices[target_pos];
-                            cell_copy(&c, &t->rows.items[tj].cells.items[arg_idx[e]]);
-                        }
-                        break;
-                    }
-                    case WIN_FIRST_VALUE:
-                    case WIN_LAST_VALUE: {
-                        c.type = COLUMN_TYPE_INT;
-                        c.is_null = 1;
-                        size_t first_j = 0, last_j = 0;
-                        int found_any = 0;
-                        for (size_t rj = 0; rj < nmatch; rj++) {
-                            size_t j = sorted[rj].idx;
-                            if (se->win.has_partition && part_idx[e] >= 0 &&
-                                !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                &t->rows.items[j].cells.items[part_idx[e]]))
-                                continue;
-                            if (!found_any) { first_j = j; found_any = 1; }
-                            last_j = j;
-                        }
-                        if (found_any && arg_idx[e] >= 0) {
-                            size_t tj = (se->win.func == WIN_FIRST_VALUE) ? first_j : last_j;
-                            cell_copy(&c, &t->rows.items[tj].cells.items[arg_idx[e]]);
-                        }
-                        break;
-                    }
-                    case WIN_NTH_VALUE: {
-                        c.type = COLUMN_TYPE_INT;
-                        c.is_null = 1;
-                        int nth = se->win.offset; /* 1-based */
-                        size_t count = 0;
-                        for (size_t rj = 0; rj < nmatch; rj++) {
-                            size_t j = sorted[rj].idx;
-                            if (se->win.has_partition && part_idx[e] >= 0 &&
-                                !cell_equal_nullsafe(&src->cells.items[part_idx[e]],
-                                                &t->rows.items[j].cells.items[part_idx[e]]))
-                                continue;
-                            count++;
-                            if ((int)count == nth && arg_idx[e] >= 0) {
-                                cell_copy(&c, &t->rows.items[j].cells.items[arg_idx[e]]);
-                                break;
-                            }
-                        }
-                        break;
-                    }
+                size_t ps = part_starts[p];
+                size_t pe = part_starts[p + 1];
+                size_t psize = pe - ps;
+                size_t target = ri; /* default */
+                size_t pos = ri - ps;
+                if (se->win.func == WIN_LAG) {
+                    if (pos >= (size_t)se->win.offset) target = ri - (size_t)se->win.offset;
+                } else if (se->win.func == WIN_LEAD) {
+                    target = ri + (size_t)se->win.offset;
+                } else if (se->win.func == WIN_FIRST_VALUE) {
+                    target = ps;
+                } else if (se->win.func == WIN_LAST_VALUE) {
+                    target = pe - 1;
+                } else if (se->win.func == WIN_NTH_VALUE) {
+                    int nth = se->win.offset;
+                    target = (nth >= 1 && (size_t)nth <= psize) ? ps + (size_t)(nth - 1) : ri;
+                }
+                struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
+                if (column_type_is_text(ac->type)) {
+                    c.type = COLUMN_TYPE_INT; /* reset */
+                    c.is_null = 0;
+                    cell_copy(&c, ac);
                 }
             }
+
             da_push(&dst.cells, c);
         }
         rows_push(result, dst);
     }
 
-    /* apply outer ORDER BY if present */
+    /* apply outer ORDER BY if present — use qsort */
     if (s->has_order_by && result->count > 1) {
-        /* build a temporary table descriptor from the result for sorting */
-        /* The result columns correspond to select_exprs; we need to find
-         * the ORDER BY column index within the result columns */
-        for (uint32_t oi = 0; oi < s->order_by_count; oi++) {
+        /* resolve ORDER BY columns in result */
+        int ob_cols[32];
+        int ob_descs[32];
+        size_t ob_n = 0;
+        for (uint32_t oi = 0; oi < s->order_by_count && ob_n < 32; oi++) {
             struct order_by_item *ob = &arena->order_items.items[s->order_by_start + oi];
             sv ord_name = ob->column;
-            int ord_desc = ob->desc;
             int res_col = -1;
-            /* find matching column in select_exprs */
             for (size_t e = 0; e < nexprs; e++) {
-                if (arena->select_exprs.items[s->select_exprs_start + e].kind == SEL_COLUMN) {
-                    sv col = arena->select_exprs.items[s->select_exprs_start + e].column;
-                    /* strip table prefix from both */
+                struct select_expr *se2 = &arena->select_exprs.items[s->select_exprs_start + e];
+                if (se2->kind == SEL_COLUMN) {
+                    sv col = se2->column;
                     sv bare_col = col, bare_ord = ord_name;
                     for (size_t k = 0; k < col.len; k++)
                         if (col.data[k] == '.') { bare_col = sv_from(col.data+k+1, col.len-k-1); break; }
@@ -3653,21 +3687,23 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                         if (ord_name.data[k] == '.') { bare_ord = sv_from(ord_name.data+k+1, ord_name.len-k-1); break; }
                     if (sv_eq_ignorecase(bare_col, bare_ord)) { res_col = (int)e; break; }
                 }
-            }
-            if (res_col < 0) continue;
-            /* simple bubble sort on result rows by res_col */
-            for (size_t i = 0; i < result->count - 1; i++) {
-                for (size_t j = i + 1; j < result->count; j++) {
-                    int cmp = cell_compare(&result->data[i].cells.items[res_col],
-                                           &result->data[j].cells.items[res_col]);
-                    if (ord_desc ? (cmp < 0) : (cmp > 0)) {
-                        struct row tmp = result->data[i];
-                        result->data[i] = result->data[j];
-                        result->data[j] = tmp;
-                    }
+                /* also match by alias */
+                if (se2->alias.len > 0 && sv_eq_ignorecase(se2->alias, ord_name)) {
+                    res_col = (int)e; break;
                 }
             }
-            break; /* only sort by first ORDER BY column for now */
+            if (res_col >= 0) {
+                ob_cols[ob_n] = res_col;
+                ob_descs[ob_n] = ob->desc;
+                ob_n++;
+            }
+        }
+        if (ob_n > 0) {
+            _sort_ctx.cols = ob_cols;
+            _sort_ctx.descs = ob_descs;
+            _sort_ctx.ncols = ob_n;
+            _sort_ctx.rows = result;
+            qsort(result->data, result->count, sizeof(struct row), cmp_rows_multi);
         }
     }
 

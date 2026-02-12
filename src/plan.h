@@ -86,6 +86,26 @@ struct plan_node {
             int    has_offset;
             int    has_limit;
         } limit;
+        struct {
+            uint16_t out_ncols;       /* total output columns (passthrough + window) */
+            uint16_t n_pass;          /* number of passthrough columns */
+            int     *pass_cols;       /* bump: table column indices for passthrough */
+            uint16_t n_win;           /* number of window expressions */
+            int     *win_part_col;    /* bump: partition column index per win expr (-1 = none) */
+            int     *win_ord_col;     /* bump: order column index per win expr (-1 = none) */
+            int     *win_ord_desc;    /* bump: 1=DESC per win expr */
+            int     *win_arg_col;     /* bump: arg column index per win expr (-1 = none) */
+            int     *win_func;        /* bump: enum win_func per win expr */
+            int     *win_offset;      /* bump: offset/ntile per win expr */
+            int     *win_has_frame;   /* bump: has_frame per win expr */
+            int     *win_frame_start; /* bump: enum frame_bound */
+            int     *win_frame_end;   /* bump: enum frame_bound */
+            int     *win_frame_start_n;
+            int     *win_frame_end_n;
+            int      sort_part_col;   /* global partition col for sort (-1 = none) */
+            int      sort_ord_col;    /* global order col for sort (-1 = none) */
+            int      sort_ord_desc;   /* global order direction */
+        } window;
     };
 };
 
@@ -139,6 +159,26 @@ struct sort_state {
     /* merged result */
     uint32_t *sorted_indices;   /* bump-allocated */
     uint32_t  sorted_count;
+};
+
+struct window_state {
+    int       input_done;
+    uint32_t  emit_cursor;
+    uint32_t  total_rows;
+    /* flat columnar arrays for ALL input columns */
+    void    **flat_data;        /* bump: [ncols] */
+    uint8_t **flat_nulls;       /* bump: [ncols] */
+    enum column_type *flat_types; /* bump: [ncols] */
+    uint16_t  input_ncols;
+    /* sorted index + partition boundaries */
+    uint32_t *sorted;           /* bump: [total_rows] */
+    uint32_t *part_starts;      /* bump: [nparts+1] */
+    uint32_t  nparts;
+    /* pre-computed window result columns */
+    int32_t  *win_i32;          /* bump: [n_win * total_rows] */
+    double   *win_f64;          /* bump: [n_win * total_rows] */
+    uint8_t  *win_null;         /* bump: [n_win * total_rows] */
+    int      *win_is_dbl;       /* bump: [n_win] — 1 if result is double */
 };
 
 struct limit_state {
