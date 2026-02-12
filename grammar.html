@@ -277,6 +277,7 @@
 &ensp;&ensp;| <span class="nt">create_view_stmt</span><br>
 &ensp;&ensp;| <span class="nt">drop_view_stmt</span><br>
 &ensp;&ensp;| <span class="nt">alter_table_stmt</span><br>
+&ensp;&ensp;| <span class="nt">truncate_stmt</span><br>
 &ensp;&ensp;| <span class="nt">transaction_stmt</span><br>
 </div>
 
@@ -422,8 +423,8 @@
 &ensp;&ensp;  [ <span class="nt">conflict_clause</span> ]<br>
 &ensp;&ensp;  [ <span class="kw">RETURNING</span> <span class="nt">select_list</span> ]<br>
 <br>
-&ensp;&ensp;| <span class="kw">INSERT INTO</span> <span class="nt">table_name</span> [ <span class="kw">(</span> <span class="nt">column_list</span> <span class="kw">)</span> ]<br>
-&ensp;&ensp;&ensp;&ensp;<span class="nt">select_stmt</span><br>
+&ensp;&ensp;| [ <span class="nt">with_clause</span> ] <span class="kw">INSERT INTO</span> <span class="nt">table_name</span> [ <span class="kw">(</span> <span class="nt">column_list</span> <span class="kw">)</span> ]<br>
+&ensp;&ensp;&ensp;&ensp;<span class="nt">select_stmt</span> <span class="comment">&ensp;-- INSERT...SELECT, with optional CTE</span><br>
 &ensp;&ensp;  [ <span class="nt">conflict_clause</span> ]<br>
 &ensp;&ensp;  [ <span class="kw">RETURNING</span> <span class="nt">select_list</span> ]<br>
 <br>
@@ -530,6 +531,9 @@
 <br>
 <span class="nt">drop_view_stmt</span> <span class="op">::=</span>
   <span class="kw">DROP VIEW</span> <span class="nt">name</span><br>
+<br>
+<span class="nt">truncate_stmt</span> <span class="op">::=</span>
+  <span class="kw">TRUNCATE</span> [ <span class="kw">TABLE</span> ] <span class="nt">table_name</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -580,6 +584,7 @@
 &ensp;&ensp;| <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="comment">&ensp;-- scalar subquery</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="nt">expr</span> <span class="kw">::</span> <span class="nt">data_type</span> <span class="comment">&ensp;-- postfix cast</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">CAST</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">AS</span> <span class="nt">data_type</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">IS</span> [ <span class="kw">NOT</span> ] <span class="kw">NULL</span> <span class="comment">&ensp;-- postfix null test (expression-level)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 <br>
 <span class="nt">binary_op</span> <span class="op">::=</span>
   <span class="kw">+</span> | <span class="kw">-</span> | <span class="kw">*</span> | <span class="kw">/</span> | <span class="kw">%</span> | <span class="kw">||</span><br>
@@ -616,9 +621,24 @@
 &ensp;&ensp;| <span class="kw">DATE_TRUNC</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">AGE</span> <span class="kw">(</span> <span class="nt">expr</span> [ <span class="kw">,</span> <span class="nt">expr</span> ] <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">TO_CHAR</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">string</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">REPLACE</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">LEFT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> / <span class="kw">RIGHT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">ABS</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">ROUND</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">CEIL</span> / <span class="kw">FLOOR</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">REPLACE</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">LEFT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> / <span class="kw">RIGHT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">LPAD</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> [ <span class="kw">,</span> <span class="nt">fill</span> ] <span class="kw">)</span> / <span class="kw">RPAD</span> <span class="kw">(</span> ... <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CONCAT_WS</span> <span class="kw">(</span> <span class="nt">sep</span> <span class="kw">,</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">POSITION</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">IN</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">SPLIT_PART</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">delim</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">REPEAT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">REVERSE</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">INITCAP</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">ABS</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CEIL</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">FLOOR</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">ROUND</span> <span class="kw">(</span> <span class="nt">expr</span> [ <span class="kw">,</span> <span class="nt">n</span> ] <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">POWER</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">SQRT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">MOD</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">SIGN</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">RANDOM</span> <span class="kw">()</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">STRING_AGG</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">delimiter</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">ARRAY_AGG</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -693,9 +713,7 @@
         </tr>
         <tr>
             <td><strong>Functions</strong></td>
-            <td><code>REPLACE()</code>, <code>LEFT()</code>/<code>RIGHT()</code>,
-                <code>ABS()</code>, <code>ROUND()</code>, <code>CEIL()</code>/<code>FLOOR()</code>,
-                <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code></td>
+            <td><code>STRING_AGG()</code>, <code>ARRAY_AGG()</code></td>
             <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
         </tr>
         <tr>
@@ -709,7 +727,6 @@
             <td><strong>DDL</strong></td>
             <td><code>CREATE TABLE ... AS SELECT</code>,
                 <code>CREATE MATERIALIZED VIEW</code>,
-                <code>TRUNCATE</code>,
                 table-level constraints (<code>CONSTRAINT ... UNIQUE(...)</code>),
                 <code>IF EXISTS</code>/<code>IF NOT EXISTS</code>,
                 <code>CASCADE</code>/<code>RESTRICT</code> on DROP</td>
@@ -740,8 +757,8 @@
         <tr>
             <td><strong>Subqueries</strong></td>
             <td><code>LATERAL</code> subqueries in <code>FROM</code> (without <code>JOIN</code>),
-                <code>WITH ... INSERT/UPDATE/DELETE</code> (writable CTEs)</td>
-            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
+                <code>WITH ... UPDATE/DELETE</code> (writable CTEs; <code>WITH ... INSERT...SELECT</code> is supported)</td>
+            <td><span class="badge badge-partial">PARTIAL</span></td>
         </tr>
         <tr>
             <td><strong>Other</strong></td>
