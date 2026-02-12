@@ -235,6 +235,8 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
         return pn->set_op.ncols;
     if (pn->op == PLAN_GENERATE_SERIES)
         return 1;
+    if (pn->op == PLAN_EXPR_PROJECT)
+        return pn->expr_project.ncols;
     /* For pass-through nodes, recurse to child */
     return plan_node_ncols(arena, pn->left);
 }
@@ -690,6 +692,51 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             }
             goto done;
         }
+
+        if (column_type_is_text(cb->type)) {
+            const char *cmp_str = pn->filter.cmp_val.value.as_text;
+            char * const *vals = cb->data.str;
+            const uint8_t *nulls = cb->nulls;
+            uint16_t count = out->count;
+
+            if (!cmp_str) cmp_str = "";
+
+            switch (op) {
+                case 0: /* CMP_EQ */
+                    for (uint16_t i = 0; i < count; i++)
+                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) == 0)
+                            sel[sel_count++] = i;
+                    break;
+                case 1: /* CMP_NEQ */
+                    for (uint16_t i = 0; i < count; i++)
+                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) != 0)
+                            sel[sel_count++] = i;
+                    break;
+                case 2: /* CMP_LT */
+                    for (uint16_t i = 0; i < count; i++)
+                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) < 0)
+                            sel[sel_count++] = i;
+                    break;
+                case 3: /* CMP_GT */
+                    for (uint16_t i = 0; i < count; i++)
+                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) > 0)
+                            sel[sel_count++] = i;
+                    break;
+                case 4: /* CMP_LTE */
+                    for (uint16_t i = 0; i < count; i++)
+                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) <= 0)
+                            sel[sel_count++] = i;
+                    break;
+                case 5: /* CMP_GTE */
+                    for (uint16_t i = 0; i < count; i++)
+                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) >= 0)
+                            sel[sel_count++] = i;
+                    break;
+                default:
+                    goto fallback;
+            }
+            goto done;
+        }
     }
 
 fallback:
@@ -749,6 +796,143 @@ static int project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             out->cols[c] = input.cols[src_col];
         }
     }
+    return 0;
+}
+
+/* ---- Expression projection: evaluate arbitrary expressions per row ---- */
+
+static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                             struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct table *t = pn->expr_project.table;
+    uint16_t out_ncols = pn->expr_project.ncols;
+    uint32_t *expr_indices = pn->expr_project.expr_indices;
+
+    /* Pull a block from the child (full table scan) */
+    uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
+    if (child_ncols == 0) return -1;
+
+    struct row_block input;
+    row_block_alloc(&input, child_ncols, &ctx->arena->scratch);
+    int rc = plan_next_block(ctx, pn->left, &input);
+    if (rc != 0) return rc;
+
+    uint16_t active = row_block_active_count(&input);
+    if (active == 0) return -1;
+
+    /* Build a temporary row struct for eval_expr.
+     * We reuse the same cells array for each row — just update values. */
+    struct row tmp_row = {0};
+    tmp_row.cells.count = child_ncols;
+    struct cell *tmp_cells = (struct cell *)bump_alloc(&ctx->arena->scratch,
+                                                       child_ncols * sizeof(struct cell));
+    tmp_row.cells.items = tmp_cells;
+
+    /* Initialize output col_blocks */
+    out->count = active;
+    out->sel = NULL;
+    out->sel_count = 0;
+
+    /* Process each active row */
+    for (uint16_t r = 0; r < active; r++) {
+        uint16_t ri = row_block_row_idx(&input, r);
+
+        /* Reconstruct row from col_blocks */
+        for (uint16_t c = 0; c < child_ncols; c++) {
+            struct col_block *cb = &input.cols[c];
+            struct cell *cell = &tmp_cells[c];
+            cell->type = cb->type;
+            if (cb->nulls[ri]) {
+                cell->is_null = 1;
+                cell->value.as_int = 0;
+            } else {
+                cell->is_null = 0;
+                if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN)
+                    cell->value.as_int = cb->data.i32[ri];
+                else if (cb->type == COLUMN_TYPE_BIGINT)
+                    cell->value.as_bigint = cb->data.i64[ri];
+                else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC)
+                    cell->value.as_float = cb->data.f64[ri];
+                else
+                    cell->value.as_text = cb->data.str[ri];
+            }
+        }
+
+        /* Evaluate each output expression */
+        for (uint16_t c = 0; c < out_ncols; c++) {
+            struct cell result = eval_expr(expr_indices[c], ctx->arena, t, &tmp_row,
+                                           ctx->db, &ctx->arena->scratch);
+            struct col_block *ocb = &out->cols[c];
+
+            if (r == 0) {
+                /* First row: set the output column type */
+                ocb->type = result.is_null ? COLUMN_TYPE_TEXT : result.type;
+            }
+
+            if (result.is_null) {
+                ocb->nulls[r] = 1;
+            } else {
+                ocb->nulls[r] = 0;
+                enum column_type ot = ocb->type;
+                if (ot == COLUMN_TYPE_INT || ot == COLUMN_TYPE_BOOLEAN) {
+                    if (result.type == COLUMN_TYPE_INT || result.type == COLUMN_TYPE_BOOLEAN)
+                        ocb->data.i32[r] = result.value.as_int;
+                    else if (result.type == COLUMN_TYPE_BIGINT)
+                        ocb->data.i32[r] = (int32_t)result.value.as_bigint;
+                    else if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
+                        ocb->data.i32[r] = (int32_t)result.value.as_float;
+                    else
+                        ocb->data.i32[r] = 0;
+                } else if (ot == COLUMN_TYPE_BIGINT) {
+                    if (result.type == COLUMN_TYPE_BIGINT)
+                        ocb->data.i64[r] = result.value.as_bigint;
+                    else if (result.type == COLUMN_TYPE_INT)
+                        ocb->data.i64[r] = result.value.as_int;
+                    else if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
+                        ocb->data.i64[r] = (int64_t)result.value.as_float;
+                    else
+                        ocb->data.i64[r] = 0;
+                } else if (ot == COLUMN_TYPE_FLOAT || ot == COLUMN_TYPE_NUMERIC) {
+                    if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
+                        ocb->data.f64[r] = result.value.as_float;
+                    else if (result.type == COLUMN_TYPE_INT)
+                        ocb->data.f64[r] = result.value.as_int;
+                    else if (result.type == COLUMN_TYPE_BIGINT)
+                        ocb->data.f64[r] = (double)result.value.as_bigint;
+                    else
+                        ocb->data.f64[r] = 0.0;
+                } else {
+                    /* Text-like types */
+                    if (column_type_is_text(result.type) || result.type == COLUMN_TYPE_DATE ||
+                        result.type == COLUMN_TYPE_TIMESTAMP || result.type == COLUMN_TYPE_TIMESTAMPTZ ||
+                        result.type == COLUMN_TYPE_INTERVAL || result.type == COLUMN_TYPE_UUID ||
+                        result.type == COLUMN_TYPE_ENUM || result.type == COLUMN_TYPE_TIME) {
+                        ocb->data.str[r] = result.value.as_text;
+                        ocb->type = result.type;
+                    } else {
+                        /* Numeric result but text output column — convert */
+                        char buf[64];
+                        if (result.type == COLUMN_TYPE_INT)
+                            snprintf(buf, sizeof(buf), "%d", result.value.as_int);
+                        else if (result.type == COLUMN_TYPE_BIGINT)
+                            snprintf(buf, sizeof(buf), "%lld", result.value.as_bigint);
+                        else if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
+                            snprintf(buf, sizeof(buf), "%g", result.value.as_float);
+                        else
+                            buf[0] = '\0';
+                        ocb->data.str[r] = bump_strdup(&ctx->arena->scratch, buf);
+                    }
+                }
+                /* Update output type if first non-null row sets a more specific type */
+                if (r == 0 || (ocb->type == COLUMN_TYPE_TEXT && !column_type_is_text(result.type) && !result.is_null)) {
+                    /* Keep the type from first non-null result */
+                }
+            }
+            ocb->count = r + 1;
+        }
+    }
+
     return 0;
 }
 
@@ -2770,6 +2954,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     if (pn->op == PLAN_SET_OP)       return set_op_next(ctx, node_idx, out);
     if (pn->op == PLAN_DISTINCT)     return distinct_next(ctx, node_idx, out);
     if (pn->op == PLAN_GENERATE_SERIES) return gen_series_next(ctx, node_idx, out);
+    if (pn->op == PLAN_EXPR_PROJECT) return expr_project_next(ctx, node_idx, out);
     /* Not yet implemented */
     return -1;
 }
@@ -3592,31 +3777,54 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
 
     int select_all = sv_eq_cstr(s->columns, "*");
 
-    /* Determine projection: either SELECT * or all parsed_columns are simple column refs */
+    /* Determine projection: either SELECT * or all parsed_columns are simple column refs,
+     * or expression-based columns (UPPER(x), ABS(y), etc.) */
     int need_project = 0;
+    int need_expr_project = 0;
     int *proj_map = NULL;
+    uint32_t *expr_proj_indices = NULL;
     uint16_t proj_ncols = 0;
 
     if (select_all) {
         /* No projection needed — return all columns */
     } else if (s->parsed_columns_count > 0) {
-        /* Check that every parsed column is a simple EXPR_COLUMN_REF */
         proj_ncols = (uint16_t)s->parsed_columns_count;
         proj_map = (int *)bump_alloc(&arena->scratch, proj_ncols * sizeof(int));
+        int all_column_refs = 1;
         for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
             struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
-            if (sc->expr_idx == IDX_NONE) return IDX_NONE;
+            if (sc->expr_idx == IDX_NONE) { all_column_refs = 0; break; }
             struct expr *e = &EXPR(arena, sc->expr_idx);
-            if (e->type != EXPR_COLUMN_REF) return IDX_NONE;
+            if (e->type != EXPR_COLUMN_REF) { all_column_refs = 0; break; }
             int ci = table_find_column_sv(t, e->column_ref.column);
-            if (ci < 0) return IDX_NONE;
+            if (ci < 0) { all_column_refs = 0; break; }
             proj_map[i] = ci;
         }
-        need_project = 1;
+        if (all_column_refs) {
+            need_project = 1;
+        } else {
+            /* Check if we can use expression projection */
+            expr_proj_indices = (uint32_t *)bump_alloc(&arena->scratch, proj_ncols * sizeof(uint32_t));
+            int expr_ok = 1;
+            for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+                struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
+                if (sc->expr_idx == IDX_NONE) { expr_ok = 0; break; }
+                /* Bail out for subquery expressions — too complex */
+                struct expr *e = &EXPR(arena, sc->expr_idx);
+                if (e->type == EXPR_SUBQUERY) { expr_ok = 0; break; }
+                expr_proj_indices[i] = sc->expr_idx;
+            }
+            if (!expr_ok) return IDX_NONE;
+            need_expr_project = 1;
+        }
     } else {
         /* Legacy text-based column list — can't handle */
         return IDX_NONE;
     }
+
+    /* Expression projection can't handle ORDER BY or DISTINCT yet — bail to legacy */
+    if (need_expr_project && s->has_order_by) return IDX_NONE;
+    if (need_expr_project && s->has_distinct) return IDX_NONE;
 
     /* Pre-validate ORDER BY columns BEFORE allocating plan nodes */
     int  sort_cols_buf[32];
@@ -3766,17 +3974,23 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         enum column_type ct = t->columns.items[filter_col].type;
         if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BOOLEAN &&
             ct != COLUMN_TYPE_FLOAT && ct != COLUMN_TYPE_NUMERIC &&
-            ct != COLUMN_TYPE_BIGINT)
+            ct != COLUMN_TYPE_BIGINT && !column_type_is_text(ct))
             return IDX_NONE;
         if (cond->op > CMP_GE) return IDX_NONE;
-        /* Reject cross-type comparisons (e.g. INT col vs FLOAT value from subquery) */
-        if (!cond->value.is_null && cond->value.type != ct &&
-            !(ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT) &&
-            !(ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT))
-            return IDX_NONE;
-        /* If INT column but FLOAT value, reject — fast path can't handle */
-        if (ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)
-            return IDX_NONE;
+        /* For text columns, accept text comparison values */
+        if (column_type_is_text(ct)) {
+            if (!cond->value.is_null && !column_type_is_text(cond->value.type))
+                return IDX_NONE;
+        } else {
+            /* Reject cross-type comparisons (e.g. INT col vs FLOAT value from subquery) */
+            if (!cond->value.is_null && cond->value.type != ct &&
+                !(ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT) &&
+                !(ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT))
+                return IDX_NONE;
+            /* If INT column but FLOAT value, reject — fast path can't handle */
+            if (ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)
+                return IDX_NONE;
+        }
         filter_ok = 1;
     }
 where_done:
@@ -3928,6 +4142,16 @@ append_sort_project_limit:
         PLAN_NODE(arena, proj_idx).project.ncols = proj_ncols;
         PLAN_NODE(arena, proj_idx).project.col_map = proj_map;
         current = proj_idx;
+    }
+
+    /* Add expression projection node for computed columns */
+    if (need_expr_project) {
+        uint32_t eproj_idx = plan_alloc_node(arena, PLAN_EXPR_PROJECT);
+        PLAN_NODE(arena, eproj_idx).left = current;
+        PLAN_NODE(arena, eproj_idx).expr_project.ncols = proj_ncols;
+        PLAN_NODE(arena, eproj_idx).expr_project.expr_indices = expr_proj_indices;
+        PLAN_NODE(arena, eproj_idx).expr_project.table = t;
+        current = eproj_idx;
     }
 
     /* Add DISTINCT node if present (after sort+project, before limit) */

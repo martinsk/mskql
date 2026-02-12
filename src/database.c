@@ -1,6 +1,7 @@
 #include "database.h"
 #include "parser.h"
 #include "query.h"
+#include "plan.h"
 #include "stringview.h"
 #include <string.h>
 #include <strings.h>
@@ -1060,8 +1061,8 @@ static void snapshot_restore(struct database *db, struct db_snapshot *snap)
  * freed by remove_temp_table → table_free, called from db_exec_query which
  * is the sole caller.  Ownership is: materialize allocates, db_exec_query
  * uses and then removes — a clear producer/consumer pair in the same file. */
-static struct table *materialize_subquery(struct database *db, const char *sql,
-                                          const char *table_name)
+struct table *materialize_subquery(struct database *db, const char *sql,
+                                  const char *table_name)
 {
     struct query sq = {0};
     if (query_parse(sql, &sq) != 0) {
@@ -1069,9 +1070,30 @@ static struct table *materialize_subquery(struct database *db, const char *sql,
         return NULL;
     }
     struct rows sq_rows = {0};
-    if (db_exec(db, &sq, &sq_rows, NULL) != 0) {
-        query_free(&sq);
-        return NULL;
+
+    /* Try plan executor fast path for simple SELECTs */
+    int used_plan = 0;
+    if (sq.query_type == QUERY_TYPE_SELECT) {
+        struct query_select *ss = &sq.select;
+        struct table *src = NULL;
+        if (ss->table.len > 0)
+            src = db_find_table_sv(db, ss->table);
+        if (src) {
+            uint32_t plan_root = plan_build_select(src, ss, &sq.arena, db);
+            if (plan_root != IDX_NONE) {
+                struct plan_exec_ctx ctx;
+                plan_exec_init(&ctx, &sq.arena, db, plan_root);
+                plan_exec_to_rows(&ctx, plan_root, &sq_rows, NULL);
+                used_plan = 1;
+            }
+        }
+    }
+
+    if (!used_plan) {
+        if (db_exec(db, &sq, &sq_rows, NULL) != 0) {
+            query_free(&sq);
+            return NULL;
+        }
     }
     struct table ct = {0};
     ct.name = strdup(table_name);
@@ -1150,19 +1172,9 @@ static struct table *materialize_subquery(struct database *db, const char *sql,
             }
         }
     }
-    /* copy rows */
-    for (size_t i = 0; i < sq_rows.count; i++) {
-        struct row r = {0};
-        da_init(&r.cells);
-        for (size_t c = 0; c < sq_rows.data[i].cells.count; c++) {
-            struct cell cp;
-            cell_copy(&cp, &sq_rows.data[i].cells.items[c]);
-            da_push(&r.cells, cp);
-        }
-        da_push(&ct.rows, r);
-    }
+    /* move rows — transfer ownership, no cell_copy/strdup needed */
     for (size_t i = 0; i < sq_rows.count; i++)
-        row_free(&sq_rows.data[i]);
+        da_push(&ct.rows, sq_rows.data[i]);
     free(sq_rows.data);
     query_free(&sq);
     da_push(&db->tables, ct);
@@ -1170,7 +1182,7 @@ static struct table *materialize_subquery(struct database *db, const char *sql,
 }
 
 /* Remove a temporary table from the database by pointer */
-static void remove_temp_table(struct database *db, struct table *t)
+void remove_temp_table(struct database *db, struct table *t)
 {
     if (!t) return;
     for (size_t i = 0; i < db->tables.count; i++) {

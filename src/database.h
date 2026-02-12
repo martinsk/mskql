@@ -42,4 +42,13 @@ int  db_exec(struct database *db, struct query *q, struct rows *result, struct b
 int  db_exec_sql(struct database *db, const char *sql, struct rows *result);
 void db_free(struct database *db);
 
+/* Materialize a subquery into a temporary table added to db->tables.
+ * Returns a pointer to the new table, or NULL on failure.
+ * The caller is responsible for calling remove_temp_table when done. */
+struct table *materialize_subquery(struct database *db, const char *sql,
+                                   const char *table_name);
+
+/* Remove a temporary table from the database by pointer */
+void remove_temp_table(struct database *db, struct table *t);
+
 #endif

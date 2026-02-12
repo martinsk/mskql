@@ -834,6 +834,43 @@ static int send_row_desc_plan(int fd, struct table *t, struct table *t2,
                         ci = table_find_column_sv(t2, e->column_ref.column);
                         if (ci >= 0) colname = t2->columns.items[ci].name;
                     }
+                } else if (e->type == EXPR_FUNC_CALL) {
+                    static const char *func_names[] = {
+                        [FUNC_COALESCE]="coalesce", [FUNC_NULLIF]="nullif",
+                        [FUNC_GREATEST]="greatest", [FUNC_LEAST]="least",
+                        [FUNC_UPPER]="upper", [FUNC_LOWER]="lower",
+                        [FUNC_LENGTH]="length", [FUNC_TRIM]="trim",
+                        [FUNC_SUBSTRING]="substring", [FUNC_ABS]="abs",
+                        [FUNC_CEIL]="ceil", [FUNC_FLOOR]="floor",
+                        [FUNC_ROUND]="round", [FUNC_POWER]="power",
+                        [FUNC_SQRT]="sqrt", [FUNC_MOD]="mod",
+                        [FUNC_SIGN]="sign", [FUNC_RANDOM]="random",
+                        [FUNC_REPLACE]="replace", [FUNC_LPAD]="lpad",
+                        [FUNC_RPAD]="rpad", [FUNC_CONCAT]="concat",
+                        [FUNC_CONCAT_WS]="concat_ws", [FUNC_POSITION]="position",
+                        [FUNC_SPLIT_PART]="split_part", [FUNC_LEFT]="left",
+                        [FUNC_RIGHT]="right", [FUNC_REPEAT]="repeat",
+                        [FUNC_REVERSE]="reverse", [FUNC_INITCAP]="initcap",
+                        [FUNC_NOW]="now", [FUNC_CURRENT_TIMESTAMP]="current_timestamp",
+                        [FUNC_CURRENT_DATE]="current_date", [FUNC_EXTRACT]="extract",
+                        [FUNC_DATE_TRUNC]="date_trunc", [FUNC_DATE_PART]="date_part",
+                        [FUNC_AGE]="age", [FUNC_TO_CHAR]="to_char",
+                        [FUNC_NEXTVAL]="nextval", [FUNC_CURRVAL]="currval",
+                        [FUNC_GEN_RANDOM_UUID]="gen_random_uuid",
+                    };
+                    int fn = (int)e->func_call.func;
+                    if (fn >= 0 && fn < (int)(sizeof(func_names)/sizeof(func_names[0])) && func_names[fn])
+                        colname = func_names[fn];
+                } else if (e->type == EXPR_CAST) {
+                    /* For CAST/:: expressions, use the inner expression's column name */
+                    uint32_t inner_idx = e->cast.operand;
+                    if (inner_idx != IDX_NONE) {
+                        struct expr *inner = &EXPR(&q->arena, inner_idx);
+                        if (inner->type == EXPR_COLUMN_REF && t) {
+                            int ci = table_find_column_sv(t, inner->column_ref.column);
+                            if (ci >= 0) colname = t->columns.items[ci].name;
+                        }
+                    }
                 }
             }
         } else if (t && (size_t)i < t->columns.count) {
@@ -864,10 +901,70 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     if (q->query_type != QUERY_TYPE_SELECT) return -1;
 
     struct query_select *s = &q->select;
+
+    /* ---- CTE materialization ---- */
+    struct table *cte_temps[32] = {0};
+    size_t n_cte_temps = 0;
+    struct query_arena *qa = &q->arena;
+
+    /* Save CTE fields so we can restore them if plan_build_select fails
+     * and the legacy path needs to re-materialize */
+    uint32_t saved_ctes_count = s->ctes_count;
+    uint32_t saved_ctes_start = s->ctes_start;
+    uint32_t saved_cte_name = s->cte_name;
+    uint32_t saved_cte_sql = s->cte_sql;
+
+    if (s->ctes_count > 0 && !s->has_recursive_cte) {
+        for (uint32_t ci = 0; ci < s->ctes_count && n_cte_temps < 32; ci++) {
+            struct cte_def *cd = &qa->ctes.items[s->ctes_start + ci];
+            if (cd->is_recursive) goto cte_bail; /* recursive — fall back */
+            const char *cd_sql = ASTRING(qa, cd->sql_idx);
+            const char *cd_name = ASTRING(qa, cd->name_idx);
+            cte_temps[n_cte_temps] = materialize_subquery(db, cd_sql, cd_name);
+            if (!cte_temps[n_cte_temps]) goto cte_bail;
+            n_cte_temps++;
+        }
+        /* Clear CTE fields so plan_build_select doesn't bail */
+        s->ctes_count = 0;
+        s->cte_name = IDX_NONE;
+        s->cte_sql = IDX_NONE;
+    } else if (s->cte_name != IDX_NONE && s->cte_sql != IDX_NONE &&
+               !s->has_recursive_cte) {
+        /* Legacy single CTE */
+        const char *cd_sql = ASTRING(qa, s->cte_sql);
+        const char *cd_name = ASTRING(qa, s->cte_name);
+        cte_temps[0] = materialize_subquery(db, cd_sql, cd_name);
+        if (!cte_temps[0]) return -1;
+        n_cte_temps = 1;
+        s->cte_name = IDX_NONE;
+        s->cte_sql = IDX_NONE;
+    }
+
+    if (0) {
+    cte_bail:
+        /* Restore CTE fields and clean up temps — legacy path will handle */
+        s->ctes_count = saved_ctes_count;
+        s->ctes_start = saved_ctes_start;
+        s->cte_name = saved_cte_name;
+        s->cte_sql = saved_cte_sql;
+        for (size_t ci = n_cte_temps; ci > 0; ci--)
+            remove_temp_table(db, cte_temps[ci - 1]);
+        return -1;
+    }
+
     struct table *t = NULL;
     if (s->table.len > 0)
         t = db_find_table_sv(db, s->table);
-    if (!t && !s->has_generate_series) return -1;
+    if (!t && !s->has_generate_series) {
+        /* Restore CTE fields so legacy path can handle */
+        s->ctes_count = saved_ctes_count;
+        s->ctes_start = saved_ctes_start;
+        s->cte_name = saved_cte_name;
+        s->cte_sql = saved_cte_sql;
+        for (size_t ci = n_cte_temps; ci > 0; ci--)
+            remove_temp_table(db, cte_temps[ci - 1]);
+        return -1;
+    }
 
     /* For JOINs, find the second table */
     struct table *t2 = NULL;
@@ -877,13 +974,26 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     }
 
     uint32_t plan_root = plan_build_select(t, s, &q->arena, db);
-    if (plan_root == IDX_NONE) return -1;
+    if (plan_root == IDX_NONE) {
+        /* Restore CTE fields so legacy path can handle */
+        s->ctes_count = saved_ctes_count;
+        s->ctes_start = saved_ctes_start;
+        s->cte_name = saved_cte_name;
+        s->cte_sql = saved_cte_sql;
+        for (size_t ci = n_cte_temps; ci > 0; ci--)
+            remove_temp_table(db, cte_temps[ci - 1]);
+        return -1;
+    }
 
     struct plan_exec_ctx ctx;
     plan_exec_init(&ctx, &q->arena, db, plan_root);
 
     uint16_t ncols = plan_node_ncols(&q->arena, plan_root);
-    if (ncols == 0) return -1;
+    if (ncols == 0) {
+        for (size_t ci = n_cte_temps; ci > 0; ci--)
+            remove_temp_table(db, cte_temps[ci - 1]);
+        return -1;
+    }
 
     /* Pull first block to determine column types for RowDescription */
     struct row_block block;
@@ -896,6 +1006,8 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         for (uint16_t i = 0; i < ncols && i < 64; i++)
             types[i] = (t && i < t->columns.count) ? t->columns.items[i].type : COLUMN_TYPE_INT;
         send_row_desc_plan(fd, t, t2, q, ncols, types);
+        for (size_t ci = n_cte_temps; ci > 0; ci--)
+            remove_temp_table(db, cte_temps[ci - 1]);
         return 0;
     }
 
@@ -904,8 +1016,11 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     for (uint16_t i = 0; i < ncols && i < 64; i++)
         col_types[i] = block.cols[i].type;
 
-    if (send_row_desc_plan(fd, t, t2, q, ncols, col_types) != 0)
+    if (send_row_desc_plan(fd, t, t2, q, ncols, col_types) != 0) {
+        for (size_t ci = n_cte_temps; ci > 0; ci--)
+            remove_temp_table(db, cte_temps[ci - 1]);
         return -1;
+    }
 
     /* Send data rows directly from blocks — batched into a large buffer */
     struct msgbuf wire;
@@ -948,6 +1063,8 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         if (wire.len >= 65536) {
             if (send_all(fd, wire.data, wire.len) != 0) {
                 msgbuf_free(&wire);
+                for (size_t ci = n_cte_temps; ci > 0; ci--)
+                    remove_temp_table(db, cte_temps[ci - 1]);
                 return -1;
             }
             wire.len = 0;
@@ -963,10 +1080,16 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     if (wire.len > 0) {
         if (send_all(fd, wire.data, wire.len) != 0) {
             msgbuf_free(&wire);
+            for (size_t ci = n_cte_temps; ci > 0; ci--)
+                remove_temp_table(db, cte_temps[ci - 1]);
             return -1;
         }
     }
     msgbuf_free(&wire);
+
+    /* Clean up CTE temp tables */
+    for (size_t ci = n_cte_temps; ci > 0; ci--)
+        remove_temp_table(db, cte_temps[ci - 1]);
 
     return (int)total_rows;
 }

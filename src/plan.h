@@ -24,6 +24,7 @@ enum plan_op {
     PLAN_WINDOW,         /* window functions */
     PLAN_HASH_SEMI_JOIN, /* hash semi-join for IN (SELECT ...) */
     PLAN_GENERATE_SERIES, /* virtual table: generate_series(start, stop, step) */
+    PLAN_EXPR_PROJECT,   /* expression evaluation: UPPER(x), ABS(y), etc. */
 };
 
 /* Plan node: arena-allocated in query_arena.plan_nodes DA.
@@ -103,6 +104,11 @@ struct plan_node {
             long long step;
             int       use_bigint;    /* 1 = BIGINT, 0 = INT */
         } gen_series;
+        struct {
+            uint16_t ncols;           /* number of output columns */
+            uint32_t *expr_indices;   /* bump-allocated: arena expr index per output col */
+            struct table *table;      /* source table (for eval_expr column lookups) */
+        } expr_project;
         struct {
             uint16_t out_ncols;       /* total output columns (passthrough + window) */
             uint16_t n_pass;          /* number of passthrough columns */
