@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1770920800549,
+  "lastUpdate": 1770921809117,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -2211,6 +2211,85 @@ window.BENCHMARK_DATA = {
           {
             "name": "transaction",
             "value": 18.986,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "2919d4047caf299f6a1946cdacc011cd032d81a2",
+          "message": "remove CodSpeed benchmark workflow (replaced by github-action-benchmark in existing CI)",
+          "timestamp": "2026-02-12T10:43:05-08:00",
+          "tree_id": "03f4fef617e84abeb301e0e890fc94f6fa97332c",
+          "url": "https://github.com/martinsk/mskql/commit/2919d4047caf299f6a1946cdacc011cd032d81a2"
+        },
+        "date": 1770921808596,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 14.276,
+            "unit": "ms"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 80.884,
+            "unit": "ms"
+          },
+          {
+            "name": "select_where",
+            "value": 103.198,
+            "unit": "ms"
+          },
+          {
+            "name": "aggregate",
+            "value": 189.976,
+            "unit": "ms"
+          },
+          {
+            "name": "order_by",
+            "value": 110.718,
+            "unit": "ms"
+          },
+          {
+            "name": "join",
+            "value": 33.554,
+            "unit": "ms"
+          },
+          {
+            "name": "update",
+            "value": 24.275,
+            "unit": "ms"
+          },
+          {
+            "name": "delete",
+            "value": 118.687,
+            "unit": "ms"
+          },
+          {
+            "name": "parser",
+            "value": 254.728,
+            "unit": "ms"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.644,
+            "unit": "ms"
+          },
+          {
+            "name": "transaction",
+            "value": 19.142,
             "unit": "ms"
           }
         ]
