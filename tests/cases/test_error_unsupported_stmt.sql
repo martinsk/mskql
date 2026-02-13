@@ -1,6 +1,6 @@
 -- Unsupported SQL keyword should report the keyword
 -- input:
-EXPLAIN SELECT 1;
+GRANT ALL ON foo TO bar;
 -- expected output:
-ERROR:  expected SQL keyword, got 'EXPLAIN'
+ERROR:  expected SQL keyword, got 'GRANT'
 -- expected status: 1

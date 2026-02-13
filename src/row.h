@@ -2,12 +2,14 @@
 #define ROW_H
 
 #include <stdlib.h>
+#include <stdint.h>
 #include "dynamic_array.h"
 #include "column.h"
 
 struct bump_alloc; /* forward declaration — defined in arena.h */
 
 union cell_value {
+    int16_t as_smallint;
     int as_int;
     double as_float;
     char *as_text;

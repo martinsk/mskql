@@ -237,13 +237,16 @@ static uint32_t cell_hash(const struct cell *c)
     if (c->is_null) return 0;
     uint32_t h = 2166136261u;
     switch (c->type) {
+        case COLUMN_TYPE_SMALLINT:
         case COLUMN_TYPE_INT:
         case COLUMN_TYPE_BOOLEAN:
         case COLUMN_TYPE_BIGINT:
         case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_NUMERIC: {
             double dv;
-            if (c->type == COLUMN_TYPE_INT || c->type == COLUMN_TYPE_BOOLEAN)
+            if (c->type == COLUMN_TYPE_SMALLINT)
+                dv = (double)c->value.as_smallint;
+            else if (c->type == COLUMN_TYPE_INT || c->type == COLUMN_TYPE_BOOLEAN)
                 dv = (double)c->value.as_int;
             else if (c->type == COLUMN_TYPE_BIGINT)
                 dv = (double)c->value.as_bigint;
@@ -1367,6 +1370,61 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             }
             arena_set_error(&q->arena, "42P01", "view '%.*s' does not exist", (int)vn.len, vn.data);
             return -1;
+        }
+        case QUERY_TYPE_EXPLAIN: {
+            struct query_explain *ex = &q->explain;
+            /* Copy inner SQL to a stack buffer so stringviews remain valid */
+            size_t sql_len = ex->inner_sql.len;
+            char inner_sql[sql_len + 1];
+            memcpy(inner_sql, ex->inner_sql.data, sql_len);
+            inner_sql[sql_len] = '\0';
+
+            struct query inner_q;
+            memset(&inner_q, 0, sizeof(inner_q));
+            query_arena_init(&inner_q.arena);
+            int prc = query_parse_into(inner_sql, &inner_q, &inner_q.arena);
+            if (prc != 0) {
+                if (inner_q.arena.errmsg[0])
+                    arena_set_error(&q->arena, inner_q.arena.sqlstate, "%s", inner_q.arena.errmsg);
+                query_arena_destroy(&inner_q.arena);
+                return -1;
+            }
+
+            char explain_buf[4096];
+            int explain_len = 0;
+
+            if (inner_q.query_type == QUERY_TYPE_SELECT) {
+                struct table *t = db_find_table_sv(db, inner_q.select.table);
+                uint32_t root = IDX_NONE;
+                if (t)
+                    root = plan_build_select(t, &inner_q.select, &inner_q.arena, db);
+                if (root != IDX_NONE) {
+                    explain_len = plan_explain(&inner_q.arena, root, explain_buf, sizeof(explain_buf));
+                } else {
+                    explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
+                }
+            } else {
+                explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
+            }
+
+            /* Build result rows — one row per line */
+            char *line = explain_buf;
+            for (int i = 0; i <= explain_len; i++) {
+                if (i == explain_len || explain_buf[i] == '\n') {
+                    explain_buf[i] = '\0';
+                    struct row r = {0};
+                    da_init(&r.cells);
+                    struct cell c = {0};
+                    c.type = COLUMN_TYPE_TEXT;
+                    c.value.as_text = rb ? bump_strdup(rb, line) : strdup(line);
+                    da_push(&r.cells, c);
+                    rows_push(result, r);
+                    line = explain_buf + i + 1;
+                }
+            }
+
+            query_arena_destroy(&inner_q.arena);
+            return 0;
         }
         case QUERY_TYPE_TRUNCATE: {
             struct table *t = db_find_table_sv(db, q->del.table);

@@ -327,7 +327,8 @@ enum query_type {
     QUERY_TYPE_DROP_SEQUENCE,
     QUERY_TYPE_CREATE_VIEW,
     QUERY_TYPE_DROP_VIEW,
-    QUERY_TYPE_TRUNCATE
+    QUERY_TYPE_TRUNCATE,
+    QUERY_TYPE_EXPLAIN
 };
 
 enum alter_action {
@@ -561,6 +562,11 @@ struct query_drop_view {
     sv name;
 };
 
+struct query_explain {
+    sv inner_sql;        /* the SQL text after EXPLAIN [ANALYZE] */
+    int has_analyze;     /* 1 if EXPLAIN ANALYZE */
+};
+
 struct query {
     enum query_type query_type;
     struct query_arena arena;
@@ -580,6 +586,7 @@ struct query {
         struct query_drop_sequence drop_seq;
         struct query_create_view create_view;
         struct query_drop_view drop_view;
+        struct query_explain explain;
     };
 };
 

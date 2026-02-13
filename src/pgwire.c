@@ -186,6 +186,7 @@ static int send_empty_query(int fd, struct msgbuf *m)
 static uint32_t column_type_to_oid(enum column_type t)
 {
     switch (t) {
+        case COLUMN_TYPE_SMALLINT:  return 21;    /* int2 */
         case COLUMN_TYPE_INT:       return 23;    /* int4 */
         case COLUMN_TYPE_FLOAT:     return 701;   /* float8 */
         case COLUMN_TYPE_TEXT:      return 25;    /* text */
@@ -214,6 +215,10 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c)
     const char *txt;
     size_t len;
     switch (c->type) {
+        case COLUMN_TYPE_SMALLINT:
+            len = (size_t)snprintf(buf, sizeof(buf), "%d", (int)c->value.as_smallint);
+            txt = buf;
+            break;
         case COLUMN_TYPE_INT:
             len = (size_t)snprintf(buf, sizeof(buf), "%d", c->value.as_int);
             txt = buf;
@@ -732,7 +737,10 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
     char buf[64];
     const char *txt;
     size_t len;
-    if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
+    if (cb->type == COLUMN_TYPE_SMALLINT) {
+        len = fast_i32_to_str((int32_t)cb->data.i16[ri], buf);
+        txt = buf;
+    } else if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
         if (cb->type == COLUMN_TYPE_BOOLEAN) {
             buf[0] = cb->data.i32[ri] ? 't' : 'f';
             buf[1] = '\0';
@@ -1244,6 +1252,14 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
             break;
         case QUERY_TYPE_TRUNCATE:
             snprintf(tag, sizeof(tag), "TRUNCATE TABLE");
+            break;
+        case QUERY_TYPE_EXPLAIN:
+            if (result->count > 0) {
+                if (!skip_row_desc)
+                    send_row_description(fd, db, &q, result);
+                send_data_rows(fd, result);
+            }
+            snprintf(tag, sizeof(tag), "EXPLAIN");
             break;
         case QUERY_TYPE_BEGIN:
             snprintf(tag, sizeof(tag), "BEGIN");

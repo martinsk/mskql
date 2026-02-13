@@ -275,6 +275,9 @@ int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
 /* Get output column count for a plan node. */
 uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx);
 
+/* Generate EXPLAIN text for a plan tree. Writes into buf, returns bytes written. */
+int plan_explain(struct query_arena *arena, uint32_t node_idx, char *buf, int buflen);
+
 /* ---- Block utility functions ---- */
 
 /* Initialize a row_block with ncols columns, bump-allocated from scratch. */

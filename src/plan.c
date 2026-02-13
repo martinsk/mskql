@@ -46,7 +46,9 @@ static void scan_cache_build(struct table *t)
         sc->col_types[c] = ct;
 
         size_t elem_sz;
-        if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+        if (ct == COLUMN_TYPE_SMALLINT)
+            elem_sz = sizeof(int16_t);
+        else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
             elem_sz = sizeof(int32_t);
         else if (ct == COLUMN_TYPE_BIGINT)
             elem_sz = sizeof(int64_t);
@@ -59,7 +61,17 @@ static void scan_cache_build(struct table *t)
         sc->col_nulls[c] = (uint8_t *)calloc(nrows ? nrows : 1, 1);
 
         /* Fill from row-store */
-        if (ct == COLUMN_TYPE_INT) {
+        if (ct == COLUMN_TYPE_SMALLINT) {
+            int16_t *dst = (int16_t *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != COLUMN_TYPE_SMALLINT) {
+                    sc->col_nulls[c][r] = 1;
+                } else {
+                    dst[r] = cell->value.as_smallint;
+                }
+            }
+        } else if (ct == COLUMN_TYPE_INT) {
             int32_t *dst = (int32_t *)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[r].cells.items[c];
@@ -151,7 +163,9 @@ static uint16_t scan_cache_read(struct scan_cache *sc, size_t *cursor,
         memcpy(cb->nulls, sc->col_nulls[tc] + start, nrows);
 
         enum column_type ct = sc->col_types[tc];
-        if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+        if (ct == COLUMN_TYPE_SMALLINT)
+            memcpy(cb->data.i16, (int16_t *)sc->col_data[tc] + start, nrows * sizeof(int16_t));
+        else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
             memcpy(cb->data.i32, (int32_t *)sc->col_data[tc] + start, nrows * sizeof(int32_t));
         else if (ct == COLUMN_TYPE_BIGINT)
             memcpy(cb->data.i64, (int64_t *)sc->col_data[tc] + start, nrows * sizeof(int64_t));
@@ -171,7 +185,9 @@ static inline void cb_copy_value(struct col_block *dst, uint32_t dst_i,
                                  const struct col_block *src, uint16_t src_i)
 {
     dst->nulls[dst_i] = src->nulls[src_i];
-    if (column_type_is_text(src->type)) {
+    if (src->type == COLUMN_TYPE_SMALLINT) {
+        dst->data.i16[dst_i] = src->data.i16[src_i];
+    } else if (column_type_is_text(src->type)) {
         dst->data.str[dst_i] = src->data.str[src_i];
     } else if (src->type == COLUMN_TYPE_BIGINT) {
         dst->data.i64[dst_i] = src->data.i64[src_i];
@@ -187,7 +203,9 @@ static inline void cb_bulk_copy(struct col_block *dst,
                                 const struct col_block *src, uint32_t count)
 {
     memcpy(dst->nulls, src->nulls, count);
-    if (column_type_is_text(src->type)) {
+    if (src->type == COLUMN_TYPE_SMALLINT) {
+        memcpy(dst->data.i16, src->data.i16, count * sizeof(int16_t));
+    } else if (column_type_is_text(src->type)) {
         memcpy(dst->data.str, src->data.str, count * sizeof(char *));
     } else if (src->type == COLUMN_TYPE_BIGINT) {
         memcpy(dst->data.i64, src->data.i64, count * sizeof(int64_t));
@@ -317,8 +335,18 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
         }
         cb->count = nrows;
 
-        /* Fast path for INT columns: tight loop without per-cell switch */
-        if (col_type == COLUMN_TYPE_INT) {
+        /* Fast path for SMALLINT columns */
+        if (col_type == COLUMN_TYPE_SMALLINT) {
+            for (uint16_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[start + r].cells.items[tc];
+                if (cell->is_null || cell->type != COLUMN_TYPE_SMALLINT) {
+                    cb->nulls[r] = 1;
+                } else {
+                    cb->nulls[r] = 0;
+                    cb->data.i16[r] = cell->value.as_smallint;
+                }
+            }
+        } else if (col_type == COLUMN_TYPE_INT) {
             for (uint16_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[start + r].cells.items[tc];
                 if (cell->is_null || cell->type != COLUMN_TYPE_INT) {
@@ -359,6 +387,9 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
                 }
                 cb->nulls[r] = 0;
                 switch (cell->type) {
+                    case COLUMN_TYPE_SMALLINT:
+                        cb->data.i16[r] = cell->value.as_smallint;
+                        break;
                     case COLUMN_TYPE_INT:
                         cb->data.i32[r] = cell->value.as_int;
                         break;
@@ -411,6 +442,9 @@ void block_to_rows(const struct row_block *blk, struct rows *result, struct bump
                 cell.is_null = 1;
             } else {
                 switch (cb->type) {
+                    case COLUMN_TYPE_SMALLINT:
+                        cell.value.as_smallint = cb->data.i16[ri];
+                        break;
                     case COLUMN_TYPE_INT:
                         cell.value.as_int = cb->data.i32[ri];
                         break;
@@ -560,7 +594,9 @@ static int index_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 cb->nulls[nrows] = 1;
             } else {
                 cb->nulls[nrows] = 0;
-                if (cell->type == COLUMN_TYPE_INT)
+                if (cell->type == COLUMN_TYPE_SMALLINT)
+                    cb->data.i16[nrows] = cell->value.as_smallint;
+                else if (cell->type == COLUMN_TYPE_INT)
                     cb->data.i32[nrows] = cell->value.as_int;
                 else if (cell->type == COLUMN_TYPE_FLOAT)
                     cb->data.f64[nrows] = cell->value.as_float;
@@ -605,7 +641,23 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         struct col_block *cb = &out->cols[pn->filter.col_idx];
         int op = pn->filter.cmp_op;
 
-        if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
+        if (cb->type == COLUMN_TYPE_SMALLINT) {
+            int16_t cmp_val = (pn->filter.cmp_val.type == COLUMN_TYPE_SMALLINT)
+                ? pn->filter.cmp_val.value.as_smallint : (int16_t)pn->filter.cmp_val.value.as_int;
+            const int16_t *vals = cb->data.i16;
+            const uint8_t *nulls = cb->nulls;
+            uint16_t count = out->count;
+
+            switch (op) {
+                case CMP_EQ: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] == cmp_val) sel[sel_count++] = r; break;
+                case CMP_NE: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] != cmp_val) sel[sel_count++] = r; break;
+                case CMP_LT: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] <  cmp_val) sel[sel_count++] = r; break;
+                case CMP_GT: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] >  cmp_val) sel[sel_count++] = r; break;
+                case CMP_LE: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] <= cmp_val) sel[sel_count++] = r; break;
+                case CMP_GE: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] >= cmp_val) sel[sel_count++] = r; break;
+                default: break;
+            }
+        } else if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
             int32_t cmp_val = pn->filter.cmp_val.value.as_int;
             const int32_t *vals = cb->data.i32;
             const uint8_t *nulls = cb->nulls;
@@ -848,7 +900,9 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 memset(&cell->value, 0, sizeof(cell->value));
             } else {
                 cell->is_null = 0;
-                if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN)
+                if (cb->type == COLUMN_TYPE_SMALLINT)
+                    cell->value.as_smallint = cb->data.i16[ri];
+                else if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN)
                     cell->value.as_int = cb->data.i32[ri];
                 else if (cb->type == COLUMN_TYPE_BIGINT)
                     cell->value.as_bigint = cb->data.i64[ri];
@@ -875,8 +929,21 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             } else {
                 ocb->nulls[r] = 0;
                 enum column_type ot = ocb->type;
-                if (ot == COLUMN_TYPE_INT || ot == COLUMN_TYPE_BOOLEAN) {
-                    if (result.type == COLUMN_TYPE_INT || result.type == COLUMN_TYPE_BOOLEAN)
+                if (ot == COLUMN_TYPE_SMALLINT) {
+                    if (result.type == COLUMN_TYPE_SMALLINT)
+                        ocb->data.i16[r] = result.value.as_smallint;
+                    else if (result.type == COLUMN_TYPE_INT)
+                        ocb->data.i16[r] = (int16_t)result.value.as_int;
+                    else if (result.type == COLUMN_TYPE_BIGINT)
+                        ocb->data.i16[r] = (int16_t)result.value.as_bigint;
+                    else if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
+                        ocb->data.i16[r] = (int16_t)result.value.as_float;
+                    else
+                        ocb->data.i16[r] = 0;
+                } else if (ot == COLUMN_TYPE_INT || ot == COLUMN_TYPE_BOOLEAN) {
+                    if (result.type == COLUMN_TYPE_SMALLINT)
+                        ocb->data.i32[r] = (int32_t)result.value.as_smallint;
+                    else if (result.type == COLUMN_TYPE_INT || result.type == COLUMN_TYPE_BOOLEAN)
                         ocb->data.i32[r] = result.value.as_int;
                     else if (result.type == COLUMN_TYPE_BIGINT)
                         ocb->data.i32[r] = (int32_t)result.value.as_bigint;
@@ -887,6 +954,8 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 } else if (ot == COLUMN_TYPE_BIGINT) {
                     if (result.type == COLUMN_TYPE_BIGINT)
                         ocb->data.i64[r] = result.value.as_bigint;
+                    else if (result.type == COLUMN_TYPE_SMALLINT)
+                        ocb->data.i64[r] = result.value.as_smallint;
                     else if (result.type == COLUMN_TYPE_INT)
                         ocb->data.i64[r] = result.value.as_int;
                     else if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
@@ -896,6 +965,8 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 } else if (ot == COLUMN_TYPE_FLOAT || ot == COLUMN_TYPE_NUMERIC) {
                     if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
                         ocb->data.f64[r] = result.value.as_float;
+                    else if (result.type == COLUMN_TYPE_SMALLINT)
+                        ocb->data.f64[r] = result.value.as_smallint;
                     else if (result.type == COLUMN_TYPE_INT)
                         ocb->data.f64[r] = result.value.as_int;
                     else if (result.type == COLUMN_TYPE_BIGINT)
@@ -913,7 +984,9 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     } else {
                         /* Numeric result but text output column — convert */
                         char buf[64];
-                        if (result.type == COLUMN_TYPE_INT)
+                        if (result.type == COLUMN_TYPE_SMALLINT)
+                            snprintf(buf, sizeof(buf), "%d", (int)result.value.as_smallint);
+                        else if (result.type == COLUMN_TYPE_INT)
                             snprintf(buf, sizeof(buf), "%d", result.value.as_int);
                         else if (result.type == COLUMN_TYPE_BIGINT)
                             snprintf(buf, sizeof(buf), "%lld", result.value.as_bigint);
@@ -1398,7 +1471,11 @@ static int sort_flat_cmp(const void *a, const void *b)
 
         int cmp = 0;
         enum column_type kt = _bsort_ctx.key_types[k];
-        if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN) {
+        if (kt == COLUMN_TYPE_SMALLINT) {
+            int16_t va = ((const int16_t *)_bsort_ctx.flat_keys[k])[ia];
+            int16_t vb = ((const int16_t *)_bsort_ctx.flat_keys[k])[ib];
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN) {
             int32_t va = ((const int32_t *)_bsort_ctx.flat_keys[k])[ia];
             int32_t vb = ((const int32_t *)_bsort_ctx.flat_keys[k])[ib];
             cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
@@ -1515,7 +1592,9 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             _bsort_ctx.flat_col_types[ci] = kt;
 
             size_t elem_sz;
-            if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
+            if (kt == COLUMN_TYPE_SMALLINT)
+                elem_sz = sizeof(int16_t);
+            else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
                 elem_sz = sizeof(int32_t);
             else if (kt == COLUMN_TYPE_BIGINT)
                 elem_sz = sizeof(int64_t);
@@ -1534,7 +1613,9 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 struct col_block *src = &_bsort_ctx.all_cols[b * child_ncols + ci];
                 uint16_t cnt = st->collected[b].count;
                 memcpy(_bsort_ctx.flat_col_nulls[ci] + fi, src->nulls, cnt);
-                if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
+                if (kt == COLUMN_TYPE_SMALLINT)
+                    memcpy((int16_t *)_bsort_ctx.flat_col_data[ci] + fi, src->data.i16, cnt * sizeof(int16_t));
+                else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
                     memcpy((int32_t *)_bsort_ctx.flat_col_data[ci] + fi, src->data.i32, cnt * sizeof(int32_t));
                 else if (kt == COLUMN_TYPE_BIGINT)
                     memcpy((int64_t *)_bsort_ctx.flat_col_data[ci] + fi, src->data.i64, cnt * sizeof(int64_t));
@@ -1582,7 +1663,9 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         for (uint16_t c = 0; c < child_ncols; c++) {
             out->cols[c].nulls[out_count] = _bsort_ctx.flat_col_nulls[c][fi];
             enum column_type ct = _bsort_ctx.flat_col_types[c];
-            if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+            if (ct == COLUMN_TYPE_SMALLINT)
+                out->cols[c].data.i16[out_count] = ((const int16_t *)_bsort_ctx.flat_col_data[c])[fi];
+            else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
                 out->cols[c].data.i32[out_count] = ((const int32_t *)_bsort_ctx.flat_col_data[c])[fi];
             else if (ct == COLUMN_TYPE_BIGINT)
                 out->cols[c].data.i64[out_count] = ((const int64_t *)_bsort_ctx.flat_col_data[c])[fi];
@@ -1627,7 +1710,11 @@ static int window_sort_cmp(const void *a, const void *b)
         if (!an) {
             int cmp = 0;
             enum column_type pt = _wsort_ctx.part_type;
-            if (pt == COLUMN_TYPE_INT || pt == COLUMN_TYPE_BOOLEAN) {
+            if (pt == COLUMN_TYPE_SMALLINT) {
+                int16_t va = ((int16_t *)_wsort_ctx.part_data)[ia];
+                int16_t vb = ((int16_t *)_wsort_ctx.part_data)[ib];
+                cmp = (va > vb) - (va < vb);
+            } else if (pt == COLUMN_TYPE_INT || pt == COLUMN_TYPE_BOOLEAN) {
                 int32_t va = ((int32_t *)_wsort_ctx.part_data)[ia];
                 int32_t vb = ((int32_t *)_wsort_ctx.part_data)[ib];
                 cmp = (va > vb) - (va < vb);
@@ -1655,7 +1742,11 @@ static int window_sort_cmp(const void *a, const void *b)
         if (!an) {
             int cmp = 0;
             enum column_type ot = _wsort_ctx.ord_type;
-            if (ot == COLUMN_TYPE_INT || ot == COLUMN_TYPE_BOOLEAN) {
+            if (ot == COLUMN_TYPE_SMALLINT) {
+                int16_t va = ((int16_t *)_wsort_ctx.ord_data)[ia];
+                int16_t vb = ((int16_t *)_wsort_ctx.ord_data)[ib];
+                cmp = (va > vb) - (va < vb);
+            } else if (ot == COLUMN_TYPE_INT || ot == COLUMN_TYPE_BOOLEAN) {
                 int32_t va = ((int32_t *)_wsort_ctx.ord_data)[ia];
                 int32_t vb = ((int32_t *)_wsort_ctx.ord_data)[ib];
                 cmp = (va > vb) - (va < vb);
@@ -1684,6 +1775,7 @@ static int window_sort_cmp(const void *a, const void *b)
 static inline double flat_col_to_double(void *data, uint8_t *nulls, enum column_type ct, uint32_t idx)
 {
     if (nulls[idx]) return 0.0;
+    if (ct == COLUMN_TYPE_SMALLINT) return (double)((int16_t *)data)[idx];
     if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN) return (double)((int32_t *)data)[idx];
     if (ct == COLUMN_TYPE_BIGINT) return (double)((int64_t *)data)[idx];
     if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) return ((double *)data)[idx];
@@ -1696,6 +1788,10 @@ static inline int flat_col_ord_cmp(void *data, enum column_type ct, uint8_t *nul
     if (an && bn) return 0;
     if (an) return 1;
     if (bn) return -1;
+    if (ct == COLUMN_TYPE_SMALLINT) {
+        int16_t va = ((int16_t *)data)[a], vb = ((int16_t *)data)[b];
+        return (va > vb) - (va < vb);
+    }
     if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN) {
         int32_t va = ((int32_t *)data)[a], vb = ((int32_t *)data)[b];
         return (va > vb) - (va < vb);
@@ -1778,7 +1874,8 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             enum column_type kt = nblocks > 0 ? collected[0].cols[ci].type : COLUMN_TYPE_INT;
             st->flat_types[ci] = kt;
             size_t esz;
-            if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN) esz = sizeof(int32_t);
+            if (kt == COLUMN_TYPE_SMALLINT) esz = sizeof(int16_t);
+            else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN) esz = sizeof(int32_t);
             else if (kt == COLUMN_TYPE_BIGINT) esz = sizeof(int64_t);
             else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC) esz = sizeof(double);
             else esz = sizeof(char *);
@@ -1791,7 +1888,9 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 struct col_block *src = &collected[b].cols[ci];
                 uint16_t cnt = collected[b].count;
                 memcpy(st->flat_nulls[ci] + fi, src->nulls, cnt);
-                if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
+                if (kt == COLUMN_TYPE_SMALLINT)
+                    memcpy((int16_t *)st->flat_data[ci] + fi, src->data.i16, cnt * sizeof(int16_t));
+                else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
                     memcpy((int32_t *)st->flat_data[ci] + fi, src->data.i32, cnt * sizeof(int32_t));
                 else if (kt == COLUMN_TYPE_BIGINT)
                     memcpy((int64_t *)st->flat_data[ci] + fi, src->data.i64, cnt * sizeof(int64_t));
@@ -2093,7 +2192,9 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             int sci = pn->window.pass_cols[c];
             out->cols[c].nulls[out_count] = st->flat_nulls[sci][fi];
             enum column_type ct = st->flat_types[sci];
-            if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+            if (ct == COLUMN_TYPE_SMALLINT)
+                out->cols[c].data.i16[out_count] = ((int16_t *)st->flat_data[sci])[fi];
+            else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
                 out->cols[c].data.i32[out_count] = ((int32_t *)st->flat_data[sci])[fi];
             else if (ct == COLUMN_TYPE_BIGINT)
                 out->cols[c].data.i64[out_count] = ((int64_t *)st->flat_data[sci])[fi];
@@ -2137,6 +2238,8 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 static inline uint32_t semi_hash_flat(enum column_type type, const void *data, uint32_t i)
 {
     switch (type) {
+        case COLUMN_TYPE_SMALLINT:
+            return block_hash_i32((int32_t)((const int16_t *)data)[i]);
         case COLUMN_TYPE_INT:
         case COLUMN_TYPE_BOOLEAN:
             return block_hash_i32(((const int32_t *)data)[i]);
@@ -2164,6 +2267,8 @@ static inline int semi_eq_cb_flat(const struct col_block *cb, uint16_t oi,
 {
     if (cb->nulls[oi]) return 0;
     switch (type) {
+        case COLUMN_TYPE_SMALLINT:
+            return cb->data.i16[oi] == ((const int16_t *)data)[fi];
         case COLUMN_TYPE_INT:
         case COLUMN_TYPE_BOOLEAN:
             return cb->data.i32[oi] == ((const int32_t *)data)[fi];
@@ -2192,6 +2297,8 @@ static inline int semi_eq_cb_flat(const struct col_block *cb, uint16_t oi,
 static size_t semi_elem_size(enum column_type type)
 {
     switch (type) {
+        case COLUMN_TYPE_SMALLINT:
+            return sizeof(int16_t);
         case COLUMN_TYPE_INT:
         case COLUMN_TYPE_BOOLEAN:
             return sizeof(int32_t);
@@ -2269,6 +2376,9 @@ static void hash_semi_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
             uint32_t di = st->build_count;
             st->key_nulls[di] = 0;
             switch (st->key_type) {
+                case COLUMN_TYPE_SMALLINT:
+                    ((int16_t *)st->key_data)[di] = src_key->data.i16[ri];
+                    break;
                 case COLUMN_TYPE_INT:
                 case COLUMN_TYPE_BOOLEAN:
                     ((int32_t *)st->key_data)[di] = src_key->data.i32[ri];
@@ -2987,6 +3097,234 @@ int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
     }
 
     return 0;
+}
+
+/* ---- EXPLAIN ---- */
+
+static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
+                              char *buf, int buflen, int depth)
+{
+    if (node_idx == IDX_NONE || buflen <= 0) return 0;
+    struct plan_node *pn = &PLAN_NODE(arena, node_idx);
+    int written = 0;
+    int n;
+
+    /* indent */
+    for (int i = 0; i < depth * 2 && written < buflen - 1; i++)
+        buf[written++] = ' ';
+
+    switch (pn->op) {
+    case PLAN_SEQ_SCAN:
+        n = snprintf(buf + written, buflen - written, "Seq Scan on %s\n",
+                     pn->seq_scan.table ? pn->seq_scan.table->name : "?");
+        if (n > 0) written += n;
+        break;
+    case PLAN_INDEX_SCAN: {
+        /* Try to show the filter condition */
+        const char *tname = pn->index_scan.table ? pn->index_scan.table->name : "?";
+        if (pn->index_scan.cond_idx != IDX_NONE) {
+            struct condition *cond = &arena->conditions.items[pn->index_scan.cond_idx];
+            const char *op_str = cond->op == CMP_EQ ? "=" : cond->op == CMP_NE ? "!=" :
+                cond->op == CMP_LT ? "<" : cond->op == CMP_GT ? ">" :
+                cond->op == CMP_LE ? "<=" : cond->op == CMP_GE ? ">=" : "?";
+            char vbuf[64] = "";
+            if (!cond->value.is_null) {
+                if (cond->value.type == COLUMN_TYPE_INT)
+                    snprintf(vbuf, sizeof(vbuf), "%d", cond->value.value.as_int);
+                else if (cond->value.type == COLUMN_TYPE_SMALLINT)
+                    snprintf(vbuf, sizeof(vbuf), "%d", (int)cond->value.value.as_smallint);
+                else if (cond->value.type == COLUMN_TYPE_BIGINT)
+                    snprintf(vbuf, sizeof(vbuf), "%lld", cond->value.value.as_bigint);
+                else if (cond->value.type == COLUMN_TYPE_FLOAT || cond->value.type == COLUMN_TYPE_NUMERIC)
+                    snprintf(vbuf, sizeof(vbuf), "%g", cond->value.value.as_float);
+                else if (column_type_is_text(cond->value.type) && cond->value.value.as_text)
+                    snprintf(vbuf, sizeof(vbuf), "'%s'", cond->value.value.as_text);
+                else
+                    snprintf(vbuf, sizeof(vbuf), "?");
+            }
+            n = snprintf(buf + written, buflen - written,
+                         "Index Scan on %s (" SV_FMT " %s %s)\n",
+                         tname, (int)cond->column.len, cond->column.data, op_str, vbuf);
+        } else {
+            n = snprintf(buf + written, buflen - written, "Index Scan on %s\n", tname);
+        }
+        if (n > 0) written += n;
+        break;
+    }
+    case PLAN_FILTER: {
+        /* Show filter condition */
+        if (pn->filter.cond_idx != IDX_NONE) {
+            struct condition *cond = &arena->conditions.items[pn->filter.cond_idx];
+            const char *op_str = cond->op == CMP_EQ ? "=" : cond->op == CMP_NE ? "!=" :
+                cond->op == CMP_LT ? "<" : cond->op == CMP_GT ? ">" :
+                cond->op == CMP_LE ? "<=" : cond->op == CMP_GE ? ">=" : "?";
+            char vbuf[64] = "";
+            if (!cond->value.is_null) {
+                if (cond->value.type == COLUMN_TYPE_INT)
+                    snprintf(vbuf, sizeof(vbuf), "%d", cond->value.value.as_int);
+                else if (cond->value.type == COLUMN_TYPE_SMALLINT)
+                    snprintf(vbuf, sizeof(vbuf), "%d", (int)cond->value.value.as_smallint);
+                else if (cond->value.type == COLUMN_TYPE_BIGINT)
+                    snprintf(vbuf, sizeof(vbuf), "%lld", cond->value.value.as_bigint);
+                else if (cond->value.type == COLUMN_TYPE_FLOAT || cond->value.type == COLUMN_TYPE_NUMERIC)
+                    snprintf(vbuf, sizeof(vbuf), "%g", cond->value.value.as_float);
+                else if (column_type_is_text(cond->value.type) && cond->value.value.as_text)
+                    snprintf(vbuf, sizeof(vbuf), "'%s'", cond->value.value.as_text);
+                else
+                    snprintf(vbuf, sizeof(vbuf), "?");
+            }
+            n = snprintf(buf + written, buflen - written,
+                         "Filter: (" SV_FMT " %s %s)\n",
+                         (int)cond->column.len, cond->column.data, op_str, vbuf);
+        } else {
+            n = snprintf(buf + written, buflen - written, "Filter\n");
+        }
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    }
+    case PLAN_PROJECT:
+        n = snprintf(buf + written, buflen - written, "Project\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    case PLAN_EXPR_PROJECT:
+        n = snprintf(buf + written, buflen - written, "Project (expressions)\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    case PLAN_SORT: {
+        n = snprintf(buf + written, buflen - written, "Sort");
+        if (n > 0) written += n;
+        /* show sort columns */
+        if (pn->sort.nsort_cols > 0 && pn->left != IDX_NONE) {
+            /* try to get table from child seq_scan */
+            struct plan_node *child = &PLAN_NODE(arena, pn->left);
+            struct table *st = NULL;
+            if (child->op == PLAN_SEQ_SCAN) st = child->seq_scan.table;
+            else if (child->op == PLAN_FILTER && child->left != IDX_NONE) {
+                struct plan_node *gc = &PLAN_NODE(arena, child->left);
+                if (gc->op == PLAN_SEQ_SCAN) st = gc->seq_scan.table;
+            }
+            if (st) {
+                n = snprintf(buf + written, buflen - written, " (");
+                if (n > 0) written += n;
+                for (uint16_t k = 0; k < pn->sort.nsort_cols; k++) {
+                    int ci = pn->sort.sort_cols[k];
+                    if (ci >= 0 && (size_t)ci < st->columns.count) {
+                        if (k > 0) { n = snprintf(buf + written, buflen - written, ", "); if (n > 0) written += n; }
+                        n = snprintf(buf + written, buflen - written, "%s", st->columns.items[ci].name);
+                        if (n > 0) written += n;
+                        if (pn->sort.sort_descs[k]) {
+                            n = snprintf(buf + written, buflen - written, " DESC");
+                            if (n > 0) written += n;
+                        }
+                    }
+                }
+                n = snprintf(buf + written, buflen - written, ")");
+                if (n > 0) written += n;
+            }
+        }
+        n = snprintf(buf + written, buflen - written, "\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    }
+    case PLAN_HASH_JOIN:
+        n = snprintf(buf + written, buflen - written, "Hash Join\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->right, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    case PLAN_HASH_SEMI_JOIN:
+        n = snprintf(buf + written, buflen - written, "Hash Semi Join\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->right, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    case PLAN_LIMIT: {
+        if (pn->limit.has_limit && pn->limit.has_offset)
+            n = snprintf(buf + written, buflen - written, "Limit (%zu, offset %zu)\n",
+                         pn->limit.limit, pn->limit.offset);
+        else if (pn->limit.has_limit)
+            n = snprintf(buf + written, buflen - written, "Limit (%zu)\n", pn->limit.limit);
+        else
+            n = snprintf(buf + written, buflen - written, "Limit\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    }
+    case PLAN_DISTINCT:
+        n = snprintf(buf + written, buflen - written, "HashAggregate (DISTINCT)\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    case PLAN_HASH_AGG:
+        n = snprintf(buf + written, buflen - written, "HashAggregate\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    case PLAN_SIMPLE_AGG:
+        n = snprintf(buf + written, buflen - written, "Aggregate\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    case PLAN_SET_OP: {
+        const char *opname = "SetOp";
+        if (pn->set_op.set_op == 0) opname = pn->set_op.set_all ? "Append (UNION ALL)" : "HashSetOp Union";
+        else if (pn->set_op.set_op == 1) opname = "HashSetOp Intersect";
+        else if (pn->set_op.set_op == 2) opname = "HashSetOp Except";
+        n = snprintf(buf + written, buflen - written, "%s\n", opname);
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->right, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    }
+    case PLAN_WINDOW:
+        n = snprintf(buf + written, buflen - written, "WindowAgg\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    case PLAN_GENERATE_SERIES:
+        n = snprintf(buf + written, buflen - written, "Function Scan on generate_series\n");
+        if (n > 0) written += n;
+        break;
+    case PLAN_NESTED_LOOP:
+        n = snprintf(buf + written, buflen - written, "Nested Loop\n");
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        n = plan_explain_node(arena, pn->right, buf + written, buflen - written, depth + 1);
+        if (n > 0) written += n;
+        break;
+    }
+    return written;
+}
+
+int plan_explain(struct query_arena *arena, uint32_t node_idx, char *buf, int buflen)
+{
+    int written = plan_explain_node(arena, node_idx, buf, buflen, 0);
+    /* strip trailing newline */
+    if (written > 0 && buf[written - 1] == '\n')
+        buf[--written] = '\0';
+    else if (written < buflen)
+        buf[written] = '\0';
+    return written;
 }
 
 /* ---- Plan builder ---- */

@@ -41,8 +41,8 @@ void table_add_column(struct table *t, struct column *col)
         .serial_next = col->serial_next,
         .fk_table = col->fk_table ? strdup(col->fk_table) : NULL,
         .fk_column = col->fk_column ? strdup(col->fk_column) : NULL,
-        .fk_on_delete_cascade = col->fk_on_delete_cascade,
-        .fk_on_update_cascade = col->fk_on_update_cascade
+        .fk_on_delete = col->fk_on_delete,
+        .fk_on_update = col->fk_on_update
     };
     if (col->has_default && col->default_value) {
         c.default_value = calloc(1, sizeof(struct cell));
@@ -82,8 +82,8 @@ void table_deep_copy(struct table *dst, const struct table *src)
             .serial_next = sc->serial_next,
             .fk_table = sc->fk_table ? strdup(sc->fk_table) : NULL,
             .fk_column = sc->fk_column ? strdup(sc->fk_column) : NULL,
-            .fk_on_delete_cascade = sc->fk_on_delete_cascade,
-            .fk_on_update_cascade = sc->fk_on_update_cascade
+            .fk_on_delete = sc->fk_on_delete,
+            .fk_on_update = sc->fk_on_update
         };
         if (sc->has_default && sc->default_value) {
             c.default_value = calloc(1, sizeof(struct cell));

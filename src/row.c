@@ -43,13 +43,26 @@ int cell_compare(const struct cell *a, const struct cell *b)
     if (a_null && b_null) return 0;
     if (a_null) return 1;  /* NULL sorts last */
     if (b_null) return -1;
-    /* promote INT <-> FLOAT for numeric comparison */
-    if ((a->type == COLUMN_TYPE_INT && b->type == COLUMN_TYPE_FLOAT) ||
-        (a->type == COLUMN_TYPE_FLOAT && b->type == COLUMN_TYPE_INT)) {
-        double da = (a->type == COLUMN_TYPE_FLOAT) ? a->value.as_float : (double)a->value.as_int;
-        double db = (b->type == COLUMN_TYPE_FLOAT) ? b->value.as_float : (double)b->value.as_int;
+    /* promote SMALLINT/INT <-> FLOAT for numeric comparison */
+    int a_is_int = (a->type == COLUMN_TYPE_INT || a->type == COLUMN_TYPE_SMALLINT);
+    int b_is_int = (b->type == COLUMN_TYPE_INT || b->type == COLUMN_TYPE_SMALLINT);
+    if ((a_is_int && b->type == COLUMN_TYPE_FLOAT) ||
+        (a->type == COLUMN_TYPE_FLOAT && b_is_int)) {
+        double da = (a->type == COLUMN_TYPE_FLOAT) ? a->value.as_float :
+                    (a->type == COLUMN_TYPE_SMALLINT) ? (double)a->value.as_smallint : (double)a->value.as_int;
+        double db = (b->type == COLUMN_TYPE_FLOAT) ? b->value.as_float :
+                    (b->type == COLUMN_TYPE_SMALLINT) ? (double)b->value.as_smallint : (double)b->value.as_int;
         if (da < db) return -1;
         if (da > db) return  1;
+        return 0;
+    }
+    /* promote SMALLINT <-> INT */
+    if ((a->type == COLUMN_TYPE_SMALLINT && b->type == COLUMN_TYPE_INT) ||
+        (a->type == COLUMN_TYPE_INT && b->type == COLUMN_TYPE_SMALLINT)) {
+        int va = (a->type == COLUMN_TYPE_SMALLINT) ? (int)a->value.as_smallint : a->value.as_int;
+        int vb = (b->type == COLUMN_TYPE_SMALLINT) ? (int)b->value.as_smallint : b->value.as_int;
+        if (va < vb) return -1;
+        if (va > vb) return  1;
         return 0;
     }
     /* allow cross-comparison between text-based types (TEXT, DATE, TIME, etc.) */
@@ -64,6 +77,10 @@ int cell_compare(const struct cell *a, const struct cell *b)
         return -2; /* incompatible types */
     }
     switch (a->type) {
+        case COLUMN_TYPE_SMALLINT:
+            if (a->value.as_smallint < b->value.as_smallint) return -1;
+            if (a->value.as_smallint > b->value.as_smallint) return  1;
+            return 0;
         case COLUMN_TYPE_INT:
             if (a->value.as_int < b->value.as_int) return -1;
             if (a->value.as_int > b->value.as_int) return  1;
@@ -107,15 +124,27 @@ int cell_equal(const struct cell *a, const struct cell *b)
     int a_null = a->is_null || (column_type_is_text(a->type) && !a->value.as_text);
     int b_null = b->is_null || (column_type_is_text(b->type) && !b->value.as_text);
     if (a_null || b_null) return 0;
-    /* promote INT <-> FLOAT */
-    if ((a->type == COLUMN_TYPE_INT && b->type == COLUMN_TYPE_FLOAT) ||
-        (a->type == COLUMN_TYPE_FLOAT && b->type == COLUMN_TYPE_INT)) {
-        double da = (a->type == COLUMN_TYPE_FLOAT) ? a->value.as_float : (double)a->value.as_int;
-        double db = (b->type == COLUMN_TYPE_FLOAT) ? b->value.as_float : (double)b->value.as_int;
+    /* promote SMALLINT/INT <-> FLOAT */
+    int a_is_int2 = (a->type == COLUMN_TYPE_INT || a->type == COLUMN_TYPE_SMALLINT);
+    int b_is_int2 = (b->type == COLUMN_TYPE_INT || b->type == COLUMN_TYPE_SMALLINT);
+    if ((a_is_int2 && b->type == COLUMN_TYPE_FLOAT) ||
+        (a->type == COLUMN_TYPE_FLOAT && b_is_int2)) {
+        double da = (a->type == COLUMN_TYPE_FLOAT) ? a->value.as_float :
+                    (a->type == COLUMN_TYPE_SMALLINT) ? (double)a->value.as_smallint : (double)a->value.as_int;
+        double db = (b->type == COLUMN_TYPE_FLOAT) ? b->value.as_float :
+                    (b->type == COLUMN_TYPE_SMALLINT) ? (double)b->value.as_smallint : (double)b->value.as_int;
         return da == db;
+    }
+    /* promote SMALLINT <-> INT */
+    if ((a->type == COLUMN_TYPE_SMALLINT && b->type == COLUMN_TYPE_INT) ||
+        (a->type == COLUMN_TYPE_INT && b->type == COLUMN_TYPE_SMALLINT)) {
+        int va = (a->type == COLUMN_TYPE_SMALLINT) ? (int)a->value.as_smallint : a->value.as_int;
+        int vb = (b->type == COLUMN_TYPE_SMALLINT) ? (int)b->value.as_smallint : b->value.as_int;
+        return va == vb;
     }
     if (a->type != b->type) return 0;
     switch (a->type) {
+        case COLUMN_TYPE_SMALLINT: return a->value.as_smallint == b->value.as_smallint;
         case COLUMN_TYPE_INT:     return a->value.as_int == b->value.as_int;
         case COLUMN_TYPE_FLOAT:   return a->value.as_float == b->value.as_float;
         case COLUMN_TYPE_BOOLEAN: return a->value.as_bool == b->value.as_bool;

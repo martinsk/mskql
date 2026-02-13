@@ -68,6 +68,7 @@ static int is_keyword(sv word)
         "OVER", "PARTITION", "BY", "ORDER",
         "UPDATE", "SET", "AND", "OR", "NOT", "NULL", "IS",
         "LIMIT", "OFFSET", "ASC", "DESC", "GROUP", "HAVING",
+        "SMALLINT", "INT2", "SMALLSERIAL", "SERIAL2",
         "INT", "INTEGER", "INT4", "SERIAL", "FLOAT", "FLOAT8", "DOUBLE", "REAL", "TEXT",
         "VARCHAR", "CHAR", "CHARACTER", "BOOLEAN", "BOOL",
         "BIGINT", "INT8", "BIGSERIAL", "NUMERIC", "DECIMAL",
@@ -93,6 +94,7 @@ static int is_keyword(sv word)
         "CAST",
         "EXTRACT", "CURRENT_TIMESTAMP",
         "TRUNCATE",
+        "EXPLAIN", "ANALYZE",
         "ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "POWER", "SQRT", "MOD", "SIGN", "RANDOM",
         "LPAD", "RPAD", "CONCAT", "CONCAT_WS", "POSITION", "SPLIT_PART",
         "LEFT", "RIGHT", "REPEAT", "REVERSE", "INITCAP",
@@ -3442,6 +3444,11 @@ static int parse_insert(struct lexer *l, struct query *out)
 
 static enum column_type parse_column_type(sv type_name)
 {
+    if (sv_eq_ignorecase_cstr(type_name, "SMALLINT") ||
+        sv_eq_ignorecase_cstr(type_name, "INT2") ||
+        sv_eq_ignorecase_cstr(type_name, "SMALLSERIAL") ||
+        sv_eq_ignorecase_cstr(type_name, "SERIAL2"))
+        return COLUMN_TYPE_SMALLINT;
     if (sv_eq_ignorecase_cstr(type_name, "INT") ||
         sv_eq_ignorecase_cstr(type_name, "INTEGER") ||
         sv_eq_ignorecase_cstr(type_name, "INT4") ||
@@ -3611,7 +3618,9 @@ static int parse_create_table(struct lexer *l, struct query *out)
             return -1;
         }
         int is_serial = sv_eq_ignorecase_cstr(tok.value, "SERIAL") ||
-                        sv_eq_ignorecase_cstr(tok.value, "BIGSERIAL");
+                        sv_eq_ignorecase_cstr(tok.value, "BIGSERIAL") ||
+                        sv_eq_ignorecase_cstr(tok.value, "SMALLSERIAL") ||
+                        sv_eq_ignorecase_cstr(tok.value, "SERIAL2");
         struct column col = {
             .name = col_name,
             .type = parse_column_type(tok.value),
@@ -3677,20 +3686,33 @@ static int parse_create_table(struct lexer *l, struct query *out)
                     col.fk_column = bump_strndup(&out->arena.bump, ref_col.value.data, ref_col.value.len);
                     lexer_next(l); /* consume ) */
                 }
-                /* parse optional ON DELETE/UPDATE CASCADE */
+                /* parse optional ON DELETE/UPDATE actions */
                 for (;;) {
                     struct token on_peek = lexer_peek(l);
                     if (on_peek.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(on_peek.value, "ON"))
                         break;
                     lexer_next(l); /* consume ON */
-                    struct token action = lexer_next(l);
-                    struct token cascade = lexer_next(l);
-                    if (sv_eq_ignorecase_cstr(action.value, "DELETE") &&
-                        sv_eq_ignorecase_cstr(cascade.value, "CASCADE"))
-                        col.fk_on_delete_cascade = 1;
-                    else if (sv_eq_ignorecase_cstr(action.value, "UPDATE") &&
-                             sv_eq_ignorecase_cstr(cascade.value, "CASCADE"))
-                        col.fk_on_update_cascade = 1;
+                    struct token action = lexer_next(l); /* DELETE or UPDATE */
+                    int is_delete = sv_eq_ignorecase_cstr(action.value, "DELETE");
+                    int is_update = sv_eq_ignorecase_cstr(action.value, "UPDATE");
+                    struct token act_tok = lexer_next(l);
+                    enum fk_action fka = FK_NO_ACTION;
+                    if (sv_eq_ignorecase_cstr(act_tok.value, "CASCADE")) {
+                        fka = FK_CASCADE;
+                    } else if (sv_eq_ignorecase_cstr(act_tok.value, "RESTRICT")) {
+                        fka = FK_RESTRICT;
+                    } else if (sv_eq_ignorecase_cstr(act_tok.value, "SET")) {
+                        struct token set_what = lexer_next(l);
+                        if (sv_eq_ignorecase_cstr(set_what.value, "NULL"))
+                            fka = FK_SET_NULL;
+                        else if (sv_eq_ignorecase_cstr(set_what.value, "DEFAULT"))
+                            fka = FK_SET_DEFAULT;
+                    } else if (sv_eq_ignorecase_cstr(act_tok.value, "NO")) {
+                        lexer_next(l); /* consume ACTION */
+                        fka = FK_NO_ACTION;
+                    }
+                    if (is_delete) col.fk_on_delete = fka;
+                    else if (is_update) col.fk_on_update = fka;
                 }
             } else if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "CHECK")) {
                 lexer_next(l); /* consume CHECK */
@@ -4339,6 +4361,27 @@ static int query_parse_internal(const char *sql, struct query *out)
         out->del.table = tok.value;
         out->del.where.has_where = 0;
         out->del.where.where_cond = IDX_NONE;
+        return 0;
+    }
+
+    if (sv_eq_ignorecase_cstr(tok.value, "EXPLAIN")) {
+        out->query_type = QUERY_TYPE_EXPLAIN;
+        out->explain.has_analyze = 0;
+        /* optional ANALYZE keyword */
+        tok = lexer_peek(&l);
+        if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "ANALYZE")) {
+            lexer_next(&l);
+            out->explain.has_analyze = 1;
+        }
+        /* capture remaining SQL text as inner_sql */
+        const char *rest = l.input + l.pos;
+        while (*rest == ' ' || *rest == '\t' || *rest == '\n' || *rest == '\r') rest++;
+        size_t rest_len = strlen(rest);
+        /* strip trailing semicolons and whitespace */
+        while (rest_len > 0 && (rest[rest_len - 1] == ';' || rest[rest_len - 1] == ' ' ||
+               rest[rest_len - 1] == '\n' || rest[rest_len - 1] == '\r'))
+            rest_len--;
+        out->explain.inner_sql = sv_from(rest, rest_len);
         return 0;
     }
 

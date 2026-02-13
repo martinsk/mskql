@@ -4,6 +4,7 @@
 #include "dynamic_array.h"
 
 enum column_type {
+    COLUMN_TYPE_SMALLINT,
     COLUMN_TYPE_INT,
     COLUMN_TYPE_FLOAT,
     COLUMN_TYPE_TEXT,
@@ -41,6 +42,14 @@ int  enum_type_valid(struct enum_type *et, const char *value);
 
 struct cell; /* forward declaration for default_value */
 
+enum fk_action {
+    FK_NO_ACTION,    /* default — error on violation (same as RESTRICT) */
+    FK_RESTRICT,     /* error on violation */
+    FK_CASCADE,      /* propagate delete/update to referencing rows */
+    FK_SET_NULL,     /* set referencing column to NULL */
+    FK_SET_DEFAULT   /* set referencing column to its DEFAULT value */
+};
+
 struct column {
     // TODO: STRINGVIEW OPPORTUNITY: name and enum_type_name are char* requiring strdup/free
     // on every copy (table_add_column, do_single_join, rebuild_indexes, query_free, etc.).
@@ -59,8 +68,8 @@ struct column {
     /* REFERENCES (foreign key) */
     char *fk_table;         /* referenced table name, or NULL */
     char *fk_column;        /* referenced column name, or NULL */
-    int fk_on_delete_cascade;
-    int fk_on_update_cascade;
+    enum fk_action fk_on_delete;
+    enum fk_action fk_on_update;
 };
 
 void column_free(struct column *col);

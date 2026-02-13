@@ -1441,6 +1441,7 @@ static int cell_is_null(const struct cell *c)
 
 static double cell_to_double_val(const struct cell *c)
 {
+    if (c->type == COLUMN_TYPE_SMALLINT) return (double)c->value.as_smallint;
     if (c->type == COLUMN_TYPE_INT)    return (double)c->value.as_int;
     if (c->type == COLUMN_TYPE_FLOAT)  return c->value.as_float;
     if (c->type == COLUMN_TYPE_BIGINT) return (double)c->value.as_bigint;
@@ -1455,7 +1456,9 @@ static char *cell_to_text(const struct cell *c)
     if (column_type_is_text(c->type) && c->value.as_text)
         return strdup(c->value.as_text);
     char buf[64];
-    if (c->type == COLUMN_TYPE_INT)
+    if (c->type == COLUMN_TYPE_SMALLINT)
+        snprintf(buf, sizeof(buf), "%d", (int)c->value.as_smallint);
+    else if (c->type == COLUMN_TYPE_INT)
         snprintf(buf, sizeof(buf), "%d", c->value.as_int);
     else if (c->type == COLUMN_TYPE_FLOAT)
         snprintf(buf, sizeof(buf), "%g", c->value.as_float);
@@ -1476,7 +1479,9 @@ static char *cell_to_text_rb(const struct cell *c, struct bump_alloc *rb)
     if (column_type_is_text(c->type) && c->value.as_text)
         return bump_strdup(rb, c->value.as_text);
     char buf[64];
-    if (c->type == COLUMN_TYPE_INT)
+    if (c->type == COLUMN_TYPE_SMALLINT)
+        snprintf(buf, sizeof(buf), "%d", (int)c->value.as_smallint);
+    else if (c->type == COLUMN_TYPE_INT)
         snprintf(buf, sizeof(buf), "%d", c->value.as_int);
     else if (c->type == COLUMN_TYPE_FLOAT)
         snprintf(buf, sizeof(buf), "%g", c->value.as_float);
@@ -1521,7 +1526,9 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         struct cell operand = eval_expr(e->unary.operand, arena, t, row, db, rb);
         if (cell_is_null(&operand)) return operand;
         if (e->unary.op == OP_NEG) {
-            if (operand.type == COLUMN_TYPE_INT) {
+            if (operand.type == COLUMN_TYPE_SMALLINT) {
+                operand.value.as_smallint = -operand.value.as_smallint;
+            } else if (operand.type == COLUMN_TYPE_INT) {
                 operand.value.as_int = -operand.value.as_int;
             } else if (operand.type == COLUMN_TYPE_FLOAT) {
                 operand.value.as_float = -operand.value.as_float;
@@ -2632,15 +2639,17 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         if (src.type == target) return src;
 
         /* numeric → numeric conversions */
-        if ((target == COLUMN_TYPE_INT || target == COLUMN_TYPE_BIGINT ||
+        if ((target == COLUMN_TYPE_SMALLINT || target == COLUMN_TYPE_INT || target == COLUMN_TYPE_BIGINT ||
              target == COLUMN_TYPE_FLOAT || target == COLUMN_TYPE_NUMERIC) &&
-            (src.type == COLUMN_TYPE_INT || src.type == COLUMN_TYPE_BIGINT ||
+            (src.type == COLUMN_TYPE_SMALLINT || src.type == COLUMN_TYPE_INT || src.type == COLUMN_TYPE_BIGINT ||
              src.type == COLUMN_TYPE_FLOAT || src.type == COLUMN_TYPE_NUMERIC)) {
             double v = cell_to_double_val(&src);
             cell_release_rb(&src, rb);
             struct cell r = {0};
             r.type = target;
-            if (target == COLUMN_TYPE_INT) {
+            if (target == COLUMN_TYPE_SMALLINT) {
+                r.value.as_smallint = (int16_t)v;
+            } else if (target == COLUMN_TYPE_INT) {
                 r.value.as_int = (int)v;
             } else if (target == COLUMN_TYPE_BIGINT) {
                 r.value.as_bigint = (long long)v;
@@ -2654,11 +2663,13 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
 
         /* numeric → text */
         if (column_type_is_text(target) &&
-            (src.type == COLUMN_TYPE_INT || src.type == COLUMN_TYPE_BIGINT ||
+            (src.type == COLUMN_TYPE_SMALLINT || src.type == COLUMN_TYPE_INT || src.type == COLUMN_TYPE_BIGINT ||
              src.type == COLUMN_TYPE_FLOAT || src.type == COLUMN_TYPE_NUMERIC ||
              src.type == COLUMN_TYPE_BOOLEAN)) {
             char buf[128];
-            if (src.type == COLUMN_TYPE_INT)
+            if (src.type == COLUMN_TYPE_SMALLINT)
+                snprintf(buf, sizeof(buf), "%d", (int)src.value.as_smallint);
+            else if (src.type == COLUMN_TYPE_INT)
                 snprintf(buf, sizeof(buf), "%d", src.value.as_int);
             else if (src.type == COLUMN_TYPE_BIGINT)
                 snprintf(buf, sizeof(buf), "%lld", src.value.as_bigint);
@@ -2674,13 +2685,15 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         }
 
         /* text → numeric */
-        if ((target == COLUMN_TYPE_INT || target == COLUMN_TYPE_BIGINT ||
+        if ((target == COLUMN_TYPE_SMALLINT || target == COLUMN_TYPE_INT || target == COLUMN_TYPE_BIGINT ||
              target == COLUMN_TYPE_FLOAT || target == COLUMN_TYPE_NUMERIC) &&
             column_type_is_text(src.type) && src.value.as_text) {
             const char *s = src.value.as_text;
             struct cell r = {0};
             r.type = target;
-            if (target == COLUMN_TYPE_INT) {
+            if (target == COLUMN_TYPE_SMALLINT) {
+                r.value.as_smallint = (int16_t)atoi(s);
+            } else if (target == COLUMN_TYPE_INT) {
                 r.value.as_int = atoi(s);
             } else if (target == COLUMN_TYPE_BIGINT) {
                 r.value.as_bigint = atoll(s);
@@ -2722,6 +2735,9 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         r.type = target;
         if (column_type_is_text(target)) {
             r.value.as_text = txt;
+        } else if (target == COLUMN_TYPE_SMALLINT) {
+            r.value.as_smallint = txt ? (int16_t)atoi(txt) : 0;
+            if (!rb && txt) free(txt);
         } else if (target == COLUMN_TYPE_INT) {
             r.value.as_int = txt ? atoi(txt) : 0;
             if (!rb && txt) free(txt);
@@ -3226,6 +3242,7 @@ static int cmp_indices_multi(const void *a, const void *b)
 static double cell_to_double(const struct cell *c)
 {
     switch (c->type) {
+        case COLUMN_TYPE_SMALLINT: return (double)c->value.as_smallint;
         case COLUMN_TYPE_INT:     return (double)c->value.as_int;
         case COLUMN_TYPE_FLOAT:   return c->value.as_float;
         case COLUMN_TYPE_BOOLEAN: return (double)c->value.as_bool;
@@ -4616,13 +4633,24 @@ static void emit_returning_row(struct table *t, struct row *src,
     rows_push(result, ret);
 }
 
-static int query_delete_exec(struct table *t, struct query_delete *d, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
+static int fk_check_value_exists(struct database *db, const char *ref_table_name,
+                                  const char *ref_col_name, const struct cell *value);
+static int fk_enforce_delete(struct database *db, struct table *parent_t,
+                              struct row *deleted_row, struct query_arena *arena);
+static int fk_enforce_update(struct database *db, struct table *parent_t,
+                              const struct cell *old_val, const struct cell *new_val,
+                              const char *parent_col_name, struct query_arena *arena);
+
+static int query_delete_exec(struct table *t, struct query_delete *d, struct query_arena *arena, struct rows *result, struct database *db, struct bump_alloc *rb)
 {
     int has_ret = (d->has_returning && d->returning_columns.len > 0);
     int return_all = has_ret && sv_eq_cstr(d->returning_columns, "*");
     size_t deleted = 0;
     for (size_t i = 0; i < t->rows.count; ) {
         if (row_matches(t, &d->where, arena, &t->rows.items[i], NULL)) {
+            /* enforce FK constraints before deleting */
+            if (fk_enforce_delete(db, t, &t->rows.items[i], arena) != 0)
+                return -1;
             /* capture row for RETURNING before freeing */
             if (has_ret && result)
                 emit_returning_row(t, &t->rows.items[i], d->returning_columns, return_all, result, rb);
@@ -4676,6 +4704,35 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                 cell_copy(&new_vals[sc], &scp->value);
             }
         }
+        /* enforce FK constraints before applying new values */
+        for (size_t sc = 0; sc < nsc; sc++) {
+            if (col_idxs[sc] < 0) continue;
+            int ci = col_idxs[sc];
+            /* referencing side: if this column has an FK, validate new value exists */
+            if (t->columns.items[ci].fk_table) {
+                if (!fk_check_value_exists(db, t->columns.items[ci].fk_table,
+                                            t->columns.items[ci].fk_column, &new_vals[sc])) {
+                    arena_set_error(arena, "23503",
+                        "insert or update on table '%s' violates foreign key constraint on column '%s'",
+                        t->name, t->columns.items[ci].name);
+                    for (size_t k = 0; k < nsc; k++) {
+                        if (column_type_is_text(new_vals[k].type) && new_vals[k].value.as_text)
+                            free(new_vals[k].value.as_text);
+                    }
+                    return -1;
+                }
+            }
+            /* referenced side: if another table references this column, enforce FK action */
+            struct cell *old_val = &t->rows.items[i].cells.items[ci];
+            if (fk_enforce_update(db, t, old_val, &new_vals[sc],
+                                   t->columns.items[ci].name, arena) != 0) {
+                for (size_t k = 0; k < nsc; k++) {
+                    if (column_type_is_text(new_vals[k].type) && new_vals[k].value.as_text)
+                        free(new_vals[k].value.as_text);
+                }
+                return -1;
+            }
+        }
         /* now apply all new values */
         for (size_t sc = 0; sc < nsc; sc++) {
             if (col_idxs[sc] < 0) continue;
@@ -4707,6 +4764,166 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
 }
 
 /* copy_cell_into → use shared cell_copy from row.h */
+
+/* --- Foreign key helpers --- */
+
+/* Check if a value exists in the referenced table's column. Returns 1 if found. */
+static int fk_check_value_exists(struct database *db, const char *ref_table_name,
+                                  const char *ref_col_name, const struct cell *value)
+{
+    if (!ref_table_name || !ref_col_name) return 1; /* no FK → ok */
+    if (value->is_null) return 1; /* NULLs bypass FK check */
+    struct table *ref_t = db_find_table(db, ref_table_name);
+    if (!ref_t) return 0;
+    int col_idx = -1;
+    for (size_t c = 0; c < ref_t->columns.count; c++) {
+        if (strcmp(ref_t->columns.items[c].name, ref_col_name) == 0) {
+            col_idx = (int)c;
+            break;
+        }
+    }
+    if (col_idx < 0) return 0;
+    for (size_t r = 0; r < ref_t->rows.count; r++) {
+        if (cell_compare(value, &ref_t->rows.items[r].cells.items[col_idx]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Apply FK action on DELETE: scan all tables for columns referencing this table.
+ * For each matching referencing row, apply the fk_on_delete action.
+ * Returns 0 on success, -1 on error (sets arena error). */
+static int fk_enforce_delete(struct database *db, struct table *parent_t,
+                              struct row *deleted_row, struct query_arena *arena)
+{
+    for (size_t ti = 0; ti < db->tables.count; ti++) {
+        struct table *child_t = &db->tables.items[ti];
+        for (size_t ci = 0; ci < child_t->columns.count; ci++) {
+            struct column *col = &child_t->columns.items[ci];
+            if (!col->fk_table || strcmp(col->fk_table, parent_t->name) != 0)
+                continue;
+            /* Find the referenced column index in parent */
+            int parent_col = -1;
+            for (size_t pc = 0; pc < parent_t->columns.count; pc++) {
+                if (col->fk_column && strcmp(parent_t->columns.items[pc].name, col->fk_column) == 0) {
+                    parent_col = (int)pc;
+                    break;
+                }
+            }
+            if (parent_col < 0) continue;
+            struct cell *parent_val = &deleted_row->cells.items[parent_col];
+            if (parent_val->is_null) continue;
+
+            enum fk_action action = col->fk_on_delete;
+
+            /* Scan child rows for matches */
+            for (size_t r = 0; r < child_t->rows.count; ) {
+                struct cell *child_val = &child_t->rows.items[r].cells.items[ci];
+                if (child_val->is_null || cell_compare(parent_val, child_val) != 0) {
+                    r++;
+                    continue;
+                }
+                /* Match found — apply action */
+                switch (action) {
+                    case FK_NO_ACTION:
+                    case FK_RESTRICT:
+                        arena_set_error(arena, "23503",
+                            "update or delete on table '%s' violates foreign key constraint on table '%s'",
+                            parent_t->name, child_t->name);
+                        return -1;
+                    case FK_CASCADE:
+                        row_free(&child_t->rows.items[r]);
+                        memmove(&child_t->rows.items[r],
+                                &child_t->rows.items[r + 1],
+                                (child_t->rows.count - r - 1) * sizeof(struct row));
+                        child_t->rows.count--;
+                        child_t->generation++;
+                        continue; /* don't increment r */
+                    case FK_SET_NULL:
+                        cell_free_text(child_val);
+                        memset(&child_val->value, 0, sizeof(child_val->value));
+                        child_val->is_null = 1;
+                        child_t->generation++;
+                        r++;
+                        break;
+                    case FK_SET_DEFAULT:
+                        cell_free_text(child_val);
+                        if (col->has_default && col->default_value) {
+                            cell_copy(child_val, col->default_value);
+                        } else {
+                            memset(&child_val->value, 0, sizeof(child_val->value));
+                            child_val->is_null = 1;
+                        }
+                        child_t->generation++;
+                        r++;
+                        break;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Apply FK action on UPDATE: scan all tables for columns referencing this table.
+ * old_val is the value being changed, new_val is what it's changing to.
+ * Returns 0 on success, -1 on error. */
+static int fk_enforce_update(struct database *db, struct table *parent_t,
+                              const struct cell *old_val, const struct cell *new_val,
+                              const char *parent_col_name, struct query_arena *arena)
+{
+    if (old_val->is_null) return 0;
+    if (cell_compare(old_val, new_val) == 0) return 0; /* value unchanged */
+
+    for (size_t ti = 0; ti < db->tables.count; ti++) {
+        struct table *child_t = &db->tables.items[ti];
+        for (size_t ci = 0; ci < child_t->columns.count; ci++) {
+            struct column *col = &child_t->columns.items[ci];
+            if (!col->fk_table || strcmp(col->fk_table, parent_t->name) != 0)
+                continue;
+            if (!col->fk_column || strcmp(col->fk_column, parent_col_name) != 0)
+                continue;
+
+            enum fk_action action = col->fk_on_update;
+
+            for (size_t r = 0; r < child_t->rows.count; r++) {
+                struct cell *child_val = &child_t->rows.items[r].cells.items[ci];
+                if (child_val->is_null || cell_compare(old_val, child_val) != 0)
+                    continue;
+                /* Match found — apply action */
+                switch (action) {
+                    case FK_NO_ACTION:
+                    case FK_RESTRICT:
+                        arena_set_error(arena, "23503",
+                            "update or delete on table '%s' violates foreign key constraint on table '%s'",
+                            parent_t->name, child_t->name);
+                        return -1;
+                    case FK_CASCADE:
+                        cell_free_text(child_val);
+                        cell_copy(child_val, new_val);
+                        child_t->generation++;
+                        break;
+                    case FK_SET_NULL:
+                        cell_free_text(child_val);
+                        memset(&child_val->value, 0, sizeof(child_val->value));
+                        child_val->is_null = 1;
+                        child_t->generation++;
+                        break;
+                    case FK_SET_DEFAULT:
+                        cell_free_text(child_val);
+                        if (col->has_default && col->default_value) {
+                            cell_copy(child_val, col->default_value);
+                        } else {
+                            memset(&child_val->value, 0, sizeof(child_val->value));
+                            child_val->is_null = 1;
+                        }
+                        child_t->generation++;
+                        break;
+                }
+            }
+        }
+    }
+    return 0;
+}
 
 static int query_insert_exec(struct table *t, struct query_insert *ins, struct query_arena *arena, struct rows *result, struct database *db, struct bump_alloc *rb)
 {
@@ -4793,13 +5010,17 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                     if (t->columns.items[i].type == COLUMN_TYPE_BIGINT) {
                         c->type = COLUMN_TYPE_BIGINT;
                         c->value.as_bigint = val;
+                    } else if (t->columns.items[i].type == COLUMN_TYPE_SMALLINT) {
+                        c->type = COLUMN_TYPE_SMALLINT;
+                        c->value.as_smallint = (int16_t)val;
                     } else {
                         c->type = COLUMN_TYPE_INT;
                         c->value.as_int = (int)val;
                     }
                 } else {
                     /* user provided a value — update serial_next if needed */
-                    long long v = (c->type == COLUMN_TYPE_BIGINT) ? c->value.as_bigint : c->value.as_int;
+                    long long v = (c->type == COLUMN_TYPE_BIGINT) ? c->value.as_bigint :
+                                  (c->type == COLUMN_TYPE_SMALLINT) ? (long long)c->value.as_smallint : c->value.as_int;
                     if (v >= t->columns.items[i].serial_next)
                         t->columns.items[i].serial_next = v + 1;
                 }
@@ -4831,6 +5052,46 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                         row_free(&copy);
                         return -1;
                     }
+                }
+            }
+        }
+        /* enforce SMALLINT range and coerce INT literals to SMALLINT */
+        for (size_t i = 0; i < t->columns.count && i < copy.cells.count; i++) {
+            if (t->columns.items[i].type == COLUMN_TYPE_SMALLINT) {
+                struct cell *c = &copy.cells.items[i];
+                if (c->is_null) continue;
+                long long v;
+                if (c->type == COLUMN_TYPE_SMALLINT) {
+                    v = c->value.as_smallint;
+                } else if (c->type == COLUMN_TYPE_INT) {
+                    v = c->value.as_int;
+                } else if (c->type == COLUMN_TYPE_BIGINT) {
+                    v = c->value.as_bigint;
+                } else if (c->type == COLUMN_TYPE_FLOAT || c->type == COLUMN_TYPE_NUMERIC) {
+                    v = (long long)c->value.as_float;
+                } else {
+                    continue;
+                }
+                if (v < -32768 || v > 32767) {
+                    arena_set_error(arena, "22003", "smallint out of range for column '%s'", t->columns.items[i].name);
+                    row_free(&copy);
+                    return -1;
+                }
+                c->type = COLUMN_TYPE_SMALLINT;
+                c->value.as_smallint = (int16_t)v;
+            }
+        }
+        /* enforce FK constraints on INSERT */
+        for (size_t i = 0; i < t->columns.count && i < copy.cells.count; i++) {
+            if (t->columns.items[i].fk_table) {
+                struct cell *c = &copy.cells.items[i];
+                if (!fk_check_value_exists(db, t->columns.items[i].fk_table,
+                                            t->columns.items[i].fk_column, c)) {
+                    arena_set_error(arena, "23503",
+                        "insert or update on table '%s' violates foreign key constraint on column '%s'",
+                        t->name, t->columns.items[i].name);
+                    row_free(&copy);
+                    return -1;
                 }
             }
         }
@@ -4873,13 +5134,14 @@ int query_exec(struct table *t, struct query *q, struct rows *result, struct dat
         case QUERY_TYPE_CREATE_VIEW:
         case QUERY_TYPE_DROP_VIEW:
         case QUERY_TYPE_TRUNCATE:
+        case QUERY_TYPE_EXPLAIN:
             return -1;
         case QUERY_TYPE_SELECT:
             return query_select_exec(t, &q->select, &q->arena, result, db, rb);
         case QUERY_TYPE_INSERT:
             return query_insert_exec(t, &q->insert, &q->arena, result, db, rb);
         case QUERY_TYPE_DELETE:
-            return query_delete_exec(t, &q->del, &q->arena, result, rb);
+            return query_delete_exec(t, &q->del, &q->arena, result, db, rb);
         case QUERY_TYPE_UPDATE:
             return query_update_exec(t, &q->update, &q->arena, result, db, rb);
     }

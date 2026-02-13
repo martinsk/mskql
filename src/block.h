@@ -17,6 +17,7 @@ struct col_block {
     uint16_t         count;                    /* 0..BLOCK_CAPACITY */
     uint8_t          nulls[BLOCK_CAPACITY];    /* 0=not-null, 1=null */
     union {
+        int16_t   i16[BLOCK_CAPACITY];         /* SMALLINT */
         int32_t   i32[BLOCK_CAPACITY];         /* INT, BOOLEAN */
         int64_t   i64[BLOCK_CAPACITY];         /* BIGINT */
         double    f64[BLOCK_CAPACITY];         /* FLOAT, NUMERIC */
@@ -123,6 +124,8 @@ static inline uint32_t block_hash_cell(const struct col_block *cb, uint16_t i)
 {
     if (cb->nulls[i]) return 0;
     switch (cb->type) {
+        case COLUMN_TYPE_SMALLINT:
+            return block_hash_i32((int32_t)cb->data.i16[i]);
         case COLUMN_TYPE_INT:
         case COLUMN_TYPE_BOOLEAN:
             return block_hash_i32(cb->data.i32[i]);
@@ -150,6 +153,8 @@ static inline int block_cell_eq(const struct col_block *a, uint16_t ai,
 {
     if (a->nulls[ai] || b->nulls[bi]) return 0; /* NULL != anything */
     switch (a->type) {
+        case COLUMN_TYPE_SMALLINT:
+            return a->data.i16[ai] == b->data.i16[bi];
         case COLUMN_TYPE_INT:
         case COLUMN_TYPE_BOOLEAN:
             return a->data.i32[ai] == b->data.i32[bi];
