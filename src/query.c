@@ -416,7 +416,8 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
             }
             struct cell lhs_tmp = {0};
             struct cell *c;
-            if (cond->lhs_expr != IDX_NONE) {
+            int has_lhs_expr = (cond->lhs_expr != IDX_NONE);
+            if (has_lhs_expr) {
                 lhs_tmp = eval_expr(cond->lhs_expr, arena, t, row, db, NULL);
                 c = &lhs_tmp;
             } else {
@@ -424,18 +425,23 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                 if (col_idx < 0) return 0;
                 c = &row->cells.items[col_idx];
             }
-            if (cond->op == CMP_IS_NULL)
-                return c->is_null || (column_type_is_text(c->type)
+            int cond_result = 0;
+            if (cond->op == CMP_IS_NULL) {
+                cond_result = c->is_null || (column_type_is_text(c->type)
                        ? (c->value.as_text == NULL) : 0);
-            if (cond->op == CMP_IS_NOT_NULL)
-                return !c->is_null && (column_type_is_text(c->type)
+                goto cond_cleanup;
+            }
+            if (cond->op == CMP_IS_NOT_NULL) {
+                cond_result = !c->is_null && (column_type_is_text(c->type)
                        ? (c->value.as_text != NULL) : 1);
+                goto cond_cleanup;
+            }
             /* IN / NOT IN */
             if (cond->op == CMP_IN || cond->op == CMP_NOT_IN) {
                 /* SQL standard: NULL IN (...) → UNKNOWN (false);
                  * NULL NOT IN (...) → UNKNOWN (false) */
                 if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
-                    return 0;
+                    goto cond_cleanup;
                 int found = 0;
                 for (uint32_t i = 0; i < cond->in_values_count; i++) {
                     struct cell *iv = &ACELL(arena, cond->in_values_start + i);
@@ -443,14 +449,16 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                     if (iv->is_null) continue;
                     if (cell_compare(c, iv) == 0) { found = 1; break; }
                 }
-                return cond->op == CMP_IN ? found : !found;
+                cond_result = cond->op == CMP_IN ? found : !found;
+                goto cond_cleanup;
             }
             /* BETWEEN */
             if (cond->op == CMP_BETWEEN) {
                 int lo = cell_compare(c, &cond->value);
                 int hi = cell_compare(c, &cond->between_high);
-                if (lo == -2 || hi == -2) return 0;
-                return lo >= 0 && hi <= 0;
+                if (lo == -2 || hi == -2) goto cond_cleanup;
+                cond_result = lo >= 0 && hi <= 0;
+                goto cond_cleanup;
             }
             /* IS DISTINCT FROM / IS NOT DISTINCT FROM */
             if (cond->op == CMP_IS_DISTINCT || cond->op == CMP_IS_NOT_DISTINCT) {
@@ -461,33 +469,37 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                 struct cell rhs_col_cell;
                 if (cond->rhs_column.len > 0) {
                     int rhs_col = table_find_column_sv(t, cond->rhs_column);
-                    if (rhs_col < 0) return 0;
+                    if (rhs_col < 0) goto cond_cleanup;
                     rhs_col_cell = row->cells.items[rhs_col];
                     rhs_val = &rhs_col_cell;
                 }
                 int b_null = rhs_val->is_null || (column_type_is_text(rhs_val->type)
                              && !rhs_val->value.as_text);
                 if (a_null && b_null) {
-                    return cond->op == CMP_IS_NOT_DISTINCT; /* both NULL → not distinct */
+                    cond_result = (cond->op == CMP_IS_NOT_DISTINCT);
+                    goto cond_cleanup;
                 }
                 if (a_null || b_null) {
-                    return cond->op == CMP_IS_DISTINCT; /* one NULL → distinct */
+                    cond_result = (cond->op == CMP_IS_DISTINCT);
+                    goto cond_cleanup;
                 }
                 int eq = (cell_compare(c, rhs_val) == 0);
-                return cond->op == CMP_IS_DISTINCT ? !eq : eq;
+                cond_result = cond->op == CMP_IS_DISTINCT ? !eq : eq;
+                goto cond_cleanup;
             }
             /* LIKE / ILIKE */
             if (cond->op == CMP_LIKE || cond->op == CMP_ILIKE) {
                 if (!column_type_is_text(c->type) || !c->value.as_text)
-                    return 0;
-                if (!cond->value.value.as_text) return 0;
-                return like_match(cond->value.value.as_text, c->value.as_text,
+                    goto cond_cleanup;
+                if (!cond->value.value.as_text) goto cond_cleanup;
+                cond_result = like_match(cond->value.value.as_text, c->value.as_text,
                                   cond->op == CMP_ILIKE);
+                goto cond_cleanup;
             }
             /* ANY/ALL/SOME: col op ANY(ARRAY[...]) */
             if (cond->is_any || cond->is_all) {
                 if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
-                    return 0;
+                    goto cond_cleanup;
                 for (uint32_t i = 0; i < cond->array_values_count; i++) {
                     struct cell *av = &ACELL(arena, cond->array_values_start + i);
                     int r = cell_compare(c, av);
@@ -514,29 +526,30 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                                 break;
                         }
                     }
-                    if (cond->is_any && match) return 1;
-                    if (cond->is_all && !match) return 0;
+                    if (cond->is_any && match) { cond_result = 1; goto cond_cleanup; }
+                    if (cond->is_all && !match) { cond_result = 0; goto cond_cleanup; }
                 }
-                return cond->is_all ? 1 : 0;
+                cond_result = cond->is_all ? 1 : 0;
+                goto cond_cleanup;
             }
             /* column-to-column comparison (JOIN ON conditions) */
             if (cond->rhs_column.len > 0) {
                 int rhs_col = table_find_column_sv(t, cond->rhs_column);
-                if (rhs_col < 0) return 0;
+                if (rhs_col < 0) goto cond_cleanup;
                 struct cell *rhs = &row->cells.items[rhs_col];
                 if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
-                    return 0;
+                    goto cond_cleanup;
                 if (rhs->is_null || (column_type_is_text(rhs->type) && !rhs->value.as_text))
-                    return 0;
+                    goto cond_cleanup;
                 int r = cell_compare(c, rhs);
-                if (r == -2) return 0;
+                if (r == -2) goto cond_cleanup;
                 switch (cond->op) {
-                    case CMP_EQ: return r == 0;
-                    case CMP_NE: return r != 0;
-                    case CMP_LT: return r < 0;
-                    case CMP_GT: return r > 0;
-                    case CMP_LE: return r <= 0;
-                    case CMP_GE: return r >= 0;
+                    case CMP_EQ: cond_result = (r == 0); break;
+                    case CMP_NE: cond_result = (r != 0); break;
+                    case CMP_LT: cond_result = (r < 0); break;
+                    case CMP_GT: cond_result = (r > 0); break;
+                    case CMP_LE: cond_result = (r <= 0); break;
+                    case CMP_GE: cond_result = (r >= 0); break;
                     case CMP_IS_NULL:
                     case CMP_IS_NOT_NULL:
                     case CMP_IN:
@@ -548,8 +561,9 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                     case CMP_IS_NOT_DISTINCT:
                     case CMP_EXISTS:
                     case CMP_NOT_EXISTS:
-                        return 0;
+                        break;
                 }
+                goto cond_cleanup;
             }
             /* correlated scalar subquery: re-evaluate per row */
             if (cond->scalar_subquery_sql != IDX_NONE && db) {
@@ -570,27 +584,29 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                                 row_free(&sq_result.data[i]);
                             free(sq_result.data);
                             query_free(&sq);
-                            if (r == -2) return 0;
-                            switch (cond->op) {
-                                case CMP_EQ: return r == 0;
-                                case CMP_NE: return r != 0;
-                                case CMP_LT: return r < 0;
-                                case CMP_GT: return r > 0;
-                                case CMP_LE: return r <= 0;
-                                case CMP_GE: return r >= 0;
-                                case CMP_IS_NULL:
-                                case CMP_IS_NOT_NULL:
-                                case CMP_IN:
-                                case CMP_NOT_IN:
-                                case CMP_BETWEEN:
-                                case CMP_LIKE:
-                                case CMP_ILIKE:
-                                case CMP_IS_DISTINCT:
-                                case CMP_IS_NOT_DISTINCT:
-                                case CMP_EXISTS:
-                                case CMP_NOT_EXISTS:
-                                    return 0;
+                            if (r != -2) {
+                                switch (cond->op) {
+                                    case CMP_EQ: cond_result = (r == 0); break;
+                                    case CMP_NE: cond_result = (r != 0); break;
+                                    case CMP_LT: cond_result = (r < 0); break;
+                                    case CMP_GT: cond_result = (r > 0); break;
+                                    case CMP_LE: cond_result = (r <= 0); break;
+                                    case CMP_GE: cond_result = (r >= 0); break;
+                                    case CMP_IS_NULL:
+                                    case CMP_IS_NOT_NULL:
+                                    case CMP_IN:
+                                    case CMP_NOT_IN:
+                                    case CMP_BETWEEN:
+                                    case CMP_LIKE:
+                                    case CMP_ILIKE:
+                                    case CMP_IS_DISTINCT:
+                                    case CMP_IS_NOT_DISTINCT:
+                                    case CMP_EXISTS:
+                                    case CMP_NOT_EXISTS:
+                                        break;
+                                }
                             }
+                            goto cond_cleanup;
                         }
                         for (size_t i = 0; i < sq_result.count; i++)
                             row_free(&sq_result.data[i]);
@@ -598,33 +614,39 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                     }
                 }
                 query_free(&sq);
-                return 0; /* subquery returned no rows or failed */
+                goto cond_cleanup; /* subquery returned no rows or failed */
             }
             /* SQL three-valued logic: any comparison with NULL → UNKNOWN (false) */
             if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
-                return 0;
-            int r = cell_compare(c, &cond->value);
-            if (r == -2) return 0;
-            switch (cond->op) {
-                case CMP_EQ: return r == 0;
-                case CMP_NE: return r != 0;
-                case CMP_LT: return r < 0;
-                case CMP_GT: return r > 0;
-                case CMP_LE: return r <= 0;
-                case CMP_GE: return r >= 0;
-                case CMP_IS_NULL:
-                case CMP_IS_NOT_NULL:
-                case CMP_IN:
-                case CMP_NOT_IN:
-                case CMP_BETWEEN:
-                case CMP_LIKE:
-                case CMP_ILIKE:
-                case CMP_IS_DISTINCT:
-                case CMP_IS_NOT_DISTINCT:
-                case CMP_EXISTS:
-                case CMP_NOT_EXISTS:
-                    return 0;
+                goto cond_cleanup;
+            {
+                int r = cell_compare(c, &cond->value);
+                if (r != -2) {
+                    switch (cond->op) {
+                        case CMP_EQ: cond_result = (r == 0); break;
+                        case CMP_NE: cond_result = (r != 0); break;
+                        case CMP_LT: cond_result = (r < 0); break;
+                        case CMP_GT: cond_result = (r > 0); break;
+                        case CMP_LE: cond_result = (r <= 0); break;
+                        case CMP_GE: cond_result = (r >= 0); break;
+                        case CMP_IS_NULL:
+                        case CMP_IS_NOT_NULL:
+                        case CMP_IN:
+                        case CMP_NOT_IN:
+                        case CMP_BETWEEN:
+                        case CMP_LIKE:
+                        case CMP_ILIKE:
+                        case CMP_IS_DISTINCT:
+                        case CMP_IS_NOT_DISTINCT:
+                        case CMP_EXISTS:
+                        case CMP_NOT_EXISTS:
+                            break;
+                    }
+                }
             }
+            cond_cleanup:
+            if (has_lhs_expr) cell_release(&lhs_tmp);
+            return cond_result;
         }
     }
     return 0;
@@ -2948,7 +2970,7 @@ next_col:
     rows_push(result, dst);
 }
 
-int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result)
+int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
 {
     /* find WHERE column index if applicable (legacy path) */
     int where_col = -1;
@@ -3137,7 +3159,8 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                     c.is_null = 1;
                 } else {
                     struct cell *src = (ae->func == AGG_MIN) ? &min_cells[a] : &max_cells[a];
-                    cell_copy(&c, src);
+                    if (rb) cell_copy_bump(&c, src, rb);
+                    else    cell_copy(&c, src);
                 }
                 break;
             }
@@ -3221,7 +3244,7 @@ static double cell_to_double(const struct cell *c)
     return 0.0;
 }
 
-static int query_window(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result)
+static int query_window(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
 {
     size_t nrows = t->rows.count;
     size_t nexprs = s->select_exprs_count;
@@ -3613,7 +3636,8 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
             struct cell c = {0};
 
             if (se->kind == SEL_COLUMN) {
-                cell_copy(&c, &src->cells.items[col_idx[e]]);
+                if (rb) cell_copy_bump(&c, &src->cells.items[col_idx[e]], rb);
+                else    cell_copy(&c, &src->cells.items[col_idx[e]]);
             } else if (win_is_null[ri * nexprs + e]) {
                 c.type = (win_is_dbl[e]) ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
                 c.is_null = 1;
@@ -3657,7 +3681,8 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                 if (column_type_is_text(ac->type)) {
                     c.type = COLUMN_TYPE_INT; /* reset */
                     c.is_null = 0;
-                    cell_copy(&c, ac);
+                    if (rb) cell_copy_bump(&c, ac, rb);
+                    else    cell_copy(&c, ac);
                 }
             }
 
@@ -3744,7 +3769,7 @@ static int grp_find_result_col(struct table *t, int *grp_cols, size_t ngrp,
     return -1;
 }
 
-int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result)
+int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
 {
     /* resolve GROUP BY column indices */
     size_t ngrp = s->group_by_count;
@@ -3950,7 +3975,8 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             /* default: group key columns first */
             for (size_t k = 0; k < ngrp; k++) {
                 struct cell gc;
-                cell_copy(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]]);
+                if (rb) cell_copy_bump(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]], rb);
+                else    cell_copy(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]]);
                 da_push(&dst.cells, gc);
             }
         }
@@ -4012,7 +4038,8 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                         c.is_null = 1;
                     } else {
                         struct cell *src = (ae->func == AGG_MIN) ? &gmin_cells[a] : &gmax_cells[a];
-                        cell_copy(&c, src);
+                        if (rb) cell_copy_bump(&c, src, rb);
+                        else    cell_copy(&c, src);
                     }
                     break;
                 }
@@ -4026,7 +4053,8 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             /* aggregates first, then group key columns */
             for (size_t k = 0; k < ngrp; k++) {
                 struct cell gc;
-                cell_copy(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]]);
+                if (rb) cell_copy_bump(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]], rb);
+                else    cell_copy(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]]);
                 da_push(&dst.cells, gc);
             }
         }
@@ -4035,7 +4063,8 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
         if (has_having_t) {
             int passes = eval_condition(s->having_cond, arena, &dst, &having_t, NULL);
             if (!passes) {
-                row_free(&dst);
+                if (rb) da_free(&dst.cells);
+                else    row_free(&dst);
                 continue;
             }
         }
@@ -4079,8 +4108,20 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             rows_push(&trimmed, result->data[i]);
             result->data[i] = (struct row){0};
         }
-        rows_free(result);
+        /* free discarded rows: bump text must not be free'd */
+        int owns = result->arena_owns_text;
+        if (rb) {
+            for (size_t i = 0; i < result->count; i++)
+                da_free(&result->data[i].cells);
+            free(result->data);
+            result->data = NULL;
+            result->count = 0;
+            result->capacity = 0;
+        } else {
+            rows_free(result);
+        }
         *result = trimmed;
+        result->arena_owns_text = owns;
     }
 
     return 0;
@@ -4106,7 +4147,7 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
 {
     /* dispatch to window path if select_exprs are present */
     if (s->select_exprs_count > 0)
-        return query_window(t, s, arena, result);
+        return query_window(t, s, arena, result, rb);
 
     /* dispatch to GROUP BY path */
     if (s->has_group_by) {
@@ -4160,7 +4201,7 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                     /* grand total: run as plain aggregate (no GROUP BY) */
                     s->has_group_by = 0;
                     struct rows sub = {0};
-                    query_aggregate(t, s, arena, &sub);
+                    query_aggregate(t, s, arena, &sub, NULL);
                     s->has_group_by = 1;
                     /* prepend NULL group columns if agg_before_cols is 0 */
                     for (size_t r = 0; r < sub.count; r++) {
@@ -4176,7 +4217,8 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                             }
                             for (size_t ci = 0; ci < sub.data[r].cells.count; ci++) {
                                 struct cell dup;
-                                cell_copy(&dup, &sub.data[r].cells.items[ci]);
+                                if (rb) cell_copy_bump(&dup, &sub.data[r].cells.items[ci], rb);
+                                else    cell_copy(&dup, &sub.data[r].cells.items[ci]);
                                 da_push(&newrow.cells, dup);
                             }
                             row_free(&sub.data[r]);
@@ -4192,7 +4234,7 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                     s->group_by_count = tmp_count;
                     s->group_by_col = ASV(arena, tmp_start);
                     struct rows sub = {0};
-                    query_group_by(t, s, arena, &sub);
+                    query_group_by(t, s, arena, &sub, NULL);
                     /* NULL-out columns not in this grouping set */
                     for (size_t r = 0; r < sub.count; r++) {
                         if (!s->agg_before_cols) {
@@ -4205,7 +4247,8 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                                 if (mask & (1u << k)) {
                                     if (sub_grp_i < sub.data[r].cells.count) {
                                         struct cell dup;
-                                        cell_copy(&dup, &sub.data[r].cells.items[sub_grp_i]);
+                                        if (rb) cell_copy_bump(&dup, &sub.data[r].cells.items[sub_grp_i], rb);
+                                        else    cell_copy(&dup, &sub.data[r].cells.items[sub_grp_i]);
                                         da_push(&newrow.cells, dup);
                                     }
                                     sub_grp_i++;
@@ -4219,7 +4262,8 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                             /* append aggregate columns */
                             for (size_t ci = sub_grp_i; ci < sub.data[r].cells.count; ci++) {
                                 struct cell dup;
-                                cell_copy(&dup, &sub.data[r].cells.items[ci]);
+                                if (rb) cell_copy_bump(&dup, &sub.data[r].cells.items[ci], rb);
+                                else    cell_copy(&dup, &sub.data[r].cells.items[ci]);
                                 da_push(&newrow.cells, dup);
                             }
                             row_free(&sub.data[r]);
@@ -4240,12 +4284,12 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
             s->group_by_cube = orig_cube;
             return 0;
         }
-        return query_group_by(t, s, arena, result);
+        return query_group_by(t, s, arena, result, rb);
     }
 
     /* dispatch to aggregate path if aggregates are present */
     if (s->aggregates_count > 0)
-        return query_aggregate(t, s, arena, result);
+        return query_aggregate(t, s, arena, result, rb);
 
     int select_all = sv_eq_cstr(s->columns, "*");
 
@@ -4539,14 +4583,15 @@ static void rebuild_indexes(struct table *t)
 
 static void emit_returning_row(struct table *t, struct row *src,
                                sv returning_columns, int return_all,
-                               struct rows *result)
+                               struct rows *result, struct bump_alloc *rb)
 {
     struct row ret = {0};
     da_init(&ret.cells);
     if (return_all) {
         for (size_t c = 0; c < src->cells.count; c++) {
             struct cell cp;
-            cell_copy(&cp, &src->cells.items[c]);
+            if (rb) cell_copy_bump(&cp, &src->cells.items[c], rb);
+            else    cell_copy(&cp, &src->cells.items[c]);
             da_push(&ret.cells, cp);
         }
     } else {
@@ -4558,7 +4603,8 @@ static void emit_returning_row(struct table *t, struct row *src,
             for (size_t j = 0; j < t->columns.count; j++) {
                 if (sv_eq_cstr(one, t->columns.items[j].name)) {
                     struct cell cp;
-                    cell_copy(&cp, &src->cells.items[j]);
+                    if (rb) cell_copy_bump(&cp, &src->cells.items[j], rb);
+                    else    cell_copy(&cp, &src->cells.items[j]);
                     da_push(&ret.cells, cp);
                     break;
                 }
@@ -4570,7 +4616,7 @@ static void emit_returning_row(struct table *t, struct row *src,
     rows_push(result, ret);
 }
 
-static int query_delete_exec(struct table *t, struct query_delete *d, struct query_arena *arena, struct rows *result)
+static int query_delete_exec(struct table *t, struct query_delete *d, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
 {
     int has_ret = (d->has_returning && d->returning_columns.len > 0);
     int return_all = has_ret && sv_eq_cstr(d->returning_columns, "*");
@@ -4579,7 +4625,7 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct que
         if (row_matches(t, &d->where, arena, &t->rows.items[i], NULL)) {
             /* capture row for RETURNING before freeing */
             if (has_ret && result)
-                emit_returning_row(t, &t->rows.items[i], d->returning_columns, return_all, result);
+                emit_returning_row(t, &t->rows.items[i], d->returning_columns, return_all, result, rb);
             row_free(&t->rows.items[i]);
             for (size_t j = i; j + 1 < t->rows.count; j++)
                 t->rows.items[j] = t->rows.items[j + 1];
@@ -4606,7 +4652,7 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct que
     return 0;
 }
 
-static int query_update_exec(struct table *t, struct query_update *u, struct query_arena *arena, struct rows *result, struct database *db)
+static int query_update_exec(struct table *t, struct query_update *u, struct query_arena *arena, struct rows *result, struct database *db, struct bump_alloc *rb)
 {
     int has_ret = (u->has_returning && u->returning_columns.len > 0);
     int return_all = has_ret && sv_eq_cstr(u->returning_columns, "*");
@@ -4640,7 +4686,7 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
         }
         /* capture row for RETURNING after SET */
         if (has_ret && result)
-            emit_returning_row(t, &t->rows.items[i], u->returning_columns, return_all, result);
+            emit_returning_row(t, &t->rows.items[i], u->returning_columns, return_all, result, rb);
     }
     /* rebuild indexes after cell mutation */
     if (updated > 0) {
@@ -4662,7 +4708,7 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
 
 /* copy_cell_into → use shared cell_copy from row.h */
 
-static int query_insert_exec(struct table *t, struct query_insert *ins, struct query_arena *arena, struct rows *result, struct database *db)
+static int query_insert_exec(struct table *t, struct query_insert *ins, struct query_arena *arena, struct rows *result, struct database *db, struct bump_alloc *rb)
 {
     int has_returning = (ins->returning_columns.len > 0);
     int return_all = has_returning && sv_eq_cstr(ins->returning_columns, "*");
@@ -4674,7 +4720,7 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
         for (size_t ci = 0; ci < src->cells.count; ci++) {
             if (src->cells.items[ci].is_null == 2) {
                 uint32_t ei = (uint32_t)src->cells.items[ci].value.as_int;
-                struct cell val = eval_expr(ei, arena, t, NULL, db, NULL);
+                struct cell val = eval_expr(ei, arena, t, NULL, db, &arena->bump);
                 src->cells.items[ci] = val;
             }
         }
@@ -4803,7 +4849,7 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
         }
 
         if (has_returning && result)
-            emit_returning_row(t, &t->rows.items[t->rows.count - 1], ins->returning_columns, return_all, result);
+            emit_returning_row(t, &t->rows.items[t->rows.count - 1], ins->returning_columns, return_all, result, rb);
     }
 
     return 0;
@@ -4831,11 +4877,11 @@ int query_exec(struct table *t, struct query *q, struct rows *result, struct dat
         case QUERY_TYPE_SELECT:
             return query_select_exec(t, &q->select, &q->arena, result, db, rb);
         case QUERY_TYPE_INSERT:
-            return query_insert_exec(t, &q->insert, &q->arena, result, db);
+            return query_insert_exec(t, &q->insert, &q->arena, result, db, rb);
         case QUERY_TYPE_DELETE:
-            return query_delete_exec(t, &q->del, &q->arena, result);
+            return query_delete_exec(t, &q->del, &q->arena, result, rb);
         case QUERY_TYPE_UPDATE:
-            return query_update_exec(t, &q->update, &q->arena, result, db);
+            return query_update_exec(t, &q->update, &q->arena, result, db, rb);
     }
     return -1;
 }

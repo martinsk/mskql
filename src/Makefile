@@ -1,5 +1,5 @@
-CC       = cc
-CFLAGS  ?= -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O3 -flto -DNDEBUG -g
+CC       ?= cc
+CFLAGS  ?= -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O1 -g -fsanitize=address -fno-omit-frame-pointer
 BUILDDIR = ../build
 SRCS     = main.c database.c table.c query.c row.c parser.c pgwire.c index.c column.c plan.c
 OBJS     = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
@@ -8,16 +8,27 @@ LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/%.o,$(LIB_SRCS))
 TARGET   = $(BUILDDIR)/mskql
 BENCH    = $(BUILDDIR)/mskql_bench
 
+# ── Release flags (for benchmarks / production) ──────────────────
+RELEASE_CFLAGS = -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O3 -flto -DNDEBUG -g
+RELEASE_OBJS     = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(SRCS))
+RELEASE_LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(LIB_SRCS))
+
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
-bench: $(LIB_OBJS) $(BUILDDIR)/bench.o
-	$(CC) $(CFLAGS) -o $(BENCH) $^ -lm
+release: $(RELEASE_OBJS)
+	$(CC) $(RELEASE_CFLAGS) -o $(TARGET) $^ -lm
 
-$(BUILDDIR)/bench.o: ../bench/bench.c | $(BUILDDIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+bench: $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_bench.o
+	$(CC) $(RELEASE_CFLAGS) -o $(BENCH) $^ -lm
+
+$(BUILDDIR)/rel_bench.o: ../bench/bench.c | $(BUILDDIR)
+	$(CC) $(RELEASE_CFLAGS) -c -o $@ $<
+
+$(BUILDDIR)/rel_%.o: %.c | $(BUILDDIR)
+	$(CC) $(RELEASE_CFLAGS) -c -o $@ $<
 
 $(BUILDDIR)/%.o: %.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -60,4 +71,4 @@ wasm-stubs: | $(BUILDDIR)
 $(WASM_TARGET): $(WASM_SRCS) | $(BUILDDIR)
 	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $(WASM_SRCS)
 
-.PHONY: all clean bench wasm
+.PHONY: all clean release bench wasm

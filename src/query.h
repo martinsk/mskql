@@ -586,8 +586,8 @@ struct query {
 int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db, struct bump_alloc *rb);
 int parse_datetime(const char *s, struct tm *out);
 double parse_interval_to_seconds(const char *s);
-int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result);
-int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result);
+int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb);
+int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb);
 
 /* arena helpers that need complete type definitions — must come after all structs */
 #include "arena_helpers.h"

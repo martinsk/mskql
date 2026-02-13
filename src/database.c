@@ -699,7 +699,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
         if (!a1) a1 = t1->name;
         if (!a2) a2 = t2->name;
         if (do_single_join(t1, a1, t2, a2, ji->join_left_col, ji->join_right_col, ji->join_type,
-                           ji->join_op, &merged, &merged_t, a, ji->join_on_cond, rb) != 0) {
+                           ji->join_op, &merged, &merged_t, a, ji->join_on_cond, NULL) != 0) {
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
             return -1;
@@ -734,7 +734,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
             snprintf(jn_alias_buf, sizeof(jn_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
         if (do_single_join(&merged_t, NULL, tn, jn_alias_buf[0] ? jn_alias_buf : NULL,
                            ji->join_left_col, ji->join_right_col, ji->join_type,
-                           ji->join_op, &next_merged, &next_meta, a, ji->join_on_cond, rb) != 0) {
+                           ji->join_op, &next_merged, &next_meta, a, ji->join_on_cond, NULL) != 0) {
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
             return -1;
@@ -811,9 +811,9 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
         merged_t.rows.capacity = merged.count;
         int rc;
         if (s->has_group_by)
-            rc = query_group_by(&merged_t, s, a, result);
+            rc = query_group_by(&merged_t, s, a, result, rb);
         else
-            rc = query_aggregate(&merged_t, s, a, result);
+            rc = query_aggregate(&merged_t, s, a, result, rb);
         free_merged_rows(&merged);
         free_merged_columns(&merged_t);
         return rc;
@@ -838,7 +838,9 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
 
         if (select_all) {
             for (size_t c = 0; c < merged.data[i].cells.count; c++) {
-                struct cell cp; cell_copy(&cp, &merged.data[i].cells.items[c]);
+                struct cell cp;
+                if (rb) cell_copy_bump(&cp, &merged.data[i].cells.items[c], rb);
+                else    cell_copy(&cp, &merged.data[i].cells.items[c]);
                 da_push(&dst.cells, cp);
             }
         } else {
@@ -890,7 +892,9 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
                     }
                 }
                 if (idx >= 0) {
-                    struct cell cp; cell_copy(&cp, &merged.data[i].cells.items[idx]);
+                    struct cell cp;
+                    if (rb) cell_copy_bump(&cp, &merged.data[i].cells.items[idx], rb);
+                    else    cell_copy(&cp, &merged.data[i].cells.items[idx]);
                     da_push(&dst.cells, cp);
                 }
 
@@ -1777,7 +1781,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 rows_push(result, dst);
                 sel_rc = 0;
             } else if (s->has_join) {
-                sel_rc = exec_join(db, q, result, NULL);
+                sel_rc = exec_join(db, q, result, rb);
             } else {
                 sel_rc = db_table_exec_query(db, s->table, q, result, rb);
             }
@@ -2119,13 +2123,13 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 }
                 if (ins->insert_rows_count == 0) return 0;
             }
-            return db_table_exec_query(db, ins->table, q, result, NULL);
+            return db_table_exec_query(db, ins->table, q, result, rb);
         }
         case QUERY_TYPE_DELETE:
             /* resolve subqueries in WHERE */
             if (q->del.where.has_where && q->del.where.where_cond != IDX_NONE)
                 resolve_subqueries(db, &q->arena, q->del.where.where_cond, NULL);
-            return db_table_exec_query(db, q->del.table, q, result, NULL);
+            return db_table_exec_query(db, q->del.table, q, result, rb);
         case QUERY_TYPE_UPDATE: {
             struct query_update *u = &q->update;
             /* resolve subqueries in WHERE */
@@ -2243,7 +2247,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 }
                 return 0;
             }
-            return db_table_exec_query(db, u->table, q, result, NULL);
+            return db_table_exec_query(db, u->table, q, result, rb);
         }
         case QUERY_TYPE_ALTER: {
             struct query_alter *a = &q->alter;

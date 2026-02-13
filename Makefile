@@ -3,6 +3,9 @@
 all:
 	$(MAKE) -C src
 
+release:
+	$(MAKE) -C src release
+
 clean:
 	$(MAKE) -C src clean
 
@@ -13,7 +16,7 @@ test-concurrent: all
 	$(MAKE) -C tests/cases/concurrent
 	./build/test_concurrent
 
-bench:
+bench: release
 	$(MAKE) -C src bench
 
-.PHONY: all clean test test-concurrent bench
+.PHONY: all clean release test test-concurrent bench

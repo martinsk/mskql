@@ -1,0 +1,11 @@
+# LeakSanitizer suppressions for macOS system libraries (false positives)
+leak:_fetchInitializingClassList
+leak:_libxpc_initializer
+leak:libSystem_initializer
+leak:initializeNonMetaClass
+leak:dyld::ThreadLocalVariables
+leak:_tlv_get_addr
+# macOS libc dtoa thread-local caches (allocated by snprintf %g/%f, never freed)
+leak:__Balloc_D2A
+# macOS libc localtime thread-local buffer (allocated once, never freed)
+leak:localtime

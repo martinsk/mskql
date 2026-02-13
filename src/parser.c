@@ -4091,11 +4091,11 @@ static int parse_alter(struct lexer *l, struct query *out)
             arena_set_error(&out->arena, "42601", "expected column name in ADD COLUMN");
             return -1;
         }
-        a->alter_new_col.name = sv_to_cstr(tok.value);
+        a->alter_new_col.name = bump_strndup(&out->arena.bump, tok.value.data, tok.value.len);
         tok = lexer_next(l);
         a->alter_new_col.type = parse_column_type(tok.value);
         if (a->alter_new_col.type == COLUMN_TYPE_ENUM)
-            a->alter_new_col.enum_type_name = sv_to_cstr(tok.value);
+            a->alter_new_col.enum_type_name = bump_strndup(&out->arena.bump, tok.value.data, tok.value.len);
         /* skip optional (n) */
         {
             struct token peek = lexer_peek(l);
@@ -4355,8 +4355,5 @@ static int query_parse_internal(const char *sql, struct query *out)
 void query_free(struct query *q)
 {
     query_arena_destroy(&q->arena);
-
-    /* free ALTER column (not arena-managed since it uses column_free) */
-    if (q->query_type == QUERY_TYPE_ALTER)
-        column_free(&q->alter.alter_new_col);
+    /* ALTER column name/enum_type_name are bump-allocated — freed with arena */
 }
