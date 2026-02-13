@@ -98,6 +98,7 @@ static int is_keyword(sv word)
         "ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "POWER", "SQRT", "MOD", "SIGN", "RANDOM",
         "LPAD", "RPAD", "CONCAT", "CONCAT_WS", "POSITION", "SPLIT_PART",
         "LEFT", "RIGHT", "REPEAT", "REVERSE", "INITCAP",
+        "SHOW", "RESET", "DISCARD", "DEALLOCATE",
         NULL
     };
     for (int i = 0; keywords[i]; i++) {
@@ -3841,10 +3842,33 @@ static int parse_create(struct lexer *l, struct query *out)
         return 0;
     }
 
-    /* CREATE INDEX name ON table (column) */
+    /* CREATE INDEX [IF NOT EXISTS] name ON table (column) */
     if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "INDEX")) {
         out->query_type = QUERY_TYPE_CREATE_INDEX;
         struct query_create_index *ci = &out->create_index;
+        ci->if_not_exists = 0;
+
+        /* optional IF NOT EXISTS */
+        tok = lexer_peek(l);
+        if ((tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) &&
+            sv_eq_ignorecase_cstr(tok.value, "IF")) {
+            lexer_next(l); /* consume IF */
+            struct token not_tok = lexer_next(l);
+            if ((not_tok.type == TOK_IDENTIFIER || not_tok.type == TOK_KEYWORD) &&
+                sv_eq_ignorecase_cstr(not_tok.value, "NOT")) {
+                struct token exists_tok = lexer_next(l);
+                if ((exists_tok.type == TOK_IDENTIFIER || exists_tok.type == TOK_KEYWORD) &&
+                    sv_eq_ignorecase_cstr(exists_tok.value, "EXISTS")) {
+                    ci->if_not_exists = 1;
+                } else {
+                    arena_set_error(&out->arena, "42601", "expected EXISTS after IF NOT");
+                    return -1;
+                }
+            } else {
+                arena_set_error(&out->arena, "42601", "expected NOT after IF");
+                return -1;
+            }
+        }
 
         tok = lexer_next(l);
         if (tok.type != TOK_IDENTIFIER && tok.type != TOK_STRING) {
@@ -3894,7 +3918,34 @@ static int parse_create(struct lexer *l, struct query *out)
         return -1;
     }
 
-    return parse_create_table(l, out);
+    /* optional IF NOT EXISTS */
+    int if_not_exists = 0;
+    {
+        struct token peek = lexer_peek(l);
+        if ((peek.type == TOK_IDENTIFIER || peek.type == TOK_KEYWORD) &&
+            sv_eq_ignorecase_cstr(peek.value, "IF")) {
+            lexer_next(l); /* consume IF */
+            struct token not_tok = lexer_next(l);
+            if ((not_tok.type == TOK_IDENTIFIER || not_tok.type == TOK_KEYWORD) &&
+                sv_eq_ignorecase_cstr(not_tok.value, "NOT")) {
+                struct token exists_tok = lexer_next(l);
+                if ((exists_tok.type == TOK_IDENTIFIER || exists_tok.type == TOK_KEYWORD) &&
+                    sv_eq_ignorecase_cstr(exists_tok.value, "EXISTS")) {
+                    if_not_exists = 1;
+                } else {
+                    arena_set_error(&out->arena, "42601", "expected EXISTS after IF NOT");
+                    return -1;
+                }
+            } else {
+                arena_set_error(&out->arena, "42601", "expected NOT after IF");
+                return -1;
+            }
+        }
+    }
+
+    int rc = parse_create_table(l, out);
+    if (rc == 0) out->create_table.if_not_exists = if_not_exists;
+    return rc;
 }
 
 static int parse_drop(struct lexer *l, struct query *out)
@@ -4457,6 +4508,29 @@ static int query_parse_internal(const char *sql, struct query *out)
                rest[rest_len - 1] == '\n' || rest[rest_len - 1] == '\r'))
             rest_len--;
         out->explain.inner_sql = sv_from(rest, rest_len);
+        return 0;
+    }
+
+    /* SET ... / RESET ... / DISCARD ... — silently accept as no-op */
+    if (sv_eq_ignorecase_cstr(tok.value, "SET") ||
+        sv_eq_ignorecase_cstr(tok.value, "RESET") ||
+        sv_eq_ignorecase_cstr(tok.value, "DISCARD") ||
+        sv_eq_ignorecase_cstr(tok.value, "DEALLOCATE")) {
+        out->query_type = QUERY_TYPE_SET;
+        /* consume all remaining tokens */
+        while (lexer_next(&l).type != TOK_EOF) {}
+        return 0;
+    }
+
+    /* SHOW parameter */
+    if (sv_eq_ignorecase_cstr(tok.value, "SHOW")) {
+        out->query_type = QUERY_TYPE_SHOW;
+        tok = lexer_next(&l);
+        if (tok.type == TOK_EOF) {
+            arena_set_error(&out->arena, "42601", "expected parameter name after SHOW");
+            return -1;
+        }
+        out->show.parameter = tok.value;
         return 0;
     }
 

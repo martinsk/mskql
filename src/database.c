@@ -1240,6 +1240,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
     switch (q->query_type) {
         case QUERY_TYPE_CREATE: {
             struct query_create_table *crt = &q->create_table;
+            if (crt->if_not_exists && db_find_table_sv(db, crt->table))
+                return 0;
             struct table t;
             table_init_own(&t, sv_to_cstr(crt->table));
             for (uint32_t i = 0; i < crt->columns_count; i++) {
@@ -1453,6 +1455,13 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             if (!t) {
                 arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)ci->table.len, ci->table.data);
                 return -1;
+            }
+            /* IF NOT EXISTS: check if index already exists */
+            if (ci->if_not_exists) {
+                for (size_t ii = 0; ii < t->indexes.count; ii++) {
+                    if (sv_eq_cstr(ci->index_name, t->indexes.items[ii].name))
+                        return 0;
+                }
             }
             int col_idx = table_find_column_sv(t, ci->index_column);
             if (col_idx < 0) {
@@ -2386,6 +2395,40 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             return 0; /* handled above */
         case QUERY_TYPE_COPY:
             return 0; /* handled in pgwire */
+        case QUERY_TYPE_SET:
+            return 0; /* no-op: silently accept SET/RESET/DISCARD */
+        case QUERY_TYPE_SHOW: {
+            /* return a single-row, single-column result */
+            sv param = q->show.parameter;
+            const char *val = "";
+            if (sv_eq_ignorecase_cstr(param, "search_path"))
+                val = "\"$user\", public";
+            else if (sv_eq_ignorecase_cstr(param, "server_version"))
+                val = "15.0";
+            else if (sv_eq_ignorecase_cstr(param, "server_encoding"))
+                val = "UTF8";
+            else if (sv_eq_ignorecase_cstr(param, "client_encoding"))
+                val = "UTF8";
+            else if (sv_eq_ignorecase_cstr(param, "standard_conforming_strings"))
+                val = "on";
+            else if (sv_eq_ignorecase_cstr(param, "is_superuser"))
+                val = "on";
+            else if (sv_eq_ignorecase_cstr(param, "TimeZone") ||
+                     sv_eq_ignorecase_cstr(param, "timezone"))
+                val = "UTC";
+            else if (sv_eq_ignorecase_cstr(param, "integer_datetimes"))
+                val = "on";
+            else if (sv_eq_ignorecase_cstr(param, "DateStyle"))
+                val = "ISO, MDY";
+            struct row r = {0};
+            da_init(&r.cells);
+            struct cell c = {0};
+            c.type = COLUMN_TYPE_TEXT;
+            c.value.as_text = rb ? bump_strdup(rb, val) : strdup(val);
+            da_push(&r.cells, c);
+            rows_push(result, r);
+            return 0;
+        }
     }
     return -1;
 }

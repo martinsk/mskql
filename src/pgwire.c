@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include <strings.h>
 #include <poll.h>
 #include <fcntl.h>
 
@@ -1112,6 +1113,254 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     return (int)total_rows;
 }
 
+/* ---- system catalog virtual tables ---- */
+
+/* case-insensitive strstr */
+static const char *ci_strstr(const char *haystack, const char *needle)
+{
+    size_t nlen = strlen(needle);
+    for (; *haystack; haystack++) {
+        if (strncasecmp(haystack, needle, nlen) == 0)
+            return haystack;
+    }
+    return NULL;
+}
+
+/* helper: send a RowDescription for N text columns */
+static void catalog_send_row_desc(int fd, struct msgbuf *m,
+                                  const char **col_names, int ncols)
+{
+    m->len = 0;
+    msgbuf_push_u16(m, (uint16_t)ncols);
+    for (int i = 0; i < ncols; i++) {
+        msgbuf_push_cstr(m, col_names[i]);
+        msgbuf_push_u32(m, 0);            /* table OID */
+        msgbuf_push_u16(m, 0);            /* column attr number */
+        msgbuf_push_u32(m, 25);           /* type OID: text */
+        msgbuf_push_u16(m, (uint16_t)-1); /* type size */
+        msgbuf_push_u32(m, 0);            /* type modifier */
+        msgbuf_push_u16(m, 0);            /* format: text */
+    }
+    msg_send(fd, 'T', m);
+}
+
+/* helper: send a DataRow with N text values */
+static void catalog_send_row(int fd, struct msgbuf *m,
+                             const char **vals, int ncols)
+{
+    m->len = 0;
+    msgbuf_push_u16(m, (uint16_t)ncols);
+    for (int i = 0; i < ncols; i++) {
+        if (vals[i] == NULL) {
+            msgbuf_push_u32(m, (uint32_t)-1); /* NULL */
+        } else {
+            uint32_t len = (uint32_t)strlen(vals[i]);
+            msgbuf_push_u32(m, len);
+            msgbuf_push(m, (const uint8_t *)vals[i], len);
+        }
+    }
+    msg_send(fd, 'D', m);
+}
+
+/* Extract a simple WHERE filter value: looks for "table_name = 'xxx'" or
+ * "relname = 'xxx'" pattern. Returns the value string (points into sql) or NULL. */
+static const char *catalog_extract_where_filter(const char *sql, const char *col,
+                                                 char *buf, size_t bufsz)
+{
+    const char *p = ci_strstr(sql, col);
+    if (!p) return NULL;
+    p += strlen(col);
+    while (*p == ' ') p++;
+    if (*p != '=') return NULL;
+    p++;
+    while (*p == ' ') p++;
+    if (*p != '\'') return NULL;
+    p++;
+    const char *end = strchr(p, '\'');
+    if (!end) return NULL;
+    size_t len = (size_t)(end - p);
+    if (len >= bufsz) len = bufsz - 1;
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+/* Map column_type to PostgreSQL type name */
+static const char *column_type_pg_name(enum column_type t)
+{
+    switch (t) {
+        case COLUMN_TYPE_SMALLINT:   return "smallint";
+        case COLUMN_TYPE_INT:        return "integer";
+        case COLUMN_TYPE_BIGINT:     return "bigint";
+        case COLUMN_TYPE_FLOAT:      return "double precision";
+        case COLUMN_TYPE_NUMERIC:    return "numeric";
+        case COLUMN_TYPE_TEXT:       return "text";
+        case COLUMN_TYPE_ENUM:       return "USER-DEFINED";
+        case COLUMN_TYPE_BOOLEAN:    return "boolean";
+        case COLUMN_TYPE_DATE:       return "date";
+        case COLUMN_TYPE_TIME:       return "time without time zone";
+        case COLUMN_TYPE_TIMESTAMP:  return "timestamp without time zone";
+        case COLUMN_TYPE_TIMESTAMPTZ:return "timestamp with time zone";
+        case COLUMN_TYPE_INTERVAL:   return "interval";
+        case COLUMN_TYPE_UUID:       return "uuid";
+    }
+    return "text";
+}
+
+/* Try to handle a system catalog query. Returns number of rows sent (>=0) on
+ * success, or -1 if this is not a system catalog query (fall through to normal
+ * parse path). */
+static int try_system_catalog(int fd, struct database *db, const char *sql,
+                              struct msgbuf *m, int skip_row_desc)
+{
+    /* Quick check: does the SQL reference any system schema? */
+    int has_info_tables = (ci_strstr(sql, "information_schema.tables") != NULL);
+    int has_info_columns = (ci_strstr(sql, "information_schema.columns") != NULL);
+    int has_pg_type = (ci_strstr(sql, "pg_type") != NULL);
+    int has_pg_class = (ci_strstr(sql, "pg_class") != NULL);
+    int has_pg_namespace = (ci_strstr(sql, "pg_namespace") != NULL);
+    int has_pg_attribute = (ci_strstr(sql, "pg_attribute") != NULL);
+    int has_pg_database = (ci_strstr(sql, "pg_database") != NULL);
+    int has_pg_settings = (ci_strstr(sql, "pg_settings") != NULL);
+
+    if (!has_info_tables && !has_info_columns && !has_pg_type &&
+        !has_pg_class && !has_pg_namespace && !has_pg_attribute &&
+        !has_pg_database && !has_pg_settings)
+        return -1;
+
+    char filter_buf[256];
+    int nrows = 0;
+
+    if (has_info_tables) {
+        const char *cols[] = {"table_catalog", "table_schema", "table_name", "table_type"};
+        if (!skip_row_desc)
+            catalog_send_row_desc(fd, m, cols, 4);
+        const char *filter = catalog_extract_where_filter(sql, "table_name", filter_buf, sizeof(filter_buf));
+        for (size_t i = 0; i < db->tables.count; i++) {
+            const char *tname = db->tables.items[i].name;
+            if (filter && strcmp(tname, filter) != 0) continue;
+            /* skip internal temp tables (start with __) */
+            if (tname[0] == '_' && tname[1] == '_') continue;
+            const char *vals[] = {"mskql", "public", tname, "BASE TABLE"};
+            catalog_send_row(fd, m, vals, 4);
+            nrows++;
+        }
+    } else if (has_info_columns) {
+        const char *cols[] = {"table_catalog", "table_schema", "table_name",
+                              "column_name", "ordinal_position", "column_default",
+                              "is_nullable", "data_type"};
+        if (!skip_row_desc)
+            catalog_send_row_desc(fd, m, cols, 8);
+        const char *filter = catalog_extract_where_filter(sql, "table_name", filter_buf, sizeof(filter_buf));
+        for (size_t i = 0; i < db->tables.count; i++) {
+            struct table *t = &db->tables.items[i];
+            if (t->name[0] == '_' && t->name[1] == '_') continue;
+            if (filter && strcmp(t->name, filter) != 0) continue;
+            for (size_t c = 0; c < t->columns.count; c++) {
+                struct column *col = &t->columns.items[c];
+                char pos_buf[16];
+                snprintf(pos_buf, sizeof(pos_buf), "%zu", c + 1);
+                const char *vals[] = {
+                    "mskql", "public", t->name,
+                    col->name, pos_buf, NULL,
+                    col->not_null ? "NO" : "YES",
+                    column_type_pg_name(col->type)
+                };
+                catalog_send_row(fd, m, vals, 8);
+                nrows++;
+            }
+        }
+    } else if (has_pg_type) {
+        const char *cols[] = {"oid", "typname", "typnamespace", "typlen"};
+        if (!skip_row_desc)
+            catalog_send_row_desc(fd, m, cols, 4);
+        static const struct { const char *oid; const char *name; const char *len; } types[] = {
+            {"16",   "bool",        "1"},
+            {"20",   "int8",        "8"},
+            {"21",   "int2",        "2"},
+            {"23",   "int4",        "4"},
+            {"25",   "text",        "-1"},
+            {"701",  "float8",      "8"},
+            {"1043", "varchar",     "-1"},
+            {"1082", "date",        "4"},
+            {"1083", "time",        "8"},
+            {"1114", "timestamp",   "8"},
+            {"1184", "timestamptz", "8"},
+            {"1186", "interval",    "16"},
+            {"1700", "numeric",     "-1"},
+            {"2950", "uuid",        "16"},
+        };
+        const char *filter = catalog_extract_where_filter(sql, "typname", filter_buf, sizeof(filter_buf));
+        for (size_t i = 0; i < sizeof(types)/sizeof(types[0]); i++) {
+            if (filter && strcmp(types[i].name, filter) != 0) continue;
+            const char *vals[] = {types[i].oid, types[i].name, "11", types[i].len};
+            catalog_send_row(fd, m, vals, 4);
+            nrows++;
+        }
+    } else if (has_pg_class) {
+        const char *cols[] = {"oid", "relname", "relnamespace", "relkind"};
+        if (!skip_row_desc)
+            catalog_send_row_desc(fd, m, cols, 4);
+        const char *filter = catalog_extract_where_filter(sql, "relname", filter_buf, sizeof(filter_buf));
+        for (size_t i = 0; i < db->tables.count; i++) {
+            const char *tname = db->tables.items[i].name;
+            if (tname[0] == '_' && tname[1] == '_') continue;
+            if (filter && strcmp(tname, filter) != 0) continue;
+            char oid_buf[16];
+            snprintf(oid_buf, sizeof(oid_buf), "%zu", 16384 + i);
+            const char *vals[] = {oid_buf, tname, "2200", "r"};
+            catalog_send_row(fd, m, vals, 4);
+            nrows++;
+        }
+    } else if (has_pg_namespace) {
+        const char *cols[] = {"oid", "nspname"};
+        if (!skip_row_desc)
+            catalog_send_row_desc(fd, m, cols, 2);
+        const char *vals1[] = {"11", "pg_catalog"};
+        catalog_send_row(fd, m, vals1, 2);
+        const char *vals2[] = {"2200", "public"};
+        catalog_send_row(fd, m, vals2, 2);
+        nrows = 2;
+    } else if (has_pg_attribute) {
+        const char *cols[] = {"attrelid", "attname", "atttypid", "attnum", "attnotnull"};
+        if (!skip_row_desc)
+            catalog_send_row_desc(fd, m, cols, 5);
+        const char *filter = catalog_extract_where_filter(sql, "relname", filter_buf, sizeof(filter_buf));
+        for (size_t i = 0; i < db->tables.count; i++) {
+            struct table *t = &db->tables.items[i];
+            if (t->name[0] == '_' && t->name[1] == '_') continue;
+            if (filter && strcmp(t->name, filter) != 0) continue;
+            char relid_buf[16];
+            snprintf(relid_buf, sizeof(relid_buf), "%zu", 16384 + i);
+            for (size_t c = 0; c < t->columns.count; c++) {
+                struct column *col = &t->columns.items[c];
+                char typid_buf[16], attnum_buf[16];
+                snprintf(typid_buf, sizeof(typid_buf), "%u", column_type_to_oid(col->type));
+                snprintf(attnum_buf, sizeof(attnum_buf), "%zu", c + 1);
+                const char *vals[] = {
+                    relid_buf, col->name, typid_buf, attnum_buf,
+                    col->not_null ? "t" : "f"
+                };
+                catalog_send_row(fd, m, vals, 5);
+                nrows++;
+            }
+        }
+    } else {
+        /* pg_database, pg_settings, or other unrecognized — return empty result */
+        const char *cols[] = {"oid", "datname"};
+        int nc = 2;
+        if (has_pg_settings) {
+            const char *scols[] = {"name", "setting"};
+            cols[0] = scols[0]; cols[1] = scols[1];
+        }
+        if (!skip_row_desc)
+            catalog_send_row_desc(fd, m, cols, nc);
+        nrows = 0;
+    }
+
+    return nrows;
+}
+
 /* ---- handle a single query string (may contain one statement) ---- */
 
 /* Inner handler: parse, execute, send results + CommandComplete.
@@ -1129,6 +1378,17 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     if (*p == '\0') {
         send_empty_query(fd, m);
         return 0;
+    }
+
+    /* Try system catalog interception before parsing */
+    {
+        int cat_rows = try_system_catalog(fd, db, sql, m, skip_row_desc);
+        if (cat_rows >= 0) {
+            char tag[128];
+            snprintf(tag, sizeof(tag), "SELECT %d", cat_rows);
+            send_command_complete(fd, m, tag);
+            return 0;
+        }
     }
 
     struct query q = {0};
@@ -1382,6 +1642,30 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
             break;
         case QUERY_TYPE_COPY:
             snprintf(tag, sizeof(tag), "COPY");
+            break;
+        case QUERY_TYPE_SET:
+            snprintf(tag, sizeof(tag), "SET");
+            break;
+        case QUERY_TYPE_SHOW:
+            if (!skip_row_desc) {
+                /* send a single-column RowDescription with the parameter name */
+                char col_name[128];
+                snprintf(col_name, sizeof(col_name), "%.*s",
+                         (int)q.show.parameter.len, q.show.parameter.data);
+                m->len = 0;
+                msgbuf_push_u16(m, 1); /* 1 column */
+                msgbuf_push(m, (const uint8_t *)col_name, strlen(col_name));
+                msgbuf_push_byte(m, 0); /* null terminator */
+                msgbuf_push_u32(m, 0);  /* table OID */
+                msgbuf_push_u16(m, 0);  /* column attr number */
+                msgbuf_push_u32(m, 25); /* type OID: text */
+                msgbuf_push_u16(m, (uint16_t)-1); /* type size */
+                msgbuf_push_u32(m, 0);  /* type modifier */
+                msgbuf_push_u16(m, 0);  /* format: text */
+                msg_send(fd, 'T', m);
+            }
+            send_data_rows(fd, result);
+            snprintf(tag, sizeof(tag), "SHOW");
             break;
     }
 

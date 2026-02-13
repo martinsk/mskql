@@ -5394,6 +5394,9 @@ int query_exec(struct table *t, struct query *q, struct rows *result, struct dat
         case QUERY_TYPE_DROP_VIEW:
         case QUERY_TYPE_TRUNCATE:
         case QUERY_TYPE_EXPLAIN:
+        case QUERY_TYPE_COPY:
+        case QUERY_TYPE_SET:
+        case QUERY_TYPE_SHOW:
             return -1;
         case QUERY_TYPE_SELECT:
             return query_select_exec(t, &q->select, &q->arena, result, db, rb);

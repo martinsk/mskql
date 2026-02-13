@@ -332,7 +332,9 @@ enum query_type {
     QUERY_TYPE_DROP_VIEW,
     QUERY_TYPE_TRUNCATE,
     QUERY_TYPE_EXPLAIN,
-    QUERY_TYPE_COPY
+    QUERY_TYPE_COPY,
+    QUERY_TYPE_SET,
+    QUERY_TYPE_SHOW
 };
 
 struct query_copy {
@@ -517,6 +519,7 @@ struct query_create_table {
     sv table;
     uint32_t columns_start; /* index into arena.columns (consecutive) */
     uint32_t columns_count;
+    int if_not_exists;
 };
 
 struct query_drop_table {
@@ -536,6 +539,7 @@ struct query_create_index {
     sv table;
     sv index_name;
     sv index_column;
+    int if_not_exists;
 };
 
 struct query_drop_index {
@@ -578,6 +582,10 @@ struct query_explain {
     int has_analyze;     /* 1 if EXPLAIN ANALYZE */
 };
 
+struct query_show {
+    sv parameter;        /* parameter name for SHOW */
+};
+
 struct query {
     enum query_type query_type;
     struct query_arena arena;
@@ -599,6 +607,7 @@ struct query {
         struct query_drop_view drop_view;
         struct query_explain explain;
         struct query_copy copy;
+        struct query_show show;
     };
 };
 
