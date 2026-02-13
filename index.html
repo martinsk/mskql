@@ -176,6 +176,7 @@
         }
         @media (max-width: 700px) {
             .cta-row { flex-direction: column; }
+            .ai-split { flex-direction: column; }
         }
 
         /* ── Benchmark summary ───────────────────────────────── */
@@ -267,17 +268,26 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 
 <h2 id="ai-built">Built entirely by AI agents</h2>
 
-<p>
-    Three agents&mdash;a Writer, a Challenger, and a Reviewer&mdash;collaborated in
-    iterative rounds. The Challenger writes adversarial tests, the Reviewer flags
-    code-quality issues, and the Writer ships fixes until all 892 tests pass
-    cleanly.<span class="sidenote">The adversarial model drove the implementation toward
-    correctness the same way rigorous code review does on a human team&mdash;except
-    all three sides were machines.</span>
+<div class="ai-split" style="display:flex; gap:2rem; align-items:flex-start; margin:1rem 0 1.4rem 0;">
+<div style="flex:1 1 50%; min-width:0;">
+<p style="margin-bottom:0.8rem;">
+    Three agents collaborated in iterative rounds. The <strong>Challenger</strong>
+    writes adversarial SQL tests designed to break the system. The
+    <strong>Reviewer</strong> reads the source and flags code-quality issues.
+    The <strong>Writer</strong> runs the tests, addresses feedback, and ships
+    fixes&mdash;repeating until all 892 tests pass cleanly.
 </p>
-
-<div class="diagram" style="margin:1rem auto; max-width:420px;">
-<svg viewBox="0 0 620 160" xmlns="http://www.w3.org/2000/svg" font-family="'EB Garamond', Georgia, serif">
+<p style="margin-bottom:0.8rem;">
+    No human wrote any of the C code or SQL test cases. The adversarial model
+    drove the implementation toward correctness the same way rigorous code review
+    does on a human team&mdash;except all three sides were machines.
+</p>
+<p style="margin-bottom:0;">
+    &#8594;&ensp;<a href="construction.html"><strong>Read more about the process</strong></a>
+</p>
+</div>
+<div style="flex:1 1 50%; min-width:0;">
+<svg viewBox="0 0 620 160" xmlns="http://www.w3.org/2000/svg" font-family="'EB Garamond', Georgia, serif" style="width:100%; height:auto;">
   <rect width="620" height="160" fill="#fffff8"/>
   <defs>
     <marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
@@ -302,10 +312,7 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
   <text x="310" y="130" text-anchor="middle" font-size="10" fill="#555" font-style="italic">iterate until all 892 tests pass</text>
 </svg>
 </div>
-
-<p>
-    &#8594;&ensp;<a href="construction.html"><strong>Read more about the adversarial process</strong></a>
-</p>
+</div>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--  NOW WHAT: Embedded playground                              -->
