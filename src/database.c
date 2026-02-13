@@ -1519,6 +1519,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                             for (size_t ri = 0; ri < ct->rows.count; ri++)
                                 row_free(&ct->rows.items[ri]);
                             ct->rows.count = 0;
+                            ct->generation++;
 
                             for (size_t ri = 0; ri < rec_rows.count; ri++) {
                                 /* add to accumulator */

@@ -845,7 +845,7 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             cell->type = cb->type;
             if (cb->nulls[ri]) {
                 cell->is_null = 1;
-                cell->value.as_int = 0;
+                memset(&cell->value, 0, sizeof(cell->value));
             } else {
                 cell->is_null = 0;
                 if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN)
