@@ -1412,6 +1412,12 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             ? st->mins[idx] : st->maxs[idx]);
                     }
                     break;
+                case AGG_STRING_AGG:
+                case AGG_ARRAY_AGG:
+                    /* not supported in plan executor — fall back to legacy path */
+                    dst->type = COLUMN_TYPE_TEXT;
+                    dst->nulls[out_count] = 1;
+                    break;
                 case AGG_NONE:
                     break;
             }

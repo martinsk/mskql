@@ -3180,6 +3180,115 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                 }
                 break;
             }
+            case AGG_STRING_AGG:
+            case AGG_ARRAY_AGG: {
+                c.type = COLUMN_TYPE_TEXT;
+                if (nonnull_count[a] == 0 && ae->func == AGG_STRING_AGG) {
+                    c.is_null = 1;
+                    c.value.as_text = NULL;
+                } else {
+                    /* Build concatenated string by re-scanning rows */
+                    char *buf = bump_alloc(&arena->scratch, 4096);
+                    size_t buf_len = 0, buf_cap = 4096;
+                    int is_array = (ae->func == AGG_ARRAY_AGG);
+                    if (is_array) { buf[buf_len++] = '{'; }
+                    int first = 1;
+                    /* Track seen values for DISTINCT */
+                    struct cell *seen_vals = NULL;
+                    int seen_count = 0;
+                    if (ae->has_distinct && nonnull_count[a] > 0)
+                        seen_vals = bump_calloc(&arena->scratch, nonnull_count[a], sizeof(struct cell));
+                    for (size_t i = 0; i < t->rows.count; i++) {
+                        if (s->where.has_where) {
+                            if (s->where.where_cond != IDX_NONE) {
+                                if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
+                                    continue;
+                            } else if (where_col >= 0) {
+                                if (!cell_equal(&t->rows.items[i].cells.items[where_col], &s->where.where_value))
+                                    continue;
+                            }
+                        }
+                        struct cell ev;
+                        struct cell *cv;
+                        if (agg_col[a] == -2) {
+                            ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL);
+                            cv = &ev;
+                        } else if (agg_col[a] >= 0) {
+                            cv = &t->rows.items[i].cells.items[agg_col[a]];
+                        } else {
+                            continue;
+                        }
+                        int is_null_val = cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text);
+                        /* STRING_AGG skips NULLs; ARRAY_AGG includes them */
+                        if (is_null_val && !is_array) continue;
+                        /* DISTINCT check */
+                        if (ae->has_distinct && !is_null_val && seen_vals) {
+                            int dup = 0;
+                            for (int d = 0; d < seen_count; d++) {
+                                if (cell_compare(cv, &seen_vals[d]) == 0) { dup = 1; break; }
+                            }
+                            if (dup) continue;
+                            seen_vals[seen_count++] = *cv;
+                        }
+                        /* Get text representation */
+                        char tmp[128];
+                        const char *val_str = NULL;
+                        if (is_null_val) {
+                            val_str = "NULL";
+                        } else if (column_type_is_text(cv->type)) {
+                            val_str = cv->value.as_text;
+                        } else if (cv->type == COLUMN_TYPE_INT) {
+                            snprintf(tmp, sizeof(tmp), "%d", cv->value.as_int);
+                            val_str = tmp;
+                        } else if (cv->type == COLUMN_TYPE_BIGINT) {
+                            snprintf(tmp, sizeof(tmp), "%lld", cv->value.as_bigint);
+                            val_str = tmp;
+                        } else if (cv->type == COLUMN_TYPE_FLOAT || cv->type == COLUMN_TYPE_NUMERIC) {
+                            snprintf(tmp, sizeof(tmp), "%g", cv->value.as_float);
+                            val_str = tmp;
+                        } else if (cv->type == COLUMN_TYPE_BOOLEAN) {
+                            val_str = cv->value.as_bool ? "true" : "false";
+                        } else if (cv->type == COLUMN_TYPE_SMALLINT) {
+                            snprintf(tmp, sizeof(tmp), "%d", (int)cv->value.as_smallint);
+                            val_str = tmp;
+                        }
+                        if (!val_str) continue;
+                        size_t val_len = strlen(val_str);
+                        /* Add separator */
+                        const char *sep = NULL;
+                        size_t sep_len = 0;
+                        if (!first) {
+                            if (is_array) {
+                                sep = ","; sep_len = 1;
+                            } else if (ae->separator.len > 0) {
+                                sep = ae->separator.data; sep_len = ae->separator.len;
+                            }
+                        }
+                        /* Ensure buffer capacity */
+                        size_t needed = buf_len + (sep ? sep_len : 0) + val_len + 2;
+                        while (needed > buf_cap) {
+                            buf_cap *= 2;
+                            char *nb = bump_alloc(&arena->scratch, buf_cap);
+                            memcpy(nb, buf, buf_len);
+                            buf = nb;
+                        }
+                        if (sep) { memcpy(buf + buf_len, sep, sep_len); buf_len += sep_len; }
+                        memcpy(buf + buf_len, val_str, val_len); buf_len += val_len;
+                        first = 0;
+                    }
+                    if (is_array) { buf[buf_len++] = '}'; }
+                    buf[buf_len] = '\0';
+                    if (is_array && buf_len == 2) {
+                        /* empty array_agg — return NULL */
+                        c.is_null = 1;
+                        c.value.as_text = NULL;
+                    } else {
+                        if (rb) c.value.as_text = bump_strdup(rb, buf);
+                        else    c.value.as_text = strdup(buf);
+                    }
+                }
+                break;
+            }
             case AGG_NONE:
                 break;
         }
@@ -3773,11 +3882,13 @@ static int grp_find_result_col(struct table *t, int *grp_cols, size_t ngrp,
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
         const char *agg_name = "?";
         switch (ae->func) {
-            case AGG_SUM:   agg_name = "sum";   break;
-            case AGG_COUNT: agg_name = "count"; break;
-            case AGG_AVG:   agg_name = "avg";   break;
-            case AGG_MIN:   agg_name = "min";   break;
-            case AGG_MAX:   agg_name = "max";   break;
+            case AGG_SUM:        agg_name = "sum";        break;
+            case AGG_COUNT:      agg_name = "count";      break;
+            case AGG_AVG:        agg_name = "avg";        break;
+            case AGG_MIN:        agg_name = "min";        break;
+            case AGG_MAX:        agg_name = "max";        break;
+            case AGG_STRING_AGG: agg_name = "string_agg"; break;
+            case AGG_ARRAY_AGG:  agg_name = "array_agg";  break;
             case AGG_NONE: break;
         }
         if (sv_eq_cstr(name, agg_name))
@@ -3897,11 +4008,13 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
             const char *agg_name = "?";
             switch (ae->func) {
-                case AGG_SUM:   agg_name = "sum";   break;
-                case AGG_COUNT: agg_name = "count"; break;
-                case AGG_AVG:   agg_name = "avg";   break;
-                case AGG_MIN:   agg_name = "min";   break;
-                case AGG_MAX:   agg_name = "max";   break;
+                case AGG_SUM:        agg_name = "sum";        break;
+                case AGG_COUNT:      agg_name = "count";      break;
+                case AGG_AVG:        agg_name = "avg";        break;
+                case AGG_MIN:        agg_name = "min";        break;
+                case AGG_MAX:        agg_name = "max";        break;
+                case AGG_STRING_AGG: agg_name = "string_agg"; break;
+                case AGG_ARRAY_AGG:  agg_name = "array_agg";  break;
                 case AGG_NONE: break;
             }
             int ac_idx = gagg_cols[a];
@@ -3912,6 +4025,8 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                 ctype = COLUMN_TYPE_FLOAT;
             if (ae->func == AGG_COUNT)
                 ctype = COLUMN_TYPE_INT;
+            if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG)
+                ctype = COLUMN_TYPE_TEXT;
             struct column col_a = { .name = strdup(agg_name),
                                     .type = ctype,
                                     .enum_type_name = NULL };
@@ -4057,6 +4172,92 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                         struct cell *src = (ae->func == AGG_MIN) ? &gmin_cells[a] : &gmax_cells[a];
                         if (rb) cell_copy_bump(&c, src, rb);
                         else    cell_copy(&c, src);
+                    }
+                    break;
+                }
+                case AGG_STRING_AGG:
+                case AGG_ARRAY_AGG: {
+                    c.type = COLUMN_TYPE_TEXT;
+                    if (gnonnull[a] == 0 && ae->func == AGG_STRING_AGG) {
+                        c.is_null = 1;
+                        c.value.as_text = NULL;
+                    } else {
+                        char *buf = bump_alloc(&arena->scratch, 4096);
+                        size_t buf_len = 0, buf_cap = 4096;
+                        int is_array = (ae->func == AGG_ARRAY_AGG);
+                        if (is_array) { buf[buf_len++] = '{'; }
+                        int first = 1;
+                        for (size_t m = 0; m < matching_count; m++) {
+                            size_t ri = matching[m];
+                            int eq = 1;
+                            for (size_t k = 0; k < ngrp; k++) {
+                                if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
+                                                &t->rows.items[first_ri].cells.items[grp_cols[k]])) {
+                                    eq = 0; break;
+                                }
+                            }
+                            if (!eq) continue;
+                            struct cell ev;
+                            struct cell *cv;
+                            if (ac_idx == -2) {
+                                ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[ri], NULL, NULL);
+                                cv = &ev;
+                            } else if (ac_idx >= 0) {
+                                cv = &t->rows.items[ri].cells.items[ac_idx];
+                            } else {
+                                continue;
+                            }
+                            int is_null_val = cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text);
+                            if (is_null_val && !is_array) continue;
+                            char tmp[128];
+                            const char *val_str = NULL;
+                            if (is_null_val) {
+                                val_str = "NULL";
+                            } else if (column_type_is_text(cv->type)) {
+                                val_str = cv->value.as_text;
+                            } else if (cv->type == COLUMN_TYPE_INT) {
+                                snprintf(tmp, sizeof(tmp), "%d", cv->value.as_int);
+                                val_str = tmp;
+                            } else if (cv->type == COLUMN_TYPE_BIGINT) {
+                                snprintf(tmp, sizeof(tmp), "%lld", cv->value.as_bigint);
+                                val_str = tmp;
+                            } else if (cv->type == COLUMN_TYPE_FLOAT || cv->type == COLUMN_TYPE_NUMERIC) {
+                                snprintf(tmp, sizeof(tmp), "%g", cv->value.as_float);
+                                val_str = tmp;
+                            } else if (cv->type == COLUMN_TYPE_BOOLEAN) {
+                                val_str = cv->value.as_bool ? "true" : "false";
+                            } else if (cv->type == COLUMN_TYPE_SMALLINT) {
+                                snprintf(tmp, sizeof(tmp), "%d", (int)cv->value.as_smallint);
+                                val_str = tmp;
+                            }
+                            if (!val_str) continue;
+                            size_t val_len = strlen(val_str);
+                            const char *sep = NULL;
+                            size_t sep_len = 0;
+                            if (!first) {
+                                if (is_array) { sep = ","; sep_len = 1; }
+                                else if (ae->separator.len > 0) { sep = ae->separator.data; sep_len = ae->separator.len; }
+                            }
+                            size_t needed = buf_len + (sep ? sep_len : 0) + val_len + 2;
+                            while (needed > buf_cap) {
+                                buf_cap *= 2;
+                                char *nb = bump_alloc(&arena->scratch, buf_cap);
+                                memcpy(nb, buf, buf_len);
+                                buf = nb;
+                            }
+                            if (sep) { memcpy(buf + buf_len, sep, sep_len); buf_len += sep_len; }
+                            memcpy(buf + buf_len, val_str, val_len); buf_len += val_len;
+                            first = 0;
+                        }
+                        if (is_array) { buf[buf_len++] = '}'; }
+                        buf[buf_len] = '\0';
+                        if (is_array && buf_len == 2) {
+                            c.is_null = 1;
+                            c.value.as_text = NULL;
+                        } else {
+                            if (rb) c.value.as_text = bump_strdup(rb, buf);
+                            else    c.value.as_text = strdup(buf);
+                        }
                     }
                     break;
                 }
@@ -4680,6 +4881,8 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct que
     return 0;
 }
 
+static int check_constraints_ok(struct table *t, struct row *row, struct query_arena *arena, struct database *db);
+
 static int query_update_exec(struct table *t, struct query_update *u, struct query_arena *arena, struct rows *result, struct database *db, struct bump_alloc *rb)
 {
     int has_ret = (u->has_returning && u->returning_columns.len > 0);
@@ -4741,6 +4944,9 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                 free(dst->value.as_text);
             *dst = new_vals[sc];
         }
+        /* enforce CHECK constraints on the updated row */
+        if (check_constraints_ok(t, &t->rows.items[i], arena, db) != 0)
+            return -1;
         /* capture row for RETURNING after SET */
         if (has_ret && result)
             emit_returning_row(t, &t->rows.items[i], u->returning_columns, return_all, result, rb);
@@ -4925,6 +5131,54 @@ static int fk_enforce_update(struct database *db, struct table *parent_t,
     return 0;
 }
 
+/* Evaluate CHECK constraints for a row. Returns 0 if all pass, -1 on violation. */
+static int check_constraints_ok(struct table *t, struct row *row, struct query_arena *arena, struct database *db)
+{
+    for (size_t i = 0; i < t->columns.count; i++) {
+        if (!t->columns.items[i].check_expr_sql)
+            continue;
+        /* Parse the check expression as a WHERE condition:
+         * "SELECT 1 FROM _dummy WHERE <check_expr>" */
+        char sql_buf[512];
+        snprintf(sql_buf, sizeof(sql_buf), "SELECT 1 FROM _dummy WHERE %s",
+                 t->columns.items[i].check_expr_sql);
+        struct query chk = {0};
+        if (query_parse(sql_buf, &chk) != 0 || chk.query_type != QUERY_TYPE_SELECT) {
+            query_free(&chk);
+            continue; /* unparseable check — skip */
+        }
+        /* SQL standard: CHECK is satisfied if expression is TRUE or NULL.
+         * For NULL columns, eval_condition returns false for comparisons,
+         * but SQL says CHECK(x > 0) should pass when x IS NULL.
+         * Check if any referenced column is NULL — if so, skip. */
+        int any_null = 0;
+        for (size_t ci = 0; ci < row->cells.count && ci < t->columns.count; ci++) {
+            if (t->columns.items[ci].check_expr_sql == t->columns.items[i].check_expr_sql) {
+                /* This is the column with the CHECK — check if its value is NULL */
+                struct cell *c = &row->cells.items[ci];
+                if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
+                    any_null = 1;
+            }
+        }
+        if (any_null) {
+            query_free(&chk);
+            continue; /* NULL satisfies CHECK per SQL standard */
+        }
+        /* Evaluate the WHERE condition against the row */
+        if (chk.select.where.has_where && chk.select.where.where_cond != IDX_NONE) {
+            int passes = eval_condition(chk.select.where.where_cond, &chk.arena, row, t, db);
+            if (!passes) {
+                arena_set_error(arena, "23514", "CHECK constraint violated for column '%s'",
+                                t->columns.items[i].name);
+                query_free(&chk);
+                return -1;
+            }
+        }
+        query_free(&chk);
+    }
+    return 0;
+}
+
 static int query_insert_exec(struct table *t, struct query_insert *ins, struct query_arena *arena, struct rows *result, struct database *db, struct bump_alloc *rb)
 {
     int has_returning = (ins->returning_columns.len > 0);
@@ -5094,6 +5348,11 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                     return -1;
                 }
             }
+        }
+        /* enforce CHECK constraints */
+        if (check_constraints_ok(t, &copy, arena, db) != 0) {
+            row_free(&copy);
+            return -1;
         }
         da_push(&t->rows, copy);
         t->generation++;

@@ -2384,6 +2384,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
         case QUERY_TYPE_COMMIT:
         case QUERY_TYPE_ROLLBACK:
             return 0; /* handled above */
+        case QUERY_TYPE_COPY:
+            return 0; /* handled in pgwire */
     }
     return -1;
 }

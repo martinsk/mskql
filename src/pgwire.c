@@ -306,6 +306,14 @@ struct client_state {
     struct prepared_stmt prepared[MAX_PREPARED];
     struct portal portals[MAX_PORTALS];
     int extended_error;         /* 1 = error occurred, skip until Sync */
+    /* COPY FROM STDIN state */
+    int copy_in_active;         /* 1 = receiving CopyData */
+    struct table *copy_in_table;
+    char copy_in_delim;
+    int copy_in_is_csv;
+    size_t copy_in_row_count;
+    char copy_in_linebuf[8192];
+    size_t copy_in_linelen;
 };
 
 static void prepared_stmt_free(struct prepared_stmt *ps)
@@ -638,12 +646,14 @@ static int send_row_description(int fd, struct database *db, struct query *q,
             }
         } else if (q->select.aggregates_count > 0 && (uint32_t)i < q->select.aggregates_count) {
             switch (q->arena.aggregates.items[q->select.aggregates_start + i].func) {
-                case AGG_SUM:   colname = "sum";   break;
-                case AGG_COUNT: colname = "count"; break;
-                case AGG_AVG:   colname = "avg";   break;
-                case AGG_MIN:   colname = "min";   break;
-                case AGG_MAX:   colname = "max";   break;
-                case AGG_NONE:  colname = "?";     break;
+                case AGG_SUM:        colname = "sum";        break;
+                case AGG_COUNT:      colname = "count";      break;
+                case AGG_AVG:        colname = "avg";        break;
+                case AGG_MIN:        colname = "min";        break;
+                case AGG_MAX:        colname = "max";        break;
+                case AGG_STRING_AGG: colname = "string_agg"; break;
+                case AGG_ARRAY_AGG:  colname = "array_agg";  break;
+                case AGG_NONE:       colname = "?";          break;
             }
             if (result->count > 0)
                 type_oid = column_type_to_oid(result->data[0].cells.items[i].type);
@@ -1144,6 +1154,106 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
         }
     }
 
+    /* COPY TO STDOUT — send data using CopyOut protocol */
+    if (q.query_type == QUERY_TYPE_COPY && !q.copy.is_from) {
+        struct table *ct = db_find_table_sv(db, q.copy.table);
+        if (!ct) {
+            send_error(fd, m, "ERROR", "42P01", "table not found");
+            return -1;
+        }
+        char delim = q.copy.is_csv ? ',' : '\t';
+        /* CopyOutResponse: 'H', int32 len, int8 format(0=text), int16 ncols, int16[ncols] col_formats(0=text) */
+        uint16_t ncols = (uint16_t)ct->columns.count;
+        m->len = 0;
+        msgbuf_push_byte(m, 0); /* overall format: text */
+        msgbuf_push_u16(m, ncols);
+        for (uint16_t i = 0; i < ncols; i++)
+            msgbuf_push_u16(m, 0); /* per-column format: text */
+        msg_send(fd, 'H', m);
+        /* CSV HEADER row */
+        if (q.copy.has_header) {
+            m->len = 0;
+            for (uint16_t i = 0; i < ncols; i++) {
+                if (i > 0) msgbuf_push_byte(m, (uint8_t)delim);
+                const char *cn = ct->columns.items[i].name;
+                msgbuf_push(m, (const uint8_t *)cn, strlen(cn));
+            }
+            msgbuf_push_byte(m, '\n');
+            msg_send(fd, 'd', m);
+        }
+        /* Data rows */
+        for (size_t r = 0; r < ct->rows.count; r++) {
+            struct row *row = &ct->rows.items[r];
+            m->len = 0;
+            for (uint16_t c = 0; c < ncols && c < (uint16_t)row->cells.count; c++) {
+                if (c > 0) msgbuf_push_byte(m, (uint8_t)delim);
+                struct cell *cell = &row->cells.items[c];
+                if (cell->is_null || (column_type_is_text(cell->type) && !cell->value.as_text)) {
+                    if (q.copy.is_csv) {
+                        /* CSV: empty field for NULL */
+                    } else {
+                        msgbuf_push(m, (const uint8_t *)"\\N", 2);
+                    }
+                } else {
+                    char buf[128];
+                    const char *val = NULL;
+                    size_t vlen = 0;
+                    if (column_type_is_text(cell->type)) {
+                        val = cell->value.as_text;
+                        vlen = strlen(val);
+                    } else if (cell->type == COLUMN_TYPE_INT) {
+                        vlen = (size_t)snprintf(buf, sizeof(buf), "%d", cell->value.as_int);
+                        val = buf;
+                    } else if (cell->type == COLUMN_TYPE_BIGINT) {
+                        vlen = (size_t)snprintf(buf, sizeof(buf), "%lld", cell->value.as_bigint);
+                        val = buf;
+                    } else if (cell->type == COLUMN_TYPE_FLOAT || cell->type == COLUMN_TYPE_NUMERIC) {
+                        vlen = (size_t)snprintf(buf, sizeof(buf), "%g", cell->value.as_float);
+                        val = buf;
+                    } else if (cell->type == COLUMN_TYPE_BOOLEAN) {
+                        val = cell->value.as_bool ? "t" : "f";
+                        vlen = 1;
+                    } else if (cell->type == COLUMN_TYPE_SMALLINT) {
+                        vlen = (size_t)snprintf(buf, sizeof(buf), "%d", (int)cell->value.as_smallint);
+                        val = buf;
+                    } else {
+                        val = "?"; vlen = 1;
+                    }
+                    if (val) msgbuf_push(m, (const uint8_t *)val, vlen);
+                }
+            }
+            msgbuf_push_byte(m, '\n');
+            msg_send(fd, 'd', m);
+        }
+        /* CopyDone */
+        m->len = 0;
+        msg_send(fd, 'c', m);
+        char tag[128];
+        snprintf(tag, sizeof(tag), "COPY %zu", ct->rows.count);
+        send_command_complete(fd, m, tag);
+        return 0;
+    }
+
+    /* COPY FROM STDIN — send CopyInResponse and return 1 to signal copy-in mode.
+     * The actual data reception happens in process_messages. */
+    if (q.query_type == QUERY_TYPE_COPY && q.copy.is_from) {
+        struct table *ct = db_find_table_sv(db, q.copy.table);
+        if (!ct) {
+            send_error(fd, m, "ERROR", "42P01", "table not found");
+            return -1;
+        }
+        uint16_t ncols = (uint16_t)ct->columns.count;
+        /* CopyInResponse: 'G' */
+        m->len = 0;
+        msgbuf_push_byte(m, 0); /* text format */
+        msgbuf_push_u16(m, ncols);
+        for (uint16_t i = 0; i < ncols; i++)
+            msgbuf_push_u16(m, 0);
+        msg_send(fd, 'G', m);
+        /* Return 1 to signal copy-in mode; caller sets up copy state */
+        return 1;
+    }
+
     struct rows *result = &conn_arena->result;
     result->arena_owns_text = 1;
     int rc = db_exec(db, &q, result, &conn_arena->result_text);
@@ -1270,6 +1380,9 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
         case QUERY_TYPE_ROLLBACK:
             snprintf(tag, sizeof(tag), "ROLLBACK");
             break;
+        case QUERY_TYPE_COPY:
+            snprintf(tag, sizeof(tag), "COPY");
+            break;
     }
 
     send_command_complete(fd, m, tag);
@@ -1277,12 +1390,79 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     return 0;
 }
 
-/* Simple Query handler: execute + ReadyForQuery */
-static int handle_query(int fd, struct database *db, const char *sql,
-                        struct msgbuf *m, struct query_arena *conn_arena)
+/* Process a single line of COPY FROM data, inserting a row into the table. */
+static void copy_in_process_line(struct client_state *c, const char *line, size_t len)
 {
-    handle_query_inner(fd, db, sql, m, conn_arena, 0);
-    send_ready_for_query(fd, m, db->in_transaction ? 'T' : 'I');
+    struct table *ct = c->copy_in_table;
+    if (!ct) return;
+    uint16_t ncols = (uint16_t)ct->columns.count;
+    char delim = c->copy_in_delim;
+    /* skip terminator line "\." */
+    if (len == 2 && line[0] == '\\' && line[1] == '.') return;
+    if (len == 0) return;
+    struct row new_row = {0};
+    da_init(&new_row.cells);
+    const char *p = line;
+    const char *end = line + len;
+    for (uint16_t ci = 0; ci < ncols; ci++) {
+        const char *field_start = p;
+        while (p < end && *p != delim) p++;
+        size_t flen = (size_t)(p - field_start);
+        if (p < end && *p == delim) p++;
+        struct cell cell = {0};
+        if (!c->copy_in_is_csv && flen == 2 &&
+            field_start[0] == '\\' && field_start[1] == 'N') {
+            cell.is_null = 1;
+            cell.type = ct->columns.items[ci].type;
+        } else {
+            char fstr[8192];
+            if (flen >= sizeof(fstr)) flen = sizeof(fstr) - 1;
+            memcpy(fstr, field_start, flen);
+            fstr[flen] = '\0';
+            enum column_type ctype = ct->columns.items[ci].type;
+            cell.type = ctype;
+            if (ctype == COLUMN_TYPE_INT) {
+                cell.value.as_int = atoi(fstr);
+            } else if (ctype == COLUMN_TYPE_BIGINT) {
+                cell.value.as_bigint = atoll(fstr);
+            } else if (ctype == COLUMN_TYPE_FLOAT || ctype == COLUMN_TYPE_NUMERIC) {
+                cell.value.as_float = atof(fstr);
+            } else if (ctype == COLUMN_TYPE_BOOLEAN) {
+                cell.value.as_bool = (fstr[0] == 't' || fstr[0] == 'T' || fstr[0] == '1');
+            } else if (ctype == COLUMN_TYPE_SMALLINT) {
+                cell.value.as_smallint = (int16_t)atoi(fstr);
+            } else {
+                cell.type = COLUMN_TYPE_TEXT;
+                cell.value.as_text = strdup(fstr);
+            }
+        }
+        da_push(&new_row.cells, cell);
+    }
+    da_push(&ct->rows, new_row);
+    ct->generation++;
+    c->copy_in_row_count++;
+}
+
+/* Simple Query handler: execute + ReadyForQuery.
+ * Returns 1 if COPY FROM STDIN was initiated (caller must not send RFQ yet). */
+static int handle_query_sq(struct client_state *c, struct database *db,
+                           const char *sql)
+{
+    int rc = handle_query_inner(c->fd, db, sql, &c->send_buf, &c->arena, 0);
+    if (rc == 1) {
+        /* COPY FROM STDIN initiated — parse the query again to get table info */
+        struct query q = {0};
+        if (query_parse_into(sql, &q, &c->arena) == 0 && q.query_type == QUERY_TYPE_COPY) {
+            c->copy_in_active = 1;
+            c->copy_in_table = db_find_table_sv(db, q.copy.table);
+            c->copy_in_delim = q.copy.is_csv ? ',' : '\t';
+            c->copy_in_is_csv = q.copy.is_csv;
+            c->copy_in_row_count = 0;
+            c->copy_in_linelen = 0;
+        }
+        return 1;
+    }
+    send_ready_for_query(c->fd, &c->send_buf, db->in_transaction ? 'T' : 'I');
     return 0;
 }
 
@@ -1876,15 +2056,60 @@ static int process_messages(struct client_state *c, struct database *db)
             case 'Q': { /* Simple Query */
                 c->extended_error = 0; /* Simple Query resets error state */
                 if (body_len > 0) {
-                    /* NUL-terminate the SQL in-place (safe — we own the buffer) */
-                    c->recv_buf[1 + msg_len] = '\0'; /* just past the message */
-                    /* but actually the body starts at offset 5 */
                     char *sql = (char *)(c->recv_buf + 5);
-                    /* ensure NUL termination within the body */
                     char saved = sql[body_len];
                     sql[body_len] = '\0';
-                    handle_query(c->fd, db, sql, &c->send_buf, &c->arena);
+                    handle_query_sq(c, db, sql);
                     sql[body_len] = saved;
+                }
+                break;
+            }
+
+            /* ---- COPY FROM STDIN data messages ---- */
+            case 'd': { /* CopyData */
+                if (c->copy_in_active) {
+                    const uint8_t *data = c->recv_buf + 5;
+                    for (uint32_t di = 0; di < body_len; di++) {
+                        if (data[di] == '\n') {
+                            c->copy_in_linebuf[c->copy_in_linelen] = '\0';
+                            copy_in_process_line(c, c->copy_in_linebuf, c->copy_in_linelen);
+                            c->copy_in_linelen = 0;
+                        } else {
+                            if (c->copy_in_linelen < sizeof(c->copy_in_linebuf) - 1)
+                                c->copy_in_linebuf[c->copy_in_linelen++] = (char)data[di];
+                        }
+                    }
+                }
+                break;
+            }
+            case 'c': { /* CopyDone */
+                if (c->copy_in_active) {
+                    /* flush any remaining partial line */
+                    if (c->copy_in_linelen > 0) {
+                        c->copy_in_linebuf[c->copy_in_linelen] = '\0';
+                        copy_in_process_line(c, c->copy_in_linebuf, c->copy_in_linelen);
+                        c->copy_in_linelen = 0;
+                    }
+                    /* Invalidate scan cache */
+                    if (c->copy_in_table)
+                        c->copy_in_table->scan_cache.generation = 0;
+                    char tag[128];
+                    snprintf(tag, sizeof(tag), "COPY %zu", c->copy_in_row_count);
+                    send_command_complete(c->fd, &c->send_buf, tag);
+                    send_ready_for_query(c->fd, &c->send_buf,
+                                         db->in_transaction ? 'T' : 'I');
+                    c->copy_in_active = 0;
+                    c->copy_in_table = NULL;
+                }
+                break;
+            }
+            case 'f': { /* CopyFail */
+                if (c->copy_in_active) {
+                    c->copy_in_active = 0;
+                    c->copy_in_table = NULL;
+                    send_error(c->fd, &c->send_buf, "ERROR", "57014", "COPY FROM cancelled");
+                    send_ready_for_query(c->fd, &c->send_buf,
+                                         db->in_transaction ? 'T' : 'I');
                 }
                 break;
             }
@@ -1934,7 +2159,7 @@ static int process_messages(struct client_state *c, struct database *db)
             case 'X': /* Terminate */
                 return -1;
             default:
-                /* ignore unknown messages */
+                /* ignore unknown messages (including 'd'/'c'/'f' when not in copy mode) */
                 break;
         }
 

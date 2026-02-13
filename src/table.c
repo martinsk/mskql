@@ -42,7 +42,8 @@ void table_add_column(struct table *t, struct column *col)
         .fk_table = col->fk_table ? strdup(col->fk_table) : NULL,
         .fk_column = col->fk_column ? strdup(col->fk_column) : NULL,
         .fk_on_delete = col->fk_on_delete,
-        .fk_on_update = col->fk_on_update
+        .fk_on_update = col->fk_on_update,
+        .check_expr_sql = col->check_expr_sql ? strdup(col->check_expr_sql) : NULL
     };
     if (col->has_default && col->default_value) {
         c.default_value = calloc(1, sizeof(struct cell));
@@ -83,7 +84,8 @@ void table_deep_copy(struct table *dst, const struct table *src)
             .fk_table = sc->fk_table ? strdup(sc->fk_table) : NULL,
             .fk_column = sc->fk_column ? strdup(sc->fk_column) : NULL,
             .fk_on_delete = sc->fk_on_delete,
-            .fk_on_update = sc->fk_on_update
+            .fk_on_update = sc->fk_on_update,
+            .check_expr_sql = sc->check_expr_sql ? strdup(sc->check_expr_sql) : NULL
         };
         if (sc->has_default && sc->default_value) {
             c.default_value = calloc(1, sizeof(struct cell));
@@ -190,6 +192,7 @@ void table_free(struct table *t)
         free(t->columns.items[i].enum_type_name);
         free(t->columns.items[i].fk_table);
         free(t->columns.items[i].fk_column);
+        free(t->columns.items[i].check_expr_sql);
         if (t->columns.items[i].default_value) {
             if (column_type_is_text(t->columns.items[i].default_value->type)
                 && t->columns.items[i].default_value->value.as_text)

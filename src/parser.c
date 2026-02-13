@@ -61,7 +61,7 @@ static int is_keyword(sv word)
         "DELETE", "WHERE", "CREATE", "TABLE", "DROP",
         "JOIN", "ON", "RETURNING", "INDEX",
         "TYPE", "AS", "ENUM",
-        "SUM", "COUNT", "AVG", "MIN", "MAX",
+        "SUM", "COUNT", "AVG", "MIN", "MAX", "STRING_AGG", "ARRAY_AGG",
         "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE",
         "PERCENT_RANK", "CUME_DIST",
         "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE",
@@ -94,7 +94,7 @@ static int is_keyword(sv word)
         "CAST",
         "EXTRACT", "CURRENT_TIMESTAMP",
         "TRUNCATE",
-        "EXPLAIN", "ANALYZE",
+        "EXPLAIN", "ANALYZE", "COPY", "STDIN", "STDOUT", "CSV", "HEADER",
         "ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "POWER", "SQRT", "MOD", "SIGN", "RANDOM",
         "LPAD", "RPAD", "CONCAT", "CONCAT_WS", "POSITION", "SPLIT_PART",
         "LEFT", "RIGHT", "REPEAT", "REVERSE", "INITCAP",
@@ -351,7 +351,9 @@ static int is_agg_keyword(sv word)
         || sv_eq_ignorecase_cstr(word, "COUNT")
         || sv_eq_ignorecase_cstr(word, "AVG")
         || sv_eq_ignorecase_cstr(word, "MIN")
-        || sv_eq_ignorecase_cstr(word, "MAX");
+        || sv_eq_ignorecase_cstr(word, "MAX")
+        || sv_eq_ignorecase_cstr(word, "STRING_AGG")
+        || sv_eq_ignorecase_cstr(word, "ARRAY_AGG");
 }
 
 static int is_win_keyword(sv word)
@@ -387,11 +389,13 @@ static int is_win_only_keyword(sv word)
 
 static enum agg_func agg_from_keyword(sv word)
 {
-    if (sv_eq_ignorecase_cstr(word, "SUM"))   return AGG_SUM;
-    if (sv_eq_ignorecase_cstr(word, "COUNT")) return AGG_COUNT;
-    if (sv_eq_ignorecase_cstr(word, "AVG"))   return AGG_AVG;
-    if (sv_eq_ignorecase_cstr(word, "MIN"))   return AGG_MIN;
-    if (sv_eq_ignorecase_cstr(word, "MAX"))   return AGG_MAX;
+    if (sv_eq_ignorecase_cstr(word, "SUM"))        return AGG_SUM;
+    if (sv_eq_ignorecase_cstr(word, "COUNT"))      return AGG_COUNT;
+    if (sv_eq_ignorecase_cstr(word, "AVG"))        return AGG_AVG;
+    if (sv_eq_ignorecase_cstr(word, "MIN"))        return AGG_MIN;
+    if (sv_eq_ignorecase_cstr(word, "MAX"))        return AGG_MAX;
+    if (sv_eq_ignorecase_cstr(word, "STRING_AGG")) return AGG_STRING_AGG;
+    if (sv_eq_ignorecase_cstr(word, "ARRAY_AGG"))  return AGG_ARRAY_AGG;
     return AGG_NONE;
 }
 
@@ -2269,6 +2273,19 @@ static int parse_single_agg(struct lexer *l, struct query_arena *a, sv func_name
             agg->column = sv_from("*", 1); /* placeholder — expr_idx takes precedence */
         }
     }
+    /* STRING_AGG(col, separator) — parse the separator argument */
+    tok = lexer_peek(l);
+    if (tok.type == TOK_COMMA && agg->func == AGG_STRING_AGG) {
+        lexer_next(l); /* consume comma */
+        struct token sep_tok = lexer_next(l);
+        if (sep_tok.type == TOK_STRING) {
+            agg->separator = sep_tok.value;
+        } else {
+            arena_set_error(a, "42601", "expected string literal separator in STRING_AGG");
+            return -1;
+        }
+        tok = lexer_peek(l);
+    }
     tok = lexer_next(l);
     if (tok.type != TOK_RPAREN) {
         arena_set_error(a, "42601", "expected ')' after aggregate expression");
@@ -3716,9 +3733,10 @@ static int parse_create_table(struct lexer *l, struct query *out)
                 }
             } else if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "CHECK")) {
                 lexer_next(l); /* consume CHECK */
-                /* skip CHECK(...) — consume until matching ')' */
+                /* capture CHECK(...) expression text */
                 struct token lp = lexer_next(l);
                 if (lp.type == TOK_LPAREN) {
+                    const char *expr_start = l->input + l->pos;
                     int depth = 1;
                     while (depth > 0) {
                         tok = lexer_next(l);
@@ -3726,6 +3744,13 @@ static int parse_create_table(struct lexer *l, struct query *out)
                         else if (tok.type == TOK_RPAREN) depth--;
                         else if (tok.type == TOK_EOF) break;
                     }
+                    /* tok is the closing ')' — expression text is between expr_start and just before it */
+                    const char *expr_end = tok.value.data; /* points at ')' */
+                    size_t expr_len = (size_t)(expr_end - expr_start);
+                    /* trim trailing whitespace */
+                    while (expr_len > 0 && (expr_start[expr_len-1] == ' ' || expr_start[expr_len-1] == '\t'))
+                        expr_len--;
+                    col.check_expr_sql = bump_strndup(&out->arena.bump, expr_start, expr_len);
                 }
             } else {
                 /* unknown constraint keyword, skip it */
@@ -4361,6 +4386,56 @@ static int query_parse_internal(const char *sql, struct query *out)
         out->del.table = tok.value;
         out->del.where.has_where = 0;
         out->del.where.where_cond = IDX_NONE;
+        return 0;
+    }
+
+    if (sv_eq_ignorecase_cstr(tok.value, "COPY")) {
+        out->query_type = QUERY_TYPE_COPY;
+        /* COPY table_name FROM/TO STDIN/STDOUT [WITH CSV [HEADER]] */
+        tok = lexer_next(&l);
+        if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
+            arena_set_error(&out->arena, "42601", "expected table name after COPY");
+            return -1;
+        }
+        out->copy.table = tok.value;
+        tok = lexer_next(&l);
+        if (tok.type != TOK_KEYWORD) {
+            arena_set_error(&out->arena, "42601", "expected FROM or TO after table name");
+            return -1;
+        }
+        if (sv_eq_ignorecase_cstr(tok.value, "FROM"))
+            out->copy.is_from = 1;
+        else if (sv_eq_ignorecase_cstr(tok.value, "TO"))
+            out->copy.is_from = 0;
+        else {
+            arena_set_error(&out->arena, "42601", "expected FROM or TO after table name");
+            return -1;
+        }
+        tok = lexer_next(&l);
+        /* STDIN or STDOUT */
+        if (tok.type != TOK_KEYWORD ||
+            (!sv_eq_ignorecase_cstr(tok.value, "STDIN") &&
+             !sv_eq_ignorecase_cstr(tok.value, "STDOUT"))) {
+            arena_set_error(&out->arena, "42601", "expected STDIN or STDOUT");
+            return -1;
+        }
+        /* optional WITH CSV [HEADER] */
+        out->copy.is_csv = 0;
+        out->copy.has_header = 0;
+        tok = lexer_peek(&l);
+        if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "WITH")) {
+            lexer_next(&l);
+            tok = lexer_peek(&l);
+        }
+        if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "CSV")) {
+            lexer_next(&l);
+            out->copy.is_csv = 1;
+            tok = lexer_peek(&l);
+            if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "HEADER")) {
+                lexer_next(&l);
+                out->copy.has_header = 1;
+            }
+        }
         return 0;
     }
 

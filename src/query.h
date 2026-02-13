@@ -16,7 +16,9 @@ enum agg_func {
     AGG_COUNT,
     AGG_AVG,
     AGG_MIN,
-    AGG_MAX
+    AGG_MAX,
+    AGG_STRING_AGG,
+    AGG_ARRAY_AGG
 };
 
 struct agg_expr {
@@ -25,6 +27,7 @@ struct agg_expr {
     sv alias; /* optional AS alias name */
     int has_distinct; /* COUNT(DISTINCT col) */
     uint32_t expr_idx; /* index into arena.exprs, or IDX_NONE — when set, evaluate expression instead of bare column */
+    sv separator; /* STRING_AGG delimiter (empty for ARRAY_AGG) */
 };
 
 enum win_func {
@@ -328,7 +331,15 @@ enum query_type {
     QUERY_TYPE_CREATE_VIEW,
     QUERY_TYPE_DROP_VIEW,
     QUERY_TYPE_TRUNCATE,
-    QUERY_TYPE_EXPLAIN
+    QUERY_TYPE_EXPLAIN,
+    QUERY_TYPE_COPY
+};
+
+struct query_copy {
+    sv table;       /* table name */
+    int is_from;    /* 1 = COPY FROM, 0 = COPY TO */
+    int is_csv;     /* WITH CSV */
+    int has_header; /* WITH CSV HEADER */
 };
 
 enum alter_action {
@@ -587,6 +598,7 @@ struct query {
         struct query_create_view create_view;
         struct query_drop_view drop_view;
         struct query_explain explain;
+        struct query_copy copy;
     };
 };
 

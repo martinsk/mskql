@@ -70,6 +70,8 @@ struct column {
     char *fk_column;        /* referenced column name, or NULL */
     enum fk_action fk_on_delete;
     enum fk_action fk_on_update;
+    /* CHECK constraint */
+    char *check_expr_sql;       /* raw SQL text of CHECK body, or NULL */
 };
 
 void column_free(struct column *col);

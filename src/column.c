@@ -19,6 +19,7 @@ void column_free(struct column *col)
         cell_free_text(col->default_value);
         free(col->default_value);
     }
+    free(col->check_expr_sql);
 }
 
 int enum_type_valid(struct enum_type *et, const char *value)
