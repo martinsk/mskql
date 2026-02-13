@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Getting Started</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
+
+<h1>Getting Started</h1>
+<span class="subtitle">A small company in ten queries</span>
+<hr class="title-rule">
+
+<h2 id="prerequisites">Prerequisites</h2>
+
+<p>
+    A C11 compiler and <code>make</code>. Nothing else.
+</p>
+
+<pre><code class="language-bash">make                                          # build
+./build/mskql                                 # start server on port 5433
+psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
+
+<p>
+    Set <code>MSKQL_PORT</code> to listen on a different port:
+</p>
+
+<pre><code class="language-bash">MSKQL_PORT=5444 ./build/mskql</code></pre>
+
+<h2 id="ten-queries">A small company in ten queries</h2>
+
+<p><strong>Step 1 &mdash; Schema.</strong> Two tables with constraints, a serial primary key, and a foreign key.</p>
+
+<pre><code class="language-sql">CREATE TABLE departments (
+    id    SERIAL PRIMARY KEY,
+    name  TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE employees (
+    id         SERIAL PRIMARY KEY,
+    name       TEXT NOT NULL,
+    dept_id    INT REFERENCES departments(id),
+    salary     INT DEFAULT 0,
+    hired      DATE
+);
+
+INSERT INTO departments (name) VALUES
+    ('Engineering'), ('Design'), ('Sales');
+
+INSERT INTO employees (name, dept_id, salary, hired) VALUES
+    ('Alice',   1, 130000, '2022-03-15'),
+    ('Bob',     1,  95000, '2023-01-10'),
+    ('Carol',   2, 110000, '2021-07-01'),
+    ('Dave',    2,  90000, '2024-02-20'),
+    ('Eve',     3, 105000, '2023-06-01'),
+    ('Frank', NULL,  80000, '2024-11-01');</code></pre>
+
+<p><strong>Step 2 &mdash; Filter.</strong> Who earns above six figures?</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT name, salary
+FROM employees
+WHERE salary > 100000
+ORDER BY salary DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>salary</th></tr></thead>
+<tbody>
+<tr><td>Alice</td><td class="num-val">130000</td></tr>
+<tr><td>Carol</td><td class="num-val">110000</td></tr>
+<tr><td>Eve</td><td class="num-val">105000</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p><strong>Step 3 &mdash; LEFT JOIN + COALESCE.</strong> Show every employee&rsquo;s department, including unassigned.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT e.name,
+       COALESCE(d.name, 'Unassigned')
+         AS department
+FROM employees e
+LEFT JOIN departments d
+  ON e.dept_id = d.id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>department</th></tr></thead>
+<tbody>
+<tr><td>Alice</td><td>Engineering</td></tr>
+<tr><td>Bob</td><td>Engineering</td></tr>
+<tr><td>Carol</td><td>Design</td></tr>
+<tr><td>Dave</td><td>Design</td></tr>
+<tr><td>Eve</td><td>Sales</td></tr>
+<tr><td>Frank</td><td>Unassigned</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p><strong>Step 4 &mdash; Aggregation + HAVING.</strong> Average salary per department, filtering to departments above 100k.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT d.name AS department,
+       COUNT(*)    AS headcount,
+       AVG(e.salary) AS avg_salary
+FROM employees e
+JOIN departments d ON e.dept_id = d.id
+GROUP BY d.name
+HAVING AVG(e.salary) > 100000;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>department</th><th>headcount</th><th>avg_salary</th></tr></thead>
+<tbody>
+<tr><td>Engineering</td><td class="num-val">2</td><td class="num-val">112500</td></tr>
+<tr><td>Sales</td><td class="num-val">1</td><td class="num-val">105000</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p><strong>Step 5 &mdash; Window function.</strong> Rank employees within each department by salary.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT e.name, d.name AS dept,
+       e.salary,
+       RANK() OVER (
+         PARTITION BY d.name
+         ORDER BY e.salary DESC
+       ) AS rnk
+FROM employees e
+JOIN departments d
+  ON e.dept_id = d.id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>dept</th><th>salary</th><th>rnk</th></tr></thead>
+<tbody>
+<tr><td>Carol</td><td>Design</td><td class="num-val">110000</td><td class="num-val">1</td></tr>
+<tr><td>Dave</td><td>Design</td><td class="num-val">90000</td><td class="num-val">2</td></tr>
+<tr><td>Alice</td><td>Engineering</td><td class="num-val">130000</td><td class="num-val">1</td></tr>
+<tr><td>Bob</td><td>Engineering</td><td class="num-val">95000</td><td class="num-val">2</td></tr>
+<tr><td>Eve</td><td>Sales</td><td class="num-val">105000</td><td class="num-val">1</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p><strong>Step 6 &mdash; Upsert.</strong> Insert-or-update with <code>ON CONFLICT DO UPDATE</code>.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">INSERT INTO departments (id, name)
+VALUES (2, 'Product Design')
+ON CONFLICT (id) DO UPDATE
+  SET name = 'Product Design';
+
+SELECT * FROM departments
+ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>name</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>Engineering</td></tr>
+<tr><td class="num-val">2</td><td>Product Design</td></tr>
+<tr><td class="num-val">3</td><td>Sales</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p><strong>Step 7 &mdash; View.</strong> Create a reusable view for department summaries.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">CREATE VIEW dept_summary AS
+SELECT d.name AS department,
+       COUNT(*) AS headcount,
+       AVG(e.salary) AS avg_salary
+FROM employees e
+JOIN departments d ON e.dept_id = d.id
+GROUP BY d.name;
+
+SELECT * FROM dept_summary
+ORDER BY avg_salary DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>department</th><th>headcount</th><th>avg_salary</th></tr></thead>
+<tbody>
+<tr><td>Engineering</td><td class="num-val">2</td><td class="num-val">112500</td></tr>
+<tr><td>Sales</td><td class="num-val">1</td><td class="num-val">105000</td></tr>
+<tr><td>Product Design</td><td class="num-val">2</td><td class="num-val">100000</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p><strong>Step 8 &mdash; Sequence + UUID.</strong> Use a sequence and generate a UUID.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">CREATE SEQUENCE invoice_seq
+  START WITH 1000;
+
+SELECT NEXTVAL('invoice_seq') AS inv,
+       GEN_RANDOM_UUID()      AS ref;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>inv</th><th>ref</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1000</td><td style="font-family:'Menlo','Consolas',monospace;font-size:0.82rem">a3f7c2e1-90b4-4d8a-b6f3-7e2d1c4f5a21</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p><strong>Step 9 &mdash; Window frame.</strong> Running salary total within each department.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT e.name, d.name AS dept,
+       e.salary,
+       SUM(e.salary) OVER (
+         PARTITION BY d.name
+         ORDER BY e.salary
+         ROWS BETWEEN UNBOUNDED
+           PRECEDING AND CURRENT ROW
+       ) AS running_total
+FROM employees e
+JOIN departments d
+  ON e.dept_id = d.id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>dept</th><th>salary</th><th>running_total</th></tr></thead>
+<tbody>
+<tr><td>Dave</td><td>Product Design</td><td class="num-val">90000</td><td class="num-val">90000</td></tr>
+<tr><td>Carol</td><td>Product Design</td><td class="num-val">110000</td><td class="num-val">200000</td></tr>
+<tr><td>Bob</td><td>Engineering</td><td class="num-val">95000</td><td class="num-val">95000</td></tr>
+<tr><td>Alice</td><td>Engineering</td><td class="num-val">130000</td><td class="num-val">225000</td></tr>
+<tr><td>Eve</td><td>Sales</td><td class="num-val">105000</td><td class="num-val">105000</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p><strong>Step 10 &mdash; Recursive CTE.</strong> Build a running headcount at each hire date using a recursive series.</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">WITH RECURSIVE hire_dates AS (
+    SELECT MIN(hired) AS dt
+    FROM employees
+    UNION ALL
+    SELECT (SELECT MIN(e.hired)
+            FROM employees e
+            WHERE e.hired > hire_dates.dt)
+    FROM hire_dates
+    WHERE dt < (SELECT MAX(hired)
+                FROM employees)
+)
+SELECT dt AS hire_date,
+       (SELECT COUNT(*)
+        FROM employees e
+        WHERE e.hired <= dt)
+          AS headcount
+FROM hire_dates
+ORDER BY dt;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>hire_date</th><th>headcount</th></tr></thead>
+<tbody>
+<tr><td>2021-07-01</td><td class="num-val">1</td></tr>
+<tr><td>2022-03-15</td><td class="num-val">2</td></tr>
+<tr><td>2023-01-10</td><td class="num-val">3</td></tr>
+<tr><td>2023-06-01</td><td class="num-val">4</td></tr>
+<tr><td>2024-02-20</td><td class="num-val">5</td></tr>
+<tr><td>2024-11-01</td><td class="num-val">6</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p>Ten queries, zero configuration&mdash;from <code>CREATE TABLE</code> with foreign keys
+    to recursive CTEs, window frames, views, sequences, and upserts, all through a
+    standard Postgres connection.</p>
+
+<footer class="site-footer">
+    <a href="index.html">Home</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="architecture.html">Architecture</a>
+    &ensp;&middot;&ensp;
+    <a href="sql-reference.html">SQL Reference</a>
+    &ensp;&middot;&ensp;
+    <a href="testing.html">Testing</a>
+    &ensp;&middot;&ensp;
+    <a href="playground.html">Playground</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

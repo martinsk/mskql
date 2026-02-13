@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Architecture</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
+
+<h1>Architecture</h1>
+<span class="subtitle">Four-stage pipeline from wire to storage</span>
+<hr class="title-rule">
+
+<h2 id="pipeline">The pipeline</h2>
+
+<p>
+    The system is structured as a pipeline of four stages:
+</p>
+
+<table>
+    <thead>
+        <tr><th>Stage</th><th>Source</th><th>Description</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Wire protocol</strong></td>
+            <td><code>pgwire.c</code></td>
+            <td>Accepts TCP connections on port&nbsp;5433, handles SSL negotiation,
+                implements the Simple Query, Extended Query (prepared
+                statements, portals, <code>$1</code>/<code>$2</code> parameter
+                substitution), and COPY protocols (tab-delimited and CSV),
+                intercepts <code>information_schema</code> and
+                <code>pg_catalog</code> queries for tool compatibility,
+                and serializes result rows</td>
+        </tr>
+        <tr>
+            <td><strong>SQL parser</strong></td>
+            <td><code>parser.c</code></td>
+            <td>Hand-written recursive-descent parser producing a typed
+                <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
+                4,551 lines the parser is the largest single file (with <code>plan.c</code>
+                adding another 4,520 lines for the block-oriented executor). It includes a
+                recursive-descent expression parser with proper operator precedence
+                (<code>||</code>&nbsp;&lt;&nbsp;<code>+-</code>&nbsp;&lt;&nbsp;<code>*/%</code>)
+                and handles the full grammar including CTEs, window functions, views,
+                sequences, set operations, <code>ORDER&nbsp;BY</code> expressions,
+                <code>COPY&nbsp;TO/FROM</code>,
+                and <code>generate_series()</code> table functions.</span></td>
+        </tr>
+        <tr>
+            <td><strong>Query executor</strong></td>
+            <td><code>query.c</code>, <code>database.c</code></td>
+            <td>Tree-walking evaluator that executes the AST against in-memory tables.
+                A block-oriented plan executor (<code>plan.c</code>) handles most
+                queries with vectorized operators: sequential scan, filter, project,
+                expression project, sort, limit, hash join, hash semi-join (for
+                <code>IN&nbsp;(SELECT&hellip;)</code>), hash aggregation, index scan,
+                window functions, <code>DISTINCT</code>, set operations, CTE
+                materialization, and <code>generate_series()</code>; only the most
+                complex queries fall back to the legacy
+                row-at-a-time path.<span class="sidenote">The plan executor processes
+                data in 1,024-row column blocks, enabling cache-friendly scans and
+                vectorized numeric comparisons. It covers
+                <code>SELECT</code> with <code>WHERE</code>, projections (including
+                expression projections with scalar functions), <code>ORDER BY</code>
+                (multi-column, mixed ASC/DESC), <code>LIMIT</code>/<code>OFFSET</code>,
+                hash joins, hash semi-joins for subquery predicates, hash aggregation,
+                B-tree index scans for equality predicates, window functions
+                (<code>ROW_NUMBER</code>, <code>RANK</code>, etc.), <code>DISTINCT</code>,
+                set operations (<code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT</code>),
+                CTEs, and <code>generate_series()</code>.
+                A scan cache with generation tracking avoids
+                redundant sequential scans when the underlying table has not
+                been mutated. A direct columnar-to-wire serialization path bypasses
+                row materialization entirely for plan-executed queries.</span>
+                Handles joins (with compound <code>ON</code> conditions),
+                aggregation (including <code>DISTINCT</code> aggregates,
+                <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code>,
+                <code>ROLLUP</code>/<code>CUBE</code>),
+                window functions (with frame clauses), set operations, CTEs,
+                correlated subqueries (including scalar subqueries), views,
+                sequences, foreign keys, upserts, <code>TRUNCATE&nbsp;TABLE</code>,
+                <code>COPY&nbsp;TO/FROM</code> (tab-delimited, CSV, header),
+                <code>IS&nbsp;[NOT]&nbsp;DISTINCT&nbsp;FROM</code>,
+                <code>generate_series()</code> table functions (integer and
+                timestamp sequences with optional step), and transactions</td>
+        </tr>
+        <tr>
+            <td><strong>Storage</strong></td>
+            <td><code>table.c</code>, <code>row.c</code>, <code>index.c</code></td>
+            <td>Tables are arrays of rows; rows are arrays of typed cells. B-tree indexes
+                for equality lookups. Snapshot-and-restore for transaction rollback</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2 id="memory">Memory management</h2>
+
+<p>
+    All memory is managed explicitly through a pool-based arena allocator
+    (<code>arena.h</code>). Parsed structures reference items by <code>uint32_t</code>
+    index instead of pointers; freeing an entire query is a single
+    <code>query_arena_destroy()</code> call&mdash;no recursive walks.<span class="sidenote">This
+    replaced the earlier recursive-deallocation approach, eliminating an entire class of
+    memory leaks and simplifying the parser&rsquo;s public API to just two functions:
+    <code>query_parse()</code> and <code>query_free()</code>.</span>
+    Expressions are represented as a tagged-union AST (<code>struct&nbsp;expr</code>)
+    with types for literals, column references, binary/unary operators, function calls,
+    <code>CASE&nbsp;WHEN</code>, casts, <code>IS&nbsp;[NOT]&nbsp;NULL</code>,
+    and subqueries&mdash;evaluated by a tree-walking
+    <code>eval_expr()</code>. The <code>CAST()</code> function and PostgreSQL&rsquo;s
+    <code>::</code> postfix operator support numeric, text, boolean, and
+    date/timestamp conversions. Date/time arithmetic (timestamp &plusmn; interval,
+    timestamp &minus; timestamp) and temporal functions
+    (<code>EXTRACT</code>, <code>DATE_TRUNC</code>, <code>AGE</code>,
+    <code>TO_CHAR</code>, <code>NOW</code>) are handled natively.
+    Math functions (<code>ABS</code>, <code>CEIL</code>, <code>FLOOR</code>,
+    <code>ROUND</code>, <code>POWER</code>, <code>SQRT</code>, <code>MOD</code>,
+    <code>SIGN</code>) and string functions (<code>CONCAT</code>,
+    <code>REPLACE</code>, <code>LPAD</code>/<code>RPAD</code>,
+    <code>POSITION</code>, <code>SPLIT_PART</code>, <code>LEFT</code>/<code>RIGHT</code>,
+    <code>REPEAT</code>, <code>REVERSE</code>, <code>INITCAP</code>) round out the
+    built-in function library.
+    Ownership follows JPL rules: the allocating module
+    deallocates, with <code>cell_release()</code> as the single canonical release
+    function for cell text.
+    A slab-chain bump allocator (<code>arena.scratch</code>) handles temporary
+    executor allocations&mdash;aggregate accumulators, sort buffers, match indices,
+    window-function state&mdash;all freed in bulk by
+    <code>query_arena_destroy()</code>, yielding zero per-query
+    <code>malloc</code>/<code>free</code> calls at steady state. A separate
+    result-text bump allocator (<code>arena.result_text</code>) eliminates
+    per-cell <code>strdup</code>/<code>free</code> for text values in query
+    results, bulk-freeing all result strings between
+    requests.<span class="sidenote">The bump allocator uses a linked list of
+    fixed-size slabs rather than a single <code>realloc</code>&rsquo;d buffer,
+    so pointers into earlier slabs remain valid even after new slabs are
+    appended&mdash;critical for the plan executor which holds references across
+    block iterations.</span>
+    A generic dynamic-array macro (<code>dynamic_array.h</code>) and zero-copy string views
+    (<code>stringview.h</code>) round out the internal abstractions.
+</p>
+
+<footer class="site-footer">
+    <a href="index.html">Home</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="sql-reference.html">SQL Reference</a>
+    &ensp;&middot;&ensp;
+    <a href="testing.html">Testing</a>
+    &ensp;&middot;&ensp;
+    <a href="getting-started.html">Getting Started</a>
+    &ensp;&middot;&ensp;
+    <a href="playground.html">Playground</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

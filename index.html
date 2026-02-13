@@ -8,313 +8,185 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="style.css">
     <style>
-        /* ── Reset & base ────────────────────────────────────── */
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-        :root {
-            --body-width: 55%;
-            --fg: #111;
-            --fg-dim: #555;
-            --bg: #fffff8;
-            --accent: #a00;
-            --rule: #ccc;
-            --code-bg: #f3f1eb;
-            --sidenote-width: 300px;
+        /* ── Playground (embedded) ───────────────────────────── */
+        .playground-controls {
+            display: flex;
+            gap: 0.6rem;
+            align-items: center;
+            margin-bottom: 0.8rem;
+            flex-wrap: wrap;
         }
-
-        html { font-size: 15px; }
-
-        body {
-            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+        .playground-controls select {
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 0.95rem;
+            padding: 0.3rem 0.5rem;
+            border: 1px solid var(--rule);
             background: var(--bg);
             color: var(--fg);
-            width: var(--body-width);
-            margin-left: auto;
-            margin-right: auto;
-            padding: 3rem 0 5rem 0;
-            counter-reset: sidenote-counter;
+            border-radius: 3px;
         }
-
-        /* ── Typography ──────────────────────────────────────── */
-        p, ol, ul, dl { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
-        li { margin-bottom: 0.3rem; }
-        ol, ul { padding-left: 1.6rem; }
-
-        a { color: var(--fg); text-decoration: none; background-image: linear-gradient(var(--accent), var(--accent)); background-size: 1px 1px; background-repeat: repeat-x; background-position: 0 1.15em; }
-        a:hover { color: var(--accent); }
-
-        strong { font-weight: 600; }
-
-        /* ── Headings ────────────────────────────────────────── */
-        h1 {
-            font-weight: 400;
-            font-size: 2.6rem;
-            line-height: 1.15;
-            margin-bottom: 0.4rem;
-        }
-
-        .subtitle {
-            font-style: italic;
-            font-size: 1.3rem;
-            color: var(--fg-dim);
-            display: block;
-            margin-bottom: 0.6rem;
-            line-height: 1.4;
-        }
-
-        .byline {
+        .playground-controls button {
+            font-family: 'EB Garamond', Georgia, serif;
             font-size: 0.95rem;
-            color: var(--fg-dim);
-            margin-bottom: 2rem;
+            padding: 0.3rem 1rem;
+            border: 1px solid var(--rule);
+            background: var(--bg);
+            color: var(--fg);
+            border-radius: 3px;
+            cursor: pointer;
         }
-        .byline a { font-size: 0.95rem; }
-        .byline .author-name { font-size: 1.0rem; }
+        .playground-controls button:hover { border-color: var(--accent); color: var(--accent); }
+        .run-btn { background: var(--accent) !important; color: #fff !important; border-color: var(--accent) !important; font-weight: 600; }
+        .run-btn:hover { background: #800 !important; }
+        .run-btn:disabled { opacity: 0.5; cursor: default; }
 
-        h2 {
-            font-weight: 400;
-            font-style: italic;
-            font-size: 1.6rem;
-            margin-top: 2.8rem;
-            margin-bottom: 0.6rem;
-            padding-bottom: 0.15rem;
-        }
-
-        h3 {
-            font-weight: 600;
-            font-style: normal;
-            font-size: 1.15rem;
-            margin-top: 1.6rem;
-            margin-bottom: 0.4rem;
-        }
-
-        /* ── Accent rule under title ─────────────────────────── */
-        .title-rule {
-            border: none;
-            height: 3px;
-            background: var(--accent);
-            width: 60px;
-            margin: 0 0 2rem 0;
-        }
-
-        /* ── Epigraph ────────────────────────────────────────── */
-        .epigraph {
-            margin: 2.5rem 0 2.5rem 0;
-            padding: 0;
-        }
-        .epigraph blockquote {
-            font-style: italic;
-            font-size: 1.05rem;
-            line-height: 1.65;
-            margin: 0;
-            padding: 0 0 0 1.5rem;
+        .editor-wrap {
+            position: relative;
+            min-height: 160px;
+            border: 1px solid var(--rule);
             border-left: 3px solid var(--accent);
+            background: var(--code-bg);
+            border-radius: 0;
         }
-        .epigraph blockquote footer {
-            font-style: normal;
-            font-size: 0.9rem;
-            color: var(--fg-dim);
-            margin-top: 0.5rem;
-        }
-
-        /* ── Sidenotes / margin notes ────────────────────────── */
-        .sidenote, .marginnote {
-            float: right;
-            clear: right;
-            margin-right: calc(-1 * var(--sidenote-width) - 40px);
-            width: var(--sidenote-width);
-            font-size: 0.85rem;
-            line-height: 1.45;
-            color: var(--fg-dim);
-            vertical-align: baseline;
-            position: relative;
-        }
-        .sidenote { counter-increment: sidenote-counter; }
-        .sidenote::before {
-            content: counter(sidenote-counter);
-            font-size: 0.7rem;
-            position: relative;
-            top: -0.4rem;
-            padding-right: 0.15rem;
-            color: var(--accent);
-            font-weight: 600;
-        }
-        sup.sidenote-ref {
-            font-size: 0.7rem;
-            color: var(--accent);
-            font-weight: 600;
-            cursor: default;
-        }
-        sup.sidenote-ref::after {
-            content: counter(sidenote-counter);
-            counter-increment: sidenote-counter;
-        }
-
-        /* ── Code ────────────────────────────────────────────── */
-        code {
+        .editor-wrap pre {
+            margin: 0;
+            padding: 1rem 1.2rem;
+            border: none;
+            background: transparent;
             font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
             font-size: 0.82rem;
-            background: var(--code-bg);
-            padding: 0.1em 0.35em;
-            border-radius: 2px;
+            line-height: 1.55;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow: hidden;
+            pointer-events: none;
         }
-        pre {
-            background: var(--code-bg);
-            border-left: 3px solid var(--accent);
-            padding: 1rem 1.2rem;
-            overflow-x: auto;
+        .editor-wrap pre code {
+            font-family: inherit;
+            font-size: inherit;
+            background: none;
+            padding: 0;
+            border-radius: 0;
+        }
+        .editor-wrap pre code.hljs {
+            background: transparent;
+            padding: 0;
+        }
+        #sql-input {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
             font-size: 0.82rem;
             line-height: 1.55;
-            margin: 1rem 0 1.4rem 0;
-        }
-        pre code { background: none; padding: 0; border-radius: 0; }
-        pre code.hljs { background: var(--code-bg); padding: 0; }
-        .hljs { background: var(--code-bg); }
-
-        /* ── Tables (Tufte: full-width, minimal rules) ───────── */
-        .fullwidth { width: 100%; }
-        table {
-            border-collapse: collapse;
-            font-size: 0.95rem;
-            width: 100%;
-            margin: 1rem 0 1.4rem 0;
-        }
-        th, td {
-            padding: 0.4rem 0.8rem;
-            text-align: left;
-            border-bottom: 1px solid var(--rule);
-        }
-        thead th {
-            border-bottom: 2px solid var(--fg);
-            font-weight: 600;
-            font-size: 0.85rem;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-        }
-        tbody tr:last-child td { border-bottom: 2px solid var(--fg); }
-        td code { font-size: 0.8rem; }
-
-        /* ── Result tables (Tufte style) ───────────────────────── */
-        .result-table {
-            font-family: 'EB Garamond', Georgia, serif;
-            font-size: 0.92rem;
-            border-collapse: collapse;
-            margin: 0.6rem 0 1.2rem 0;
-            width: 100%;
-            border-top: 2px solid var(--fg);
-            border-bottom: 2px solid var(--fg);
-        }
-        .result-table th {
-            font-weight: 400;
-            font-size: 0.78rem;
-            font-variant: small-caps;
-            text-transform: lowercase;
-            letter-spacing: 0.05em;
-            border-bottom: 1px solid var(--fg);
-            padding: 0.3rem 0.6rem 0.25rem;
-            text-align: left;
-            color: var(--fg);
-        }
-        .result-table td {
-            padding: 0.22rem 0.6rem;
+            padding: 1rem 1.2rem;
             border: none;
-            white-space: nowrap;
+            background: transparent;
+            color: transparent;
+            caret-color: var(--fg);
+            resize: none;
+            tab-size: 4;
+            outline: none;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow: auto;
         }
-        .result-table .null-val { color: #999; font-style: italic; }
-        .result-table .num-val {
-            text-align: right;
-            font-variant-numeric: tabular-nums;
-            font-family: 'EB Garamond', Georgia, serif;
+        #sql-input::selection {
+            background: rgba(160, 0, 0, 0.2);
+            color: transparent;
         }
-        .result-label {
-            font-family: 'EB Garamond', Georgia, serif;
-            font-size: 0.8rem;
-            font-style: italic;
+
+        .pg-status {
+            font-size: 0.85rem;
             color: var(--fg-dim);
-            margin: 0 0 0.3rem 0;
+            margin-top: 0.4rem;
+            margin-bottom: 1rem;
+            min-height: 1.2em;
         }
-        .query-pair {
+        .pg-status.error { color: var(--accent); }
+
+        .pg-result-wrap {
+            overflow-x: auto;
+            margin-top: 0.5rem;
+        }
+        .pg-result-table {
+            border-collapse: collapse;
+            font-size: 0.85rem;
+            width: 100%;
+            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+        }
+        .pg-result-table th {
+            text-align: left;
+            font-weight: 600;
+            padding: 0.4rem 0.8rem;
+            border-bottom: 2px solid var(--fg);
+            white-space: nowrap;
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 0.95rem;
+        }
+        .pg-result-table td {
+            padding: 0.3rem 0.8rem;
+            border-bottom: 1px solid var(--rule);
+            white-space: pre;
+        }
+        .pg-result-table tr:last-child td { border-bottom: 2px solid var(--fg); }
+        .pg-result-table .null-cell { color: var(--fg-dim); font-style: italic; }
+
+        .pg-result-message {
+            font-size: 0.95rem;
+            color: var(--fg-dim);
+            padding: 0.8rem 0;
+            font-style: italic;
+        }
+        .pg-result-message.error-msg {
+            color: var(--accent);
+            font-style: normal;
+            font-family: 'Menlo', 'Consolas', monospace;
+            font-size: 0.82rem;
+        }
+
+        /* ── CTA cards ───────────────────────────────────────── */
+        .cta-row {
             display: flex;
             gap: 1.2rem;
-            align-items: stretch;
-            margin: 0.8rem 0 1.4rem 0;
+            margin: 2rem 0;
         }
-        .query-pair pre {
-            flex: 1 1 50%;
-            min-width: 0;
-            margin: 0;
+        .cta-card {
+            flex: 1;
+            border: 1px solid var(--rule);
+            padding: 1.2rem 1.4rem;
+            border-radius: 4px;
+            background: #fff;
         }
-        .query-pair .result-wrap {
-            flex: 1 1 50%;
-            min-width: 0;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
+        .cta-card h3 {
+            margin-top: 0;
+            margin-bottom: 0.4rem;
         }
-        .query-pair .result-table {
-            margin: 0;
+        .cta-card p {
+            font-size: 0.95rem;
+            margin-bottom: 0.5rem;
         }
-        @media (max-width: 900px) {
-            .query-pair {
-                flex-direction: column;
-            }
-            .query-pair pre,
-            .query-pair .result-wrap {
-                flex: 1 1 auto;
-            }
-        }
-
-        /* ── Divider ─────────────────────────────────────────── */
-        hr {
-            border: none;
-            border-top: 1px solid var(--rule);
-            margin: 2.5rem 0;
-        }
-
-        /* ── Footer ──────────────────────────────────────────── */
-        footer.site-footer {
-            margin-top: 3rem;
-            padding-top: 1.5rem;
-            border-top: 1px solid var(--rule);
-            font-size: 0.85rem;
-            color: var(--fg-dim);
-        }
-        footer.site-footer a { font-size: 0.85rem; }
-
-        /* ── Diagram ─────────────────────────────────────────── */
-        .diagram {
-            margin: 2rem auto;
-            text-align: center;
-        }
-        .diagram svg {
-            max-width: 100%;
-            height: auto;
-        }
-
-        /* ── Responsive: collapse sidenotes on narrow screens ── */
-        @media (max-width: 1100px) {
-            body { width: 80%; }
-            .sidenote, .marginnote {
-                float: none;
-                display: block;
-                margin: 0.8rem 0 0.8rem 1.5rem;
-                width: auto;
-                font-size: 0.9rem;
-                color: var(--fg-dim);
-                border-left: 2px solid var(--rule);
-                padding-left: 0.8rem;
-            }
+        .cta-card a.cta-link {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: var(--accent);
+            background-image: none;
         }
         @media (max-width: 700px) {
-            body { width: 90%; padding: 2rem 0 3rem 0; }
-            h1 { font-size: 2rem; }
+            .cta-row { flex-direction: column; }
         }
+
+        /* ── Benchmark summary ───────────────────────────────── */
+        .bench-faster { color: #1a7a1a; font-weight: 600; }
+        .bench-slower { color: var(--accent); font-weight: 600; }
     </style>
 </head>
 <body>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
-<!--  Title block                                                -->
+<!--  WHAT: Title block                                          -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
 <h1>mskql</h1>
@@ -325,15 +197,9 @@
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
     &ensp;&middot;&ensp;
     <a href="tutorials/index.html">Tutorials</a>
-    &ensp;&middot;&ensp;
-    <a href="playground.html"><strong>Try it &rarr;</strong></a>
     &ensp;&middot;&ensp; ~23,800 lines of C11 &ensp;&middot;&ensp; 892 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
-
-<!-- ═══════════════════════════════════════════════════════════ -->
-<!--  Epigraph                                                   -->
-<!-- ═══════════════════════════════════════════════════════════ -->
 
 <div class="epigraph">
     <blockquote>
@@ -341,59 +207,73 @@
     </blockquote>
 </div>
 
-<!-- ═══════════════════════════════════════════════════════════ -->
-<!--  1. Motivation                                              -->
-<!-- ═══════════════════════════════════════════════════════════ -->
-
-<h2 id="motivation">1. Motivation</h2>
-
 <p>
-    <strong>Understanding database internals.</strong>&ensp;Production databases are
-    millions of lines of code. mskql distills the core ideas&mdash;wire protocol, parser,
-    query executor, storage engine, arena allocator, plan executor&mdash;into ~23,800
-    readable lines of C11 with zero dependencies. Every layer is visible and
-    modifiable: from how a <code>SELECT</code> is parsed into an AST, to how a hash join
-    probes its build table, to how a bump allocator recycles memory across
-    requests.<span class="sidenote">The codebase is structured so each subsystem
+    mskql distills the core ideas of a database engine&mdash;wire protocol, parser,
+    query executor, storage engine, arena allocator, block-oriented plan
+    executor&mdash;into ~23,800 readable lines of C11 with zero dependencies.
+    Every layer is visible and modifiable. The entire project was built by
+    AI agents through an adversarial collaboration; no human wrote any C code
+    or SQL test case.<span class="sidenote">The codebase is structured so each subsystem
     (<code>pgwire.c</code>, <code>parser.c</code>, <code>query.c</code>,
     <code>plan.c</code>, <code>database.c</code>) can be studied in isolation.
     No generated code, no macros hiding control flow.</span>
 </p>
 
-<p>
-    <strong>Enabling real software development with modern AI.</strong>&ensp;This project
-    was built entirely by AI agents&mdash;no human wrote any C code or SQL test case.
-    It demonstrates that adversarial AI collaboration can produce non-trivial systems
-    software: a hand-written recursive-descent parser, a block-oriented vectorized
-    executor, arena-based memory management, and a PostgreSQL-compatible wire protocol.
-    The key enabler is a tight feedback loop&mdash;write code, run 892 tests, fix
-    failures, repeat&mdash;that mirrors how experienced engineers ship production
-    systems.<span class="sidenote">The adversarial model (one agent writes code, another
-    writes tests to break it, a third reviews the source and leaves actionable comments) drove the
-    implementation toward correctness the same way rigorous code review does on a human
-    team&mdash;except all three sides were machines.</span>
-</p>
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  SO WHAT: Three proof points                                -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="wire-compat">PostgreSQL wire-protocol compatible</h2>
 
 <p>
-    <strong>Wire-protocol compatibility.</strong>&ensp;Most embeddable databases expose a
-    custom API or implement a subset of SQL behind a proprietary protocol. mskql
-    implements the PostgreSQL wire protocol&nbsp;(v3) directly, so any tool that speaks
-    Postgres works without modification&mdash;<code>psql</code>, pgAdmin, DBeaver, any
-    language driver.<span class="sidenote">The default port is&nbsp;5433, configurable
+    mskql implements the PostgreSQL wire protocol&nbsp;(v3) directly&mdash;Simple Query,
+    Extended Query (prepared statements, portals, <code>$1</code>/<code>$2</code>
+    parameter substitution), and COPY. Any tool that speaks Postgres works without
+    modification: <code>psql</code>, pgAdmin, DBeaver, any language
+    driver.<span class="sidenote">The default port is&nbsp;5433, configurable
     via <code>MSKQL_PORT</code>.</span>
 </p>
 
-<!-- ═══════════════════════════════════════════════════════════ -->
-<!--  2. How This Project Was Built                              -->
-<!-- ═══════════════════════════════════════════════════════════ -->
+<pre><code class="language-bash">make && ./build/mskql                         # build & start
+psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 
-<h2 id="construction">2. How This Project Was Built</h2>
+<h2 id="performance">Competitive performance</h2>
 
 <p>
-    mskql was written entirely by AI through an adversarial collaboration between
-    three agents. No human wrote any of the C code or SQL test cases.<span class="sidenote">The
-    adversarial loop drove the implementation toward correctness the same way a rigorous
-    code-review culture does on a human team&mdash;except all three sides were machines.</span>
+    Identical workloads run against both mskql and PostgreSQL over the wire.
+    Ratio &lt;&nbsp;1.0 means mskql was faster.
+</p>
+
+<table>
+    <thead>
+        <tr><th>Workload</th><th>Ratio</th><th></th></tr>
+    </thead>
+    <tbody>
+        <tr><td>insert_bulk</td><td class="bench-faster">0.44&times;</td><td>mskql 2.3&times; faster</td></tr>
+        <tr><td>select_full_scan</td><td class="bench-faster">0.68&times;</td><td>mskql 1.5&times; faster</td></tr>
+        <tr><td>aggregate</td><td class="bench-faster">0.64&times;</td><td>mskql 1.6&times; faster</td></tr>
+        <tr><td>join</td><td class="bench-faster">0.52&times;</td><td>mskql 1.9&times; faster</td></tr>
+        <tr><td>window_functions</td><td class="bench-faster">0.67&times;</td><td>mskql 1.5&times; faster</td></tr>
+        <tr><td>order_by</td><td class="bench-faster">0.98&times;</td><td>~matching</td></tr>
+        <tr><td>index_lookup</td><td class="bench-slower">1.38&times;</td><td>PostgreSQL faster</td></tr>
+    </tbody>
+</table>
+
+<p>
+    &#8594;&ensp;<a href="bench-vs-pg.html"><strong>Full benchmark comparison</strong></a>
+    &ensp;&middot;&ensp;
+    <a href="dev/bench/index.html"><strong>Historical charts</strong></a>
+</p>
+
+<h2 id="ai-built">Built entirely by AI agents</h2>
+
+<p>
+    Three agents&mdash;a Writer, a Challenger, and a Reviewer&mdash;collaborated in
+    iterative rounds. The Challenger writes adversarial tests, the Reviewer flags
+    code-quality issues, and the Writer ships fixes until all 892 tests pass
+    cleanly.<span class="sidenote">The adversarial model drove the implementation toward
+    correctness the same way rigorous code review does on a human team&mdash;except
+    all three sides were machines.</span>
 </p>
 
 <div class="diagram">
@@ -404,40 +284,26 @@
       <path d="M0,0 L8,3 L0,6" fill="#a00"/>
     </marker>
   </defs>
-
-  <!-- The Challenger (left) -->
   <rect x="20" y="20" width="160" height="80" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
   <text x="100" y="50" text-anchor="middle" font-size="15" font-weight="600" fill="#111">The Challenger</text>
   <text x="100" y="72" text-anchor="middle" font-size="11" fill="#555">adversarial test cases</text>
-
-  <!-- The Writer (center) -->
   <rect x="230" y="20" width="160" height="80" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
   <text x="310" y="50" text-anchor="middle" font-size="15" font-weight="600" fill="#111">The Writer</text>
   <text x="310" y="72" text-anchor="middle" font-size="11" fill="#555">writes &amp; fixes code</text>
-
-  <!-- The Reviewer (right) -->
   <rect x="440" y="20" width="160" height="80" rx="6" fill="#fff" stroke="#111" stroke-width="1.5"/>
   <text x="520" y="50" text-anchor="middle" font-size="15" font-weight="600" fill="#111">The Reviewer</text>
   <text x="520" y="72" text-anchor="middle" font-size="11" fill="#555">actionable comments</text>
-
-  <!-- Challenger ↔ Writer arrows -->
   <path d="M180,45 L230,45" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
   <path d="M230,75 L180,75" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
   <text x="205" y="38" text-anchor="middle" font-size="9" fill="#a00" font-style="italic">tests</text>
   <text x="205" y="90" text-anchor="middle" font-size="9" fill="#a00" font-style="italic">fixes</text>
-
-  <!-- Writer ↔ Reviewer arrows -->
   <path d="M390,45 L440,45" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
   <path d="M440,75 L390,75" stroke="#a00" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
   <text x="415" y="38" text-anchor="middle" font-size="9" fill="#a00" font-style="italic">code</text>
   <text x="415" y="90" text-anchor="middle" font-size="9" fill="#a00" font-style="italic">feedback</text>
-
-  <!-- Loop arrow -->
   <path d="M520,100 C520,130 310,140 100,130 C60,128 40,120 40,100"
         stroke="#ccc" stroke-width="1.2" fill="none" stroke-dasharray="4,3"/>
   <text x="310" y="148" text-anchor="middle" font-size="11" fill="#555" font-style="italic">iterate until stable</text>
-
-  <!-- Result box -->
   <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
   <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">892 tests pass</text>
   <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~23,800 lines of C &middot; zero human code</text>
@@ -445,25 +311,90 @@
 </div>
 
 <p>
-    The three agents worked in iterative rounds. The Challenger would study the current
-    codebase and produce <code>.sql</code> test files exercising corner
-    cases&mdash;empty tables, NULL handling, multi-column ordering, stale index entries
-    after deletes, and more. The Reviewer would read the source and annotate it with
-    actionable comments flagging code-quality issues, missing edge-case handling,
-    and architectural improvements. The Writer would then run the new tests, address the
-    comments, diagnose failures, and ship fixes. This continued until the full suite passed
-    cleanly.
+    &#8594;&ensp;<a href="construction.html"><strong>Read more about the adversarial process</strong></a>
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
-<!--  3. Architecture                                            -->
+<!--  NOW WHAT: Embedded playground                              -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
-<h2 id="architecture">3. Architecture</h2>
+<h2 id="try-it">Try it &mdash; right here</h2>
 
 <p>
-    The system is structured as a pipeline of four stages:
+    A fully functional mskql database running <strong>entirely in your browser</strong>
+    via WebAssembly&mdash;no server, no network requests. Choose an example or write
+    your own SQL.
 </p>
+
+<div class="playground-controls">
+    <select id="examples" aria-label="Example queries">
+        <option value="">— Choose an example —</option>
+        <option value="basics">Create, Insert &amp; Select</option>
+        <option value="joins">Joins</option>
+        <option value="aggregation">Aggregation &amp; GROUP BY</option>
+        <option value="window">Window Functions</option>
+        <option value="generate_series">generate_series()</option>
+        <option value="cte">Common Table Expressions</option>
+        <option value="upsert">Upsert (ON CONFLICT)</option>
+        <option value="datetime">Date/Time Arithmetic</option>
+    </select>
+    <button class="run-btn" id="run-btn" disabled>&#9654; Run</button>
+    <button id="reset-btn" disabled>Reset DB</button>
+</div>
+
+<div class="editor-wrap">
+    <pre><code id="sql-highlight" class="language-sql"></code></pre>
+    <textarea id="sql-input" spellcheck="false" placeholder="Enter SQL here...">CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT,
+    age INT
+);
+
+INSERT INTO users VALUES
+    (1, 'Alice',   'alice@example.com',   32),
+    (2, 'Bob',     'bob@example.com',     28),
+    (3, 'Charlie', 'charlie@example.com', 35),
+    (4, 'Diana',   'diana@example.com',   29);
+
+SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
+</div>
+
+<div class="pg-status" id="pg-status">Loading WebAssembly&hellip;</div>
+
+<div id="pg-result">
+    <div class="pg-result-message">Run a query to see results here.</div>
+</div>
+
+<p style="font-size:0.9rem; color:var(--fg-dim); margin-top:0.5rem;">
+    &#8594;&ensp;<a href="playground.html"><strong>Open full playground</strong></a>
+    &ensp;(more space, more examples)
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  CTA cards                                                  -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<div class="cta-row">
+    <div class="cta-card">
+        <h3>Build &amp; connect</h3>
+        <p>Ten queries from <code>CREATE TABLE</code> to recursive CTEs, all through <code>psql</code>.</p>
+        <a href="getting-started.html" class="cta-link">Getting started &rarr;</a>
+    </div>
+    <div class="cta-card">
+        <h3>Read the source</h3>
+        <p>~23,800 lines of C11. Every subsystem in a single file.</p>
+        <a href="https://github.com/martinsk/mskql" class="cta-link">GitHub &rarr;</a>
+    </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Below the fold: compact reference pointers                 -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<hr>
+
+<h2 id="architecture">Architecture</h2>
 
 <table>
     <thead>
@@ -473,672 +404,75 @@
         <tr>
             <td><strong>Wire protocol</strong></td>
             <td><code>pgwire.c</code></td>
-            <td>Accepts TCP connections on port&nbsp;5433, handles SSL negotiation,
-                implements the Simple Query, Extended Query (prepared
-                statements, portals, <code>$1</code>/<code>$2</code> parameter
-                substitution), and COPY protocols (tab-delimited and CSV),
-                intercepts <code>information_schema</code> and
-                <code>pg_catalog</code> queries for tool compatibility,
-                and serializes result rows</td>
+            <td>PostgreSQL v3 wire protocol: Simple Query, Extended Query, COPY</td>
         </tr>
         <tr>
             <td><strong>SQL parser</strong></td>
             <td><code>parser.c</code></td>
-            <td>Hand-written recursive-descent parser producing a typed
-                <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
-                4,551 lines the parser is the largest single file (with <code>plan.c</code>
-                adding another 4,520 lines for the block-oriented executor). It includes a
-                recursive-descent expression parser with proper operator precedence
-                (<code>||</code>&nbsp;&lt;&nbsp;<code>+-</code>&nbsp;&lt;&nbsp;<code>*/%</code>)
-                and handles the full grammar including CTEs, window functions, views,
-                sequences, set operations, <code>ORDER&nbsp;BY</code> expressions,
-                <code>COPY&nbsp;TO/FROM</code>,
-                and <code>generate_series()</code> table functions.</span></td>
+            <td>Hand-written recursive-descent parser &rarr; typed AST</td>
         </tr>
         <tr>
             <td><strong>Query executor</strong></td>
-            <td><code>query.c</code>, <code>database.c</code></td>
-            <td>Tree-walking evaluator that executes the AST against in-memory tables.
-                A block-oriented plan executor (<code>plan.c</code>) handles most
-                queries with vectorized operators: sequential scan, filter, project,
-                expression project, sort, limit, hash join, hash semi-join (for
-                <code>IN&nbsp;(SELECT&hellip;)</code>), hash aggregation, index scan,
-                window functions, <code>DISTINCT</code>, set operations, CTE
-                materialization, and <code>generate_series()</code>; only the most
-                complex queries fall back to the legacy
-                row-at-a-time path.<span class="sidenote">The plan executor processes
-                data in 1,024-row column blocks, enabling cache-friendly scans and
-                vectorized numeric comparisons. It covers
-                <code>SELECT</code> with <code>WHERE</code>, projections (including
-                expression projections with scalar functions), <code>ORDER BY</code>
-                (multi-column, mixed ASC/DESC), <code>LIMIT</code>/<code>OFFSET</code>,
-                hash joins, hash semi-joins for subquery predicates, hash aggregation,
-                B-tree index scans for equality predicates, window functions
-                (<code>ROW_NUMBER</code>, <code>RANK</code>, etc.), <code>DISTINCT</code>,
-                set operations (<code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT</code>),
-                CTEs, and <code>generate_series()</code>.
-                A scan cache with generation tracking avoids
-                redundant sequential scans when the underlying table has not
-                been mutated. A direct columnar-to-wire serialization path bypasses
-                row materialization entirely for plan-executed queries.</span>
-                Handles joins (with compound <code>ON</code> conditions),
-                aggregation (including <code>DISTINCT</code> aggregates,
-                <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code>,
-                <code>ROLLUP</code>/<code>CUBE</code>),
-                window functions (with frame clauses), set operations, CTEs,
-                correlated subqueries (including scalar subqueries), views,
-                sequences, foreign keys, upserts, <code>TRUNCATE&nbsp;TABLE</code>,
-                <code>COPY&nbsp;TO/FROM</code> (tab-delimited, CSV, header),
-                <code>IS&nbsp;[NOT]&nbsp;DISTINCT&nbsp;FROM</code>,
-                <code>generate_series()</code> table functions (integer and
-                timestamp sequences with optional step), and transactions</td>
+            <td><code>query.c</code>, <code>plan.c</code></td>
+            <td>Block-oriented vectorized executor (1,024-row column blocks) with legacy row-at-a-time fallback</td>
         </tr>
         <tr>
             <td><strong>Storage</strong></td>
-            <td><code>table.c</code>, <code>row.c</code>, <code>index.c</code></td>
-            <td>Tables are arrays of rows; rows are arrays of typed cells. B-tree indexes
-                for equality lookups. Snapshot-and-restore for transaction rollback</td>
+            <td><code>table.c</code>, <code>index.c</code></td>
+            <td>In-memory row store, B-tree indexes, snapshot-based transactions</td>
         </tr>
     </tbody>
 </table>
 
 <p>
-    All memory is managed explicitly through a pool-based arena allocator
-    (<code>arena.h</code>). Parsed structures reference items by <code>uint32_t</code>
-    index instead of pointers; freeing an entire query is a single
-    <code>query_arena_destroy()</code> call&mdash;no recursive walks.<span class="sidenote">This
-    replaced the earlier recursive-deallocation approach, eliminating an entire class of
-    memory leaks and simplifying the parser&rsquo;s public API to just two functions:
-    <code>query_parse()</code> and <code>query_free()</code>.</span>
-    Expressions are represented as a tagged-union AST (<code>struct&nbsp;expr</code>)
-    with types for literals, column references, binary/unary operators, function calls,
-    <code>CASE&nbsp;WHEN</code>, casts, <code>IS&nbsp;[NOT]&nbsp;NULL</code>,
-    and subqueries&mdash;evaluated by a tree-walking
-    <code>eval_expr()</code>. The <code>CAST()</code> function and PostgreSQL&rsquo;s
-    <code>::</code> postfix operator support numeric, text, boolean, and
-    date/timestamp conversions. Date/time arithmetic (timestamp &plusmn; interval,
-    timestamp &minus; timestamp) and temporal functions
-    (<code>EXTRACT</code>, <code>DATE_TRUNC</code>, <code>AGE</code>,
-    <code>TO_CHAR</code>, <code>NOW</code>) are handled natively.
-    Math functions (<code>ABS</code>, <code>CEIL</code>, <code>FLOOR</code>,
-    <code>ROUND</code>, <code>POWER</code>, <code>SQRT</code>, <code>MOD</code>,
-    <code>SIGN</code>) and string functions (<code>CONCAT</code>,
-    <code>REPLACE</code>, <code>LPAD</code>/<code>RPAD</code>,
-    <code>POSITION</code>, <code>SPLIT_PART</code>, <code>LEFT</code>/<code>RIGHT</code>,
-    <code>REPEAT</code>, <code>REVERSE</code>, <code>INITCAP</code>) round out the
-    built-in function library.
-    Ownership follows JPL rules: the allocating module
-    deallocates, with <code>cell_release()</code> as the single canonical release
-    function for cell text.
-    A slab-chain bump allocator (<code>arena.scratch</code>) handles temporary
-    executor allocations&mdash;aggregate accumulators, sort buffers, match indices,
-    window-function state&mdash;all freed in bulk by
-    <code>query_arena_destroy()</code>, yielding zero per-query
-    <code>malloc</code>/<code>free</code> calls at steady state. A separate
-    result-text bump allocator (<code>arena.result_text</code>) eliminates
-    per-cell <code>strdup</code>/<code>free</code> for text values in query
-    results, bulk-freeing all result strings between
-    requests.<span class="sidenote">The bump allocator uses a linked list of
-    fixed-size slabs rather than a single <code>realloc</code>&rsquo;d buffer,
-    so pointers into earlier slabs remain valid even after new slabs are
-    appended&mdash;critical for the plan executor which holds references across
-    block iterations.</span>
-    A generic dynamic-array macro (<code>dynamic_array.h</code>) and zero-copy string views
-    (<code>stringview.h</code>) round out the internal abstractions.
+    &#8594;&ensp;<a href="architecture.html"><strong>Full architecture details</strong></a>
+    &ensp;(memory management, arena allocator, expression evaluator)
 </p>
 
-<!-- ═══════════════════════════════════════════════════════════ -->
-<!--  3. Supported SQL                                           -->
-<!-- ═══════════════════════════════════════════════════════════ -->
-
-<h2 id="supported-sql">4. Supported SQL</h2>
-
-<table>
-    <thead>
-        <tr><th>Category</th><th>Supported</th></tr>
-    </thead>
-    <tbody>
-        <tr>
-            <td><strong>DDL</strong></td>
-            <td><code>CREATE TABLE</code> (<code>IF NOT EXISTS</code>),
-                <code>DROP TABLE</code>,
-                <code>CREATE INDEX</code> (<code>IF NOT EXISTS</code>),
-                <code>DROP INDEX</code>,
-                <code>CREATE TYPE &hellip; AS ENUM</code>, <code>DROP TYPE</code>,
-                <code>CREATE SEQUENCE</code>, <code>DROP SEQUENCE</code>,
-                <code>CREATE VIEW</code>, <code>DROP VIEW</code>,
-                <code>ALTER TABLE</code> (<code>ADD</code>/<code>DROP</code>/<code>RENAME COLUMN</code>,
-                <code>ALTER COLUMN TYPE</code>)</td>
-        </tr>
-        <tr>
-            <td><strong>DML</strong></td>
-            <td><code>INSERT</code> (single, multi-row, <code>INSERT&hellip;SELECT</code>),
-                <code>SELECT</code>, <code>UPDATE</code> (incl. <code>UPDATE&hellip;FROM</code>),
-                <code>DELETE</code>,
-                <code>RETURNING</code>,
-                <code>ON CONFLICT DO NOTHING</code>,
-                <code>ON CONFLICT DO UPDATE</code>,
-                <code>TRUNCATE TABLE</code>,
-                <code>COPY TO STDOUT</code> (tab/CSV/header),
-                <code>COPY FROM STDIN</code> (tab/CSV)</td>
-        </tr>
-        <tr>
-            <td><strong>Filtering</strong></td>
-            <td><code>WHERE</code> with <code>AND</code>/<code>OR</code>/<code>NOT</code>,
-                <code>BETWEEN</code>, <code>IN</code> (values, subqueries, multi-column),
-                <code>ANY</code>/<code>ALL</code>,
-                <code>LIKE</code>, <code>ILIKE</code>,
-                <code>IS [NOT] NULL</code>, <code>IS [NOT] DISTINCT FROM</code>,
-                <code>=</code> <code>!=</code> <code>&lt;&gt;</code>
-                <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code></td>
-        </tr>
-        <tr>
-            <td><strong>Joins</strong></td>
-            <td><code>INNER</code>, <code>LEFT</code>, <code>RIGHT</code>,
-                <code>FULL OUTER</code>, <code>CROSS</code>,
-                <code>NATURAL</code>, <code>USING</code>,
-                <code>LATERAL</code>, multi-table,
-                compound <code>ON</code> conditions (<code>AND</code>/<code>OR</code>)</td>
-        </tr>
-        <tr>
-            <td><strong>Aggregation</strong></td>
-            <td><code>COUNT</code>, <code>SUM</code>, <code>AVG</code>,
-                <code>MIN</code>, <code>MAX</code>,
-                <code>COUNT(DISTINCT&nbsp;col)</code>,
-                <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code>,
-                expression aggregates (<code>SUM(price&nbsp;*&nbsp;qty)</code>),
-                <code>GROUP BY</code> (multi-column, positional: <code>GROUP&nbsp;BY&nbsp;1,&nbsp;2</code>),
-                <code>GROUP BY ROLLUP</code>, <code>GROUP BY CUBE</code>,
-                <code>HAVING</code></td>
-        </tr>
-        <tr>
-            <td><strong>Window functions</strong></td>
-            <td><code>ROW_NUMBER()</code>, <code>RANK()</code>, <code>DENSE_RANK()</code>,
-                <code>NTILE()</code>, <code>PERCENT_RANK()</code>, <code>CUME_DIST()</code>,
-                <code>LAG()</code>, <code>LEAD()</code>,
-                <code>FIRST_VALUE()</code>, <code>LAST_VALUE()</code>, <code>NTH_VALUE()</code>,
-                <code>SUM()</code>, <code>COUNT()</code>, <code>AVG()</code>
-                over <code>PARTITION BY &hellip; ORDER BY &hellip;</code>,
-                window frames (<code>ROWS BETWEEN &hellip;</code>)</td>
-        </tr>
-        <tr>
-            <td><strong>Set operations</strong></td>
-            <td><code>UNION</code>, <code>UNION ALL</code>,
-                <code>INTERSECT</code>, <code>EXCEPT</code></td>
-        </tr>
-        <tr>
-            <td><strong>CTEs</strong></td>
-            <td><code>WITH name AS (SELECT &hellip;) SELECT &hellip;</code>,
-                <code>WITH RECURSIVE</code></td>
-        </tr>
-        <tr>
-            <td><strong>Expressions</strong></td>
-            <td><code>+</code> <code>-</code> <code>*</code> <code>/</code> <code>%</code>,
-                unary <code>-</code>, operator precedence,
-                <code>CASE WHEN&hellip;THEN&hellip;ELSE&hellip;END</code>,
-                <code>COALESCE()</code>, <code>NULLIF()</code>,
-                <code>GREATEST()</code>, <code>LEAST()</code></td>
-        </tr>
-        <tr>
-            <td><strong>Result control</strong></td>
-            <td><code>DISTINCT</code>, <code>DISTINCT ON</code>,
-                <code>ORDER BY</code> (multi-column, per-column <code>ASC</code>/<code>DESC</code>),
-                <code>LIMIT</code>, <code>OFFSET</code></td>
-        </tr>
-        <tr>
-            <td><strong>Constraints</strong></td>
-            <td><code>NOT NULL</code>, <code>UNIQUE</code>, <code>PRIMARY KEY</code>,
-                <code>DEFAULT</code>, <code>CHECK</code>,
-                <code>REFERENCES</code> (foreign keys with
-                <code>ON DELETE/UPDATE CASCADE</code>,
-                <code>RESTRICT</code>, <code>SET NULL</code>,
-                <code>SET DEFAULT</code>)</td>
-        </tr>
-        <tr>
-            <td><strong>Transactions</strong></td>
-            <td><code>BEGIN</code>, <code>COMMIT</code>, <code>ROLLBACK</code>
-                (snapshot-based)</td>
-        </tr>
-        <tr>
-            <td><strong>String functions</strong></td>
-            <td><code>UPPER()</code>, <code>LOWER()</code>, <code>LENGTH()</code>,
-                <code>TRIM()</code>, <code>CONCAT()</code>, <code>CONCAT_WS()</code>,
-                <code>||</code>, <code>SUBSTRING()</code>,
-                <code>REPLACE()</code>, <code>LPAD()</code>/<code>RPAD()</code>,
-                <code>POSITION()</code>, <code>SPLIT_PART()</code>,
-                <code>LEFT()</code>/<code>RIGHT()</code>,
-                <code>REPEAT()</code>, <code>REVERSE()</code>, <code>INITCAP()</code></td>
-        </tr>
-        <tr>
-            <td><strong>Math functions</strong></td>
-            <td><code>ABS()</code>, <code>CEIL()</code>/<code>CEILING()</code>,
-                <code>FLOOR()</code>, <code>ROUND()</code> (with optional decimal places),
-                <code>POWER()</code>, <code>SQRT()</code>, <code>MOD()</code>,
-                <code>SIGN()</code>, <code>RANDOM()</code></td>
-        </tr>
-        <tr>
-            <td><strong>Date/time functions</strong></td>
-            <td><code>NOW()</code>, <code>CURRENT_TIMESTAMP</code>, <code>CURRENT_DATE</code>,
-                <code>EXTRACT()</code>, <code>DATE_TRUNC()</code>, <code>DATE_PART()</code>,
-                <code>AGE()</code>, <code>TO_CHAR()</code>,
-                date/timestamp &plusmn; interval arithmetic,
-                timestamp &minus; timestamp &rarr; interval,
-                date &plusmn; integer days</td>
-        </tr>
-        <tr>
-            <td><strong>Type casting</strong></td>
-            <td><code>CAST(expr AS type)</code>, <code>expr::type</code> postfix syntax,
-                numeric&harr;numeric, numeric&harr;text, text&harr;boolean,
-                text&rarr;date/timestamp conversions</td>
-        </tr>
-        <tr>
-            <td><strong>Table functions</strong></td>
-            <td><code>generate_series(start, stop [, step])</code> &mdash; integer,
-                timestamp, and date sequences with optional step and column aliases</td>
-        </tr>
-        <tr>
-            <td><strong>Sequences &amp; utilities</strong></td>
-            <td><code>NEXTVAL()</code>, <code>CURRVAL()</code>,
-                <code>GEN_RANDOM_UUID()</code></td>
-        </tr>
-        <tr>
-            <td><strong>Subqueries</strong></td>
-            <td>Scalar subqueries in <code>SELECT</code> list,
-                correlated subqueries,
-                <code>EXISTS</code> / <code>NOT EXISTS</code> (correlated),
-                <code>IN (SELECT&hellip;)</code></td>
-        </tr>
-        <tr>
-            <td><strong>Introspection</strong></td>
-            <td><code>EXPLAIN</code> (plan-based and legacy execution paths),
-                <code>SHOW</code> (<code>server_version</code>, <code>search_path</code>,
-                <code>client_encoding</code>, etc.),
-                <code>SET</code>/<code>RESET</code>/<code>DISCARD</code> (accepted, no-op),
-                <code>information_schema.tables</code>,
-                <code>information_schema.columns</code>,
-                <code>pg_catalog.pg_type</code>,
-                <code>pg_catalog.pg_class</code>,
-                <code>pg_catalog.pg_namespace</code>,
-                <code>pg_catalog.pg_attribute</code></td>
-        </tr>
-    </tbody>
-</table>
+<h2 id="sql">SQL coverage</h2>
 
 <p>
-    &#8594;&ensp;<a href="grammar.html"><strong>Full SQL grammar reference</strong></a> &mdash; production
-    rules for every statement, with implemented/not-implemented status for each feature.
+    DDL (CREATE/DROP/ALTER TABLE, INDEX, VIEW, SEQUENCE, ENUM),
+    DML (INSERT, SELECT, UPDATE, DELETE, COPY, TRUNCATE, RETURNING, upserts),
+    joins (INNER, LEFT, RIGHT, FULL, CROSS, LATERAL, NATURAL, USING),
+    aggregation (COUNT, SUM, AVG, MIN, MAX, STRING_AGG, ARRAY_AGG, ROLLUP, CUBE, HAVING),
+    window functions (ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, frames),
+    CTEs (WITH, WITH RECURSIVE), set operations (UNION, INTERSECT, EXCEPT),
+    subqueries (scalar, correlated, EXISTS, IN), expressions (CASE, COALESCE, CAST, ::),
+    30+ built-in functions (math, string, date/time),
+    generate_series(), constraints, foreign keys, transactions.
 </p>
-
-<!-- ═══════════════════════════════════════════════════════════ -->
-<!--  4. Data Types                                              -->
-<!-- ═══════════════════════════════════════════════════════════ -->
-
-<h2 id="data-types">5. Data Types</h2>
-
-<table>
-    <thead>
-        <tr><th>Type</th><th>Description</th></tr>
-    </thead>
-    <tbody>
-        <tr><td><code>SMALLINT</code> / <code>INT2</code></td><td>16-bit signed integer</td></tr>
-        <tr><td><code>INT</code></td><td>32-bit signed integer</td></tr>
-        <tr><td><code>BIGINT</code></td><td>64-bit signed integer</td></tr>
-        <tr><td><code>FLOAT</code></td><td>Double-precision floating point</td></tr>
-        <tr><td><code>NUMERIC</code> / <code>DECIMAL</code></td><td>Decimal number</td></tr>
-        <tr><td><code>TEXT</code></td><td>Variable-length string</td></tr>
-        <tr><td><code>VARCHAR(n)</code></td><td>Length-bounded string</td></tr>
-        <tr><td><code>BOOLEAN</code></td><td><code>TRUE</code> / <code>FALSE</code></td></tr>
-        <tr><td><code>DATE</code></td><td>Calendar date</td></tr>
-        <tr><td><code>TIME</code></td><td>Time of day</td></tr>
-        <tr><td><code>TIMESTAMP</code></td><td>Date and time</td></tr>
-        <tr><td><code>TIMESTAMPTZ</code></td><td>Date and time with time zone</td></tr>
-        <tr><td><code>INTERVAL</code></td><td>Time span</td></tr>
-        <tr><td><code>UUID</code></td><td>128-bit universally unique identifier</td></tr>
-        <tr><td><code>SMALLSERIAL</code> / <code>SERIAL</code> / <code>BIGSERIAL</code></td><td>Auto-incrementing integer (16-bit / 32-bit / 64-bit)</td></tr>
-        <tr><td><code>ENUM</code></td><td>User-defined enumeration type</td></tr>
-    </tbody>
-</table>
-
-<!-- ═══════════════════════════════════════════════════════════ -->
-<!--  5. Getting Started                                         -->
-<!-- ═══════════════════════════════════════════════════════════ -->
-
-<h2 id="getting-started">6. Getting Started</h2>
 
 <p>
-    Prerequisites: a C11 compiler and <code>make</code>. Nothing else.
+    &#8594;&ensp;<a href="sql-reference.html"><strong>Full SQL reference</strong></a>
+    &ensp;&middot;&ensp;
+    <a href="grammar.html"><strong>Grammar</strong></a>
 </p>
 
-<pre><code class="language-bash">make                                          # build
-./build/mskql                                 # start server on port 5433
-psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
+<h2 id="testing">Testing</h2>
 
 <p>
-    Set <code>MSKQL_PORT</code> to listen on a different port:
+    892 test cases with <strong>two layers of verification</strong>: functional correctness
+    (output diff) and memory safety (AddressSanitizer + LeakSanitizer on every test).
+    A correct query that leaks memory is a failure. Tests run in parallel across all CPU
+    cores, each in an isolated server instance. Additional C-level test suites exercise
+    the Extended Query Protocol and multi-client concurrency.
 </p>
-
-<pre><code class="language-bash">MSKQL_PORT=5444 ./build/mskql</code></pre>
-
-<h3>A small company in ten queries</h3>
-
-<p><strong>Step 1 &mdash; Schema.</strong> Two tables with constraints, a serial primary key, and a foreign key.</p>
-
-<pre><code class="language-sql">CREATE TABLE departments (
-    id    SERIAL PRIMARY KEY,
-    name  TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE employees (
-    id         SERIAL PRIMARY KEY,
-    name       TEXT NOT NULL,
-    dept_id    INT REFERENCES departments(id),
-    salary     INT DEFAULT 0,
-    hired      DATE
-);
-
-INSERT INTO departments (name) VALUES
-    ('Engineering'), ('Design'), ('Sales');
-
-INSERT INTO employees (name, dept_id, salary, hired) VALUES
-    ('Alice',   1, 130000, '2022-03-15'),
-    ('Bob',     1,  95000, '2023-01-10'),
-    ('Carol',   2, 110000, '2021-07-01'),
-    ('Dave',    2,  90000, '2024-02-20'),
-    ('Eve',     3, 105000, '2023-06-01'),
-    ('Frank', NULL,  80000, '2024-11-01');</code></pre>
-
-<p><strong>Step 2 &mdash; Filter.</strong> Who earns above six figures?</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">SELECT name, salary
-FROM employees
-WHERE salary > 100000
-ORDER BY salary DESC;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>name</th><th>salary</th></tr></thead>
-<tbody>
-<tr><td>Alice</td><td class="num-val">130000</td></tr>
-<tr><td>Carol</td><td class="num-val">110000</td></tr>
-<tr><td>Eve</td><td class="num-val">105000</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<p><strong>Step 3 &mdash; LEFT JOIN + COALESCE.</strong> Show every employee&rsquo;s department, including unassigned.</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">SELECT e.name,
-       COALESCE(d.name, 'Unassigned')
-         AS department
-FROM employees e
-LEFT JOIN departments d
-  ON e.dept_id = d.id;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>name</th><th>department</th></tr></thead>
-<tbody>
-<tr><td>Alice</td><td>Engineering</td></tr>
-<tr><td>Bob</td><td>Engineering</td></tr>
-<tr><td>Carol</td><td>Design</td></tr>
-<tr><td>Dave</td><td>Design</td></tr>
-<tr><td>Eve</td><td>Sales</td></tr>
-<tr><td>Frank</td><td>Unassigned</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<p><strong>Step 4 &mdash; Aggregation + HAVING.</strong> Average salary per department, filtering to departments above 100k.</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">SELECT d.name AS department,
-       COUNT(*)    AS headcount,
-       AVG(e.salary) AS avg_salary
-FROM employees e
-JOIN departments d ON e.dept_id = d.id
-GROUP BY d.name
-HAVING AVG(e.salary) > 100000;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>department</th><th>headcount</th><th>avg_salary</th></tr></thead>
-<tbody>
-<tr><td>Engineering</td><td class="num-val">2</td><td class="num-val">112500</td></tr>
-<tr><td>Sales</td><td class="num-val">1</td><td class="num-val">105000</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<p><strong>Step 5 &mdash; Window function.</strong> Rank employees within each department by salary.</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">SELECT e.name, d.name AS dept,
-       e.salary,
-       RANK() OVER (
-         PARTITION BY d.name
-         ORDER BY e.salary DESC
-       ) AS rnk
-FROM employees e
-JOIN departments d
-  ON e.dept_id = d.id;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>name</th><th>dept</th><th>salary</th><th>rnk</th></tr></thead>
-<tbody>
-<tr><td>Carol</td><td>Design</td><td class="num-val">110000</td><td class="num-val">1</td></tr>
-<tr><td>Dave</td><td>Design</td><td class="num-val">90000</td><td class="num-val">2</td></tr>
-<tr><td>Alice</td><td>Engineering</td><td class="num-val">130000</td><td class="num-val">1</td></tr>
-<tr><td>Bob</td><td>Engineering</td><td class="num-val">95000</td><td class="num-val">2</td></tr>
-<tr><td>Eve</td><td>Sales</td><td class="num-val">105000</td><td class="num-val">1</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<p><strong>Step 6 &mdash; Upsert.</strong> Insert-or-update with <code>ON CONFLICT DO UPDATE</code>.</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">INSERT INTO departments (id, name)
-VALUES (2, 'Product Design')
-ON CONFLICT (id) DO UPDATE
-  SET name = 'Product Design';
-
-SELECT * FROM departments
-ORDER BY id;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>id</th><th>name</th></tr></thead>
-<tbody>
-<tr><td class="num-val">1</td><td>Engineering</td></tr>
-<tr><td class="num-val">2</td><td>Product Design</td></tr>
-<tr><td class="num-val">3</td><td>Sales</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<p><strong>Step 7 &mdash; View.</strong> Create a reusable view for department summaries.</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">CREATE VIEW dept_summary AS
-SELECT d.name AS department,
-       COUNT(*) AS headcount,
-       AVG(e.salary) AS avg_salary
-FROM employees e
-JOIN departments d ON e.dept_id = d.id
-GROUP BY d.name;
-
-SELECT * FROM dept_summary
-ORDER BY avg_salary DESC;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>department</th><th>headcount</th><th>avg_salary</th></tr></thead>
-<tbody>
-<tr><td>Engineering</td><td class="num-val">2</td><td class="num-val">112500</td></tr>
-<tr><td>Sales</td><td class="num-val">1</td><td class="num-val">105000</td></tr>
-<tr><td>Product Design</td><td class="num-val">2</td><td class="num-val">100000</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<p><strong>Step 8 &mdash; Sequence + UUID.</strong> Use a sequence and generate a UUID.</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">CREATE SEQUENCE invoice_seq
-  START WITH 1000;
-
-SELECT NEXTVAL('invoice_seq') AS inv,
-       GEN_RANDOM_UUID()      AS ref;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>inv</th><th>ref</th></tr></thead>
-<tbody>
-<tr><td class="num-val">1000</td><td style="font-family:'Menlo','Consolas',monospace;font-size:0.82rem">a3f7c2e1-90b4-4d8a-b6f3-7e2d1c4f5a21</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<p><strong>Step 9 &mdash; Window frame.</strong> Running salary total within each department.</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">SELECT e.name, d.name AS dept,
-       e.salary,
-       SUM(e.salary) OVER (
-         PARTITION BY d.name
-         ORDER BY e.salary
-         ROWS BETWEEN UNBOUNDED
-           PRECEDING AND CURRENT ROW
-       ) AS running_total
-FROM employees e
-JOIN departments d
-  ON e.dept_id = d.id;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>name</th><th>dept</th><th>salary</th><th>running_total</th></tr></thead>
-<tbody>
-<tr><td>Dave</td><td>Product Design</td><td class="num-val">90000</td><td class="num-val">90000</td></tr>
-<tr><td>Carol</td><td>Product Design</td><td class="num-val">110000</td><td class="num-val">200000</td></tr>
-<tr><td>Bob</td><td>Engineering</td><td class="num-val">95000</td><td class="num-val">95000</td></tr>
-<tr><td>Alice</td><td>Engineering</td><td class="num-val">130000</td><td class="num-val">225000</td></tr>
-<tr><td>Eve</td><td>Sales</td><td class="num-val">105000</td><td class="num-val">105000</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<p><strong>Step 10 &mdash; Recursive CTE.</strong> Build a running headcount at each hire date using a recursive series.</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">WITH RECURSIVE hire_dates AS (
-    SELECT MIN(hired) AS dt
-    FROM employees
-    UNION ALL
-    SELECT (SELECT MIN(e.hired)
-            FROM employees e
-            WHERE e.hired > hire_dates.dt)
-    FROM hire_dates
-    WHERE dt < (SELECT MAX(hired)
-                FROM employees)
-)
-SELECT dt AS hire_date,
-       (SELECT COUNT(*)
-        FROM employees e
-        WHERE e.hired <= dt)
-          AS headcount
-FROM hire_dates
-ORDER BY dt;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>hire_date</th><th>headcount</th></tr></thead>
-<tbody>
-<tr><td>2021-07-01</td><td class="num-val">1</td></tr>
-<tr><td>2022-03-15</td><td class="num-val">2</td></tr>
-<tr><td>2023-01-10</td><td class="num-val">3</td></tr>
-<tr><td>2023-06-01</td><td class="num-val">4</td></tr>
-<tr><td>2024-02-20</td><td class="num-val">5</td></tr>
-<tr><td>2024-11-01</td><td class="num-val">6</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<p>Ten queries, zero configuration&mdash;from <code>CREATE TABLE</code> with foreign keys
-    to recursive CTEs, window frames, views, sequences, and upserts, all through a
-    standard Postgres connection.</p>
-
-<!-- ═══════════════════════════════════════════════════════════ -->
-<!--  6. Testing                                                 -->
-<!-- ═══════════════════════════════════════════════════════════ -->
-
-<h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes 892 test cases: SQL tests covering DDL
-    (<code>IF&nbsp;NOT&nbsp;EXISTS</code>, <code>CHECK</code> constraints),
-    DML, joins,
-    aggregation (including expression aggregates, positional <code>GROUP&nbsp;BY</code>,
-    <code>STRING_AGG()</code>, and <code>ARRAY_AGG()</code>),
-    window functions (including frames), set operations, CTEs,
-    transactions (including nested <code>BEGIN</code>), NULL handling,
-    type coercion, <code>CAST</code>/<code>::</code> conversions, constraint enforcement,
-    foreign keys (<code>CASCADE</code>, <code>RESTRICT</code>,
-    <code>SET&nbsp;NULL</code>, <code>SET&nbsp;DEFAULT</code>),
-    sequences, views, <code>SMALLINT</code> type,
-    <code>EXPLAIN</code>, system catalog queries
-    (<code>information_schema</code>, <code>pg_catalog</code>),
-    <code>SET</code>/<code>SHOW</code>/<code>DISCARD</code>,
-    math functions (<code>ABS</code>,
-    <code>ROUND</code>, <code>POWER</code>, etc.), string functions
-    (<code>CONCAT</code>, <code>REPLACE</code>, <code>SPLIT_PART</code>,
-    <code>INITCAP</code>, etc.), date/time arithmetic, temporal functions,
-    expression evaluation, <code>TRUNCATE&nbsp;TABLE</code>,
-    <code>COPY&nbsp;TO/FROM</code> (tab-delimited, CSV, header),
-    <code>IS&nbsp;[NOT]&nbsp;DISTINCT&nbsp;FROM</code>,
-    <code>ORDER&nbsp;BY</code> expressions, <code>INSERT...SELECT</code> with CTEs,
-    <code>generate_series()</code> (integer, timestamp, step, aliases),
-    upserts, correlated subqueries (including scalar subqueries),
-    error message propagation,
-    and various edge cases; plus C-based test suites for the Extended Query
-    Protocol (prepared statements, portals, parameter binding) and multi-client
-    concurrency.<span class="sidenote">SQL tests start a fresh server instance, send SQL
-    via <code>psql</code>, and validate output against expected results. The Extended
-    Query Protocol suite uses a custom C client that speaks the pgwire binary
-    protocol directly. No test framework&mdash;just shell scripts and
-    <code>diff</code>.</span>
+    &#8594;&ensp;<a href="testing.html"><strong>Testing methodology</strong></a>
 </p>
 
-<pre><code class="language-bash">make test</code></pre>
-
-<!-- ═══════════════════════════════════════════════════════════ -->
-<!--  7. Benchmarks                                              -->
-<!-- ═══════════════════════════════════════════════════════════ -->
-
-<h2 id="benchmarks">8. Benchmarks</h2>
+<h2 id="benchmarks">Benchmarks</h2>
 
 <p>
     A micro-benchmark suite measures wall-clock time for core operations: bulk insert,
     full-table scan, filtered select, aggregation, ordering, joins, update, delete,
     parsing, index lookup, and transactions. Results are tracked continuously via CI.
-    A separate comparison script (<code>bench/bench_vs_pg.py</code>) runs identical
-    workloads against both mskql and PostgreSQL over the wire, providing an
-    apples-to-apples throughput comparison.
 </p>
 
 <p>
-    &#8594;&ensp;<a href="dev/bench/index.html"><strong>View historical benchmark charts</strong></a>
+    &#8594;&ensp;<a href="dev/bench/index.html"><strong>Historical benchmark charts</strong></a>
     <br>
     &#8594;&ensp;<a href="bench-vs-pg.html"><strong>mskql vs PostgreSQL comparison</strong></a>
 </p>
@@ -1152,11 +486,17 @@ ORDER BY dt;</code></pre>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
     &ensp;&middot;&ensp;
-    <a href="dev/bench/index.html">Benchmarks</a>
+    <a href="getting-started.html">Getting Started</a>
     &ensp;&middot;&ensp;
-    <a href="bench-vs-pg.html">vs PostgreSQL</a>
+    <a href="architecture.html">Architecture</a>
     &ensp;&middot;&ensp;
-    <a href="grammar.html">SQL Grammar</a>
+    <a href="sql-reference.html">SQL Reference</a>
+    &ensp;&middot;&ensp;
+    <a href="testing.html">Testing</a>
+    &ensp;&middot;&ensp;
+    <a href="bench-vs-pg.html">Benchmarks</a>
+    &ensp;&middot;&ensp;
+    <a href="grammar.html">Grammar</a>
     &ensp;&middot;&ensp;
     <a href="tutorials/index.html">Tutorials</a>
 </footer>
@@ -1164,6 +504,163 @@ ORDER BY dt;</code></pre>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
-<script>hljs.highlightAll();</script>
+<script src="wasm/mskql-wasm.js"></script>
+<script>
+(function() {
+    const db = new MskqlDB();
+    const sqlInput   = document.getElementById('sql-input');
+    const runBtn     = document.getElementById('run-btn');
+    const resetBtn   = document.getElementById('reset-btn');
+    const statusEl   = document.getElementById('pg-status');
+    const resultEl   = document.getElementById('pg-result');
+    const examplesEl = document.getElementById('examples');
+    const highlightEl = document.getElementById('sql-highlight');
+
+    function syncHighlight() {
+        highlightEl.textContent = sqlInput.value + '\n';
+        delete highlightEl.dataset.highlighted;
+        hljs.highlightElement(highlightEl);
+    }
+    sqlInput.addEventListener('input', syncHighlight);
+    sqlInput.addEventListener('scroll', function() {
+        highlightEl.parentElement.scrollTop = sqlInput.scrollTop;
+        highlightEl.parentElement.scrollLeft = sqlInput.scrollLeft;
+    });
+
+    var examples = {
+        basics: "CREATE TABLE users (\n    id INT PRIMARY KEY,\n    name TEXT NOT NULL,\n    email TEXT,\n    age INT\n);\n\nINSERT INTO users VALUES\n    (1, 'Alice',   'alice@example.com',   32),\n    (2, 'Bob',     'bob@example.com',     28),\n    (3, 'Charlie', 'charlie@example.com', 35),\n    (4, 'Diana',   'diana@example.com',   29);\n\nSELECT * FROM users WHERE age > 30 ORDER BY name;",
+
+        joins: "CREATE TABLE departments (id INT PRIMARY KEY, name TEXT);\nINSERT INTO departments VALUES (1, 'Engineering'), (2, 'Marketing'), (3, 'Sales');\n\nCREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT, salary INT);\nINSERT INTO employees VALUES\n    (1, 'Alice', 1, 95000), (2, 'Bob', 1, 88000),\n    (3, 'Charlie', 2, 72000), (4, 'Diana', 3, 81000),\n    (5, 'Eve', 2, 69000);\n\nSELECT e.name, d.name AS department, e.salary\nFROM employees e\nJOIN departments d ON e.dept_id = d.id\nORDER BY e.salary DESC;",
+
+        aggregation: "CREATE TABLE sales (\n    id INT PRIMARY KEY,\n    product TEXT,\n    region TEXT,\n    amount NUMERIC\n);\n\nINSERT INTO sales VALUES\n    (1, 'Widget', 'North', 150.00),\n    (2, 'Widget', 'South', 200.00),\n    (3, 'Gadget', 'North', 300.00),\n    (4, 'Gadget', 'South', 250.00),\n    (5, 'Widget', 'North', 175.00),\n    (6, 'Gadget', 'North', 325.00);\n\nSELECT product, region,\n       COUNT(*) AS num_sales,\n       SUM(amount) AS total,\n       AVG(amount) AS avg_sale\nFROM sales\nGROUP BY product, region\nORDER BY product, region;",
+
+        window: "CREATE TABLE scores (\n    student TEXT,\n    subject TEXT,\n    score INT\n);\n\nINSERT INTO scores VALUES\n    ('Alice', 'Math', 92), ('Alice', 'English', 88),\n    ('Bob', 'Math', 85), ('Bob', 'English', 91),\n    ('Charlie', 'Math', 96), ('Charlie', 'English', 79),\n    ('Diana', 'Math', 88), ('Diana', 'English', 94);\n\nSELECT student, subject, score,\n       RANK() OVER (PARTITION BY subject ORDER BY score DESC) AS rank,\n       AVG(score) OVER (PARTITION BY subject) AS subject_avg\nFROM scores\nORDER BY subject, rank;",
+
+        generate_series: "SELECT n, n * n AS square\nFROM generate_series(1, 10) AS g(n);",
+
+        cte: "CREATE TABLE tree (id INT PRIMARY KEY, parent_id INT, name TEXT);\nINSERT INTO tree VALUES\n    (1, NULL, 'Root'),\n    (2, 1, 'Child A'), (3, 1, 'Child B'),\n    (4, 2, 'Grandchild A1'), (5, 2, 'Grandchild A2'),\n    (6, 3, 'Grandchild B1');\n\nWITH RECURSIVE descendants AS (\n    SELECT id, name, 0 AS depth FROM tree WHERE parent_id IS NULL\n    UNION ALL\n    SELECT t.id, t.name, d.depth + 1\n    FROM tree t JOIN descendants d ON t.parent_id = d.id\n)\nSELECT depth, name FROM descendants ORDER BY depth, name;",
+
+        upsert: "CREATE TABLE kv (key TEXT PRIMARY KEY, value INT);\n\nINSERT INTO kv VALUES ('a', 1), ('b', 2), ('c', 3);\n\nINSERT INTO kv VALUES ('b', 20), ('d', 4)\nON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;\n\nSELECT * FROM kv ORDER BY key;",
+
+        datetime: "SELECT\n    '2024-01-15'::date + 30 AS plus_30_days,\n    '2024-06-15 10:30:00'::timestamp - '2024-01-01 00:00:00'::timestamp AS diff,\n    EXTRACT(MONTH FROM '2024-03-15'::date) AS month,\n    DATE_TRUNC('month', '2024-03-15'::date) AS trunc_month;"
+    };
+
+    examplesEl.addEventListener('change', function() {
+        if (this.value && examples[this.value]) {
+            sqlInput.value = examples[this.value];
+            syncHighlight();
+            this.selectedIndex = 0;
+        }
+    });
+
+    function runQuery() {
+        var sql = sqlInput.value.trim();
+        if (!sql) return;
+
+        statusEl.className = 'pg-status';
+        statusEl.textContent = 'Running\u2026';
+
+        setTimeout(function() {
+            var t0 = performance.now();
+            var res = db.exec(sql);
+            var elapsed = (performance.now() - t0).toFixed(1);
+
+            if (!res.ok) {
+                statusEl.className = 'pg-status error';
+                statusEl.textContent = 'Error (' + elapsed + ' ms)';
+                resultEl.innerHTML = '<div class="pg-result-message error-msg">' +
+                    escapeHtml(res.output) + '</div>';
+                return;
+            }
+
+            var output = res.output.trim();
+            if (output === 'OK' || output === '') {
+                statusEl.className = 'pg-status';
+                statusEl.textContent = 'OK (' + elapsed + ' ms)';
+                resultEl.innerHTML = '<div class="pg-result-message">Statement executed successfully.</div>';
+                return;
+            }
+
+            var lines = output.split('\n').filter(function(l) { return l.length > 0; });
+            if (lines.length === 0) {
+                statusEl.className = 'pg-status';
+                statusEl.textContent = '0 rows (' + elapsed + ' ms)';
+                resultEl.innerHTML = '<div class="pg-result-message">Query returned no rows.</div>';
+                return;
+            }
+
+            var headers = lines[0].split('\t');
+            var dataLines = lines.slice(1);
+
+            statusEl.className = 'pg-status';
+            statusEl.textContent = dataLines.length + ' row' + (dataLines.length !== 1 ? 's' : '') + ' (' + elapsed + ' ms)';
+
+            var html = '<div class="pg-result-wrap"><table class="pg-result-table">';
+            html += '<thead><tr>';
+            for (var j = 0; j < headers.length; j++) {
+                html += '<th>' + escapeHtml(headers[j]) + '</th>';
+            }
+            html += '</tr></thead><tbody>';
+            for (var i = 0; i < dataLines.length; i++) {
+                var cells = dataLines[i].split('\t');
+                html += '<tr>';
+                for (var j2 = 0; j2 < cells.length; j2++) {
+                    var val = cells[j2];
+                    if (val === 'NULL') {
+                        html += '<td class="null-cell">NULL</td>';
+                    } else {
+                        html += '<td>' + escapeHtml(val) + '</td>';
+                    }
+                }
+                html += '</tr>';
+            }
+            html += '</tbody></table></div>';
+            resultEl.innerHTML = html;
+        }, 10);
+    }
+
+    function escapeHtml(s) {
+        return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    runBtn.addEventListener('click', runQuery);
+
+    sqlInput.addEventListener('keydown', function(e) {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            runQuery();
+        }
+        if (e.key === 'Tab') {
+            e.preventDefault();
+            var start = this.selectionStart;
+            var end = this.selectionEnd;
+            this.value = this.value.substring(0, start) + '    ' + this.value.substring(end);
+            this.selectionStart = this.selectionEnd = start + 4;
+        }
+    });
+
+    resetBtn.addEventListener('click', function() {
+        db.reset();
+        statusEl.className = 'pg-status';
+        statusEl.textContent = 'Database reset.';
+        resultEl.innerHTML = '<div class="pg-result-message">Database has been reset. All tables dropped.</div>';
+    });
+
+    syncHighlight();
+
+    db.init('wasm/mskql.wasm').then(function() {
+        statusEl.textContent = 'Database ready. Press Run or Ctrl+Enter.';
+        runBtn.disabled = false;
+        resetBtn.disabled = false;
+    }).catch(function(err) {
+        statusEl.className = 'pg-status error';
+        statusEl.textContent = 'Failed to load: ' + err.message;
+        console.error(err);
+    });
+
+    hljs.highlightAll();
+})();
+</script>
+
 </body>
 </html>

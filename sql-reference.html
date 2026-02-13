@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; SQL Reference</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
+
+<h1>SQL Reference</h1>
+<span class="subtitle">Supported SQL and data types</span>
+<hr class="title-rule">
+
+<h2 id="supported-sql">Supported SQL</h2>
+
+<table>
+    <thead>
+        <tr><th>Category</th><th>Supported</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>DDL</strong></td>
+            <td><code>CREATE TABLE</code> (<code>IF NOT EXISTS</code>),
+                <code>DROP TABLE</code>,
+                <code>CREATE INDEX</code> (<code>IF NOT EXISTS</code>),
+                <code>DROP INDEX</code>,
+                <code>CREATE TYPE &hellip; AS ENUM</code>, <code>DROP TYPE</code>,
+                <code>CREATE SEQUENCE</code>, <code>DROP SEQUENCE</code>,
+                <code>CREATE VIEW</code>, <code>DROP VIEW</code>,
+                <code>ALTER TABLE</code> (<code>ADD</code>/<code>DROP</code>/<code>RENAME COLUMN</code>,
+                <code>ALTER COLUMN TYPE</code>)</td>
+        </tr>
+        <tr>
+            <td><strong>DML</strong></td>
+            <td><code>INSERT</code> (single, multi-row, <code>INSERT&hellip;SELECT</code>),
+                <code>SELECT</code>, <code>UPDATE</code> (incl. <code>UPDATE&hellip;FROM</code>),
+                <code>DELETE</code>,
+                <code>RETURNING</code>,
+                <code>ON CONFLICT DO NOTHING</code>,
+                <code>ON CONFLICT DO UPDATE</code>,
+                <code>TRUNCATE TABLE</code>,
+                <code>COPY TO STDOUT</code> (tab/CSV/header),
+                <code>COPY FROM STDIN</code> (tab/CSV)</td>
+        </tr>
+        <tr>
+            <td><strong>Filtering</strong></td>
+            <td><code>WHERE</code> with <code>AND</code>/<code>OR</code>/<code>NOT</code>,
+                <code>BETWEEN</code>, <code>IN</code> (values, subqueries, multi-column),
+                <code>ANY</code>/<code>ALL</code>,
+                <code>LIKE</code>, <code>ILIKE</code>,
+                <code>IS [NOT] NULL</code>, <code>IS [NOT] DISTINCT FROM</code>,
+                <code>=</code> <code>!=</code> <code>&lt;&gt;</code>
+                <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code></td>
+        </tr>
+        <tr>
+            <td><strong>Joins</strong></td>
+            <td><code>INNER</code>, <code>LEFT</code>, <code>RIGHT</code>,
+                <code>FULL OUTER</code>, <code>CROSS</code>,
+                <code>NATURAL</code>, <code>USING</code>,
+                <code>LATERAL</code>, multi-table,
+                compound <code>ON</code> conditions (<code>AND</code>/<code>OR</code>)</td>
+        </tr>
+        <tr>
+            <td><strong>Aggregation</strong></td>
+            <td><code>COUNT</code>, <code>SUM</code>, <code>AVG</code>,
+                <code>MIN</code>, <code>MAX</code>,
+                <code>COUNT(DISTINCT&nbsp;col)</code>,
+                <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code>,
+                expression aggregates (<code>SUM(price&nbsp;*&nbsp;qty)</code>),
+                <code>GROUP BY</code> (multi-column, positional: <code>GROUP&nbsp;BY&nbsp;1,&nbsp;2</code>),
+                <code>GROUP BY ROLLUP</code>, <code>GROUP BY CUBE</code>,
+                <code>HAVING</code></td>
+        </tr>
+        <tr>
+            <td><strong>Window functions</strong></td>
+            <td><code>ROW_NUMBER()</code>, <code>RANK()</code>, <code>DENSE_RANK()</code>,
+                <code>NTILE()</code>, <code>PERCENT_RANK()</code>, <code>CUME_DIST()</code>,
+                <code>LAG()</code>, <code>LEAD()</code>,
+                <code>FIRST_VALUE()</code>, <code>LAST_VALUE()</code>, <code>NTH_VALUE()</code>,
+                <code>SUM()</code>, <code>COUNT()</code>, <code>AVG()</code>
+                over <code>PARTITION BY &hellip; ORDER BY &hellip;</code>,
+                window frames (<code>ROWS BETWEEN &hellip;</code>)</td>
+        </tr>
+        <tr>
+            <td><strong>Set operations</strong></td>
+            <td><code>UNION</code>, <code>UNION ALL</code>,
+                <code>INTERSECT</code>, <code>EXCEPT</code></td>
+        </tr>
+        <tr>
+            <td><strong>CTEs</strong></td>
+            <td><code>WITH name AS (SELECT &hellip;) SELECT &hellip;</code>,
+                <code>WITH RECURSIVE</code></td>
+        </tr>
+        <tr>
+            <td><strong>Expressions</strong></td>
+            <td><code>+</code> <code>-</code> <code>*</code> <code>/</code> <code>%</code>,
+                unary <code>-</code>, operator precedence,
+                <code>CASE WHEN&hellip;THEN&hellip;ELSE&hellip;END</code>,
+                <code>COALESCE()</code>, <code>NULLIF()</code>,
+                <code>GREATEST()</code>, <code>LEAST()</code></td>
+        </tr>
+        <tr>
+            <td><strong>Result control</strong></td>
+            <td><code>DISTINCT</code>, <code>DISTINCT ON</code>,
+                <code>ORDER BY</code> (multi-column, per-column <code>ASC</code>/<code>DESC</code>),
+                <code>LIMIT</code>, <code>OFFSET</code></td>
+        </tr>
+        <tr>
+            <td><strong>Constraints</strong></td>
+            <td><code>NOT NULL</code>, <code>UNIQUE</code>, <code>PRIMARY KEY</code>,
+                <code>DEFAULT</code>, <code>CHECK</code>,
+                <code>REFERENCES</code> (foreign keys with
+                <code>ON DELETE/UPDATE CASCADE</code>,
+                <code>RESTRICT</code>, <code>SET NULL</code>,
+                <code>SET DEFAULT</code>)</td>
+        </tr>
+        <tr>
+            <td><strong>Transactions</strong></td>
+            <td><code>BEGIN</code>, <code>COMMIT</code>, <code>ROLLBACK</code>
+                (snapshot-based)</td>
+        </tr>
+        <tr>
+            <td><strong>String functions</strong></td>
+            <td><code>UPPER()</code>, <code>LOWER()</code>, <code>LENGTH()</code>,
+                <code>TRIM()</code>, <code>CONCAT()</code>, <code>CONCAT_WS()</code>,
+                <code>||</code>, <code>SUBSTRING()</code>,
+                <code>REPLACE()</code>, <code>LPAD()</code>/<code>RPAD()</code>,
+                <code>POSITION()</code>, <code>SPLIT_PART()</code>,
+                <code>LEFT()</code>/<code>RIGHT()</code>,
+                <code>REPEAT()</code>, <code>REVERSE()</code>, <code>INITCAP()</code></td>
+        </tr>
+        <tr>
+            <td><strong>Math functions</strong></td>
+            <td><code>ABS()</code>, <code>CEIL()</code>/<code>CEILING()</code>,
+                <code>FLOOR()</code>, <code>ROUND()</code> (with optional decimal places),
+                <code>POWER()</code>, <code>SQRT()</code>, <code>MOD()</code>,
+                <code>SIGN()</code>, <code>RANDOM()</code></td>
+        </tr>
+        <tr>
+            <td><strong>Date/time functions</strong></td>
+            <td><code>NOW()</code>, <code>CURRENT_TIMESTAMP</code>, <code>CURRENT_DATE</code>,
+                <code>EXTRACT()</code>, <code>DATE_TRUNC()</code>, <code>DATE_PART()</code>,
+                <code>AGE()</code>, <code>TO_CHAR()</code>,
+                date/timestamp &plusmn; interval arithmetic,
+                timestamp &minus; timestamp &rarr; interval,
+                date &plusmn; integer days</td>
+        </tr>
+        <tr>
+            <td><strong>Type casting</strong></td>
+            <td><code>CAST(expr AS type)</code>, <code>expr::type</code> postfix syntax,
+                numeric&harr;numeric, numeric&harr;text, text&harr;boolean,
+                text&rarr;date/timestamp conversions</td>
+        </tr>
+        <tr>
+            <td><strong>Table functions</strong></td>
+            <td><code>generate_series(start, stop [, step])</code> &mdash; integer,
+                timestamp, and date sequences with optional step and column aliases</td>
+        </tr>
+        <tr>
+            <td><strong>Sequences &amp; utilities</strong></td>
+            <td><code>NEXTVAL()</code>, <code>CURRVAL()</code>,
+                <code>GEN_RANDOM_UUID()</code></td>
+        </tr>
+        <tr>
+            <td><strong>Subqueries</strong></td>
+            <td>Scalar subqueries in <code>SELECT</code> list,
+                correlated subqueries,
+                <code>EXISTS</code> / <code>NOT EXISTS</code> (correlated),
+                <code>IN (SELECT&hellip;)</code></td>
+        </tr>
+        <tr>
+            <td><strong>Introspection</strong></td>
+            <td><code>EXPLAIN</code> (plan-based and legacy execution paths),
+                <code>SHOW</code> (<code>server_version</code>, <code>search_path</code>,
+                <code>client_encoding</code>, etc.),
+                <code>SET</code>/<code>RESET</code>/<code>DISCARD</code> (accepted, no-op),
+                <code>information_schema.tables</code>,
+                <code>information_schema.columns</code>,
+                <code>pg_catalog.pg_type</code>,
+                <code>pg_catalog.pg_class</code>,
+                <code>pg_catalog.pg_namespace</code>,
+                <code>pg_catalog.pg_attribute</code></td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    &#8594;&ensp;<a href="grammar.html"><strong>Full SQL grammar reference</strong></a> &mdash; production
+    rules for every statement, with implemented/not-implemented status for each feature.
+</p>
+
+<h2 id="data-types">Data Types</h2>
+
+<table>
+    <thead>
+        <tr><th>Type</th><th>Description</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><code>SMALLINT</code> / <code>INT2</code></td><td>16-bit signed integer</td></tr>
+        <tr><td><code>INT</code></td><td>32-bit signed integer</td></tr>
+        <tr><td><code>BIGINT</code></td><td>64-bit signed integer</td></tr>
+        <tr><td><code>FLOAT</code></td><td>Double-precision floating point</td></tr>
+        <tr><td><code>NUMERIC</code> / <code>DECIMAL</code></td><td>Decimal number</td></tr>
+        <tr><td><code>TEXT</code></td><td>Variable-length string</td></tr>
+        <tr><td><code>VARCHAR(n)</code></td><td>Length-bounded string</td></tr>
+        <tr><td><code>BOOLEAN</code></td><td><code>TRUE</code> / <code>FALSE</code></td></tr>
+        <tr><td><code>DATE</code></td><td>Calendar date</td></tr>
+        <tr><td><code>TIME</code></td><td>Time of day</td></tr>
+        <tr><td><code>TIMESTAMP</code></td><td>Date and time</td></tr>
+        <tr><td><code>TIMESTAMPTZ</code></td><td>Date and time with time zone</td></tr>
+        <tr><td><code>INTERVAL</code></td><td>Time span</td></tr>
+        <tr><td><code>UUID</code></td><td>128-bit universally unique identifier</td></tr>
+        <tr><td><code>SMALLSERIAL</code> / <code>SERIAL</code> / <code>BIGSERIAL</code></td><td>Auto-incrementing integer (16-bit / 32-bit / 64-bit)</td></tr>
+        <tr><td><code>ENUM</code></td><td>User-defined enumeration type</td></tr>
+    </tbody>
+</table>
+
+<footer class="site-footer">
+    <a href="index.html">Home</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="architecture.html">Architecture</a>
+    &ensp;&middot;&ensp;
+    <a href="grammar.html">Grammar</a>
+    &ensp;&middot;&ensp;
+    <a href="testing.html">Testing</a>
+    &ensp;&middot;&ensp;
+    <a href="playground.html">Playground</a>
+</footer>
+
+</body>
+</html>

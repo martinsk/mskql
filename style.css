@@ -1,0 +1,312 @@
+/* ══════════════════════════════════════════════════════════════
+   mskql — shared Tufte-inspired stylesheet
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── Reset & base ────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --body-width: 55%;
+    --fg: #111;
+    --fg-dim: #555;
+    --bg: #fffff8;
+    --accent: #a00;
+    --rule: #ccc;
+    --code-bg: #f3f1eb;
+    --sidenote-width: 300px;
+}
+
+html { font-size: 15px; }
+
+body {
+    font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+    background: var(--bg);
+    color: var(--fg);
+    width: var(--body-width);
+    margin-left: auto;
+    margin-right: auto;
+    padding: 3rem 0 5rem 0;
+    counter-reset: sidenote-counter;
+}
+
+/* ── Typography ──────────────────────────────────────── */
+p, ol, ul, dl { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+li { margin-bottom: 0.3rem; }
+ol, ul { padding-left: 1.6rem; }
+
+a { color: var(--fg); text-decoration: none; background-image: linear-gradient(var(--accent), var(--accent)); background-size: 1px 1px; background-repeat: repeat-x; background-position: 0 1.15em; }
+a:hover { color: var(--accent); }
+
+strong { font-weight: 600; }
+
+/* ── Headings ────────────────────────────────────────── */
+h1 {
+    font-weight: 400;
+    font-size: 2.6rem;
+    line-height: 1.15;
+    margin-bottom: 0.4rem;
+}
+
+.subtitle {
+    font-style: italic;
+    font-size: 1.3rem;
+    color: var(--fg-dim);
+    display: block;
+    margin-bottom: 0.6rem;
+    line-height: 1.4;
+}
+
+.byline {
+    font-size: 0.95rem;
+    color: var(--fg-dim);
+    margin-bottom: 2rem;
+}
+.byline a { font-size: 0.95rem; }
+.byline .author-name { font-size: 1.0rem; }
+
+h2 {
+    font-weight: 400;
+    font-style: italic;
+    font-size: 1.6rem;
+    margin-top: 2.8rem;
+    margin-bottom: 0.6rem;
+    padding-bottom: 0.15rem;
+}
+
+h3 {
+    font-weight: 600;
+    font-style: normal;
+    font-size: 1.15rem;
+    margin-top: 1.6rem;
+    margin-bottom: 0.4rem;
+}
+
+/* ── Accent rule under title ─────────────────────────── */
+.title-rule {
+    border: none;
+    height: 3px;
+    background: var(--accent);
+    width: 60px;
+    margin: 0 0 2rem 0;
+}
+
+/* ── Epigraph ────────────────────────────────────────── */
+.epigraph {
+    margin: 2.5rem 0 2.5rem 0;
+    padding: 0;
+}
+.epigraph blockquote {
+    font-style: italic;
+    font-size: 1.05rem;
+    line-height: 1.65;
+    margin: 0;
+    padding: 0 0 0 1.5rem;
+    border-left: 3px solid var(--accent);
+}
+.epigraph blockquote footer {
+    font-style: normal;
+    font-size: 0.9rem;
+    color: var(--fg-dim);
+    margin-top: 0.5rem;
+}
+
+/* ── Sidenotes / margin notes ────────────────────────── */
+.sidenote, .marginnote {
+    float: right;
+    clear: right;
+    margin-right: calc(-1 * var(--sidenote-width) - 40px);
+    width: var(--sidenote-width);
+    font-size: 0.85rem;
+    line-height: 1.45;
+    color: var(--fg-dim);
+    vertical-align: baseline;
+    position: relative;
+}
+.sidenote { counter-increment: sidenote-counter; }
+.sidenote::before {
+    content: counter(sidenote-counter);
+    font-size: 0.7rem;
+    position: relative;
+    top: -0.4rem;
+    padding-right: 0.15rem;
+    color: var(--accent);
+    font-weight: 600;
+}
+sup.sidenote-ref {
+    font-size: 0.7rem;
+    color: var(--accent);
+    font-weight: 600;
+    cursor: default;
+}
+sup.sidenote-ref::after {
+    content: counter(sidenote-counter);
+    counter-increment: sidenote-counter;
+}
+
+/* ── Code ────────────────────────────────────────────── */
+code {
+    font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+    font-size: 0.82rem;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 2px;
+}
+pre {
+    background: var(--code-bg);
+    border-left: 3px solid var(--accent);
+    padding: 1rem 1.2rem;
+    overflow-x: auto;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    margin: 1rem 0 1.4rem 0;
+}
+pre code { background: none; padding: 0; border-radius: 0; }
+pre code.hljs { background: var(--code-bg); padding: 0; }
+.hljs { background: var(--code-bg); }
+
+/* ── Tables (Tufte: full-width, minimal rules) ───────── */
+.fullwidth { width: 100%; }
+table {
+    border-collapse: collapse;
+    font-size: 0.95rem;
+    width: 100%;
+    margin: 1rem 0 1.4rem 0;
+}
+th, td {
+    padding: 0.4rem 0.8rem;
+    text-align: left;
+    border-bottom: 1px solid var(--rule);
+}
+thead th {
+    border-bottom: 2px solid var(--fg);
+    font-weight: 600;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+tbody tr:last-child td { border-bottom: 2px solid var(--fg); }
+td code { font-size: 0.8rem; }
+
+/* ── Result tables (Tufte style) ───────────────────────── */
+.result-table {
+    font-family: 'EB Garamond', Georgia, serif;
+    font-size: 0.92rem;
+    border-collapse: collapse;
+    margin: 0.6rem 0 1.2rem 0;
+    width: 100%;
+    border-top: 2px solid var(--fg);
+    border-bottom: 2px solid var(--fg);
+}
+.result-table th {
+    font-weight: 400;
+    font-size: 0.78rem;
+    font-variant: small-caps;
+    text-transform: lowercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid var(--fg);
+    padding: 0.3rem 0.6rem 0.25rem;
+    text-align: left;
+    color: var(--fg);
+}
+.result-table td {
+    padding: 0.22rem 0.6rem;
+    border: none;
+    white-space: nowrap;
+}
+.result-table .null-val { color: #999; font-style: italic; }
+.result-table .num-val {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-family: 'EB Garamond', Georgia, serif;
+}
+.result-label {
+    font-family: 'EB Garamond', Georgia, serif;
+    font-size: 0.8rem;
+    font-style: italic;
+    color: var(--fg-dim);
+    margin: 0 0 0.3rem 0;
+}
+.query-pair {
+    display: flex;
+    gap: 1.2rem;
+    align-items: stretch;
+    margin: 0.8rem 0 1.4rem 0;
+}
+.query-pair pre {
+    flex: 1 1 50%;
+    min-width: 0;
+    margin: 0;
+}
+.query-pair .result-wrap {
+    flex: 1 1 50%;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+.query-pair .result-table {
+    margin: 0;
+}
+@media (max-width: 900px) {
+    .query-pair {
+        flex-direction: column;
+    }
+    .query-pair pre,
+    .query-pair .result-wrap {
+        flex: 1 1 auto;
+    }
+}
+
+/* ── Divider ─────────────────────────────────────────── */
+hr {
+    border: none;
+    border-top: 1px solid var(--rule);
+    margin: 2.5rem 0;
+}
+
+/* ── Footer ──────────────────────────────────────────── */
+footer.site-footer {
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--rule);
+    font-size: 0.85rem;
+    color: var(--fg-dim);
+}
+footer.site-footer a { font-size: 0.85rem; }
+
+/* ── Diagram ─────────────────────────────────────────── */
+.diagram {
+    margin: 2rem auto;
+    text-align: center;
+}
+.diagram svg {
+    max-width: 100%;
+    height: auto;
+}
+
+/* ── Breadcrumb nav ──────────────────────────────────── */
+.breadcrumb {
+    font-size: 0.85rem;
+    color: var(--fg-dim);
+    margin-bottom: 1.5rem;
+}
+.breadcrumb a { font-size: 0.85rem; }
+
+/* ── Responsive: collapse sidenotes on narrow screens ── */
+@media (max-width: 1100px) {
+    body { width: 80%; }
+    .sidenote, .marginnote {
+        float: none;
+        display: block;
+        margin: 0.8rem 0 0.8rem 1.5rem;
+        width: auto;
+        font-size: 0.9rem;
+        color: var(--fg-dim);
+        border-left: 2px solid var(--rule);
+        padding-left: 0.8rem;
+    }
+}
+@media (max-width: 700px) {
+    body { width: 90%; padding: 2rem 0 3rem 0; }
+    h1 { font-size: 2rem; }
+}

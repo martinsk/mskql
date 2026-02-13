@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Testing Methodology</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
+
+<h1>Testing</h1>
+<span class="subtitle">892 tests &middot; two layers of verification &middot; zero tolerance for leaks</span>
+<hr class="title-rule">
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  1. Two layers                                              -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="two-layers">Two layers of verification</h2>
+
+<p>
+    Every <code>make test</code> run validates two independent properties for
+    every test case. A test passes <strong>only if both layers are green</strong>.
+    A query that returns the correct result but leaks 16&nbsp;bytes is a failure.
+</p>
+
+<table>
+    <thead>
+        <tr><th>Layer</th><th>What it catches</th><th>Mechanism</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Functional correctness</strong></td>
+            <td>Wrong output, missing rows, wrong types, parse errors</td>
+            <td>SQL output compared to expected results via <code>diff</code></td>
+        </tr>
+        <tr>
+            <td><strong>Memory safety</strong></td>
+            <td>Leaks, use-after-free, buffer overflows, double-free</td>
+            <td>AddressSanitizer + LeakSanitizer enabled by default
+                (<code>-fsanitize=address</code>)</td>
+        </tr>
+    </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  2. Test runner architecture                                -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="runner">Test runner architecture</h2>
+
+<p>
+    The test runner (<code>tests/test.sh</code>, 459&nbsp;lines) orchestrates
+    everything. No test framework&mdash;just shell scripts and <code>diff</code>.
+</p>
+
+<h3>Per-test server isolation</h3>
+
+<p>
+    Each <code>.sql</code> test file starts a <em>fresh</em> server process.
+    No shared state between tests. This eliminates ordering dependencies and
+    makes every test independently reproducible.
+</p>
+
+<h3>ASAN / LeakSanitizer by default</h3>
+
+<p>
+    The default build (<code>src/Makefile</code>) compiles with
+    <code>-fsanitize=address -fno-omit-frame-pointer</code>. The test runner
+    sets <code>ASAN_OPTIONS="detect_leaks=1:log_path=..."</code> and
+    <code>LSAN_OPTIONS="suppressions=..."</code> per server
+    instance.<span class="sidenote">On macOS ARM64, Apple Clang does not support
+    <code>detect_leaks</code>. The test runner automatically prefers Homebrew
+    LLVM Clang (<code>/opt/homebrew/opt/llvm/bin/clang</code>) when available,
+    which does support LeakSanitizer on this platform.</span>
+    After each test, <code>check_asan_logs()</code> scans the ASAN log for
+    <code>LeakSanitizer</code> or <code>ERROR: AddressSanitizer</code>&mdash;any
+    hit fails the test with the leak summary in the output.
+</p>
+
+<h3>Suppressions for system false positives</h3>
+
+<p>
+    <code>lsan_suppressions.txt</code> whitelists known macOS system library
+    leaks that are not mskql code:
+</p>
+
+<pre><code class="language-bash"># LeakSanitizer suppressions for macOS system libraries (false positives)
+leak:_fetchInitializingClassList
+leak:_libxpc_initializer
+leak:libSystem_initializer
+leak:initializeNonMetaClass
+leak:dyld::ThreadLocalVariables
+leak:_tlv_get_addr
+# macOS libc dtoa thread-local caches (allocated by snprintf %g/%f, never freed)
+leak:__Balloc_D2A
+# macOS libc localtime thread-local buffer (allocated once, never freed)
+leak:localtime</code></pre>
+
+<h3>Parallel execution across all CPU cores</h3>
+
+<p>
+    Tests run N-wide (auto-detected via <code>nproc</code> / <code>sysctl</code>).
+    Each worker gets a unique port (<code>BASE_PORT + slot_index</code>).
+    A job-slot scheduler dispatches tests to free workers and collects results.
+    Wall-clock time is proportional to the slowest single test, not the sum.
+</p>
+
+<h3>Transaction-aware execution</h3>
+
+<p>
+    The runner detects <code>BEGIN</code> / <code>COMMIT</code> /
+    <code>ROLLBACK</code> in setup or input SQL and switches from per-statement
+    execution to single-session piped execution&mdash;necessary for transaction
+    tests to work correctly.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  3. Test format                                             -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="format">Declarative test format</h2>
+
+<p>
+    Each <code>.sql</code> file is self-contained. No fixtures, no setup files,
+    no test framework:
+</p>
+
+<pre><code class="language-sql">-- adversarial: ALTER TABLE ADD COLUMN then SELECT
+-- setup:
+CREATE TABLE t_aac (id INT, name TEXT);
+INSERT INTO t_aac VALUES (1, 'alice');
+INSERT INTO t_aac VALUES (2, 'bob');
+ALTER TABLE t_aac ADD COLUMN age INT;
+-- input:
+SELECT id, name, age FROM t_aac ORDER BY id;
+-- expected output:
+1|alice|
+2|bob|</code></pre>
+
+<p>
+    The format supports four sections:
+</p>
+
+<table>
+    <thead>
+        <tr><th>Section</th><th>Purpose</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><code>-- &lt;test name&gt;</code></td>
+            <td>First comment line; used in pass/fail reporting</td>
+        </tr>
+        <tr>
+            <td><code>-- setup:</code></td>
+            <td>SQL run before the test; output not checked</td>
+        </tr>
+        <tr>
+            <td><code>-- input:</code></td>
+            <td>SQL whose output is checked against expected</td>
+        </tr>
+        <tr>
+            <td><code>-- expected output:</code></td>
+            <td>Expected lines, compared with <code>psql&nbsp;-tA</code> output</td>
+        </tr>
+    </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  4. C-level protocol suites                                 -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="protocol-tests">C-level protocol test suites</h2>
+
+<p>
+    Two additional test suites go beyond SQL, exercising the wire protocol
+    directly with custom C clients:
+</p>
+
+<table>
+    <thead>
+        <tr><th>Suite</th><th>Source</th><th>What it tests</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Extended Query Protocol</strong></td>
+            <td><code>test_extended.c</code></td>
+            <td>Prepared statements, portals, <code>$1</code>/<code>$2</code>
+                parameter binding, error state handling, Sync/Flush semantics&mdash;speaking
+                raw pgwire binary protocol</td>
+        </tr>
+        <tr>
+            <td><strong>Concurrency</strong></td>
+            <td><code>test_concurrent.c</code></td>
+            <td>Multiple simultaneous TCP connections, rapid connect/disconnect,
+                interleaved queries, state isolation between clients</td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    These are compiled from <code>tests/cases/*/Makefile</code> and run after
+    the SQL suite. Each reports individual check counts
+    (&ldquo;All N tests passed&rdquo;).
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  5. What is tested                                          -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="coverage">What is tested</h2>
+
+<p>
+    The 892 test cases cover DDL
+    (<code>IF&nbsp;NOT&nbsp;EXISTS</code>, <code>CHECK</code> constraints),
+    DML, joins,
+    aggregation (including expression aggregates, positional <code>GROUP&nbsp;BY</code>,
+    <code>STRING_AGG()</code>, and <code>ARRAY_AGG()</code>),
+    window functions (including frames), set operations, CTEs,
+    transactions (including nested <code>BEGIN</code>), NULL handling,
+    type coercion, <code>CAST</code>/<code>::</code> conversions, constraint enforcement,
+    foreign keys (<code>CASCADE</code>, <code>RESTRICT</code>,
+    <code>SET&nbsp;NULL</code>, <code>SET&nbsp;DEFAULT</code>),
+    sequences, views, <code>SMALLINT</code> type,
+    <code>EXPLAIN</code>, system catalog queries
+    (<code>information_schema</code>, <code>pg_catalog</code>),
+    <code>SET</code>/<code>SHOW</code>/<code>DISCARD</code>,
+    math functions, string functions,
+    date/time arithmetic, temporal functions,
+    expression evaluation, <code>TRUNCATE&nbsp;TABLE</code>,
+    <code>COPY&nbsp;TO/FROM</code>,
+    <code>IS&nbsp;[NOT]&nbsp;DISTINCT&nbsp;FROM</code>,
+    <code>ORDER&nbsp;BY</code> expressions, <code>INSERT...SELECT</code> with CTEs,
+    <code>generate_series()</code>,
+    upserts, correlated subqueries,
+    error message propagation,
+    and various edge cases.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  6. Running                                                 -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="running">Running the tests</h2>
+
+<pre><code class="language-bash">make test                          # full suite: build with ASAN, run all 892 tests
+MSKQL_NO_LEAK_CHECK=1 make test   # skip leak checking (faster, less strict)</code></pre>
+
+<footer class="site-footer">
+    <a href="index.html">Home</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="architecture.html">Architecture</a>
+    &ensp;&middot;&ensp;
+    <a href="sql-reference.html">SQL Reference</a>
+    &ensp;&middot;&ensp;
+    <a href="bench-vs-pg.html">Benchmarks</a>
+    &ensp;&middot;&ensp;
+    <a href="playground.html">Playground</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>
