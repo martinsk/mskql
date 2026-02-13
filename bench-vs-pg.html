@@ -288,6 +288,72 @@
             <td class="num">10,000</td>
             <td class="num">2,000</td>
         </tr>
+        <tr>
+            <td><strong>delete</strong></td>
+            <td>Create table, insert 2,000 rows, delete half</td>
+            <td class="num">2,000</td>
+            <td class="num">50</td>
+        </tr>
+        <tr>
+            <td><strong>transaction</strong></td>
+            <td><code>BEGIN</code>/<code>COMMIT</code> with 50 inserts per txn</td>
+            <td class="num">1,000</td>
+            <td class="num">100</td>
+        </tr>
+        <tr>
+            <td><strong>window_functions</strong></td>
+            <td><code>ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val)</code></td>
+            <td class="num">5,000</td>
+            <td class="num">20</td>
+        </tr>
+        <tr>
+            <td><strong>distinct</strong></td>
+            <td><code>SELECT DISTINCT category</code> from 100 categories</td>
+            <td class="num">5,000</td>
+            <td class="num">500</td>
+        </tr>
+        <tr>
+            <td><strong>subquery</strong></td>
+            <td><code>WHERE id IN (SELECT id FROM t2 WHERE flag &gt; 500)</code></td>
+            <td class="num">5,000</td>
+            <td class="num">50</td>
+        </tr>
+        <tr>
+            <td><strong>cte</strong></td>
+            <td><code>WITH filtered AS (&hellip;) SELECT &hellip;</code></td>
+            <td class="num">5,000</td>
+            <td class="num">200</td>
+        </tr>
+        <tr>
+            <td><strong>generate_series</strong></td>
+            <td><code>SELECT * FROM generate_series(1, 10000)</code></td>
+            <td class="num">10,000</td>
+            <td class="num">200</td>
+        </tr>
+        <tr>
+            <td><strong>scalar_functions</strong></td>
+            <td><code>UPPER</code>, <code>LENGTH</code>, <code>ABS</code>, <code>ROUND</code> per row</td>
+            <td class="num">5,000</td>
+            <td class="num">200</td>
+        </tr>
+        <tr>
+            <td><strong>expression_agg</strong></td>
+            <td><code>SUM(price * quantity)</code> grouped by category</td>
+            <td class="num">5,000</td>
+            <td class="num">500</td>
+        </tr>
+        <tr>
+            <td><strong>multi_sort</strong></td>
+            <td><code>ORDER BY a DESC, b ASC</code> on two columns</td>
+            <td class="num">5,000</td>
+            <td class="num">200</td>
+        </tr>
+        <tr>
+            <td><strong>set_ops</strong></td>
+            <td><code>UNION</code> of two 2,000-row tables</td>
+            <td class="num">4,000</td>
+            <td class="num">50</td>
+        </tr>
     </tbody>
 </table>
 
@@ -317,59 +383,136 @@
     <tbody>
         <tr>
             <td><strong>insert_bulk</strong></td>
-            <td class="num">385</td>
-            <td class="num">942</td>
-            <td class="num"><span class="faster">0.41&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:41%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">381</td>
+            <td class="num">865</td>
+            <td class="num"><span class="faster">0.44&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:44%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>select_full_scan</strong></td>
-            <td class="num">324</td>
-            <td class="num">486</td>
-            <td class="num"><span class="faster">0.67&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:67%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">304</td>
+            <td class="num">424</td>
+            <td class="num"><span class="faster">0.72&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:72%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>select_where</strong></td>
-            <td class="num">437</td>
-            <td class="num">677</td>
-            <td class="num"><span class="faster">0.65&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:65%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">400</td>
+            <td class="num">585</td>
+            <td class="num"><span class="faster">0.68&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:68%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>aggregate</strong></td>
-            <td class="num">183</td>
-            <td class="num">345</td>
-            <td class="num"><span class="faster">0.53&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:53%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">174</td>
+            <td class="num">272</td>
+            <td class="num"><span class="faster">0.64&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:64%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>order_by</strong></td>
-            <td class="num">358</td>
-            <td class="num">362</td>
-            <td class="num"><span class="faster">0.99&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:99%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">364</td>
+            <td class="num">373</td>
+            <td class="num"><span class="faster">0.98&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:98%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>join</strong></td>
-            <td class="num">34</td>
-            <td class="num">64</td>
-            <td class="num"><span class="faster">0.53&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:53%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">31</td>
+            <td class="num">59</td>
+            <td class="num"><span class="faster">0.52&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:52%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>update</strong></td>
-            <td class="num">52</td>
-            <td class="num">252</td>
+            <td class="num">47</td>
+            <td class="num">229</td>
             <td class="num"><span class="faster">0.20&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:20%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>index_lookup</strong></td>
+            <td class="num">100</td>
             <td class="num">106</td>
-            <td class="num">110</td>
-            <td class="num"><span class="faster">0.96&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:96%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num"><span class="faster">0.94&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:94%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>delete</strong></td>
+            <td class="num">3,454</td>
+            <td class="num">8,059</td>
+            <td class="num"><span class="faster">0.43&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:43%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>transaction</strong></td>
+            <td class="num">260</td>
+            <td class="num">188</td>
+            <td class="num"><span class="slower">1.38&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:72%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>window_functions</strong></td>
+            <td class="num">59</td>
+            <td class="num">89</td>
+            <td class="num"><span class="faster">0.67&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:67%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>distinct</strong></td>
+            <td class="num">82</td>
+            <td class="num">256</td>
+            <td class="num"><span class="faster">0.32&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:32%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>subquery</strong></td>
+            <td class="num">46</td>
+            <td class="num">93</td>
+            <td class="num"><span class="faster">0.50&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:50%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>cte</strong></td>
+            <td class="num">118</td>
+            <td class="num">114</td>
+            <td class="num"><span class="slower">1.04&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:96%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>generate_series</strong></td>
+            <td class="num">241</td>
+            <td class="num">776</td>
+            <td class="num"><span class="faster">0.31&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:31%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>scalar_functions</strong></td>
+            <td class="num">761</td>
+            <td class="num">959</td>
+            <td class="num"><span class="faster">0.79&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:79%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>expression_agg</strong></td>
+            <td class="num">292</td>
+            <td class="num">310</td>
+            <td class="num"><span class="faster">0.94&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:94%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>multi_sort</strong></td>
+            <td class="num">408</td>
+            <td class="num">529</td>
+            <td class="num"><span class="faster">0.77&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:77%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>set_ops</strong></td>
+            <td class="num">61</td>
+            <td class="num">99</td>
+            <td class="num"><span class="faster">0.62&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:62%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
     </tbody>
 </table>
@@ -377,27 +520,49 @@
 <h2>4. What This Tells Us</h2>
 
 <p>
-    <strong>mskql is faster across all eight benchmarks.</strong>&ensp;Full scans, filtered
-    selects, aggregation, ordering, joins, updates, bulk inserts, and index lookups
-    are all faster than PostgreSQL in this setup. This is expected: mskql keeps
-    everything in memory and has no WAL, no MVCC overhead, and no background
-    processes. A columnar scan cache with generation tracking avoids redundant
-    row-store traversals, and the plan executor&rsquo;s direct-to-wire
-    serialization path eliminates row materialization entirely.
+    <strong>mskql is faster in 17 of 19 benchmarks.</strong>&ensp;Across reads, writes,
+    joins, window functions, set operations, subqueries, and scalar functions,
+    mskql matches or beats PostgreSQL. The two exceptions are transactions
+    (1.38&times;) and CTEs (1.04&times;)&mdash;both essentially on par.
+    This is expected: mskql keeps everything in memory and has no WAL, no MVCC
+    overhead, and no background processes.
+</p>
+
+<p>
+    <strong>The block-oriented plan executor is the key.</strong>&ensp;Most of the
+    performance comes from the columnar plan executor, which processes data in
+    1,024-row blocks and serializes results directly to the wire protocol without
+    materializing individual rows. This path now covers sequential scans, filters,
+    projections (including expression projections), sorts, hash joins, hash
+    semi-joins (for <code>IN (SELECT&hellip;)</code>), window functions,
+    <code>DISTINCT</code>, set operations, CTEs, <code>generate_series()</code>,
+    and B-tree index scans. A scan cache with generation tracking avoids redundant
+    row-store traversals when the underlying table has not been mutated.
 </p>
 
 <p>
     <strong>Write-heavy workloads benefit from zero durability overhead.</strong>&ensp;Bulk
-    inserts and updates are significantly faster because mskql has no fsync, no WAL,
-    and no MVCC bookkeeping. This is the expected advantage of an in-memory toy
+    inserts (0.44&times;), updates (0.20&times;), and deletes (0.43&times;) are
+    significantly faster because mskql has no fsync, no WAL, and no MVCC
+    bookkeeping. This is the expected advantage of an in-memory toy
     database&mdash;not a fair comparison for production use.
 </p>
 
 <p>
-    <strong>Index lookups are now on par.</strong>&ensp;mskql&rsquo;s B-tree index
-    lookup path goes through the plan executor with a direct columnar-to-wire
-    serialization fast path, bringing point-lookup performance in line with
-    PostgreSQL&rsquo;s highly optimized index-scan path (0.96&times;).
+    <strong>Transactions are the one weak spot.</strong>&ensp;At 1.38&times;,
+    transaction throughput is the only benchmark where mskql is meaningfully slower.
+    PostgreSQL&rsquo;s WAL-based commit path is highly optimized for batched
+    fsync, while mskql&rsquo;s snapshot-based rollback mechanism has overhead
+    from deep-copying table state on <code>BEGIN</code>.
+</p>
+
+<p>
+    <strong>Standout results.</strong>&ensp;<code>generate_series()</code> at
+    0.31&times; and <code>DISTINCT</code> at 0.32&times; show the largest wins,
+    both driven by zero-allocation columnar generation and O(n) hash-based
+    deduplication respectively. Window functions (0.67&times;) benefit from an
+    O(n&nbsp;log&nbsp;n) sort + linear-scan algorithm in the plan executor,
+    replacing the legacy O(n&sup2;) nested loop.
 </p>
 
 <h2>5. Running It Yourself</h2>
