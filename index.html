@@ -327,7 +327,7 @@
     <a href="tutorials/index.html">Tutorials</a>
     &ensp;&middot;&ensp;
     <a href="playground.html"><strong>Try it &rarr;</strong></a>
-    &ensp;&middot;&ensp; ~22,000 lines of C11 &ensp;&middot;&ensp; 752 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~23,000 lines of C11 &ensp;&middot;&ensp; 883 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -350,7 +350,7 @@
 <p>
     <strong>Understanding database internals.</strong>&ensp;Production databases are
     millions of lines of code. mskql distills the core ideas&mdash;wire protocol, parser,
-    query executor, storage engine, arena allocator, plan executor&mdash;into ~22,000
+    query executor, storage engine, arena allocator, plan executor&mdash;into ~23,000
     readable lines of C11 with zero dependencies. Every layer is visible and
     modifiable: from how a <code>SELECT</code> is parsed into an AST, to how a hash join
     probes its build table, to how a bump allocator recycles memory across
@@ -366,7 +366,7 @@
     It demonstrates that adversarial AI collaboration can produce non-trivial systems
     software: a hand-written recursive-descent parser, a block-oriented vectorized
     executor, arena-based memory management, and a PostgreSQL-compatible wire protocol.
-    The key enabler is a tight feedback loop&mdash;write code, run 752 tests, fix
+    The key enabler is a tight feedback loop&mdash;write code, run 883 tests, fix
     failures, repeat&mdash;that mirrors how experienced engineers ship production
     systems.<span class="sidenote">The adversarial model (one agent writes code, another
     writes tests to break it, a third reviews the source and leaves actionable comments) drove the
@@ -439,8 +439,8 @@
 
   <!-- Result box -->
   <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">752 tests pass</text>
-  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~22,000 lines of C &middot; zero human code</text>
+  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">883 tests pass</text>
+  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~23,000 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
@@ -483,12 +483,13 @@
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
-                4,359 lines the parser is the largest single file (with <code>plan.c</code>
-                adding another 4,176 lines for the block-oriented executor). It includes a
+                4,477 lines the parser is the largest single file (with <code>plan.c</code>
+                adding another 4,520 lines for the block-oriented executor). It includes a
                 recursive-descent expression parser with proper operator precedence
                 (<code>||</code>&nbsp;&lt;&nbsp;<code>+-</code>&nbsp;&lt;&nbsp;<code>*/%</code>)
                 and handles the full grammar including CTEs, window functions, views,
                 sequences, set operations, <code>ORDER&nbsp;BY</code> expressions,
+                <code>COPY&nbsp;TO/FROM</code>,
                 and <code>generate_series()</code> table functions.</span></td>
         </tr>
         <tr>
@@ -519,10 +520,12 @@
                 row materialization entirely for plan-executed queries.</span>
                 Handles joins (with compound <code>ON</code> conditions),
                 aggregation (including <code>DISTINCT</code> aggregates,
+                <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code>,
                 <code>ROLLUP</code>/<code>CUBE</code>),
                 window functions (with frame clauses), set operations, CTEs,
                 correlated subqueries (including scalar subqueries), views,
                 sequences, foreign keys, upserts, <code>TRUNCATE&nbsp;TABLE</code>,
+                <code>COPY&nbsp;TO/FROM</code> (tab-delimited, CSV, header),
                 <code>IS&nbsp;[NOT]&nbsp;DISTINCT&nbsp;FROM</code>,
                 <code>generate_series()</code> table functions (integer and
                 timestamp sequences with optional step), and transactions</td>
@@ -610,7 +613,9 @@
                 <code>RETURNING</code>,
                 <code>ON CONFLICT DO NOTHING</code>,
                 <code>ON CONFLICT DO UPDATE</code>,
-                <code>TRUNCATE TABLE</code></td>
+                <code>TRUNCATE TABLE</code>,
+                <code>COPY TO STDOUT</code> (tab/CSV/header),
+                <code>COPY FROM STDIN</code> (tab/CSV)</td>
         </tr>
         <tr>
             <td><strong>Filtering</strong></td>
@@ -635,6 +640,7 @@
             <td><code>COUNT</code>, <code>SUM</code>, <code>AVG</code>,
                 <code>MIN</code>, <code>MAX</code>,
                 <code>COUNT(DISTINCT&nbsp;col)</code>,
+                <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code>,
                 expression aggregates (<code>SUM(price&nbsp;*&nbsp;qty)</code>),
                 <code>GROUP BY</code> (multi-column, positional: <code>GROUP&nbsp;BY&nbsp;1,&nbsp;2</code>),
                 <code>GROUP BY ROLLUP</code>, <code>GROUP BY CUBE</code>,
@@ -1059,8 +1065,9 @@ ORDER BY dt;</code></pre>
 <h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes 752 test cases: SQL tests covering DDL, DML, joins,
-    aggregation (including expression aggregates and positional <code>GROUP&nbsp;BY</code>),
+    The project includes 883 test cases: SQL tests covering DDL, DML, joins,
+    aggregation (including expression aggregates, positional <code>GROUP&nbsp;BY</code>,
+    <code>STRING_AGG()</code>, and <code>ARRAY_AGG()</code>),
     window functions (including frames), set operations, CTEs,
     transactions (including nested <code>BEGIN</code>), NULL handling,
     type coercion, <code>CAST</code>/<code>::</code> conversions, constraint enforcement,
@@ -1069,6 +1076,7 @@ ORDER BY dt;</code></pre>
     (<code>CONCAT</code>, <code>REPLACE</code>, <code>SPLIT_PART</code>,
     <code>INITCAP</code>, etc.), date/time arithmetic, temporal functions,
     expression evaluation, <code>TRUNCATE&nbsp;TABLE</code>,
+    <code>COPY&nbsp;TO/FROM</code> (tab-delimited, CSV, header),
     <code>IS&nbsp;[NOT]&nbsp;DISTINCT&nbsp;FROM</code>,
     <code>ORDER&nbsp;BY</code> expressions, <code>INSERT...SELECT</code> with CTEs,
     <code>generate_series()</code> (integer, timestamp, step, aliases),

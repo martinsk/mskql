@@ -278,6 +278,7 @@
 &ensp;&ensp;| <span class="nt">drop_view_stmt</span><br>
 &ensp;&ensp;| <span class="nt">alter_table_stmt</span><br>
 &ensp;&ensp;| <span class="nt">truncate_stmt</span><br>
+&ensp;&ensp;| <span class="nt">copy_stmt</span><br>
 &ensp;&ensp;| <span class="nt">transaction_stmt</span><br>
 </div>
 
@@ -382,10 +383,13 @@
 
 <div class="grammar">
 <span class="nt">agg_func</span> <span class="op">::=</span>
-  <span class="kw">COUNT</span> | <span class="kw">SUM</span> | <span class="kw">AVG</span> | <span class="kw">MIN</span> | <span class="kw">MAX</span><br>
+  <span class="kw">COUNT</span> | <span class="kw">SUM</span> | <span class="kw">AVG</span> | <span class="kw">MIN</span> | <span class="kw">MAX</span>
+  | <span class="kw">STRING_AGG</span> | <span class="kw">ARRAY_AGG</span><br>
 <br>
 <span class="comment">-- COUNT(DISTINCT col) is supported</span><br>
 <span class="comment">-- COUNT(*) is supported</span><br>
+<span class="comment">-- STRING_AGG(expr, delimiter) is supported</span><br>
+<span class="comment">-- ARRAY_AGG(expr) is supported</span><br>
 </div>
 
 <h3>Window functions <span class="badge badge-yes">IMPLEMENTED</span></h3>
@@ -540,6 +544,18 @@
   <span class="kw">TRUNCATE</span> [ <span class="kw">TABLE</span> ] <span class="nt">table_name</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 </div>
 
+<h3>COPY <span class="badge badge-yes">IMPLEMENTED</span></h3>
+
+<div class="grammar">
+<span class="nt">copy_stmt</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">COPY</span> <span class="nt">table_name</span> <span class="kw">TO STDOUT</span> [ [ <span class="kw">WITH</span> ] <span class="kw">CSV</span> [ <span class="kw">HEADER</span> ] ]<br>
+&ensp;&ensp;| <span class="kw">COPY</span> <span class="nt">table_name</span> <span class="kw">FROM STDIN</span> [ [ <span class="kw">WITH</span> ] <span class="kw">CSV</span> [ <span class="kw">HEADER</span> ] ]<br>
+<br>
+<span class="comment">-- COPY TO STDOUT: tab-delimited (default), CSV, CSV HEADER</span><br>
+<span class="comment">-- COPY FROM STDIN: tab-delimited (default), CSV</span><br>
+<span class="comment">-- NULL values represented as \N</span><br>
+</div>
+
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--  Data Types                                                 -->
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -641,8 +657,8 @@
 &ensp;&ensp;| <span class="kw">MOD</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">SIGN</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">RANDOM</span> <span class="kw">()</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">STRING_AGG</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">delimiter</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">ARRAY_AGG</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">STRING_AGG</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">delimiter</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">ARRAY_AGG</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -716,11 +732,6 @@
             <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
         </tr>
         <tr>
-            <td><strong>Functions</strong></td>
-            <td><code>STRING_AGG()</code>, <code>ARRAY_AGG()</code></td>
-            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
-        </tr>
-        <tr>
             <td><strong>Expressions</strong></td>
             <td><code>SIMILAR TO</code>,
                 POSIX regex (<code>~</code>, <code>~*</code>),
@@ -754,7 +765,6 @@
             <td><strong>Aggregation</strong></td>
             <td><code>GROUPING SETS</code>,
                 <code>FILTER (WHERE ...)</code> on aggregates,
-                <code>STRING_AGG()</code>, <code>ARRAY_AGG()</code>,
                 ordered-set aggregates (<code>PERCENTILE_CONT</code>)</td>
             <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
         </tr>
@@ -769,7 +779,6 @@
             <td><code>PREPARE</code>/<code>EXECUTE</code> (SQL-level prepared statements;
                 wire-level Extended Query Protocol with <code>Parse</code>/<code>Bind</code>/<code>Execute</code>
                 is supported),
-                <code>COPY</code>,
                 <code>LISTEN</code>/<code>NOTIFY</code>,
                 <code>GRANT</code>/<code>REVOKE</code>,
                 stored procedures/functions,

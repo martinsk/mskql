@@ -292,6 +292,7 @@
         <option value="cte">Common Table Expressions</option>
         <option value="upsert">Upsert (ON CONFLICT)</option>
         <option value="datetime">Date/Time Arithmetic</option>
+        <option value="string_agg">STRING_AGG &amp; ARRAY_AGG</option>
     </select>
     <button class="run-btn" id="run-btn" disabled>&#9654; Run</button>
     <button id="reset-btn" disabled>Reset DB</button>
@@ -458,7 +459,24 @@ SELECT * FROM kv ORDER BY key;`,
     '2024-01-15'::date + 30 AS plus_30_days,
     '2024-06-15 10:30:00'::timestamp - '2024-01-01 00:00:00'::timestamp AS diff,
     EXTRACT(MONTH FROM '2024-03-15'::date) AS month,
-    DATE_TRUNC('month', '2024-03-15'::date) AS trunc_month;`
+    DATE_TRUNC('month', '2024-03-15'::date) AS trunc_month;`,
+
+        string_agg: `CREATE TABLE tags (
+    item TEXT,
+    tag TEXT
+);
+
+INSERT INTO tags VALUES
+    ('Widget', 'sale'), ('Widget', 'new'), ('Widget', 'popular'),
+    ('Gadget', 'premium'), ('Gadget', 'new'),
+    ('Gizmo', 'clearance');
+
+SELECT item,
+       STRING_AGG(tag, ', ') AS all_tags,
+       COUNT(*) AS tag_count
+FROM tags
+GROUP BY item
+ORDER BY item;`
     };
 
     examplesEl.addEventListener('change', function() {
