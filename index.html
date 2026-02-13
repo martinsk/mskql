@@ -327,7 +327,7 @@
     <a href="tutorials/index.html">Tutorials</a>
     &ensp;&middot;&ensp;
     <a href="playground.html"><strong>Try it &rarr;</strong></a>
-    &ensp;&middot;&ensp; ~23,000 lines of C11 &ensp;&middot;&ensp; 883 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~23,800 lines of C11 &ensp;&middot;&ensp; 892 test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -350,7 +350,7 @@
 <p>
     <strong>Understanding database internals.</strong>&ensp;Production databases are
     millions of lines of code. mskql distills the core ideas&mdash;wire protocol, parser,
-    query executor, storage engine, arena allocator, plan executor&mdash;into ~23,000
+    query executor, storage engine, arena allocator, plan executor&mdash;into ~23,800
     readable lines of C11 with zero dependencies. Every layer is visible and
     modifiable: from how a <code>SELECT</code> is parsed into an AST, to how a hash join
     probes its build table, to how a bump allocator recycles memory across
@@ -366,7 +366,7 @@
     It demonstrates that adversarial AI collaboration can produce non-trivial systems
     software: a hand-written recursive-descent parser, a block-oriented vectorized
     executor, arena-based memory management, and a PostgreSQL-compatible wire protocol.
-    The key enabler is a tight feedback loop&mdash;write code, run 883 tests, fix
+    The key enabler is a tight feedback loop&mdash;write code, run 892 tests, fix
     failures, repeat&mdash;that mirrors how experienced engineers ship production
     systems.<span class="sidenote">The adversarial model (one agent writes code, another
     writes tests to break it, a third reviews the source and leaves actionable comments) drove the
@@ -439,8 +439,8 @@
 
   <!-- Result box -->
   <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">883 tests pass</text>
-  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~23,000 lines of C &middot; zero human code</text>
+  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">892 tests pass</text>
+  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~23,800 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
@@ -474,16 +474,19 @@
             <td><strong>Wire protocol</strong></td>
             <td><code>pgwire.c</code></td>
             <td>Accepts TCP connections on port&nbsp;5433, handles SSL negotiation,
-                implements both the Simple and Extended Query protocols (prepared
+                implements the Simple Query, Extended Query (prepared
                 statements, portals, <code>$1</code>/<code>$2</code> parameter
-                substitution), and serializes result rows</td>
+                substitution), and COPY protocols (tab-delimited and CSV),
+                intercepts <code>information_schema</code> and
+                <code>pg_catalog</code> queries for tool compatibility,
+                and serializes result rows</td>
         </tr>
         <tr>
             <td><strong>SQL parser</strong></td>
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators<span class="sidenote">At
-                4,477 lines the parser is the largest single file (with <code>plan.c</code>
+                4,551 lines the parser is the largest single file (with <code>plan.c</code>
                 adding another 4,520 lines for the block-oriented executor). It includes a
                 recursive-descent expression parser with proper operator precedence
                 (<code>||</code>&nbsp;&lt;&nbsp;<code>+-</code>&nbsp;&lt;&nbsp;<code>*/%</code>)
@@ -597,8 +600,10 @@
     <tbody>
         <tr>
             <td><strong>DDL</strong></td>
-            <td><code>CREATE TABLE</code>, <code>DROP TABLE</code>,
-                <code>CREATE INDEX</code>, <code>DROP INDEX</code>,
+            <td><code>CREATE TABLE</code> (<code>IF NOT EXISTS</code>),
+                <code>DROP TABLE</code>,
+                <code>CREATE INDEX</code> (<code>IF NOT EXISTS</code>),
+                <code>DROP INDEX</code>,
                 <code>CREATE TYPE &hellip; AS ENUM</code>, <code>DROP TYPE</code>,
                 <code>CREATE SEQUENCE</code>, <code>DROP SEQUENCE</code>,
                 <code>CREATE VIEW</code>, <code>DROP VIEW</code>,
@@ -684,8 +689,10 @@
             <td><strong>Constraints</strong></td>
             <td><code>NOT NULL</code>, <code>UNIQUE</code>, <code>PRIMARY KEY</code>,
                 <code>DEFAULT</code>, <code>CHECK</code>,
-                <code>REFERENCES</code> (foreign keys, <code>ON DELETE CASCADE</code>,
-                <code>ON UPDATE CASCADE</code>)</td>
+                <code>REFERENCES</code> (foreign keys with
+                <code>ON DELETE/UPDATE CASCADE</code>,
+                <code>RESTRICT</code>, <code>SET NULL</code>,
+                <code>SET DEFAULT</code>)</td>
         </tr>
         <tr>
             <td><strong>Transactions</strong></td>
@@ -741,6 +748,19 @@
                 <code>EXISTS</code> / <code>NOT EXISTS</code> (correlated),
                 <code>IN (SELECT&hellip;)</code></td>
         </tr>
+        <tr>
+            <td><strong>Introspection</strong></td>
+            <td><code>EXPLAIN</code> (plan-based and legacy execution paths),
+                <code>SHOW</code> (<code>server_version</code>, <code>search_path</code>,
+                <code>client_encoding</code>, etc.),
+                <code>SET</code>/<code>RESET</code>/<code>DISCARD</code> (accepted, no-op),
+                <code>information_schema.tables</code>,
+                <code>information_schema.columns</code>,
+                <code>pg_catalog.pg_type</code>,
+                <code>pg_catalog.pg_class</code>,
+                <code>pg_catalog.pg_namespace</code>,
+                <code>pg_catalog.pg_attribute</code></td>
+        </tr>
     </tbody>
 </table>
 
@@ -760,6 +780,7 @@
         <tr><th>Type</th><th>Description</th></tr>
     </thead>
     <tbody>
+        <tr><td><code>SMALLINT</code> / <code>INT2</code></td><td>16-bit signed integer</td></tr>
         <tr><td><code>INT</code></td><td>32-bit signed integer</td></tr>
         <tr><td><code>BIGINT</code></td><td>64-bit signed integer</td></tr>
         <tr><td><code>FLOAT</code></td><td>Double-precision floating point</td></tr>
@@ -773,7 +794,7 @@
         <tr><td><code>TIMESTAMPTZ</code></td><td>Date and time with time zone</td></tr>
         <tr><td><code>INTERVAL</code></td><td>Time span</td></tr>
         <tr><td><code>UUID</code></td><td>128-bit universally unique identifier</td></tr>
-        <tr><td><code>SERIAL</code> / <code>BIGSERIAL</code></td><td>Auto-incrementing integer (32-bit / 64-bit)</td></tr>
+        <tr><td><code>SMALLSERIAL</code> / <code>SERIAL</code> / <code>BIGSERIAL</code></td><td>Auto-incrementing integer (16-bit / 32-bit / 64-bit)</td></tr>
         <tr><td><code>ENUM</code></td><td>User-defined enumeration type</td></tr>
     </tbody>
 </table>
@@ -1065,13 +1086,21 @@ ORDER BY dt;</code></pre>
 <h2 id="testing">7. Testing</h2>
 
 <p>
-    The project includes 883 test cases: SQL tests covering DDL, DML, joins,
+    The project includes 892 test cases: SQL tests covering DDL
+    (<code>IF&nbsp;NOT&nbsp;EXISTS</code>, <code>CHECK</code> constraints),
+    DML, joins,
     aggregation (including expression aggregates, positional <code>GROUP&nbsp;BY</code>,
     <code>STRING_AGG()</code>, and <code>ARRAY_AGG()</code>),
     window functions (including frames), set operations, CTEs,
     transactions (including nested <code>BEGIN</code>), NULL handling,
     type coercion, <code>CAST</code>/<code>::</code> conversions, constraint enforcement,
-    foreign keys, sequences, views, math functions (<code>ABS</code>,
+    foreign keys (<code>CASCADE</code>, <code>RESTRICT</code>,
+    <code>SET&nbsp;NULL</code>, <code>SET&nbsp;DEFAULT</code>),
+    sequences, views, <code>SMALLINT</code> type,
+    <code>EXPLAIN</code>, system catalog queries
+    (<code>information_schema</code>, <code>pg_catalog</code>),
+    <code>SET</code>/<code>SHOW</code>/<code>DISCARD</code>,
+    math functions (<code>ABS</code>,
     <code>ROUND</code>, <code>POWER</code>, etc.), string functions
     (<code>CONCAT</code>, <code>REPLACE</code>, <code>SPLIT_PART</code>,
     <code>INITCAP</code>, etc.), date/time arithmetic, temporal functions,
