@@ -1271,7 +1271,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     msgbuf_free(&wire);
 
     /* Store in result cache if small enough */
-    if (cache_buf.len > 0 && cache_buf.len <= RCACHE_MAX_BYTES && n_cte_temps == 0) {
+    if (cache_buf.len > 0 && cache_buf.len <= RCACHE_MAX_BYTES) {
         if (rce->valid) { free(rce->wire_data); free(rce->full_reply); }
         rce->wire_data = (uint8_t *)malloc(cache_buf.len);
         if (rce->wire_data) {
@@ -1741,8 +1741,10 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
         return 1;
     }
 
-    /* Invalidate result cache for write queries */
-    if (q.query_type != QUERY_TYPE_SELECT && q.query_type != QUERY_TYPE_EXPLAIN)
+    /* Invalidate result cache for write queries — but not inside transactions
+     * (mutations aren't visible until COMMIT; we invalidate there instead) */
+    if (q.query_type != QUERY_TYPE_SELECT && q.query_type != QUERY_TYPE_EXPLAIN &&
+        !(db->active_txn && db->active_txn->in_transaction))
         rcache_invalidate_all();
 
     struct rows *result = &conn_arena->result;
@@ -1867,6 +1869,7 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
             break;
         case QUERY_TYPE_COMMIT:
             snprintf(tag, sizeof(tag), "COMMIT");
+            rcache_invalidate_all();
             break;
         case QUERY_TYPE_ROLLBACK:
             snprintf(tag, sizeof(tag), "ROLLBACK");

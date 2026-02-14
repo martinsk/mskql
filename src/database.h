@@ -15,9 +15,15 @@ struct sequence {
 };
 
 struct db_snapshot {
-    DYNAMIC_ARRAY(struct table) tables;
+    /* Lazy COW: on BEGIN we just record table names + generations.
+     * On first write to a table, we deep-copy it into saved_tables. */
+    size_t orig_table_count;     /* number of tables at BEGIN time */
+    char **table_names;          /* [orig_table_count] strdup'd names */
+    uint64_t *table_generations; /* [orig_table_count] generation at BEGIN */
+    struct table *saved_tables;  /* [orig_table_count] deep-copied on COW */
+    int *saved_valid;            /* [orig_table_count] 1 if saved_tables[i] populated */
+    /* Types/sequences: small, just copy eagerly */
     DYNAMIC_ARRAY(struct enum_type) types;
-    DYNAMIC_ARRAY(struct sequence) sequences;
 };
 
 /* Per-connection transaction state.  Owned by client_state in pgwire.c;
@@ -59,5 +65,13 @@ struct table *materialize_subquery(struct database *db, const char *sql,
 
 /* Remove a temporary table from the database by pointer */
 void remove_temp_table(struct database *db, struct table *t);
+
+/* Snapshot management (used by transaction BEGIN/COMMIT/ROLLBACK) */
+struct db_snapshot *snapshot_create(struct database *db);
+void snapshot_free(struct db_snapshot *snap);
+
+/* COW trigger: call before mutating a table inside a transaction.
+ * Saves a deep-copy of the table if not already saved. */
+void snapshot_cow_table(struct db_snapshot *snap, struct database *db, const char *table_name);
 
 #endif

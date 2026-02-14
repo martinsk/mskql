@@ -74,6 +74,12 @@ int db_table_exec_query(struct database *db, sv table_name,
         arena_set_error(&q->arena, "42P01", "table '%.*s' not found", (int)table_name.len, table_name.data);
         return -1;
     }
+    /* COW trigger: save table state before first mutation in a transaction */
+    if (db->active_txn && db->active_txn->in_transaction && db->active_txn->snapshot &&
+        (q->query_type == QUERY_TYPE_INSERT || q->query_type == QUERY_TYPE_UPDATE ||
+         q->query_type == QUERY_TYPE_DELETE)) {
+        snapshot_cow_table(db->active_txn->snapshot, db, t->name);
+    }
     return query_exec(t, q, result, db, rb);
 }
 
@@ -1021,27 +1027,38 @@ static void resolve_subqueries(struct database *db, struct query_arena *arena, u
     }
 }
 
-static void snapshot_free(struct db_snapshot *snap)
+void snapshot_free(struct db_snapshot *snap)
 {
-    for (size_t i = 0; i < snap->tables.count; i++)
-        table_free(&snap->tables.items[i]);
-    da_free(&snap->tables);
+    for (size_t i = 0; i < snap->orig_table_count; i++) {
+        free(snap->table_names[i]);
+        if (snap->saved_valid[i])
+            table_free(&snap->saved_tables[i]);
+    }
+    free(snap->table_names);
+    free(snap->table_generations);
+    free(snap->saved_tables);
+    free(snap->saved_valid);
     for (size_t i = 0; i < snap->types.count; i++)
         enum_type_free(&snap->types.items[i]);
     da_free(&snap->types);
     free(snap);
 }
 
-static struct db_snapshot *snapshot_create(struct database *db)
+struct db_snapshot *snapshot_create(struct database *db)
 {
     struct db_snapshot *snap = calloc(1, sizeof(*snap));
-    da_init(&snap->tables);
-    da_init(&snap->types);
-    for (size_t i = 0; i < db->tables.count; i++) {
-        struct table t;
-        table_deep_copy(&t, &db->tables.items[i]);
-        da_push(&snap->tables, t);
+    size_t n = db->tables.count;
+    snap->orig_table_count = n;
+    snap->table_names = malloc(n * sizeof(char *));
+    snap->table_generations = malloc(n * sizeof(uint64_t));
+    snap->saved_tables = calloc(n, sizeof(struct table));
+    snap->saved_valid = calloc(n, sizeof(int));
+    for (size_t i = 0; i < n; i++) {
+        snap->table_names[i] = strdup(db->tables.items[i].name);
+        snap->table_generations[i] = db->tables.items[i].generation;
     }
+    /* Types: small, just copy eagerly */
+    da_init(&snap->types);
     for (size_t i = 0; i < db->types.count; i++) {
         struct enum_type et;
         et.name = strdup(db->types.items[i].name);
@@ -1053,21 +1070,69 @@ static struct db_snapshot *snapshot_create(struct database *db)
     return snap;
 }
 
+void snapshot_cow_table(struct db_snapshot *snap, struct database *db, const char *table_name)
+{
+    if (!snap) return;
+    for (size_t i = 0; i < snap->orig_table_count; i++) {
+        if (strcmp(snap->table_names[i], table_name) == 0) {
+            if (snap->saved_valid[i]) return; /* already saved */
+            /* Find the table in the current database and deep-copy it */
+            struct table *t = db_find_table(db, table_name);
+            if (t) {
+                table_deep_copy(&snap->saved_tables[i], t);
+                snap->saved_valid[i] = 1;
+            }
+            return;
+        }
+    }
+    /* Table not in snapshot (created during transaction) — nothing to save */
+}
+
 static void snapshot_restore(struct database *db, struct db_snapshot *snap)
 {
-    /* free current state */
-    for (size_t i = 0; i < db->tables.count; i++)
-        table_free(&db->tables.items[i]);
-    da_free(&db->tables);
+    /* Restore only the tables that were COW-saved */
+    for (size_t i = 0; i < snap->orig_table_count; i++) {
+        if (!snap->saved_valid[i]) continue;
+        /* Find the table in the current database and replace it */
+        struct table *t = db_find_table(db, snap->table_names[i]);
+        if (t) {
+            table_free(t);
+            *t = snap->saved_tables[i];
+            memset(&snap->saved_tables[i], 0, sizeof(struct table));
+            snap->saved_valid[i] = 0;
+        }
+    }
+    /* Remove tables created during the transaction (not in original snapshot) */
+    for (size_t i = db->tables.count; i > 0; i--) {
+        int found = 0;
+        for (size_t j = 0; j < snap->orig_table_count; j++) {
+            if (strcmp(db->tables.items[i - 1].name, snap->table_names[j]) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            table_free(&db->tables.items[i - 1]);
+            for (size_t k = i - 1; k + 1 < db->tables.count; k++)
+                db->tables.items[k] = db->tables.items[k + 1];
+            db->tables.count--;
+        }
+    }
+    /* Restore dropped tables from snapshot */
+    for (size_t i = 0; i < snap->orig_table_count; i++) {
+        if (!snap->saved_valid[i]) continue;
+        /* Table was saved but not found in current db — it was dropped */
+        if (!db_find_table(db, snap->table_names[i])) {
+            da_push(&db->tables, snap->saved_tables[i]);
+            memset(&snap->saved_tables[i], 0, sizeof(struct table));
+            snap->saved_valid[i] = 0;
+        }
+    }
+    /* Restore types */
     for (size_t i = 0; i < db->types.count; i++)
         enum_type_free(&db->types.items[i]);
     da_free(&db->types);
-
-    /* move snapshot data into db (memcpy because DYNAMIC_ARRAY creates anonymous struct types) */
-    memcpy(&db->tables, &snap->tables, sizeof(db->tables));
     memcpy(&db->types, &snap->types, sizeof(db->types));
-    /* zero out snap arrays so snapshot_free won't double-free */
-    memset(&snap->tables, 0, sizeof(snap->tables));
     memset(&snap->types, 0, sizeof(snap->types));
 }
 
@@ -1266,6 +1331,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             sv drop_tbl = q->drop_table.table;
             for (size_t i = 0; i < db->tables.count; i++) {
                 if (sv_eq_cstr(drop_tbl, db->tables.items[i].name)) {
+                    /* COW trigger for DROP TABLE */
+                    if (txn && txn->in_transaction && txn->snapshot)
+                        snapshot_cow_table(txn->snapshot, db, db->tables.items[i].name);
                     table_free(&db->tables.items[i]);
                     /* shift remaining tables down */
                     for (size_t j = i; j + 1 < db->tables.count; j++) {
@@ -1446,6 +1514,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)q->del.table.len, q->del.table.data);
                 return -1;
             }
+            /* COW trigger for TRUNCATE */
+            if (txn && txn->in_transaction && txn->snapshot)
+                snapshot_cow_table(txn->snapshot, db, t->name);
             /* free all rows */
             for (size_t i = 0; i < t->rows.count; i++)
                 row_free(&t->rows.items[i]);
@@ -2336,6 +2407,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)a->table.len, a->table.data);
                 return -1;
             }
+            /* COW trigger for ALTER TABLE */
+            if (txn && txn->in_transaction && txn->snapshot)
+                snapshot_cow_table(txn->snapshot, db, t->name);
             switch (a->alter_action) {
                 case ALTER_ADD_COLUMN: {
                     table_add_column(t, &a->alter_new_col);
