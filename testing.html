@@ -15,8 +15,14 @@
 <p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
 
 <h1>Testing</h1>
-<span class="subtitle">892 tests &middot; two layers of verification &middot; zero tolerance for leaks</span>
+<span class="subtitle">960+ tests &middot; two layers of verification &middot; zero tolerance for leaks</span>
 <hr class="title-rule">
+
+<p>
+    <strong>960+ tests. Every one runs under AddressSanitizer.</strong>
+    A correct query that leaks 16&nbsp;bytes is a failure.
+    Tests run in parallel across all CPU cores, each in an isolated server instance.
+</p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--  1. Two layers                                              -->
@@ -75,11 +81,7 @@
     <code>-fsanitize=address -fno-omit-frame-pointer</code>. The test runner
     sets <code>ASAN_OPTIONS="detect_leaks=1:log_path=..."</code> and
     <code>LSAN_OPTIONS="suppressions=..."</code> per server
-    instance.<span class="sidenote">On macOS ARM64, Apple Clang does not support
-    <code>detect_leaks</code>. The test runner automatically prefers Homebrew
-    LLVM Clang (<code>/opt/homebrew/opt/llvm/bin/clang</code>) when available,
-    which does support LeakSanitizer on this platform.</span>
-    After each test, <code>check_asan_logs()</code> scans the ASAN log for
+    instance. After each test, <code>check_asan_logs()</code> scans the ASAN log for
     <code>LeakSanitizer</code> or <code>ERROR: AddressSanitizer</code>&mdash;any
     hit fails the test with the leak summary in the output.
 </p>
@@ -217,7 +219,7 @@ SELECT id, name, age FROM t_aac ORDER BY id;
 <h2 id="coverage">What is tested</h2>
 
 <p>
-    The 892 test cases cover DDL
+    The 960+ test cases cover DDL
     (<code>IF&nbsp;NOT&nbsp;EXISTS</code>, <code>CHECK</code> constraints),
     DML, joins,
     aggregation (including expression aggregates, positional <code>GROUP&nbsp;BY</code>,
@@ -249,21 +251,32 @@ SELECT id, name, age FROM t_aac ORDER BY id;
 
 <h2 id="running">Running the tests</h2>
 
-<pre><code class="language-bash">make test                          # full suite: build with ASAN, run all 892 tests
+<pre><code class="language-bash">make test                          # full suite: build with ASAN, run all 960+ tests
 MSKQL_NO_LEAK_CHECK=1 make test   # skip leak checking (faster, less strict)</code></pre>
 
+<h2 id="so-what">Why this matters</h2>
+
+<p>
+    Arena allocation eliminates use-after-free and leak classes by construction.
+    AddressSanitizer catches the rest. The result: zero known memory bugs across
+    960+ adversarial test cases.
+</p>
+
+<h2 id="now-what">Explore further</h2>
+
+<p>
+    <a href="construction.html">How the tests were written</a> &ensp;&middot;&ensp;
+    <a href="architecture.html">Architecture</a> &ensp;&middot;&ensp;
+    <a href="bench-vs-pg.html">Benchmarks</a> &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+</p>
+
 <footer class="site-footer">
-    <a href="index.html">Home</a>
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
     &ensp;&middot;&ensp;
-    <a href="architecture.html">Architecture</a>
-    &ensp;&middot;&ensp;
-    <a href="sql-reference.html">SQL Reference</a>
-    &ensp;&middot;&ensp;
-    <a href="bench-vs-pg.html">Benchmarks</a>
-    &ensp;&middot;&ensp;
-    <a href="playground.html">Playground</a>
+    <a href="index.html">Documentation</a>
 </footer>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>

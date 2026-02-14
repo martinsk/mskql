@@ -156,20 +156,21 @@
             vertical-align: middle;
             margin-left: 0.4rem;
         }
-        .badge-yes {
-            background: #e6f4e6;
-            color: var(--implemented);
-            border: 1px solid #b3dab3;
-        }
+        .badge-yes { display: none; }
+        .badge-partial { display: none; }
         .badge-no {
-            background: #f0f0f0;
-            color: var(--not-implemented);
-            border: 1px solid #ddd;
-        }
-        .badge-partial {
-            background: #fff8e6;
-            color: #996600;
-            border: 1px solid #e6d9a0;
+            display: inline;
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 0.75rem;
+            font-style: italic;
+            font-weight: 400;
+            color: var(--fg-dim);
+            background: none;
+            border: none;
+            padding: 0;
+            margin-left: 0.3rem;
+            vertical-align: baseline;
+            letter-spacing: 0;
         }
 
         /* ── Feature table ─────────────────────────────────────── */
@@ -194,18 +195,6 @@
         tbody tr:last-child td { border-bottom: 2px solid var(--fg); }
         td code { font-size: 0.8rem; }
 
-        /* ── Legend ─────────────────────────────────────────────── */
-        .legend {
-            display: flex;
-            gap: 1.5rem;
-            margin: 1rem 0 1.5rem 0;
-            font-size: 0.9rem;
-        }
-        .legend-item {
-            display: flex;
-            align-items: center;
-            gap: 0.4rem;
-        }
 
         /* ── Footer ──────────────────────────────────────────────── */
         footer.site-footer {
@@ -246,16 +235,9 @@
 <hr class="title-rule">
 
 <p>
-    This page documents the SQL grammar implemented by mskql. Each production rule
-    shows the syntax accepted by the recursive-descent parser. Features are marked
-    as implemented, partially implemented, or not yet implemented.
+    Every production rule accepted by mskql&rsquo;s recursive-descent parser.
+    Unsupported features are noted inline.
 </p>
-
-<div class="legend">
-    <div class="legend-item"><span class="badge badge-yes">IMPLEMENTED</span> Fully supported</div>
-    <div class="legend-item"><span class="badge badge-partial">PARTIAL</span> Subset supported</div>
-    <div class="legend-item"><span class="badge badge-no">NOT IMPLEMENTED</span> Not yet available</div>
-</div>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--  Statements                                                 -->
@@ -382,7 +364,7 @@
 
 <h2>3. Aggregate &amp; Window Functions</h2>
 
-<h3>Aggregate functions <span class="badge badge-yes">IMPLEMENTED</span></h3>
+<h3>Aggregate functions</h3>
 
 <div class="grammar">
 <span class="nt">agg_func</span> <span class="op">::=</span>
@@ -395,7 +377,7 @@
 <span class="comment">-- ARRAY_AGG(expr) is supported</span><br>
 </div>
 
-<h3>Window functions <span class="badge badge-yes">IMPLEMENTED</span></h3>
+<h3>Window functions</h3>
 
 <div class="grammar">
 <span class="nt">window_func</span> <span class="op">::=</span><br>
@@ -484,7 +466,7 @@
 
 <h2>7. Data Definition (DDL)</h2>
 
-<h3>CREATE TABLE <span class="badge badge-yes">IMPLEMENTED</span></h3>
+<h3>CREATE TABLE</h3>
 
 <div class="grammar">
 <span class="nt">create_table_stmt</span> <span class="op">::=</span><br>
@@ -503,7 +485,7 @@
     [ <span class="kw">ON DELETE CASCADE</span> ] [ <span class="kw">ON UPDATE CASCADE</span> ]<br>
 </div>
 
-<h3>ALTER TABLE <span class="badge badge-yes">IMPLEMENTED</span></h3>
+<h3>ALTER TABLE</h3>
 
 <div class="grammar">
 <span class="nt">alter_table_stmt</span> <span class="op">::=</span><br>
@@ -513,7 +495,7 @@
 &ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">ALTER COLUMN</span> <span class="nt">column_name</span> <span class="kw">TYPE</span> <span class="nt">data_type</span><br>
 </div>
 
-<h3>Other DDL <span class="badge badge-yes">IMPLEMENTED</span></h3>
+<h3>Other DDL</h3>
 
 <div class="grammar">
 <span class="nt">drop_table_stmt</span> <span class="op">::=</span>
@@ -547,7 +529,7 @@
   <span class="kw">TRUNCATE</span> [ <span class="kw">TABLE</span> ] <span class="nt">table_name</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 </div>
 
-<h3>COPY <span class="badge badge-yes">IMPLEMENTED</span></h3>
+<h3>COPY</h3>
 
 <div class="grammar">
 <span class="nt">copy_stmt</span> <span class="op">::=</span><br>
@@ -573,7 +555,7 @@
 &ensp;&ensp;| <span class="kw">NUMERIC</span> | <span class="kw">DECIMAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">TEXT</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">VARCHAR</span> <span class="kw">(</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CHAR</span> <span class="kw">(</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">CHAR</span> <span class="kw">(</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-no">(not yet supported)</span><br>
 &ensp;&ensp;| <span class="kw">BOOLEAN</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">DATE</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">TIME</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
@@ -583,10 +565,10 @@
 &ensp;&ensp;| <span class="kw">UUID</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">SERIAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">BIGSERIAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">SMALLINT</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">BYTEA</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">JSON</span> | <span class="kw">JSONB</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">ARRAY</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">SMALLINT</span> <span class="badge badge-no">(not yet supported)</span><br>
+&ensp;&ensp;| <span class="kw">BYTEA</span> <span class="badge badge-no">(not yet supported)</span><br>
+&ensp;&ensp;| <span class="kw">JSON</span> | <span class="kw">JSONB</span> <span class="badge badge-no">(not yet supported)</span><br>
+&ensp;&ensp;| <span class="kw">ARRAY</span> <span class="badge badge-no">(not yet supported)</span><br>
 &ensp;&ensp;| <span class="nt">enum_type_name</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 </div>
 
@@ -687,8 +669,8 @@
 &ensp;&ensp;| <span class="nt">expr</span> <span class="kw">IS</span> [ <span class="kw">NOT</span> ] <span class="kw">DISTINCT FROM</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">EXISTS</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">NOT EXISTS</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">SIMILAR TO</span> <span class="nt">pattern</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">~</span> <span class="nt">pattern</span> <span class="comment">&ensp;-- POSIX regex</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">SIMILAR TO</span> <span class="nt">pattern</span> <span class="badge badge-no">(not yet supported)</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">~</span> <span class="nt">pattern</span> <span class="comment">&ensp;-- POSIX regex</span> <span class="badge badge-no">(not yet supported)</span><br>
 <br>
 <span class="nt">cmp_op</span> <span class="op">::=</span>
   <span class="kw">=</span> | <span class="kw">!=</span> | <span class="kw">&lt;&gt;</span> | <span class="kw">&lt;</span> | <span class="kw">&gt;</span> | <span class="kw">&lt;=</span> | <span class="kw">&gt;=</span><br>
@@ -705,91 +687,36 @@
 &ensp;&ensp;  <span class="kw">BEGIN</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">COMMIT</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
 &ensp;&ensp;| <span class="kw">ROLLBACK</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">RELEASE SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">ROLLBACK TO SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">NOT IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">(not yet supported)</span><br>
+&ensp;&ensp;| <span class="kw">RELEASE SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">(not yet supported)</span><br>
+&ensp;&ensp;| <span class="kw">ROLLBACK TO SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">(not yet supported)</span><br>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
-<!--  Not Implemented Summary                                    -->
+<!--  Not Yet Supported                                          -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
-<h2>12. Not Yet Implemented</h2>
+<h2>12. Not Yet Supported</h2>
 
 <p>
-    The following PostgreSQL features are not currently supported. They are listed
-    here for completeness and to indicate the scope of the grammar relative to
-    full PostgreSQL.
+    <strong>Types:</strong> <code>CHAR(n)</code>, <code>SMALLINT</code>, <code>BYTEA</code>,
+    <code>JSON</code>/<code>JSONB</code>, <code>ARRAY</code>, composite types, range types.
+    <strong>Expressions:</strong> <code>SIMILAR TO</code>, POSIX regex (<code>~</code>),
+    <code>ARRAY[...]</code> constructor.
+    <strong>DDL:</strong> <code>CREATE TABLE ... AS SELECT</code>,
+    <code>CREATE MATERIALIZED VIEW</code>, table-level constraints,
+    <code>CASCADE</code>/<code>RESTRICT</code> on DROP.
+    <strong>Transactions:</strong> <code>SAVEPOINT</code>, isolation levels.
+    <strong>Window:</strong> <code>RANGE BETWEEN</code>, <code>GROUPS BETWEEN</code>,
+    named window definitions.
+    <strong>Aggregation:</strong> <code>GROUPING SETS</code>,
+    <code>FILTER (WHERE ...)</code>, ordered-set aggregates.
+    <strong>Other:</strong> SQL-level <code>PREPARE</code>/<code>EXECUTE</code>
+    (wire-level Extended Query Protocol is supported),
+    <code>LISTEN</code>/<code>NOTIFY</code>,
+    <code>GRANT</code>/<code>REVOKE</code>,
+    stored procedures, triggers.
 </p>
-
-<table>
-    <thead>
-        <tr><th>Category</th><th>Feature</th><th>Status</th></tr>
-    </thead>
-    <tbody>
-        <tr>
-            <td><strong>Types</strong></td>
-            <td><code>CHAR(n)</code>, <code>SMALLINT</code>, <code>BYTEA</code>,
-                <code>JSON</code>/<code>JSONB</code>, <code>ARRAY</code>,
-                composite types, range types</td>
-            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
-        </tr>
-        <tr>
-            <td><strong>Expressions</strong></td>
-            <td><code>SIMILAR TO</code>,
-                POSIX regex (<code>~</code>, <code>~*</code>),
-                <code>ARRAY[...]</code> constructor</td>
-            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
-        </tr>
-        <tr>
-            <td><strong>DDL</strong></td>
-            <td><code>CREATE TABLE ... AS SELECT</code>,
-                <code>CREATE MATERIALIZED VIEW</code>,
-                table-level constraints (<code>CONSTRAINT ... UNIQUE(...)</code>),
-                <code>IF EXISTS</code>/<code>IF NOT EXISTS</code>,
-                <code>CASCADE</code>/<code>RESTRICT</code> on DROP</td>
-            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
-        </tr>
-        <tr>
-            <td><strong>Transactions</strong></td>
-            <td><code>SAVEPOINT</code>, <code>RELEASE SAVEPOINT</code>,
-                <code>ROLLBACK TO SAVEPOINT</code>,
-                isolation levels</td>
-            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
-        </tr>
-        <tr>
-            <td><strong>Window</strong></td>
-            <td><code>RANGE BETWEEN</code> frame mode,
-                <code>GROUPS BETWEEN</code> frame mode,
-                named window definitions (<code>WINDOW w AS (...)</code>)</td>
-            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
-        </tr>
-        <tr>
-            <td><strong>Aggregation</strong></td>
-            <td><code>GROUPING SETS</code>,
-                <code>FILTER (WHERE ...)</code> on aggregates,
-                ordered-set aggregates (<code>PERCENTILE_CONT</code>)</td>
-            <td><span class="badge badge-no">NOT IMPLEMENTED</span></td>
-        </tr>
-        <tr>
-            <td><strong>Subqueries</strong></td>
-            <td><code>LATERAL</code> subqueries in <code>FROM</code> (without <code>JOIN</code>),
-                <code>WITH ... UPDATE/DELETE</code> (writable CTEs; <code>WITH ... INSERT...SELECT</code> is supported)</td>
-            <td><span class="badge badge-partial">PARTIAL</span></td>
-        </tr>
-        <tr>
-            <td><strong>Other</strong></td>
-            <td><code>PREPARE</code>/<code>EXECUTE</code> (SQL-level prepared statements;
-                wire-level Extended Query Protocol with <code>Parse</code>/<code>Bind</code>/<code>Execute</code>
-                is supported),
-                <code>LISTEN</code>/<code>NOTIFY</code>,
-                <code>GRANT</code>/<code>REVOKE</code>,
-                stored procedures/functions,
-                triggers</td>
-            <td><span class="badge badge-partial">PARTIAL</span></td>
-        </tr>
-    </tbody>
-</table>
 
 <footer class="site-footer">
     <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>

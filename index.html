@@ -198,7 +198,7 @@
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
     &ensp;&middot;&ensp;
     <a href="tutorials/index.html">Tutorials</a>
-    &ensp;&middot;&ensp; ~23,800 lines of C11 &ensp;&middot;&ensp; 892 test cases &ensp;&middot;&ensp; zero dependencies
+    &ensp;&middot;&ensp; ~24,000 lines of C11 &ensp;&middot;&ensp; 960+ test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
 
@@ -221,6 +221,13 @@
 <a href="tutorials/index.html">Tutorials</a>
 </nav>
 
+<p>
+    <strong>~24K lines of C. Zero dependencies. Faster than PostgreSQL on 16 of 19
+    batch workloads.</strong> 960+ tests, every one under AddressSanitizer.
+    Built entirely by AI agents&mdash;no human wrote any C code.
+    Runs in the browser via a 312KB WebAssembly binary.
+</p>
+
 <div class="epigraph">
     <blockquote>
         No configuration files. No third-party libraries. Build and go.
@@ -229,14 +236,8 @@
 
 <p>
     mskql distills the core ideas of a database engine&mdash;wire protocol, parser,
-    query executor, storage engine, arena allocator, block-oriented plan
-    executor&mdash;into ~23,800 readable lines of C11 with zero dependencies.
-    Every layer is visible and modifiable. The entire project was built by
-    AI agents through an adversarial collaboration; no human wrote any C code
-    or SQL test case.<span class="sidenote">The codebase is structured so each subsystem
-    (<code>pgwire.c</code>, <code>parser.c</code>, <code>query.c</code>,
-    <code>plan.c</code>, <code>database.c</code>) can be studied in isolation.
-    No generated code, no macros hiding control flow.</span>
+    query executor, storage&mdash;into readable C11 with zero dependencies.
+    Every layer is visible and modifiable. One <code>.c</code> file per subsystem.
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -246,12 +247,10 @@
 <h2 id="wire-compat">PostgreSQL wire-protocol compatible</h2>
 
 <p>
-    mskql implements the PostgreSQL wire protocol&nbsp;(v3) directly&mdash;Simple Query,
-    Extended Query (prepared statements, portals, <code>$1</code>/<code>$2</code>
-    parameter substitution), and COPY. Any tool that speaks Postgres works without
-    modification: <code>psql</code>, pgAdmin, DBeaver, any language
-    driver.<span class="sidenote">The default port is&nbsp;5433, configurable
-    via <code>MSKQL_PORT</code>.</span>
+    mskql implements PostgreSQL wire protocol&nbsp;v3: Simple Query,
+    Extended Query (prepared statements, <code>$1</code>/<code>$2</code> parameters),
+    and COPY. Connect with <code>psql</code>, pgAdmin, DBeaver, or any language driver.
+    Default port&nbsp;5433.
 </p>
 
 <pre><code class="language-bash">make && ./build/mskql                         # build & start
@@ -260,23 +259,21 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 <h2 id="performance">Performance vs PostgreSQL</h2>
 
 <p>
-    Two benchmarks tell the story: batch latency (single client, sequential) and
-    concurrent throughput (10 threads, 5&nbsp;seconds). The contrast reveals where
-    an in-memory engine wins and where production engineering matters.
+    Batch latency (single client) and concurrent throughput (4 threads, 5s).
 </p>
 
-<table>
+<table style="width:max-content">
     <thead>
         <tr><th>Workload</th><th>Type</th><th>Ratio</th><th></th></tr>
     </thead>
     <tbody>
-        <tr><td>aggregate</td><td>batch</td><td class="bench-faster">0.16&times;</td><td>mskql 6&times; faster</td></tr>
-        <tr><td>distinct</td><td>batch</td><td class="bench-faster">0.18&times;</td><td>mskql 5.5&times; faster</td></tr>
-        <tr><td>join</td><td>batch</td><td class="bench-faster">0.47&times;</td><td>mskql 2&times; faster</td></tr>
-        <tr><td>order_by</td><td>batch</td><td class="bench-faster">0.53&times;</td><td>mskql 2&times; faster</td></tr>
-        <tr><td>aggregate</td><td>throughput</td><td class="bench-faster">2.55&times; QPS</td><td>mskql wins under load</td></tr>
-        <tr><td>point_read</td><td>throughput</td><td class="bench-slower">0.74&times; QPS</td><td>PG wins under load</td></tr>
-        <tr><td>join</td><td>throughput</td><td class="bench-slower">0.01&times; QPS</td><td>single-threaded bottleneck</td></tr>
+        <tr><td>aggregate</td><td>batch</td><td class="bench-faster">0.12&times;</td><td>mskql 8&times; faster</td></tr>
+        <tr><td>distinct</td><td>batch</td><td class="bench-faster">0.15&times;</td><td>mskql 7&times; faster</td></tr>
+        <tr><td>insert_bulk</td><td>batch</td><td class="bench-faster">0.33&times;</td><td>mskql 3&times; faster</td></tr>
+        <tr><td>order_by</td><td>batch</td><td class="bench-faster">0.49&times;</td><td>mskql 2&times; faster</td></tr>
+        <tr><td>aggregate</td><td>throughput</td><td class="bench-faster">9.21&times; QPS</td><td>52,670 vs 5,720 QPS</td></tr>
+        <tr><td>insert</td><td>throughput</td><td class="bench-faster">2.06&times; QPS</td><td>56,658 vs 27,520 QPS</td></tr>
+        <tr><td>full_scan</td><td>throughput</td><td class="bench-slower">0.91&times; QPS</td><td>network-bound</td></tr>
     </tbody>
 </table>
 
@@ -291,16 +288,10 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 <div class="ai-split" style="display:flex; gap:2rem; align-items:flex-start; margin:1rem 0 1.4rem 0;">
 <div style="flex:1 1 50%; min-width:0;">
 <p style="margin-bottom:0.8rem;">
-    Three agents collaborated in iterative rounds. The <strong>Challenger</strong>
-    writes adversarial SQL tests designed to break the system. The
-    <strong>Reviewer</strong> reads the source and flags code-quality issues.
-    The <strong>Writer</strong> runs the tests, addresses feedback, and ships
-    fixes&mdash;repeating until all 892 tests pass cleanly.
-</p>
-<p style="margin-bottom:0.8rem;">
-    No human wrote any of the C code or SQL test cases. The adversarial model
-    drove the implementation toward correctness the same way rigorous code review
-    does on a human team&mdash;except all three sides were machines.
+    Three agents in iterative rounds. <strong>Challenger</strong> writes adversarial
+    SQL tests. <strong>Reviewer</strong> flags code-quality issues.
+    <strong>Writer</strong> fixes until all 960+ tests pass.
+    No human wrote any C code or SQL test cases.
 </p>
 <p style="margin-bottom:0;">
     &#8594;&ensp;<a href="construction.html"><strong>Read more about the process</strong></a>
@@ -329,7 +320,7 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
   <path d="M244,40 L214,40" stroke="#a00" stroke-width="1.2" fill="none" marker-end="url(#ah)"/>
   <path d="M288,52 C288,72 170,78 52,72 C30,71 18,66 18,52"
         stroke="#ccc" stroke-width="1" fill="none" stroke-dasharray="3,2"/>
-  <text x="170" y="90" text-anchor="middle" font-size="8.5" fill="#555" font-style="italic">iterate until all 892 tests pass</text>
+  <text x="170" y="90" text-anchor="middle" font-size="8.5" fill="#555" font-style="italic">iterate until all 960+ tests pass</text>
 </svg>
 </div>
 </div>
@@ -403,7 +394,7 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
     </div>
     <div class="cta-card">
         <h3>Read the source</h3>
-        <p>~23,800 lines of C11. Every subsystem in a single file.</p>
+        <p>~24,000 lines of C11. Every subsystem in a single file.</p>
         <a href="https://github.com/martinsk/mskql" class="cta-link">GitHub &rarr;</a>
     </div>
 </div>
@@ -477,11 +468,10 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
 <h2 id="testing">Testing</h2>
 
 <p>
-    892 test cases with <strong>two layers of verification</strong>: functional correctness
-    (output diff) and memory safety (AddressSanitizer + LeakSanitizer on every test).
-    A correct query that leaks memory is a failure. Tests run in parallel across all CPU
-    cores, each in an isolated server instance. Additional C-level test suites exercise
-    the Extended Query Protocol and multi-client concurrency.
+    960+ test cases. Two layers of verification: functional correctness (output diff)
+    and memory safety (AddressSanitizer on every test). A correct query that leaks
+    memory is a failure. Tests run in parallel across all cores. Additional C-level
+    suites exercise the Extended Query Protocol and multi-client concurrency.
 </p>
 
 <p>

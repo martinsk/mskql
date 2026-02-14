@@ -18,10 +18,10 @@
 <hr class="title-rule">
 
 <p>
-    mskql was written entirely by AI through an adversarial collaboration between
-    three agents. No human wrote any of the C code or SQL test cases.<span class="sidenote">The
-    adversarial loop drove the implementation toward correctness the same way a rigorous
-    code-review culture does on a human team&mdash;except all three sides were machines.</span>
+    <strong>~24K lines of C. 960+ tests. Zero human code.</strong>
+    Three AI agents&mdash;Challenger, Writer, Reviewer&mdash;collaborated in
+    adversarial rounds until every test passed under AddressSanitizer.
+    The result beats PostgreSQL on 16 of 19 batch benchmarks.
 </p>
 
 <div class="diagram">
@@ -67,8 +67,8 @@
 
   <!-- Result box -->
   <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">892 tests pass</text>
-  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~23,800 lines of C &middot; zero human code</text>
+  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">960+ tests pass</text>
+  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~24,000 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
@@ -86,32 +86,32 @@
 <h2 id="feedback-loop">The feedback loop</h2>
 
 <p>
-    The key enabler is a tight feedback loop&mdash;write code, run 892 tests, fix
-    failures, repeat&mdash;that mirrors how experienced engineers ship production
-    systems. The adversarial model (one agent writes code, another
-    writes tests to break it, a third reviews the source and leaves actionable comments) drove the
-    implementation toward correctness the same way rigorous code review does on a human
+    Write code, run 960+ tests, fix failures, repeat. The adversarial model
+    drove correctness the same way rigorous code review does on a human
     team&mdash;except all three sides were machines.
 </p>
 
 <p>
-    The result: a hand-written recursive-descent parser, a block-oriented vectorized
-    executor, arena-based memory management, and a PostgreSQL-compatible wire protocol&mdash;all
-    produced without a single line of human-written C.
+    The result: a recursive-descent parser, block-oriented vectorized executor,
+    arena-based memory management, and PostgreSQL-compatible wire protocol&mdash;all
+    without a single line of human-written C.
+</p>
+
+<h2 id="now-what">Explore further</h2>
+
+<p>
+    <a href="architecture.html">Architecture</a> &ensp;&middot;&ensp;
+    <a href="bench-vs-pg.html">Benchmarks vs PostgreSQL</a> &ensp;&middot;&ensp;
+    <a href="testing.html">Testing methodology</a> &ensp;&middot;&ensp;
+    <a href="playground.html">Try it in the browser</a>
 </p>
 
 <footer class="site-footer">
-    <a href="index.html">Home</a>
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
     &ensp;&middot;&ensp;
-    <a href="architecture.html">Architecture</a>
-    &ensp;&middot;&ensp;
-    <a href="testing.html">Testing</a>
-    &ensp;&middot;&ensp;
-    <a href="getting-started.html">Getting Started</a>
-    &ensp;&middot;&ensp;
-    <a href="playground.html">Playground</a>
+    <a href="index.html">Documentation</a>
 </footer>
 
 </body>
