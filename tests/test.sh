@@ -14,13 +14,15 @@
 #   -- expected status: <0 or non-zero>
 #
 # All sections except the test name are optional.
-# Each testcase file is run in isolation (server is restarted).
+# Each testcase file is run in isolation (database is reset between tests).
 #
 # Tests run in parallel across all available CPU cores.
-# Each worker gets a unique port (base 15433 + worker index).
+# Each worker gets a unique port (base 15433 + worker index) and a
+# persistent server process that is reused across all tests in that worker.
+# Between tests the database is reset via SELECT __reset_db().
 #
 # The default build uses ASAN (AddressSanitizer + LeakSanitizer).
-# After each test the server's ASAN log is checked; leaks cause failure.
+# After all tests the server's ASAN log is checked; leaks cause failure.
 # Set MSKQL_NO_LEAK_CHECK=1 to skip leak checking.
 #
 set -uo pipefail
@@ -119,18 +121,6 @@ check_asan_logs() {
     echo "$leak_info"
 }
 
-run_sql() {
-    local port="$1"; shift
-    psql_cmd "$port" -c "$1" 2>&1
-}
-
-# Run multiple SQL statements in a single psql session (piped via stdin).
-# This keeps transactions alive across statements.
-run_sql_session() {
-    local port="$1"; shift
-    echo "$1" | psql_cmd "$port" 2>&1
-}
-
 # Parse a testcase file into variables:
 #   TC_NAME, TC_SETUP, TC_INPUT, TC_EXPECTED, TC_STATUS
 parse_testcase() {
@@ -188,115 +178,135 @@ parse_testcase() {
     fi
 }
 
-# Run a single testcase on a given port.
-# Writes "PASS" or "FAIL\n<details>" to the result file.
-run_testcase() {
-    local file="$1"
-    local port="$2"
-    local result_file="$3"
-    local pidfile="$4"
-    local worker_dir="$5"
-    local relpath="${file#$PROJECT_DIR/}"
-
-    parse_testcase "$file"
-
-    # start a fresh server for each test
+# Ensure the server for this worker is running. Starts or restarts as needed.
+# Sets SERVER_OK=1 on success, 0 on failure.
+ensure_server() {
+    local port="$1"
+    local pidfile="$2"
+    local worker_dir="$3"
+    SERVER_OK=1
+    if [ -f "$pidfile" ]; then
+        local pid
+        pid=$(<"$pidfile")
+        if kill -0 "$pid" 2>/dev/null; then
+            return  # already running
+        fi
+        # server died — restart
+        rm -f "$pidfile"
+    fi
     if ! start_server "$port" "$pidfile" "$worker_dir"; then
-        echo "FAIL" > "$result_file"
-        echo "FAIL $relpath: $TC_NAME (server failed to start)" >> "$result_file"
+        SERVER_OK=0
+    fi
+}
+
+# Run a batch of tests on a single worker (persistent server).
+# Reads test file paths from a manifest file (one per line).
+# Writes per-test results to individual result files.
+run_worker_batch() {
+    local worker_id="$1"
+    local manifest="$2"
+    local port=$((BASE_PORT + worker_id))
+    local worker_dir="$TMPDIR_ROOT/worker-$worker_id"
+    local pidfile="$worker_dir/server.pid"
+
+    mkdir -p "$worker_dir"
+
+    # start the persistent server for this worker
+    if ! start_server "$port" "$pidfile" "$worker_dir"; then
+        # mark all tests in this batch as failed
+        while IFS= read -r file; do
+            local rf="$TMPDIR_ROOT/result-$(basename "$file" .sql).txt"
+            local relpath="${file#$PROJECT_DIR/}"
+            { echo "FAIL"; echo "FAIL $relpath: (server failed to start)"; } > "$rf"
+        done < "$manifest"
         return
     fi
 
-    # run setup SQL — use a single session if it contains transaction statements
-    # (BEGIN), otherwise run one statement at a time for reliability
-    if [ -n "$TC_SETUP" ]; then
-        if echo "$TC_SETUP" | grep -qiE '^BEGIN'; then
-            run_sql_session "$port" "$TC_SETUP" >/dev/null 2>&1
-        else
-            while IFS= read -r stmt; do
-                stmt="$(echo "$stmt" | sed 's/;$//')"
-                [ -z "$stmt" ] && continue
-                run_sql "$port" "$stmt" >/dev/null 2>&1
-            done <<< "$TC_SETUP"
-        fi
-    fi
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        local rf="$TMPDIR_ROOT/result-$(basename "$file" .sql).txt"
+        local relpath="${file#$PROJECT_DIR/}"
 
-    # run input SQL — use a single session if it contains transaction statements,
-    # otherwise run one statement at a time (preserves per-statement output capture)
-    local actual="" status=0
-    if [ -n "$TC_INPUT" ]; then
-        if echo "$TC_INPUT" | grep -qiE '^BEGIN|^COMMIT|^ROLLBACK'; then
-            actual=$(run_sql_session "$port" "$TC_INPUT") || status=$?
-        else
-            local combined=""
-            while IFS= read -r stmt; do
-                stmt="$(echo "$stmt" | sed 's/;$//')"
-                [ -z "$stmt" ] && continue
-                local out
-                out=$(run_sql "$port" "$stmt" 2>&1) || status=$?
-                if [ -n "$out" ]; then
-                    if [ -n "$combined" ]; then combined="$combined"$'\n'"$out"
-                    else combined="$out"; fi
-                fi
-            done <<< "$TC_INPUT"
-            actual="$combined"
-        fi
-    fi
+        parse_testcase "$file"
 
+        # reset database to clean state (instead of restarting server)
+        if ! psql_cmd "$port" -c "SELECT __reset_db()" >/dev/null 2>&1; then
+            # server may have crashed — try to restart
+            stop_server "$pidfile"
+            if ! start_server "$port" "$pidfile" "$worker_dir"; then
+                { echo "FAIL"; echo "FAIL $relpath: $TC_NAME (server crashed and failed to restart)"; } > "$rf"
+                continue
+            fi
+        fi
+
+        # run setup SQL in a single psql session
+        # (ensure each line ends with a semicolon so psql can parse them)
+        if [ -n "$TC_SETUP" ]; then
+            echo "$TC_SETUP" | sed 's/;*$/;/' | psql_cmd "$port" >/dev/null 2>&1
+        fi
+
+        # run input SQL in a single psql session
+        local actual="" status=0
+        if [ -n "$TC_INPUT" ]; then
+            actual=$(echo "$TC_INPUT" | sed 's/;*$/;/' | psql_cmd "$port" 2>&1) || status=$?
+        fi
+
+        # compare
+        local ok=1
+        local fail_details=""
+
+        if [ "$TC_STATUS" = "0" ] && [ "$status" -ne 0 ]; then
+            ok=0
+            fail_details="${fail_details}    expected status 0, got $status"$'\n'
+        fi
+
+        if [ -n "$TC_EXPECTED" ]; then
+            if [ "$TC_EXPECTED" != "$actual" ]; then
+                ok=0
+                fail_details="${fail_details}    expected output:"$'\n'
+                fail_details="${fail_details}$(echo "$TC_EXPECTED" | sed 's/^/      /')"$'\n'
+                fail_details="${fail_details}    actual output:"$'\n'
+                fail_details="${fail_details}$(echo "$actual" | sed 's/^/      /')"$'\n'
+            fi
+        fi
+
+        if [ "$ok" -eq 1 ]; then
+            echo "PASS" > "$rf"
+        else
+            { echo "FAIL"; echo "FAIL $relpath: $TC_NAME"; printf '%s' "$fail_details"; } > "$rf"
+        fi
+    done < "$manifest"
+
+    # stop the persistent server
     stop_server "$pidfile"
 
-    # compare
-    local ok=1
-    local fail_details=""
-
-    # check status
-    if [ "$TC_STATUS" = "0" ] && [ "$status" -ne 0 ]; then
-        ok=0
-        fail_details="${fail_details}    expected status 0, got $status"$'\n'
-    elif [ "$TC_STATUS" != "0" ] && [ "$status" -eq 0 ]; then
-        # expected failure but got success — only fail if we also have expected output mismatch
-        :
-    fi
-
-    # check output
-    if [ -n "$TC_EXPECTED" ]; then
-        if [ "$TC_EXPECTED" != "$actual" ]; then
-            ok=0
-            fail_details="${fail_details}    expected output:"$'\n'
-            fail_details="${fail_details}$(echo "$TC_EXPECTED" | sed 's/^/      /')"$'\n'
-            fail_details="${fail_details}    actual output:"$'\n'
-            fail_details="${fail_details}$(echo "$actual" | sed 's/^/      /')"$'\n'
-        fi
-    fi
-
-    # check for memory leaks (ASAN)
+    # check for memory leaks (ASAN) — once at the end for this worker
     if [ "$NO_LEAK_CHECK" != "1" ]; then
         local leak_info
         leak_info=$(check_asan_logs "$worker_dir")
         if [ -n "$leak_info" ]; then
-            ok=0
-            fail_details="${fail_details}    memory leak detected:"$'\n'
-            fail_details="${fail_details}$(echo "$leak_info" | sed 's/^/      /')"$'\n'
+            # write a special result file for the ASAN failure
+            local rf="$TMPDIR_ROOT/result-asan-worker-$worker_id.txt"
+            { echo "FAIL"; echo "FAIL worker-$worker_id: memory leak detected"; echo "    $leak_info"; } > "$rf"
         fi
-    fi
-
-    if [ "$ok" -eq 1 ]; then
-        echo "PASS" > "$result_file"
-    else
-        {
-            echo "FAIL"
-            echo "FAIL $relpath: $TC_NAME"
-            printf '%s' "$fail_details"
-        } > "$result_file"
     fi
 }
 
 # ---- build ----
-if ! BUILD_OUT=$(cd "$PROJECT_DIR/src" && make clean && make CC="${CC:-cc}" 2>&1); then
+# Force a clean rebuild if the compiler changed (avoids ASAN version mismatches)
+_CC="${CC:-cc}"
+_CC_STAMP="$PROJECT_DIR/build/.cc_stamp"
+_CC_ID=$("$_CC" --version 2>&1 | head -1)
+if [ -f "$_CC_STAMP" ] && [ "$(<"$_CC_STAMP")" != "$_CC_ID" ]; then
+    (cd "$PROJECT_DIR/src" && make clean) >/dev/null 2>&1
+fi
+if ! BUILD_OUT=$(cd "$PROJECT_DIR/src" && make CC="$_CC" 2>&1); then
     echo "BUILD FAILED:"
     echo "$BUILD_OUT"
     exit 1
 fi
+mkdir -p "$PROJECT_DIR/build"
+echo "$_CC_ID" > "$_CC_STAMP"
 
 # ---- discover testcases ----
 testfiles=()
@@ -311,48 +321,82 @@ if [ "$total" -eq 0 ]; then
     exit 0
 fi
 
-# ---- run testcases in parallel ----
-# We use a simple job-slot approach: maintain up to NWORKERS background jobs.
-# Each job gets a unique port = BASE_PORT + slot_index.
-
-slot_pids=()    # PID of background job in each slot (empty = free)
-slot_files=()   # test file being run in each slot
-slot_results=() # result file path for each slot
-slot_dirs=()    # temp dir for each slot
-
+# ---- partition tests across workers and run in parallel ----
+# Create manifest files (one per worker) with test file paths.
 for ((i = 0; i < NWORKERS; i++)); do
-    slot_pids+=("")
-    slot_files+=("")
-    slot_results+=("")
-    d="$TMPDIR_ROOT/worker-$i"
-    mkdir -p "$d"
-    slot_dirs+=("$d")
+    mkdir -p "$TMPDIR_ROOT/worker-$i"
+    : > "$TMPDIR_ROOT/worker-$i/manifest.txt"
 done
 
+idx=0
+for f in "${testfiles[@]}"; do
+    worker=$((idx % NWORKERS))
+    echo "$f" >> "$TMPDIR_ROOT/worker-$worker/manifest.txt"
+    idx=$((idx + 1))
+done
+
+# launch all workers in parallel
+worker_pids=()
+for ((i = 0; i < NWORKERS; i++)); do
+    manifest="$TMPDIR_ROOT/worker-$i/manifest.txt"
+    if [ -s "$manifest" ]; then
+        run_worker_batch "$i" "$manifest" &
+        worker_pids+=($!)
+    fi
+done
+
+# wait for all workers, showing progress
 PASS=0
 FAIL=0
 FAIL_OUTPUT=""
 DONE=0
 
-# Print progress indicator (overwrites same line)
 show_progress() {
     printf '\r[%d/%d]' "$DONE" "$total" >&2
 }
 
-# Wait for a specific slot to finish and collect its result.
-collect_slot() {
-    local s="$1"
-    wait "${slot_pids[$s]}" 2>/dev/null || true
-    local rf="${slot_results[$s]}"
+show_progress
+
+# poll for completed result files while workers are running
+all_done=0
+while [ "$all_done" -eq 0 ]; do
+    all_done=1
+    for pid in "${worker_pids[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            all_done=0
+        fi
+    done
+
+    # count completed results
+    local_done=0
+    for f in "${testfiles[@]}"; do
+        rf="$TMPDIR_ROOT/result-$(basename "$f" .sql).txt"
+        if [ -f "$rf" ]; then
+            local_done=$((local_done + 1))
+        fi
+    done
+    if [ "$local_done" -ne "$DONE" ]; then
+        DONE=$local_done
+        show_progress
+    fi
+
+    [ "$all_done" -eq 0 ] && sleep 0.1
+done
+
+# wait for all workers to fully exit
+for pid in "${worker_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+done
+
+# collect all results
+for f in "${testfiles[@]}"; do
+    rf="$TMPDIR_ROOT/result-$(basename "$f" .sql).txt"
     if [ -f "$rf" ]; then
-        local first
         first=$(head -1 "$rf")
         if [ "$first" = "PASS" ]; then
             PASS=$((PASS + 1))
         else
             FAIL=$((FAIL + 1))
-            # append everything after the first line (the details)
-            local details
             details=$(tail -n +2 "$rf")
             if [ -n "$details" ]; then
                 FAIL_OUTPUT="${FAIL_OUTPUT}${details}"$'\n'
@@ -360,53 +404,23 @@ collect_slot() {
         fi
         rm -f "$rf"
     fi
-    DONE=$((DONE + 1))
-    show_progress
-    slot_pids[$s]=""
-}
-
-# Find a free slot, blocking until one opens up.
-acquire_slot() {
-    while true; do
-        for ((s = 0; s < NWORKERS; s++)); do
-            if [ -z "${slot_pids[$s]}" ]; then
-                ACQUIRED_SLOT=$s
-                return
-            fi
-            # check if this slot's job has finished
-            if ! kill -0 "${slot_pids[$s]}" 2>/dev/null; then
-                collect_slot "$s"
-                ACQUIRED_SLOT=$s
-                return
-            fi
-        done
-        # all slots busy — wait briefly then retry
-        sleep 0.05
-    done
-}
-
-show_progress
-
-for f in "${testfiles[@]}"; do
-    acquire_slot
-    s=$ACQUIRED_SLOT
-    port=$((BASE_PORT + s))
-    rf="$TMPDIR_ROOT/result-$(basename "$f" .sql).txt"
-    pidfile="${slot_dirs[$s]}/server.pid"
-
-    slot_files[$s]="$f"
-    slot_results[$s]="$rf"
-
-    run_testcase "$f" "$port" "$rf" "$pidfile" "${slot_dirs[$s]}" &
-    slot_pids[$s]=$!
 done
 
-# wait for all remaining slots
-for ((s = 0; s < NWORKERS; s++)); do
-    if [ -n "${slot_pids[$s]}" ]; then
-        collect_slot "$s"
+# collect ASAN worker-level results
+for ((i = 0; i < NWORKERS; i++)); do
+    rf="$TMPDIR_ROOT/result-asan-worker-$i.txt"
+    if [ -f "$rf" ]; then
+        FAIL=$((FAIL + 1))
+        details=$(tail -n +2 "$rf")
+        if [ -n "$details" ]; then
+            FAIL_OUTPUT="${FAIL_OUTPUT}${details}"$'\n'
+        fi
+        rm -f "$rf"
     fi
 done
+
+DONE=$total
+show_progress
 
 # clear progress line
 printf '\r%*s\r' 40 '' >&2

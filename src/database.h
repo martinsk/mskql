@@ -24,6 +24,8 @@ struct db_snapshot {
     int *saved_valid;            /* [orig_table_count] 1 if saved_tables[i] populated */
     /* Types/sequences: small, just copy eagerly */
     DYNAMIC_ARRAY(struct enum_type) types;
+    /* Nested transactions: pointer to parent snapshot */
+    struct db_snapshot *parent;
 };
 
 /* Per-connection transaction state.  Owned by client_state in pgwire.c;
@@ -56,6 +58,7 @@ int  db_table_exec_query(struct database *db, sv table_name,
 int  db_exec(struct database *db, struct query *q, struct rows *result, struct bump_alloc *rb);
 int  db_exec_sql(struct database *db, const char *sql, struct rows *result);
 void db_free(struct database *db);
+void db_reset(struct database *db);
 
 /* Materialize a subquery into a temporary table added to db->tables.
  * Returns a pointer to the new table, or NULL on failure.

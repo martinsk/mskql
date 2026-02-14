@@ -1521,15 +1521,17 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
     case EXPR_COLUMN_REF: {
         if (!t || !row) return cell_make_null();
         sv col = e->column_ref.column;
-        int idx = table_find_column_sv(t, col);
-        if (idx < 0 && e->column_ref.table.len > 0) {
-            /* try table.column qualified lookup */
+        int idx = -1;
+        if (e->column_ref.table.len > 0) {
+            /* try table.column qualified lookup first (avoids ambiguity in merged join tables) */
             char qname[256];
             snprintf(qname, sizeof(qname), SV_FMT "." SV_FMT,
                      SV_ARG(e->column_ref.table), SV_ARG(col));
             sv qsv = sv_from(qname, strlen(qname));
             idx = table_find_column_sv(t, qsv);
         }
+        if (idx < 0)
+            idx = table_find_column_sv(t, col);
         if (idx < 0) return cell_make_null();
         return cell_deep_copy_rb(&row->cells.items[idx], rb);
     }
@@ -3888,6 +3890,37 @@ static int grp_find_result_col(struct table *t, int *grp_cols, size_t ngrp,
     for (size_t k = 0; k < ngrp; k++) {
         if (grp_cols[k] >= 0 && sv_eq_cstr(name, t->columns.items[grp_cols[k]].name))
             return (int)(grp_offset + k);
+        if (grp_cols[k] == -2) {
+            /* expression-based group key — try matching by SELECT alias */
+            for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
+                if (sc->alias.len > 0 && sv_eq_ignorecase(sc->alias, name) &&
+                    sc->expr_idx != IDX_NONE) {
+                    return (int)(grp_offset + k);
+                }
+            }
+            /* fallback: scan raw s->columns text for " AS <name>" patterns
+             * to match aliases when parsed_columns are not available */
+            if (s->parsed_columns_count == 0 && s->columns.len > 0) {
+                const char *p = s->columns.data;
+                const char *end = s->columns.data + s->columns.len;
+                while (p < end - 3) {
+                    if ((p[0] == ' ' || p[0] == ')') &&
+                        (p[1] == 'A' || p[1] == 'a') &&
+                        (p[2] == 'S' || p[2] == 's') &&
+                        p[3] == ' ') {
+                        const char *alias_start = p + 4;
+                        while (alias_start < end && *alias_start == ' ') alias_start++;
+                        const char *alias_end = alias_start;
+                        while (alias_end < end && *alias_end != ',' && *alias_end != ' ') alias_end++;
+                        sv alias_sv = sv_from(alias_start, (size_t)(alias_end - alias_start));
+                        if (sv_eq_ignorecase(alias_sv, name))
+                            return (int)(grp_offset + k);
+                    }
+                    p++;
+                }
+            }
+        }
     }
     /* check aggregate names */
     for (size_t a = 0; a < agg_n; a++) {
@@ -3911,17 +3944,44 @@ static int grp_find_result_col(struct table *t, int *grp_cols, size_t ngrp,
 
 int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
 {
-    /* resolve GROUP BY column indices */
+    /* resolve GROUP BY column indices (grp_cols[k] = -2 means expression-based) */
     size_t ngrp = s->group_by_count;
     if (ngrp == 0) ngrp = 1; /* backward compat: single group_by_col */
     int grp_cols[32];
+    uint32_t grp_expr[32]; /* expr indices for expression-based GROUP BY keys */
+    for (size_t k = 0; k < 32; k++) grp_expr[k] = IDX_NONE;
     if (s->group_by_count > 0) {
         for (size_t k = 0; k < ngrp && k < 32; k++) {
-            sv gbcol = ASV(arena, s->group_by_start + (uint32_t)k);
-            grp_cols[k] = table_find_column_sv(t, gbcol);
-            if (grp_cols[k] < 0) {
-                arena_set_error(arena, "42703", "GROUP BY column '%.*s' not found", (int)gbcol.len, gbcol.data);
-                return -1;
+            /* check if this GROUP BY item has an expression index */
+            uint32_t expr_idx = IDX_NONE;
+            if (s->group_by_exprs_start > 0 || arena->arg_indices.count > 0) {
+                uint32_t ai = s->group_by_exprs_start + (uint32_t)k;
+                if (ai < (uint32_t)arena->arg_indices.count)
+                    expr_idx = arena->arg_indices.items[ai];
+            }
+            if (expr_idx != IDX_NONE) {
+                grp_cols[k] = -2; /* expression-based */
+                grp_expr[k] = expr_idx;
+            } else {
+                sv gbcol = ASV(arena, s->group_by_start + (uint32_t)k);
+                grp_cols[k] = table_find_column_sv(t, gbcol);
+                if (grp_cols[k] < 0) {
+                    /* try matching by SELECT alias */
+                    for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                        struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
+                        if (sc->alias.len > 0 && sv_eq_ignorecase(sc->alias, gbcol) && sc->expr_idx != IDX_NONE) {
+                            struct expr *e = &EXPR(arena, sc->expr_idx);
+                            if (e->type == EXPR_COLUMN_REF) {
+                                grp_cols[k] = table_find_column_sv(t, e->column_ref.column);
+                                if (grp_cols[k] >= 0) break;
+                            }
+                        }
+                    }
+                    if (grp_cols[k] < 0) {
+                        arena_set_error(arena, "42703", "GROUP BY column '%.*s' not found", (int)gbcol.len, gbcol.data);
+                        return -1;
+                    }
+                }
             }
         }
     } else {
@@ -3945,6 +4005,25 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
         matching[matching_count++] = i;
     }
 
+    /* Pre-compute expression-based group keys for all matching rows */
+    int has_expr_grp = 0;
+    for (size_t k = 0; k < ngrp; k++)
+        if (grp_cols[k] == -2) { has_expr_grp = 1; break; }
+
+    /* grp_vals[row_idx * ngrp + k] holds the evaluated group key for expression-based keys */
+    struct cell *grp_vals = NULL;
+    if (has_expr_grp && matching_count > 0) {
+        grp_vals = (struct cell *)bump_calloc(&arena->scratch, matching_count * ngrp, sizeof(struct cell));
+        for (size_t m = 0; m < matching_count; m++) {
+            size_t ri = matching[m];
+            for (size_t k = 0; k < ngrp; k++) {
+                if (grp_cols[k] == -2) {
+                    grp_vals[m * ngrp + k] = eval_expr(grp_expr[k], arena, t, &t->rows.items[ri], NULL, rb);
+                }
+            }
+        }
+    }
+
     /* find distinct group keys (compare all group columns as a tuple) */
     size_t *group_starts = (size_t *)bump_alloc(&arena->scratch, max_rows * sizeof(size_t));
     size_t group_starts_count = 0;
@@ -3956,9 +4035,16 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             size_t gi = matching[group_starts[g]];
             int eq = 1;
             for (size_t k = 0; k < ngrp; k++) {
-                if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
-                                &t->rows.items[gi].cells.items[grp_cols[k]])) {
-                    eq = 0; break;
+                if (grp_cols[k] == -2) {
+                    if (!cell_equal_nullsafe(&grp_vals[m * ngrp + k],
+                                    &grp_vals[group_starts[g] * ngrp + k])) {
+                        eq = 0; break;
+                    }
+                } else {
+                    if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
+                                    &t->rows.items[gi].cells.items[grp_cols[k]])) {
+                        eq = 0; break;
+                    }
                 }
             }
             if (eq) { found = 1; break; }
@@ -4010,9 +4096,14 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
         da_init(&having_t.indexes);
         if (!s->agg_before_cols) {
             for (size_t k = 0; k < ngrp; k++) {
-                struct column col_grp = { .name = strdup(t->columns.items[grp_cols[k]].name),
-                                          .type = t->columns.items[grp_cols[k]].type,
-                                          .enum_type_name = NULL };
+                struct column col_grp;
+                if (grp_cols[k] == -2) {
+                    col_grp = (struct column){ .name = strdup("?"), .type = COLUMN_TYPE_FLOAT, .enum_type_name = NULL };
+                } else {
+                    col_grp = (struct column){ .name = strdup(t->columns.items[grp_cols[k]].name),
+                                              .type = t->columns.items[grp_cols[k]].type,
+                                              .enum_type_name = NULL };
+                }
                 da_push(&having_t.columns, col_grp);
             }
         }
@@ -4046,9 +4137,14 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
         }
         if (s->agg_before_cols) {
             for (size_t k = 0; k < ngrp; k++) {
-                struct column col_grp = { .name = strdup(t->columns.items[grp_cols[k]].name),
-                                          .type = t->columns.items[grp_cols[k]].type,
-                                          .enum_type_name = NULL };
+                struct column col_grp;
+                if (grp_cols[k] == -2) {
+                    col_grp = (struct column){ .name = strdup("?"), .type = COLUMN_TYPE_FLOAT, .enum_type_name = NULL };
+                } else {
+                    col_grp = (struct column){ .name = strdup(t->columns.items[grp_cols[k]].name),
+                                              .type = t->columns.items[grp_cols[k]].type,
+                                              .enum_type_name = NULL };
+                }
                 da_push(&having_t.columns, col_grp);
             }
         }
@@ -4073,9 +4169,16 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             /* check if this row belongs to the current group */
             int eq = 1;
             for (size_t k = 0; k < ngrp; k++) {
-                if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
-                                &t->rows.items[first_ri].cells.items[grp_cols[k]])) {
-                    eq = 0; break;
+                if (grp_cols[k] == -2) {
+                    if (!cell_equal_nullsafe(&grp_vals[m * ngrp + k],
+                                    &grp_vals[group_starts[g] * ngrp + k])) {
+                        eq = 0; break;
+                    }
+                } else {
+                    if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
+                                    &t->rows.items[first_ri].cells.items[grp_cols[k]])) {
+                        eq = 0; break;
+                    }
                 }
             }
             if (!eq) continue;
@@ -4119,8 +4222,13 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             /* default: group key columns first */
             for (size_t k = 0; k < ngrp; k++) {
                 struct cell gc;
-                if (rb) cell_copy_bump(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]], rb);
-                else    cell_copy(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]]);
+                if (grp_cols[k] == -2) {
+                    if (rb) cell_copy_bump(&gc, &grp_vals[group_starts[g] * ngrp + k], rb);
+                    else    cell_copy(&gc, &grp_vals[group_starts[g] * ngrp + k]);
+                } else {
+                    if (rb) cell_copy_bump(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]], rb);
+                    else    cell_copy(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]]);
+                }
                 da_push(&dst.cells, gc);
             }
         }
@@ -4283,8 +4391,13 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             /* aggregates first, then group key columns */
             for (size_t k = 0; k < ngrp; k++) {
                 struct cell gc;
-                if (rb) cell_copy_bump(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]], rb);
-                else    cell_copy(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]]);
+                if (grp_cols[k] == -2) {
+                    if (rb) cell_copy_bump(&gc, &grp_vals[group_starts[g] * ngrp + k], rb);
+                    else    cell_copy(&gc, &grp_vals[group_starts[g] * ngrp + k]);
+                } else {
+                    if (rb) cell_copy_bump(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]], rb);
+                    else    cell_copy(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]]);
+                }
                 da_push(&dst.cells, gc);
             }
         }
@@ -4303,6 +4416,18 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
     }
 
     /* matching and group_starts are scratch-allocated — no free needed */
+    /* free strdup'd text inside grp_vals cells (array itself is bump-allocated).
+     * Only needed when rb is NULL (heap-allocated text); when rb is set,
+     * text lives in the bump arena and is freed by bump_reset. */
+    if (grp_vals && !rb) {
+        for (size_t m = 0; m < matching_count; m++) {
+            for (size_t k = 0; k < ngrp; k++) {
+                struct cell *gv = &grp_vals[m * ngrp + k];
+                if (column_type_is_text(gv->type) && gv->value.as_text)
+                    free((char *)gv->value.as_text);
+            }
+        }
+    }
     if (has_having_t) {
         for (size_t i = 0; i < having_t.columns.count; i++)
             column_free(&having_t.columns.items[i]);

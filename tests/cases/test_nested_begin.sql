@@ -7,6 +7,7 @@ INSERT INTO t1 (id, name) VALUES (2, 'bob');
 BEGIN;
 INSERT INTO t1 (id, name) VALUES (3, 'charlie');
 COMMIT;
+COMMIT;
 -- input:
 SELECT id, name FROM t1 ORDER BY id;
 -- expected output:

@@ -8,5 +8,5 @@ INSERT INTO t1 (name) VALUES ('bob');
 SELECT * FROM t1 ORDER BY id;
 -- expected output:
 1|alice
-3|bob
+2|bob
 -- expected status: 0

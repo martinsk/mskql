@@ -595,9 +595,39 @@ static int send_row_description(int fd, struct database *db, struct query *q,
     /* try to get column metadata from the table */
     if (q->query_type == QUERY_TYPE_SELECT && q->select.table.len > 0) {
         t = db_find_table_sv(db, q->select.table);
+    } else if (q->query_type == QUERY_TYPE_DELETE && q->del.table.len > 0) {
+        t = db_find_table_sv(db, q->del.table);
+    } else if (q->query_type == QUERY_TYPE_UPDATE && q->update.table.len > 0) {
+        t = db_find_table_sv(db, q->update.table);
+    } else if (q->query_type == QUERY_TYPE_INSERT && q->insert.table.len > 0) {
+        t = db_find_table_sv(db, q->insert.table);
     }
 
     msgbuf_push_u16(&m, (uint16_t)ncols);
+
+    /* For DELETE/UPDATE/INSERT RETURNING, use table column metadata directly */
+    if (q->query_type != QUERY_TYPE_SELECT) {
+        for (int i = 0; i < ncols; i++) {
+            const char *colname = "?";
+            uint32_t type_oid = 25; /* text */
+            if (t && (size_t)i < t->columns.count) {
+                colname  = t->columns.items[i].name;
+                type_oid = column_type_to_oid(t->columns.items[i].type);
+            } else if (result->count > 0 && (size_t)i < result->data[0].cells.count) {
+                type_oid = column_type_to_oid(result->data[0].cells.items[i].type);
+            }
+            msgbuf_push_cstr(&m, colname);
+            msgbuf_push_u32(&m, 0);
+            msgbuf_push_u16(&m, 0);
+            msgbuf_push_u32(&m, type_oid);
+            msgbuf_push_u16(&m, (uint16_t)-1);
+            msgbuf_push_u32(&m, (uint32_t)-1);
+            msgbuf_push_u16(&m, 0);
+        }
+        int rc = msg_send(fd, 'T', &m);
+        msgbuf_free(&m);
+        return rc;
+    }
 
     for (int i = 0; i < ncols; i++) {
         const char *colname = "?";
@@ -1586,6 +1616,31 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
     if (*p == '\0') {
         send_empty_query(fd, m);
+        return 0;
+    }
+
+    /* Internal test-only command: reset database to clean state */
+    if (strncmp(sql, "SELECT __reset_db()", 19) == 0) {
+        db_reset(db);
+        rcache_invalidate_all();
+        if (!skip_row_desc) {
+            m->len = 0;
+            msgbuf_push_u16(m, 1); /* 1 column */
+            msgbuf_push_cstr(m, "__reset_db");
+            msgbuf_push_u32(m, 0);            /* table OID */
+            msgbuf_push_u16(m, 0);            /* column attr */
+            msgbuf_push_u32(m, 25);           /* type OID: text */
+            msgbuf_push_u16(m, (uint16_t)-1); /* type size */
+            msgbuf_push_u32(m, (uint32_t)-1); /* type modifier */
+            msgbuf_push_u16(m, 0);            /* format: text */
+            msg_send(fd, 'T', m);
+        }
+        m->len = 0;
+        msgbuf_push_u16(m, 1);  /* 1 column */
+        msgbuf_push_u32(m, 2);  /* 2 bytes */
+        msgbuf_push(m, (const uint8_t *)"ok", 2);
+        msg_send(fd, 'D', m);
+        send_command_complete(fd, m, "SELECT 1");
         return 0;
     }
 
