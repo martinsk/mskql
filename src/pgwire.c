@@ -2540,11 +2540,12 @@ static int handle_execute(struct client_state *c, struct database *db,
     }
 
     /* Execute the bound SQL (no ReadyForQuery — that comes from Sync).
-     * skip_row_desc=1: in extended protocol, RowDescription was already
-     * sent by Describe, or the client doesn't expect it from Execute. */
+     * Always send RowDescription from Execute (skip_row_desc=0) so that
+     * JDBC drivers always receive field structure before DataRows.
+     * Describe may have sent RowDescription too — drivers handle this. */
     db->active_txn = &c->txn;
     handle_query_inner(c->fd, db, c->portals[idx].sql,
-                       &c->send_buf, &c->arena, 1);
+                       &c->send_buf, &c->arena, 0);
     db->active_txn = NULL;
     return 0;
 }

@@ -33,6 +33,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BASE_PORT=${MSKQL_TEST_BASE_PORT:-15433}
 NO_LEAK_CHECK=${MSKQL_NO_LEAK_CHECK:-0}
 LSAN_SUPP="$SCRIPT_DIR/lsan_suppressions.txt"
+FAILURE_LOG="$SCRIPT_DIR/test-failures.log"
 
 # Prefer Homebrew Clang for LeakSanitizer support on macOS ARM64
 # (Apple Clang does not support detect_leaks on this platform)
@@ -50,6 +51,61 @@ else
 fi
 
 TMPDIR_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/mskql-test.XXXXXX")
+
+# Wait until a port is free, killing any occupying mskql process.
+# Usage: wait_for_port_free <port>
+wait_for_port_free() {
+    local port="$1"
+    local max_attempts=20
+    for ((attempt = 0; attempt < max_attempts; attempt++)); do
+        # check if anything is listening on this port
+        local pids
+        pids=$(lsof -ti :"$port" 2>/dev/null || true)
+        if [ -z "$pids" ]; then
+            return 0  # port is free
+        fi
+        if [ "$attempt" -eq 0 ]; then
+            # first attempt: try to kill occupying mskql processes
+            for p in $pids; do
+                local pname
+                pname=$(ps -p "$p" -o comm= 2>/dev/null || true)
+                if [[ "$pname" == *mskql* ]]; then
+                    kill -TERM "$p" 2>/dev/null || true
+                fi
+            done
+        fi
+        sleep 0.25
+    done
+    # port still occupied after timeout
+    echo "WARNING: port $port still in use after ${max_attempts} attempts" >&2
+    return 1
+}
+
+# Kill any stale mskql processes on ports we plan to use.
+kill_stale_servers() {
+    local ports_to_check=()
+    for ((i = 0; i < NWORKERS; i++)); do
+        ports_to_check+=($((BASE_PORT + i)))
+    done
+    # C test suite ports
+    ports_to_check+=(15400 15401)
+
+    for port in "${ports_to_check[@]}"; do
+        local pids
+        pids=$(lsof -ti :"$port" 2>/dev/null || true)
+        if [ -n "$pids" ]; then
+            for p in $pids; do
+                local pname
+                pname=$(ps -p "$p" -o comm= 2>/dev/null || true)
+                if [[ "$pname" == *mskql* ]]; then
+                    kill -TERM "$p" 2>/dev/null || true
+                fi
+            done
+        fi
+    done
+    # brief wait for killed processes to release sockets
+    sleep 0.5
+}
 
 cleanup_all() {
     # kill any leftover server processes we may have spawned
@@ -73,6 +129,11 @@ start_server() {
     local port="$1"
     local pidfile="$2"
     local worker_dir="$3"
+    # Ensure port is free before starting
+    if ! wait_for_port_free "$port"; then
+        echo "ERROR: cannot start server — port $port is not free" >&2
+        return 1
+    fi
     # Clean up any previous ASAN logs for this worker
     rm -f "$worker_dir"/asan.log.*
     # Run server with ASAN + LeakSanitizer logging to file
@@ -90,8 +151,10 @@ start_server() {
         sleep 0.25
     done
     if ! kill -0 "$srv_pid" 2>/dev/null; then
+        echo "ERROR: server on port $port (pid $srv_pid) died during startup" >&2
         return 1
     fi
+    echo "WARNING: server on port $port (pid $srv_pid) running but not accepting connections after 5s" >&2
     return 0
 }
 
@@ -103,6 +166,8 @@ stop_server() {
         kill -TERM "$pid" 2>/dev/null
         wait "$pid" 2>/dev/null || true
         rm -f "$pidfile"
+        # brief pause for socket TIME_WAIT to clear
+        sleep 0.1
     fi
 }
 
@@ -308,6 +373,9 @@ fi
 mkdir -p "$PROJECT_DIR/build"
 echo "$_CC_ID" > "$_CC_STAMP"
 
+# ---- kill stale servers from previous runs ----
+kill_stale_servers
+
 # ---- discover testcases ----
 testfiles=()
 for f in "$TESTCASE_DIR"/*.sql; do
@@ -442,6 +510,20 @@ for ctest_dir in "$TESTCASE_DIR"/*/; do
         FAIL_OUTPUT="${FAIL_OUTPUT}FAIL tests/cases/$ctest_name/: binary not found at $ctest_bin"$'\n'
         continue
     fi
+    # map known C test suite names to their default ports
+    ctest_port=""
+    case "$ctest_name" in
+        concurrent) ctest_port=15400 ;;
+        extended)   ctest_port=15401 ;;
+    esac
+    # ensure the port for this C test suite is free
+    if [ -n "$ctest_port" ]; then
+        if ! wait_for_port_free "$ctest_port"; then
+            FAIL=$((FAIL + 1))
+            FAIL_OUTPUT="${FAIL_OUTPUT}FAIL tests/cases/$ctest_name/: port $ctest_port not free"$'\n'
+            continue
+        fi
+    fi
     # run from project root (the binary does execl("./build/mskql", ...))
     if ctest_out=$( cd "$PROJECT_DIR" && "$ctest_bin" 2>&1 ); then
         # count individual checks from "All N tests passed"
@@ -458,6 +540,19 @@ for ctest_dir in "$TESTCASE_DIR"/*/; do
     fi
 done
 
+# ---- write failure log ----
+if [ -n "$FAIL_OUTPUT" ]; then
+    {
+        echo "========================================"
+        echo "mskql test failure log"
+        echo "Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "Tests: $PASS passed, $FAIL failed (of $((PASS + FAIL)) total)"
+        echo "========================================"
+        echo ""
+        printf '%s' "$FAIL_OUTPUT"
+    } > "$FAILURE_LOG"
+fi
+
 # ---- summary ----
 if [ -n "$FAIL_OUTPUT" ]; then
     printf '%s' "$FAIL_OUTPUT"
@@ -465,8 +560,11 @@ fi
 
 if [ "$FAIL" -gt 0 ]; then
     echo "$PASS passed, $FAIL failed"
+    echo "Failure details written to: $FAILURE_LOG" >&2
     exit 1
 else
+    # clean up stale log from a previous failing run
+    rm -f "$FAILURE_LOG"
     echo "All $PASS tests passed"
     exit 0
 fi
