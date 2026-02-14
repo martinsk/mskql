@@ -13,6 +13,7 @@ void table_init(struct table *t, const char *name)
     da_init(&t->indexes);
     t->generation = 0;
     memset(&t->scan_cache, 0, sizeof(t->scan_cache));
+    memset(&t->join_cache, 0, sizeof(t->join_cache));
 }
 
 void table_init_own(struct table *t, char *name)
@@ -24,6 +25,7 @@ void table_init_own(struct table *t, char *name)
     da_init(&t->indexes);
     t->generation = 0;
     memset(&t->scan_cache, 0, sizeof(t->scan_cache));
+    memset(&t->join_cache, 0, sizeof(t->join_cache));
 }
 
 void table_add_column(struct table *t, struct column *col)
@@ -66,6 +68,7 @@ void table_deep_copy(struct table *dst, const struct table *src)
     da_init(&dst->indexes);
     dst->generation = src->generation;
     memset(&dst->scan_cache, 0, sizeof(dst->scan_cache));
+    memset(&dst->join_cache, 0, sizeof(dst->join_cache));
 
     /* deep-copy columns */
     for (size_t i = 0; i < src->columns.count; i++) {
@@ -221,5 +224,19 @@ void table_free(struct table *t)
         free(t->scan_cache.col_data);
         free(t->scan_cache.col_nulls);
         free(t->scan_cache.col_types);
+    }
+
+    /* free join cache */
+    if (t->join_cache.valid) {
+        for (uint16_t i = 0; i < t->join_cache.ncols; i++) {
+            free(t->join_cache.col_data[i]);
+            free(t->join_cache.col_nulls[i]);
+        }
+        free(t->join_cache.col_data);
+        free(t->join_cache.col_nulls);
+        free(t->join_cache.col_types);
+        free(t->join_cache.hashes);
+        free(t->join_cache.nexts);
+        free(t->join_cache.buckets);
     }
 }

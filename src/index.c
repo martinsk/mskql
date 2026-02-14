@@ -179,6 +179,19 @@ int index_lookup(struct index *idx, const struct cell *key,
     return 0;
 }
 
+void index_remove(struct index *idx, const struct cell *key, size_t row_id)
+{
+    struct btree_entry *e = node_lookup(idx->root, key);
+    if (!e) return;
+    for (size_t i = 0; i < e->row_ids.count; i++) {
+        if (e->row_ids.items[i] == row_id) {
+            e->row_ids.items[i] = e->row_ids.items[e->row_ids.count - 1];
+            e->row_ids.count--;
+            return;
+        }
+    }
+}
+
 void index_reset(struct index *idx)
 {
     node_free(idx->root);

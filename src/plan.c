@@ -137,6 +137,44 @@ static void scan_cache_build(struct table *t)
     }
 }
 
+/* Patch a single row in the scan cache in-place after an UPDATE.
+ * The caller must ensure row_idx < sc->nrows and the cache is valid. */
+void scan_cache_update_row(struct table *t, size_t row_idx)
+{
+    struct scan_cache *sc = &t->scan_cache;
+    if (!sc->col_data || row_idx >= sc->nrows) return;
+
+    for (uint16_t c = 0; c < sc->ncols; c++) {
+        struct cell *cell = &t->rows.items[row_idx].cells.items[c];
+        enum column_type ct = sc->col_types[c];
+
+        if (cell->is_null || cell->type != ct) {
+            sc->col_nulls[c][row_idx] = 1;
+            continue;
+        }
+        sc->col_nulls[c][row_idx] = 0;
+
+        if (ct == COLUMN_TYPE_SMALLINT) {
+            ((int16_t *)sc->col_data[c])[row_idx] = cell->value.as_smallint;
+        } else if (ct == COLUMN_TYPE_INT) {
+            ((int32_t *)sc->col_data[c])[row_idx] = cell->value.as_int;
+        } else if (ct == COLUMN_TYPE_BIGINT) {
+            ((int64_t *)sc->col_data[c])[row_idx] = cell->value.as_bigint;
+        } else if (ct == COLUMN_TYPE_FLOAT) {
+            ((double *)sc->col_data[c])[row_idx] = cell->value.as_float;
+        } else if (ct == COLUMN_TYPE_NUMERIC) {
+            ((double *)sc->col_data[c])[row_idx] = cell->value.as_numeric;
+        } else if (ct == COLUMN_TYPE_BOOLEAN) {
+            ((int32_t *)sc->col_data[c])[row_idx] = cell->value.as_bool;
+        } else {
+            /* text types — store pointer (valid as long as table row exists) */
+            ((char **)sc->col_data[c])[row_idx] = cell->value.as_text;
+        }
+    }
+    /* Keep cache generation in sync with table */
+    sc->generation = t->generation;
+}
+
 /* Copy a slice of the scan cache into a row_block.
  * col_map[i] = which table column to read for output column i.
  * Returns number of rows copied. */
@@ -1074,13 +1112,151 @@ static int limit_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
 /* ---- Hash join ---- */
 
+/* Helper: element size for a column type in the join cache */
+static size_t jc_elem_size(enum column_type ct)
+{
+    if (ct == COLUMN_TYPE_SMALLINT) return sizeof(int16_t);
+    if (ct == COLUMN_TYPE_BIGINT)   return sizeof(int64_t);
+    if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) return sizeof(double);
+    if (column_type_is_text(ct))    return sizeof(char *);
+    return sizeof(int32_t); /* INT, BOOLEAN, etc. */
+}
+
+/* Helper: copy data from heap cache array into col_block's fixed union array */
+static void jc_copy_to_colblock(struct col_block *dst, void *src_data,
+                                 uint8_t *src_nulls, enum column_type ct,
+                                 uint32_t nrows)
+{
+    dst->type = ct;
+    dst->count = (uint16_t)(nrows < BLOCK_CAPACITY ? nrows : BLOCK_CAPACITY);
+    size_t esz = jc_elem_size(ct);
+    memcpy(dst->nulls, src_nulls, nrows);
+    /* Copy into the union — the col_block is bump-allocated with enough space
+     * because hash_join_build already uses indices > BLOCK_CAPACITY */
+    if (column_type_is_text(ct))
+        memcpy(dst->data.str, src_data, esz * nrows);
+    else if (ct == COLUMN_TYPE_SMALLINT)
+        memcpy(dst->data.i16, src_data, esz * nrows);
+    else if (ct == COLUMN_TYPE_BIGINT)
+        memcpy(dst->data.i64, src_data, esz * nrows);
+    else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+        memcpy(dst->data.f64, src_data, esz * nrows);
+    else
+        memcpy(dst->data.i32, src_data, esz * nrows);
+}
+
+/* Helper: copy data from col_block's union array to heap cache array */
+static void *jc_copy_from_colblock(const struct col_block *src, uint32_t nrows)
+{
+    size_t esz = jc_elem_size(src->type);
+    void *dst = malloc(esz * nrows);
+    if (!dst) return NULL;
+    if (column_type_is_text(src->type))
+        memcpy(dst, src->data.str, esz * nrows);
+    else if (src->type == COLUMN_TYPE_SMALLINT)
+        memcpy(dst, src->data.i16, esz * nrows);
+    else if (src->type == COLUMN_TYPE_BIGINT)
+        memcpy(dst, src->data.i64, esz * nrows);
+    else if (src->type == COLUMN_TYPE_FLOAT || src->type == COLUMN_TYPE_NUMERIC)
+        memcpy(dst, src->data.f64, esz * nrows);
+    else
+        memcpy(dst, src->data.i32, esz * nrows);
+    return dst;
+}
+
+/* Restore hash join state from a table's join_cache into bump-allocated state */
+static int hash_join_restore_from_cache(struct plan_exec_ctx *ctx,
+                                        struct hash_join_state *st,
+                                        struct join_cache *jc)
+{
+    st->build_ncols = jc->ncols;
+    st->build_count = jc->nrows;
+    st->build_cap = jc->nrows;
+    st->build_cols = (struct col_block *)bump_calloc(&ctx->arena->scratch,
+                                                     jc->ncols, sizeof(struct col_block));
+    for (uint16_t c = 0; c < jc->ncols; c++)
+        jc_copy_to_colblock(&st->build_cols[c], jc->col_data[c], jc->col_nulls[c],
+                            jc->col_types[c], jc->nrows);
+
+    /* Restore hash table */
+    st->ht.nbuckets = jc->nbuckets;
+    st->ht.count = jc->nrows;
+    st->ht.hashes = (uint32_t *)bump_alloc(&ctx->arena->scratch, jc->nrows * sizeof(uint32_t));
+    memcpy(st->ht.hashes, jc->hashes, jc->nrows * sizeof(uint32_t));
+    st->ht.nexts = (uint32_t *)bump_alloc(&ctx->arena->scratch, jc->nrows * sizeof(uint32_t));
+    memcpy(st->ht.nexts, jc->nexts, jc->nrows * sizeof(uint32_t));
+    st->ht.buckets = (uint32_t *)bump_alloc(&ctx->arena->scratch, jc->nbuckets * sizeof(uint32_t));
+    memcpy(st->ht.buckets, jc->buckets, jc->nbuckets * sizeof(uint32_t));
+
+    st->build_done = 1;
+    return 0;
+}
+
+/* Save hash join build state to a table's join_cache (heap-allocated) */
+static void hash_join_save_to_cache(struct hash_join_state *st,
+                                    struct join_cache *jc,
+                                    int key_col, uint64_t generation)
+{
+    /* Free old cache if present */
+    if (jc->valid) {
+        for (uint16_t i = 0; i < jc->ncols; i++) {
+            free(jc->col_data[i]);
+            free(jc->col_nulls[i]);
+        }
+        free(jc->col_data);
+        free(jc->col_nulls);
+        free(jc->col_types);
+        free(jc->hashes);
+        free(jc->nexts);
+        free(jc->buckets);
+    }
+
+    jc->generation = generation;
+    jc->key_col = key_col;
+    jc->ncols = st->build_ncols;
+    jc->nrows = st->build_count;
+    jc->nbuckets = st->ht.nbuckets;
+
+    jc->col_data = (void **)malloc(st->build_ncols * sizeof(void *));
+    jc->col_nulls = (uint8_t **)malloc(st->build_ncols * sizeof(uint8_t *));
+    jc->col_types = (enum column_type *)malloc(st->build_ncols * sizeof(enum column_type));
+
+    for (uint16_t c = 0; c < st->build_ncols; c++) {
+        jc->col_types[c] = st->build_cols[c].type;
+        jc->col_data[c] = jc_copy_from_colblock(&st->build_cols[c], st->build_count);
+        jc->col_nulls[c] = (uint8_t *)malloc(st->build_count);
+        memcpy(jc->col_nulls[c], st->build_cols[c].nulls, st->build_count);
+    }
+
+    jc->hashes = (uint32_t *)malloc(st->build_count * sizeof(uint32_t));
+    memcpy(jc->hashes, st->ht.hashes, st->build_count * sizeof(uint32_t));
+    jc->nexts = (uint32_t *)malloc(st->build_count * sizeof(uint32_t));
+    memcpy(jc->nexts, st->ht.nexts, st->build_count * sizeof(uint32_t));
+    jc->buckets = (uint32_t *)malloc(st->ht.nbuckets * sizeof(uint32_t));
+    memcpy(jc->buckets, st->ht.buckets, st->ht.nbuckets * sizeof(uint32_t));
+
+    jc->valid = 1;
+}
+
 static void hash_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
 {
     struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
     struct hash_join_state *st = (struct hash_join_state *)ctx->node_states[node_idx];
+    int key_col = pn->hash_join.inner_key_col;
 
-    /* Determine inner (right child) column count */
+    /* Check join cache on inner table */
     struct plan_node *inner = &PLAN_NODE(ctx->arena, pn->right);
+    struct table *inner_t = NULL;
+    if (inner->op == PLAN_SEQ_SCAN) inner_t = inner->seq_scan.table;
+
+    if (inner_t && inner_t->join_cache.valid &&
+        inner_t->join_cache.generation == inner_t->generation &&
+        inner_t->join_cache.key_col == key_col) {
+        hash_join_restore_from_cache(ctx, st, &inner_t->join_cache);
+        return;
+    }
+
+    /* Determine inner column count */
     uint16_t inner_ncols = 0;
     if (inner->op == PLAN_SEQ_SCAN) inner_ncols = inner->seq_scan.ncols;
     else inner_ncols = 16; /* fallback estimate */
@@ -1129,7 +1305,6 @@ static void hash_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
     }
 
     /* Build hash table on the join key column */
-    int key_col = pn->hash_join.inner_key_col;
     block_ht_init(&st->ht, st->build_count > 0 ? st->build_count : 1,
                   &ctx->arena->scratch);
 
@@ -1144,6 +1319,10 @@ static void hash_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
     }
 
     st->build_done = 1;
+
+    /* Save to join cache on inner table */
+    if (inner_t && st->build_count > 0)
+        hash_join_save_to_cache(st, &inner_t->join_cache, key_col, inner_t->generation);
 }
 
 static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -1281,10 +1460,14 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
                 while (entry != IDX_NONE && entry != 0xFFFFFFFF) {
                     if (st->ht.hashes[entry] == h) {
-                        /* Check key equality */
+                        /* Check key equality (GROUP BY: NULL == NULL) */
                         int eq = 1;
                         for (uint16_t g = 0; g < ngrp; g++) {
                             int gc = pn->hash_agg.group_cols[g];
+                            int a_null = input.cols[gc].nulls[ri];
+                            int b_null = st->group_keys[g].nulls[(uint16_t)entry];
+                            if (a_null && b_null) continue; /* NULL == NULL for grouping */
+                            if (a_null || b_null) { eq = 0; break; }
                             if (!block_cell_eq(&input.cols[gc], ri,
                                                &st->group_keys[g], (uint16_t)entry)) {
                                 eq = 0;
@@ -1383,12 +1566,19 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     break;
                 case AGG_SUM:
                     if (st->nonnull[idx] == 0) {
-                        dst->type = COLUMN_TYPE_INT;
+                        dst->type = COLUMN_TYPE_BIGINT;
                         dst->nulls[out_count] = 1;
                     } else {
-                        dst->type = COLUMN_TYPE_INT;
-                        dst->nulls[out_count] = 0;
-                        dst->data.i32[out_count] = (int32_t)st->sums[idx];
+                        double sv = st->sums[idx];
+                        if (sv == (double)(int32_t)sv && sv >= -2147483648.0 && sv <= 2147483647.0) {
+                            dst->type = COLUMN_TYPE_INT;
+                            dst->nulls[out_count] = 0;
+                            dst->data.i32[out_count] = (int32_t)sv;
+                        } else {
+                            dst->type = COLUMN_TYPE_BIGINT;
+                            dst->nulls[out_count] = 0;
+                            dst->data.i64[out_count] = (int64_t)sv;
+                        }
                     }
                     break;
                 case AGG_AVG:
@@ -4101,6 +4291,82 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
 
         query_free(&rhs_q);
         return current;
+    }
+
+    /* ---- Single-table GROUP BY + aggregates fast path ---- */
+    if (s->has_group_by && s->aggregates_count > 0 && t && !s->has_join &&
+        !s->has_set_op && s->ctes_count == 0 && s->cte_sql == IDX_NONE &&
+        s->from_subquery_sql == IDX_NONE && !s->has_recursive_cte &&
+        s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
+        !s->has_distinct && !s->has_distinct_on &&
+        !s->group_by_rollup && !s->group_by_cube &&
+        !s->has_having && !s->has_order_by) {
+
+        /* Validate: all aggregates must be simple SUM/COUNT/AVG/MIN/MAX on column refs */
+        int agg_ok = 1;
+        for (uint32_t a = 0; a < s->aggregates_count; a++) {
+            struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+            if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
+                { agg_ok = 0; break; }
+            if (ae->expr_idx != IDX_NONE) { agg_ok = 0; break; }
+            if (ae->has_distinct) { agg_ok = 0; break; }
+            if (!sv_eq_cstr(ae->column, "*")) {
+                int ci = table_find_column_sv(t, ae->column);
+                if (ci < 0) { agg_ok = 0; break; }
+            }
+        }
+
+        /* Validate: GROUP BY columns are resolvable */
+        int *grp_col_idxs = NULL;
+        if (agg_ok && s->group_by_count > 0) {
+            grp_col_idxs = (int *)bump_alloc(&arena->scratch, s->group_by_count * sizeof(int));
+            for (uint32_t g = 0; g < s->group_by_count; g++) {
+                sv gcol = arena->svs.items[s->group_by_start + g];
+                grp_col_idxs[g] = table_find_column_sv(t, gcol);
+                if (grp_col_idxs[g] < 0) { agg_ok = 0; break; }
+            }
+        }
+
+        if (agg_ok) {
+            /* Build: SEQ_SCAN → HASH_AGG */
+            uint16_t scan_ncols = (uint16_t)t->columns.count;
+            int *scan_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
+            for (uint16_t i = 0; i < scan_ncols; i++) scan_map[i] = (int)i;
+
+            uint32_t scan_idx = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+            PLAN_NODE(arena, scan_idx).seq_scan.table = t;
+            PLAN_NODE(arena, scan_idx).seq_scan.ncols = scan_ncols;
+            PLAN_NODE(arena, scan_idx).seq_scan.col_map = scan_map;
+
+            uint32_t agg_idx = plan_alloc_node(arena, PLAN_HASH_AGG);
+            PLAN_NODE(arena, agg_idx).left = scan_idx;
+            PLAN_NODE(arena, agg_idx).hash_agg.ngroup_cols = (uint16_t)s->group_by_count;
+            PLAN_NODE(arena, agg_idx).hash_agg.group_cols = grp_col_idxs;
+            PLAN_NODE(arena, agg_idx).hash_agg.agg_start = s->aggregates_start;
+            PLAN_NODE(arena, agg_idx).hash_agg.agg_count = s->aggregates_count;
+            PLAN_NODE(arena, agg_idx).hash_agg.agg_before_cols = s->agg_before_cols;
+
+            uint32_t current = agg_idx;
+
+            /* Add ORDER BY if present */
+            if (s->has_order_by && s->order_by_count > 0) {
+                /* For now, bail to legacy if ORDER BY is present on aggregates */
+                /* (would need to map ORDER BY columns to agg output columns) */
+            }
+
+            /* Add LIMIT/OFFSET if present */
+            if (s->has_limit || s->has_offset) {
+                uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
+                PLAN_NODE(arena, limit_idx).left = current;
+                PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
+                PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
+                PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
+                PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
+                current = limit_idx;
+            }
+
+            return current;
+        }
     }
 
     /* ---- Single-table path (original) ---- */

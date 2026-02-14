@@ -4900,8 +4900,52 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
     int has_ret = (u->has_returning && u->returning_columns.len > 0);
     int return_all = has_ret && sv_eq_cstr(u->returning_columns, "*");
     size_t updated = 0;
-    for (size_t i = 0; i < t->rows.count; i++) {
-        if (!row_matches(t, &u->where, arena, &t->rows.items[i], db))
+
+    /* ---- Try index-accelerated WHERE lookup ---- */
+    size_t *idx_row_ids = NULL;
+    size_t idx_row_count = 0;
+    int use_index_scan = 0;
+
+    if (u->where.has_where) {
+        sv where_col = {0};
+        struct cell where_val = {0};
+        int have_simple_eq = 0;
+
+        if (u->where.where_cond == IDX_NONE && u->where.where_column.len > 0) {
+            where_col = u->where.where_column;
+            where_val = u->where.where_value;
+            have_simple_eq = 1;
+        } else if (u->where.where_cond != IDX_NONE) {
+            struct condition *cond = &arena->conditions.items[u->where.where_cond];
+            if (cond->type == COND_COMPARE && cond->op == CMP_EQ &&
+                cond->column.len > 0 && cond->lhs_expr == IDX_NONE &&
+                cond->rhs_column.len == 0 && cond->scalar_subquery_sql == IDX_NONE) {
+                where_col = cond->column;
+                where_val = cond->value;
+                have_simple_eq = 1;
+            }
+        }
+
+        if (have_simple_eq) {
+            int wcol = table_find_column_sv(t, where_col);
+            if (wcol >= 0) {
+                for (size_t ix = 0; ix < t->indexes.count; ix++) {
+                    if (t->indexes.items[ix].column_idx == wcol) {
+                        index_lookup(&t->indexes.items[ix], &where_val,
+                                     &idx_row_ids, &idx_row_count);
+                        use_index_scan = 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    size_t scan_count = use_index_scan ? idx_row_count : t->rows.count;
+    for (size_t si = 0; si < scan_count; si++) {
+        size_t i = use_index_scan ? idx_row_ids[si] : si;
+        if (i >= t->rows.count) continue;
+        if (!use_index_scan && !row_matches(t, &u->where, arena, &t->rows.items[i], db))
             continue;
         updated++;
         /* evaluate all SET expressions against the pre-update row snapshot
@@ -4948,6 +4992,19 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                 return -1;
             }
         }
+        /* incremental index update: remove old keys, insert new keys */
+        for (size_t ix = 0; ix < t->indexes.count; ix++) {
+            struct index *idx = &t->indexes.items[ix];
+            int ic = idx->column_idx;
+            /* check if this indexed column is being updated */
+            for (uint32_t sc = 0; sc < nsc; sc++) {
+                if (col_idxs[sc] == ic) {
+                    index_remove(idx, &t->rows.items[i].cells.items[ic], i);
+                    index_insert(idx, &new_vals[sc], i);
+                    break;
+                }
+            }
+        }
         /* now apply all new values */
         for (size_t sc = 0; sc < nsc; sc++) {
             if (col_idxs[sc] < 0) continue;
@@ -4963,11 +5020,18 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
         if (has_ret && result)
             emit_returning_row(t, &t->rows.items[i], u->returning_columns, return_all, result, rb);
     }
-    /* rebuild indexes after cell mutation */
+    /* bump generation (no full index rebuild needed — indexes updated incrementally) */
     if (updated > 0) {
         t->generation++;
-        if (t->indexes.count > 0)
-            rebuild_indexes(t);
+        /* patch scan cache in-place for each updated row (avoids full rebuild) */
+        if (t->scan_cache.col_data && t->scan_cache.nrows == t->rows.count) {
+            size_t scan2_count = use_index_scan ? idx_row_count : t->rows.count;
+            for (size_t si2 = 0; si2 < scan2_count; si2++) {
+                size_t ri = use_index_scan ? idx_row_ids[si2] : si2;
+                if (ri < t->rows.count)
+                    scan_cache_update_row(t, ri);
+            }
+        }
     }
 
     if (!has_ret && result) {

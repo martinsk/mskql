@@ -24,7 +24,7 @@
 #include <math.h>
 
 #define SERVER_HOST "127.0.0.1"
-#define SERVER_PORT 5433
+static int SERVER_PORT = 15401;
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -539,6 +539,9 @@ static void start_server(void)
 {
     g_server_pid = fork();
     if (g_server_pid == 0) {
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%d", SERVER_PORT);
+        setenv("MSKQL_PORT", port_str, 1);
         execl("./build/mskql", "mskql", NULL);
         perror("execl");
         _exit(1);
@@ -1163,6 +1166,9 @@ static void test_flush(void)
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
+
+    const char *port_env = getenv("MSKQL_TEST_PORT");
+    if (port_env) SERVER_PORT = atoi(port_env);
 
     printf("mskql extended query protocol tests\n");
     printf("============================================================\n");

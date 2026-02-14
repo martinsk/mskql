@@ -35,6 +35,7 @@ void index_init_sv(struct index *idx, sv name, sv col_name, int col_idx);
 void index_insert(struct index *idx, const struct cell *key, size_t row_id);
 int  index_lookup(struct index *idx, const struct cell *key,
                   size_t **out_ids, size_t *out_count);
+void index_remove(struct index *idx, const struct cell *key, size_t row_id);
 void index_reset(struct index *idx);
 void index_free(struct index *idx);
 

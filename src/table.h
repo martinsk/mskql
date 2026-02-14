@@ -18,6 +18,23 @@ struct scan_cache {
     enum column_type *col_types; /* [ncols] column types */
 };
 
+/* Cached hash join build result for a specific join key column.
+ * Invalidated when table->generation changes. */
+struct join_cache {
+    uint64_t generation;     /* generation when cache was built */
+    int      key_col;        /* inner key column index */
+    uint16_t ncols;          /* number of columns in build_cols */
+    uint32_t nrows;          /* number of rows in build_cols */
+    void   **col_data;       /* [ncols] heap-allocated typed arrays */
+    uint8_t **col_nulls;     /* [ncols] null bitmaps */
+    enum column_type *col_types; /* [ncols] column types */
+    uint32_t *hashes;        /* [nrows] hash values */
+    uint32_t *nexts;         /* [nrows] next pointers */
+    uint32_t *buckets;       /* [nbuckets] bucket heads */
+    uint32_t  nbuckets;      /* number of hash buckets */
+    int       valid;
+};
+
 struct table {
     // TODO: STRINGVIEW OPPORTUNITY: name is strdup'd from sv-originated strings in most
     // paths (db_exec CREATE TABLE). Could be sv if the schema had a persistent backing store.
@@ -28,6 +45,7 @@ struct table {
     DYNAMIC_ARRAY(struct index) indexes;
     uint64_t generation;  /* bumped on every INSERT/UPDATE/DELETE for scan cache invalidation */
     struct scan_cache scan_cache; /* cached columnar representation */
+    struct join_cache join_cache; /* cached hash join build for inner table */
 };
 
 void table_init(struct table *t, const char *name);

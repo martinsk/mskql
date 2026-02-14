@@ -922,14 +922,72 @@ static int send_row_desc_plan(int fd, struct table *t, struct table *t2,
     return rc;
 }
 
+/* ---- Result cache: replay cached wire bytes for identical SELECT queries ---- */
+
+#define RCACHE_SLOTS 256
+#define RCACHE_MAX_BYTES (512 * 1024) /* max cached wire data per entry */
+
+struct rcache_entry {
+    uint32_t sql_hash;
+    uint64_t generation;       /* sum of all table generations at cache time */
+    uint8_t *wire_data;        /* RowDescription + DataRows (heap-allocated) */
+    size_t   wire_len;
+    int      row_count;
+    int      valid;
+};
+
+static struct rcache_entry g_rcache[RCACHE_SLOTS];
+
+static uint32_t rcache_hash_sql(const char *sql, size_t len)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint8_t)sql[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static uint64_t rcache_db_generation(struct database *db)
+{
+    uint64_t g = 0;
+    for (size_t i = 0; i < db->tables.count; i++)
+        g += db->tables.items[i].generation;
+    return g;
+}
+
+static void rcache_invalidate_all(void)
+{
+    for (int i = 0; i < RCACHE_SLOTS; i++) {
+        if (g_rcache[i].valid) {
+            free(g_rcache[i].wire_data);
+            g_rcache[i].wire_data = NULL;
+            g_rcache[i].valid = 0;
+        }
+    }
+}
+
 /* Try to execute a SELECT via the plan executor and send results directly
  * from columnar blocks to the wire, bypassing block_to_rows entirely.
- * Returns row count on success, -1 if the query can't use this path. */
+ * Returns row count on success, -1 if the query can't use this path.
+ * sql/sql_len are the original SQL string for result caching. */
 static int try_plan_send(int fd, struct database *db, struct query *q,
-                         struct query_arena *conn_arena)
+                         struct query_arena *conn_arena,
+                         const char *sql, size_t sql_len)
 {
     (void)conn_arena;
     if (q->query_type != QUERY_TYPE_SELECT) return -1;
+
+    /* ---- Result cache lookup ---- */
+    uint32_t rc_hash = rcache_hash_sql(sql, sql_len);
+    uint32_t rc_slot = rc_hash & (RCACHE_SLOTS - 1);
+    uint64_t rc_gen = rcache_db_generation(db);
+    struct rcache_entry *rce = &g_rcache[rc_slot];
+    if (rce->valid && rce->sql_hash == rc_hash && rce->generation == rc_gen) {
+        /* Cache hit — replay wire bytes */
+        if (send_all(fd, rce->wire_data, rce->wire_len) == 0)
+            return rce->row_count;
+    }
 
     struct query_select *s = &q->select;
 
@@ -1047,7 +1105,72 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     for (uint16_t i = 0; i < ncols && i < 64; i++)
         col_types[i] = block.cols[i].type;
 
-    if (send_row_desc_plan(fd, t, t2, q, ncols, col_types) != 0) {
+    /* Build RowDescription into a separate buffer so we can cache it */
+    struct msgbuf rd_buf;
+    msgbuf_init(&rd_buf);
+    {
+        msgbuf_push_u16(&rd_buf, ncols);
+        int select_all_rd = sv_eq_cstr(q->select.columns, "*");
+        uint16_t t1_ncols_rd = t ? (uint16_t)t->columns.count : 0;
+        for (uint16_t i = 0; i < ncols; i++) {
+            const char *colname = "?";
+            uint32_t type_oid = column_type_to_oid(col_types[i]);
+            if (q->select.select_exprs_count > 0 && (size_t)i < q->select.select_exprs_count) {
+                struct select_expr *se = &q->arena.select_exprs.items[q->select.select_exprs_start + i];
+                if (se->alias.len > 0) {
+                    static __thread char se_alias_buf2[256];
+                    size_t alen = se->alias.len < 255 ? se->alias.len : 255;
+                    memcpy(se_alias_buf2, se->alias.data, alen);
+                    se_alias_buf2[alen] = '\0';
+                    colname = se_alias_buf2;
+                } else if (se->kind == SEL_COLUMN && se->column.len > 0) {
+                    sv col = se->column;
+                    for (size_t kk = 0; kk < col.len; kk++)
+                        if (col.data[kk] == '.') { col = sv_from(col.data+kk+1, col.len-kk-1); break; }
+                    static __thread char se_col_buf2[256];
+                    size_t clen = col.len < 255 ? col.len : 255;
+                    memcpy(se_col_buf2, col.data, clen);
+                    se_col_buf2[clen] = '\0';
+                    colname = se_col_buf2;
+                }
+            } else if (select_all_rd && !t && q->select.has_generate_series && i == 0) {
+                colname = q->select.gs_col_alias.len > 0 ? "generate_series" : "generate_series";
+            } else if (select_all_rd && t && (size_t)i < t->columns.count) {
+                colname = t->columns.items[i].name;
+            } else if (select_all_rd && t2 && i >= t1_ncols_rd && (size_t)(i - t1_ncols_rd) < t2->columns.count) {
+                colname = t2->columns.items[i - t1_ncols_rd].name;
+            } else if (q->select.parsed_columns_count > 0 && (uint32_t)i < q->select.parsed_columns_count) {
+                struct select_column *sc = &q->arena.select_cols.items[q->select.parsed_columns_start + i];
+                if (sc->alias.len > 0) {
+                    static __thread char alias_buf2[256];
+                    size_t alen = sc->alias.len < 255 ? sc->alias.len : 255;
+                    memcpy(alias_buf2, sc->alias.data, alen);
+                    alias_buf2[alen] = '\0';
+                    colname = alias_buf2;
+                } else if (sc->expr_idx != IDX_NONE) {
+                    struct expr *e = &EXPR(&q->arena, sc->expr_idx);
+                    if (e->type == EXPR_COLUMN_REF) {
+                        int ci = t ? table_find_column_sv(t, e->column_ref.column) : -1;
+                        if (ci >= 0) colname = t->columns.items[ci].name;
+                        else if (t2) { ci = table_find_column_sv(t2, e->column_ref.column); if (ci >= 0) colname = t2->columns.items[ci].name; }
+                    }
+                }
+            } else if (t && (size_t)i < t->columns.count) {
+                colname = t->columns.items[i].name;
+            }
+            msgbuf_push_cstr(&rd_buf, colname);
+            msgbuf_push_u32(&rd_buf, 0);
+            msgbuf_push_u16(&rd_buf, 0);
+            msgbuf_push_u32(&rd_buf, type_oid);
+            msgbuf_push_u16(&rd_buf, (uint16_t)-1);
+            msgbuf_push_u32(&rd_buf, (uint32_t)-1);
+            msgbuf_push_u16(&rd_buf, 0);
+        }
+    }
+
+    /* Send RowDescription */
+    if (msg_send(fd, 'T', &rd_buf) != 0) {
+        msgbuf_free(&rd_buf);
         for (size_t ci = n_cte_temps; ci > 0; ci--)
             remove_temp_table(db, cte_temps[ci - 1]);
         return -1;
@@ -1059,6 +1182,20 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     /* Pre-allocate ~64KB to reduce reallocs */
     msgbuf_ensure(&wire, 65536);
 
+    /* Also accumulate all wire bytes for result cache */
+    struct msgbuf cache_buf;
+    msgbuf_init(&cache_buf);
+    /* Copy RowDescription message into cache_buf: type('T') + len(4) + body */
+    {
+        uint8_t hdr[5];
+        hdr[0] = 'T';
+        uint32_t rd_body_len = (uint32_t)(rd_buf.len + 4);
+        put_u32(hdr + 1, rd_body_len);
+        msgbuf_push(&cache_buf, hdr, 5);
+        msgbuf_push(&cache_buf, rd_buf.data, rd_buf.len);
+    }
+    msgbuf_free(&rd_buf);
+
     size_t total_rows = 0;
 
     /* Process first block + subsequent blocks */
@@ -1068,7 +1205,6 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
             uint16_t ri = row_block_row_idx(&block, r);
 
             /* Build one DataRow message: type('D') + len(4) + body */
-            /* We accumulate the body in a temp area, then prepend header */
             size_t msg_start = wire.len;
 
             /* Reserve space for header: 1 byte type + 4 bytes length */
@@ -1084,8 +1220,12 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
 
             /* Fill in header */
             wire.data[msg_start] = 'D';
-            uint32_t body_len = (uint32_t)(wire.len - msg_start - 1); /* exclude type byte */
+            uint32_t body_len = (uint32_t)(wire.len - msg_start - 1);
             put_u32(wire.data + msg_start + 1, body_len);
+
+            /* Append to cache buffer */
+            if (cache_buf.len < RCACHE_MAX_BYTES)
+                msgbuf_push(&cache_buf, wire.data + msg_start, wire.len - msg_start);
 
             total_rows++;
         }
@@ -1094,6 +1234,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         if (wire.len >= 65536) {
             if (send_all(fd, wire.data, wire.len) != 0) {
                 msgbuf_free(&wire);
+                msgbuf_free(&cache_buf);
                 for (size_t ci = n_cte_temps; ci > 0; ci--)
                     remove_temp_table(db, cte_temps[ci - 1]);
                 return -1;
@@ -1111,12 +1252,28 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     if (wire.len > 0) {
         if (send_all(fd, wire.data, wire.len) != 0) {
             msgbuf_free(&wire);
+            msgbuf_free(&cache_buf);
             for (size_t ci = n_cte_temps; ci > 0; ci--)
                 remove_temp_table(db, cte_temps[ci - 1]);
             return -1;
         }
     }
     msgbuf_free(&wire);
+
+    /* Store in result cache if small enough */
+    if (cache_buf.len > 0 && cache_buf.len <= RCACHE_MAX_BYTES && n_cte_temps == 0) {
+        if (rce->valid) free(rce->wire_data);
+        rce->wire_data = (uint8_t *)malloc(cache_buf.len);
+        if (rce->wire_data) {
+            memcpy(rce->wire_data, cache_buf.data, cache_buf.len);
+            rce->wire_len = cache_buf.len;
+            rce->sql_hash = rc_hash;
+            rce->generation = rc_gen;
+            rce->row_count = (int)total_rows;
+            rce->valid = 1;
+        }
+    }
+    msgbuf_free(&cache_buf);
 
     /* Clean up CTE temp tables */
     for (size_t ci = n_cte_temps; ci > 0; ci--)
@@ -1420,7 +1577,7 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
 
     /* Fast path: try direct columnar→wire send for SELECT queries */
     if (q.query_type == QUERY_TYPE_SELECT && !skip_row_desc) {
-        int plan_rows = try_plan_send(fd, db, &q, conn_arena);
+        int plan_rows = try_plan_send(fd, db, &q, conn_arena, sql, sql_len);
         if (plan_rows >= 0) {
             /* Copy arena state back — plan execution may have grown
              * bump slabs and DA backing arrays in q.arena that
@@ -1532,6 +1689,10 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
         /* Return 1 to signal copy-in mode; caller sets up copy state */
         return 1;
     }
+
+    /* Invalidate result cache for write queries */
+    if (q.query_type != QUERY_TYPE_SELECT && q.query_type != QUERY_TYPE_EXPLAIN)
+        rcache_invalidate_all();
 
     struct rows *result = &conn_arena->result;
     result->arena_owns_text = 1;
@@ -2608,37 +2769,40 @@ int pgwire_run(struct pgwire_server *srv)
             }
         }
 
-        /* process each client */
+        /* Phase 1: read all ready clients (batch I/O before execution) */
         for (int i = 0; i < nclients; i++) {
             if (!(fds[2 + i].revents & (POLLIN | POLLHUP | POLLERR)))
                 continue;
 
-            /* read available data */
             client_recv_ensure(&clients[i], 4096);
             ssize_t n = read(clients[i].fd,
                              clients[i].recv_buf + clients[i].recv_len,
                              clients[i].recv_cap - clients[i].recv_len);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                    continue; /* no data yet, not an error */
-                /* real error — disconnect */
+                    continue;
                 client_disconnect(&clients[i], srv->db);
                 clients[i] = clients[nclients - 1];
+                fds[2 + i].revents = fds[2 + nclients - 1].revents;
                 nclients--;
                 i--;
                 continue;
             }
             if (n == 0) {
-                /* EOF — client disconnected */
                 client_disconnect(&clients[i], srv->db);
                 clients[i] = clients[nclients - 1];
+                fds[2 + i].revents = fds[2 + nclients - 1].revents;
                 nclients--;
                 i--;
                 continue;
             }
             clients[i].recv_len += (size_t)n;
+        }
 
-            /* process buffered data based on phase */
+        /* Phase 2: process all clients' buffered messages */
+        for (int i = 0; i < nclients; i++) {
+            if (clients[i].recv_len == 0) continue;
+
             int rc;
             switch (clients[i].phase) {
                 case PHASE_STARTUP:

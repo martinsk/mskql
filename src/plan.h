@@ -278,6 +278,9 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx);
 /* Generate EXPLAIN text for a plan tree. Writes into buf, returns bytes written. */
 int plan_explain(struct query_arena *arena, uint32_t node_idx, char *buf, int buflen);
 
+/* Patch a single row in the scan cache after UPDATE (avoids full rebuild). */
+void scan_cache_update_row(struct table *t, size_t row_idx);
+
 /* ---- Block utility functions ---- */
 
 /* Initialize a row_block with ncols columns, bump-allocated from scratch. */
