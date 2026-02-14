@@ -151,29 +151,41 @@ static struct cell cell_deep_copy(const struct cell *src);
 static struct cell cell_deep_copy_rb(const struct cell *src, struct bump_alloc *rb);
 static int cell_is_null(const struct cell *c);
 
-/* SQL LIKE pattern matching: % = any sequence, _ = any single char */
+/* SQL LIKE pattern matching: % = any sequence, _ = any single char.
+ * Iterative algorithm: tracks a single backtrack point for the last '%'
+ * seen, giving O(n*m) worst case instead of exponential. */
 static int like_match(const char *pattern, const char *text, int case_insensitive)
 {
-    while (*pattern) {
+    const char *star_p = NULL; /* pattern position after last '%' */
+    const char *star_t = NULL; /* text position at last '%' match */
+    while (*text) {
         if (*pattern == '%') {
             pattern++;
-            if (*pattern == '\0') return 1;
-            while (*text) {
-                if (like_match(pattern, text, case_insensitive)) return 1;
-                text++;
-            }
-            return 0;
-        } else if (*pattern == '_') {
-            if (*text == '\0') return 0;
-            pattern++; text++;
-        } else {
-            char pc = *pattern, tc = *text;
-            if (case_insensitive) { pc = tolower((unsigned char)pc); tc = tolower((unsigned char)tc); }
-            if (pc != tc) return 0;
-            pattern++; text++;
+            star_p = pattern;
+            star_t = text;
+            continue;
         }
+        if (*pattern == '_') {
+            pattern++; text++;
+            continue;
+        }
+        char pc = *pattern, tc = *text;
+        if (case_insensitive) { pc = tolower((unsigned char)pc); tc = tolower((unsigned char)tc); }
+        if (pc == tc) {
+            pattern++; text++;
+            continue;
+        }
+        /* mismatch — backtrack to last '%' if possible */
+        if (star_p) {
+            pattern = star_p;
+            text = ++star_t;
+            continue;
+        }
+        return 0;
     }
-    return *text == '\0';
+    /* consume trailing '%' wildcards */
+    while (*pattern == '%') pattern++;
+    return *pattern == '\0';
 }
 
 /* condition_free, query_free, and all query_*_free functions live in parser.c

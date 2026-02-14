@@ -315,6 +315,7 @@ struct client_state {
     size_t copy_in_row_count;
     char copy_in_linebuf[8192];
     size_t copy_in_linelen;
+    int copy_in_line_overflow;  /* 1 = current line exceeded buffer */
 };
 
 static void prepared_stmt_free(struct prepared_stmt *ps)
@@ -397,7 +398,9 @@ static char *substitute_params(const char *sql, const char **param_values,
                 size_t span = (size_t)(p - start);
                 if (pos + span + 1 > est) {
                     est = (pos + span + 1) * 2;
-                    out = realloc(out, est);
+                    char *tmp = realloc(out, est);
+                    if (!tmp) { free(out); return NULL; }
+                    out = tmp;
                 }
                 memcpy(out + pos, start, span);
                 pos += span;
@@ -406,19 +409,20 @@ static char *substitute_params(const char *sql, const char **param_values,
             int idx = num - 1;
             if (!param_values[idx]) {
                 /* NULL parameter */
-                if (pos + 5 > est) { est = (pos + 5) * 2; out = realloc(out, est); }
+                if (pos + 5 > est) { est = (pos + 5) * 2; char *tmp = realloc(out, est); if (!tmp) { free(out); return NULL; } out = tmp; }
                 memcpy(out + pos, "NULL", 4);
                 pos += 4;
             } else if (param_formats && param_formats[idx] == 1) {
-                /* binary format — treat as integer for common cases */
-                /* For now, just insert as text (most drivers use text format) */
+                /* binary format — quote as text with escaping */
                 const char *val = param_values[idx];
                 size_t vlen = param_lengths ? (size_t)param_lengths[idx] : strlen(val);
-                size_t need = vlen + 3;
-                if (pos + need > est) { est = (pos + need) * 2; out = realloc(out, est); }
+                size_t need = vlen * 2 + 3;
+                if (pos + need > est) { est = (pos + need) * 2; char *tmp = realloc(out, est); if (!tmp) { free(out); return NULL; } out = tmp; }
                 out[pos++] = '\'';
-                memcpy(out + pos, val, vlen);
-                pos += vlen;
+                for (size_t k = 0; k < vlen; k++) {
+                    if (val[k] == '\'') out[pos++] = '\'';
+                    out[pos++] = val[k];
+                }
                 out[pos++] = '\'';
             } else {
                 /* text format — quote the value */
@@ -428,31 +432,34 @@ static char *substitute_params(const char *sql, const char **param_values,
                 /* check if value looks numeric (no quoting needed) */
                 int is_numeric = (vlen > 0);
                 int has_dot = 0;
+                int has_digit = 0;
                 for (size_t k = 0; k < vlen && is_numeric; k++) {
                     char ch = val[k];
                     if (ch == '-' && k == 0) continue;
                     if (ch == '.' && !has_dot) { has_dot = 1; continue; }
-                    if (ch < '0' || ch > '9') is_numeric = 0;
+                    if (ch >= '0' && ch <= '9') { has_digit = 1; continue; }
+                    is_numeric = 0;
                 }
+                if (!has_digit) is_numeric = 0;
                 /* also treat 't'/'f' as boolean literals */
                 int is_bool = (vlen == 1 && (val[0] == 't' || val[0] == 'f'));
 
                 if (is_numeric && vlen > 0 && !(vlen == 1 && val[0] == '-')) {
                     /* numeric — insert without quotes */
-                    if (pos + vlen + 1 > est) { est = (pos + vlen + 1) * 2; out = realloc(out, est); }
+                    if (pos + vlen + 1 > est) { est = (pos + vlen + 1) * 2; char *tmp = realloc(out, est); if (!tmp) { free(out); return NULL; } out = tmp; }
                     memcpy(out + pos, val, vlen);
                     pos += vlen;
                 } else if (is_bool) {
                     /* boolean — insert as TRUE/FALSE */
                     const char *bval = (val[0] == 't') ? "TRUE" : "FALSE";
                     size_t blen = (val[0] == 't') ? 4 : 5;
-                    if (pos + blen + 1 > est) { est = (pos + blen + 1) * 2; out = realloc(out, est); }
+                    if (pos + blen + 1 > est) { est = (pos + blen + 1) * 2; char *tmp = realloc(out, est); if (!tmp) { free(out); return NULL; } out = tmp; }
                     memcpy(out + pos, bval, blen);
                     pos += blen;
                 } else {
                     /* text — single-quote with escaping */
                     size_t need = vlen * 2 + 3;
-                    if (pos + need > est) { est = (pos + need) * 2; out = realloc(out, est); }
+                    if (pos + need > est) { est = (pos + need) * 2; char *tmp = realloc(out, est); if (!tmp) { free(out); return NULL; } out = tmp; }
                     out[pos++] = '\'';
                     for (size_t k = 0; k < vlen; k++) {
                         if (val[k] == '\'') out[pos++] = '\'';
@@ -462,7 +469,7 @@ static char *substitute_params(const char *sql, const char **param_values,
                 }
             }
         } else {
-            if (pos + 2 > est) { est = (pos + 2) * 2; out = realloc(out, est); }
+            if (pos + 2 > est) { est = (pos + 2) * 2; char *tmp = realloc(out, est); if (!tmp) { free(out); return NULL; } out = tmp; }
             out[pos++] = *p++;
         }
     }
@@ -1372,6 +1379,13 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
                               struct msgbuf *m, struct query_arena *conn_arena,
                               int skip_row_desc)
 {
+    /* reject oversized queries */
+    size_t sql_len = strlen(sql);
+    if (sql_len > 1024 * 1024) {
+        send_error(fd, m, "ERROR", "54000", "query exceeds maximum length (1 MB)");
+        return -1;
+    }
+
     /* skip empty / whitespace-only queries */
     const char *p = sql;
     while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
@@ -1699,8 +1713,14 @@ static void copy_in_process_line(struct client_state *c, const char *line, size_
             cell.is_null = 1;
             cell.type = ct->columns.items[ci].type;
         } else {
-            char fstr[8192];
-            if (flen >= sizeof(fstr)) flen = sizeof(fstr) - 1;
+            char fstr_buf[8192];
+            char *fstr = fstr_buf;
+            char *fstr_dyn = NULL;
+            if (flen >= sizeof(fstr_buf)) {
+                fstr_dyn = (char *)malloc(flen + 1);
+                if (!fstr_dyn) return; /* OOM — skip row */
+                fstr = fstr_dyn;
+            }
             memcpy(fstr, field_start, flen);
             fstr[flen] = '\0';
             enum column_type ctype = ct->columns.items[ci].type;
@@ -1719,6 +1739,7 @@ static void copy_in_process_line(struct client_state *c, const char *line, size_
                 cell.type = COLUMN_TYPE_TEXT;
                 cell.value.as_text = strdup(fstr);
             }
+            free(fstr_dyn);
         }
         da_push(&new_row.cells, cell);
     }
@@ -2355,12 +2376,20 @@ static int process_messages(struct client_state *c, struct database *db)
                     const uint8_t *data = c->recv_buf + 5;
                     for (uint32_t di = 0; di < body_len; di++) {
                         if (data[di] == '\n') {
-                            c->copy_in_linebuf[c->copy_in_linelen] = '\0';
-                            copy_in_process_line(c, c->copy_in_linebuf, c->copy_in_linelen);
+                            if (c->copy_in_line_overflow) {
+                                /* skip this overflowed line */
+                                c->copy_in_line_overflow = 0;
+                            } else {
+                                c->copy_in_linebuf[c->copy_in_linelen] = '\0';
+                                copy_in_process_line(c, c->copy_in_linebuf, c->copy_in_linelen);
+                            }
                             c->copy_in_linelen = 0;
-                        } else {
-                            if (c->copy_in_linelen < sizeof(c->copy_in_linebuf) - 1)
+                        } else if (!c->copy_in_line_overflow) {
+                            if (c->copy_in_linelen < sizeof(c->copy_in_linebuf) - 1) {
                                 c->copy_in_linebuf[c->copy_in_linelen++] = (char)data[di];
+                            } else {
+                                c->copy_in_line_overflow = 1;
+                            }
                         }
                     }
                 }

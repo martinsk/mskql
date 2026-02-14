@@ -250,13 +250,23 @@ static struct token lexer_next(struct lexer *l)
         } else {
             /* collapse doubled quotes into single quotes using scratch buffer */
             static __thread char esc_buf[8192];
+            static __thread char *esc_dyn = NULL;
+            /* free any previous dynamic allocation */
+            if (esc_dyn) { free(esc_dyn); esc_dyn = NULL; }
+            size_t raw_len = l->pos - start;
+            char *buf = esc_buf;
+            size_t buf_cap = sizeof(esc_buf);
+            if (raw_len >= buf_cap) {
+                esc_dyn = (char *)malloc(raw_len + 1);
+                if (esc_dyn) { buf = esc_dyn; buf_cap = raw_len + 1; }
+            }
             size_t out = 0;
-            for (size_t i = start; i < l->pos && out < sizeof(esc_buf) - 1; i++) {
-                esc_buf[out++] = l->input[i];
+            for (size_t i = start; i < l->pos && out < buf_cap - 1; i++) {
+                buf[out++] = l->input[i];
                 if (l->input[i] == quote && l->input[i + 1] == quote)
                     i++; /* skip the second quote */
             }
-            tok.value = sv_from(esc_buf, out);
+            tok.value = sv_from(buf, out);
         }
         tok.type = TOK_STRING;
         if (l->input[l->pos] == quote) l->pos++;
@@ -926,7 +936,12 @@ static uint32_t parse_func_call_expr(struct lexer *l, struct query_arena *a,
     if (p.type != TOK_RPAREN) {
         for (;;) {
             uint32_t arg_idx = parse_expr(l, a);
-            if (args_count < 16) arg_indices[args_count] = arg_idx;
+            if (args_count < 16) {
+                arg_indices[args_count] = arg_idx;
+            } else if (args_count == 16) {
+                arena_set_error(a, "54023", "too many function arguments (max 16)");
+                return IDX_NONE;
+            }
             args_count++;
             p = lexer_peek(l);
             /* POSITION(sub IN str): treat IN as argument separator */
@@ -972,9 +987,19 @@ static uint32_t parse_number_literal(struct lexer *l, struct query_arena *a)
         long long v = 0;
         size_t k = 0;
         int neg = 0;
+        int overflow = 0;
         if (tok.value.len > 0 && tok.value.data[0] == '-') { neg = 1; k = 1; }
-        for (; k < tok.value.len; k++)
-            v = v * 10 + (tok.value.data[k] - '0');
+        for (; k < tok.value.len; k++) {
+            int d = tok.value.data[k] - '0';
+            if (v > (9223372036854775807LL - d) / 10) { overflow = 1; break; }
+            v = v * 10 + d;
+        }
+        if (overflow) {
+            /* too large for int64 — store as float */
+            EXPR(a, ei).literal.type = COLUMN_TYPE_FLOAT;
+            EXPR(a, ei).literal.value.as_float = sv_atof(tok.value);
+            return ei;
+        }
         if (neg) v = -v;
         if (v > 2147483647LL || v < -2147483648LL) {
             EXPR(a, ei).literal.type = COLUMN_TYPE_BIGINT;
@@ -2197,7 +2222,8 @@ static void parse_order_limit(struct lexer *l, struct query_arena *a, struct que
         struct token n = lexer_next(l);
         if (n.type == TOK_NUMBER) {
             s->has_limit = 1;
-            s->limit_count = sv_atoi(n.value);
+            int lv = sv_atoi(n.value);
+            s->limit_count = lv < 0 ? 0 : lv;
         }
         peek = lexer_peek(l);
     }
@@ -2208,7 +2234,8 @@ static void parse_order_limit(struct lexer *l, struct query_arena *a, struct que
         struct token n = lexer_next(l);
         if (n.type == TOK_NUMBER) {
             s->has_offset = 1;
-            s->offset_count = sv_atoi(n.value);
+            int ov = sv_atoi(n.value);
+            s->offset_count = ov < 0 ? 0 : ov;
         }
     }
 }
@@ -2315,8 +2342,11 @@ static int parse_win_call(struct lexer *l, struct query_arena *a, sv func_name, 
     } else if (tok.type == TOK_NUMBER) {
         /* NTILE(n) — first arg is a number */
         long long v = 0;
-        for (size_t k = 0; k < tok.value.len; k++)
-            v = v * 10 + (tok.value.data[k] - '0');
+        for (size_t k = 0; k < tok.value.len; k++) {
+            int d = tok.value.data[k] - '0';
+            if (v > (2147483647LL - d) / 10) { v = 2147483647LL; break; }
+            v = v * 10 + d;
+        }
         w->offset = (int)v;
     } else if (tok.type == TOK_RPAREN) {
         /* no args, e.g. ROW_NUMBER() */
@@ -2332,8 +2362,11 @@ static int parse_win_call(struct lexer *l, struct query_arena *a, sv func_name, 
         tok = lexer_next(l); /* second arg (offset number) */
         if (tok.type == TOK_NUMBER) {
             long long v = 0;
-            for (size_t k = 0; k < tok.value.len; k++)
-                v = v * 10 + (tok.value.data[k] - '0');
+            for (size_t k = 0; k < tok.value.len; k++) {
+                int d = tok.value.data[k] - '0';
+                if (v > (2147483647LL - d) / 10) { v = 2147483647LL; break; }
+                v = v * 10 + d;
+            }
             w->offset = (int)v;
         }
         /* skip any further args (e.g. default value — not yet supported) */

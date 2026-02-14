@@ -316,10 +316,18 @@ static int do_single_join(struct table *t1, const char *alias1,
 
     /* CROSS JOIN (type 4): cartesian product, no join columns */
     if (join_type == 4) {
+        size_t max_join_rows = 10000000;
+        size_t emitted = 0;
         for (size_t i = 0; i < t1->rows.count; i++) {
             for (size_t j = 0; j < t2->rows.count; j++) {
+                if (emitted >= max_join_rows) {
+                    arena_set_error(arena, "54000", "join result exceeds maximum row count (10000000)");
+                    build_merged_columns_ex(t1, alias1, t2, alias2, out_meta);
+                    return -1;
+                }
                 emit_merged_row(&t1->rows.items[i], ncols1,
                                 &t2->rows.items[j], ncols2, out_rows, rb);
+                emitted++;
             }
         }
         build_merged_columns_ex(t1, alias1, t2, alias2, out_meta);
@@ -570,10 +578,12 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
              * replaced with literal values from the current outer row */
             const char *outer_prefix = a1 ? a1 : t1->name;
             size_t pfx_len = strlen(outer_prefix);
-            char rewritten[4096];
             const char *src = ASTRING(a, ji->lateral_subquery_sql);
+            size_t rewritten_cap = strlen(src) * 4 + 4096;
+            char *rewritten = (char *)malloc(rewritten_cap);
+            if (!rewritten) continue; /* OOM — skip row */
             size_t wp = 0;
-            while (*src && wp < sizeof(rewritten) - 128) {
+            while (*src && wp < rewritten_cap - 128) {
                 /* check for outer_prefix.col_name */
                 if (strncasecmp(src, outer_prefix, pfx_len) == 0 && src[pfx_len] == '.') {
                     const char *col_start = src + pfx_len + 1;
@@ -592,15 +602,15 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
                     if (ci >= 0 && ci < (int)t1->rows.items[ri].cells.count) {
                         struct cell *cv = &t1->rows.items[ri].cells.items[ci];
                         if (cv->is_null) {
-                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "NULL");
+                            wp += (size_t)snprintf(rewritten + wp, rewritten_cap - wp, "NULL");
                         } else if (cv->type == COLUMN_TYPE_INT) {
-                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "%d", cv->value.as_int);
+                            wp += (size_t)snprintf(rewritten + wp, rewritten_cap - wp, "%d", cv->value.as_int);
                         } else if (cv->type == COLUMN_TYPE_FLOAT) {
-                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "%g", cv->value.as_float);
+                            wp += (size_t)snprintf(rewritten + wp, rewritten_cap - wp, "%g", cv->value.as_float);
                         } else if (column_type_is_text(cv->type) && cv->value.as_text) {
-                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "'%s'", cv->value.as_text);
+                            wp += (size_t)snprintf(rewritten + wp, rewritten_cap - wp, "'%s'", cv->value.as_text);
                         } else {
-                            wp += (size_t)snprintf(rewritten + wp, sizeof(rewritten) - wp, "NULL");
+                            wp += (size_t)snprintf(rewritten + wp, rewritten_cap - wp, "NULL");
                         }
                         src = col_end;
                         continue;
@@ -612,6 +622,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
 
             struct rows lat_rows = {0};
             db_exec_sql(db, rewritten, &lat_rows);
+            free(rewritten);
 
             /* add lateral result columns on first iteration */
             if (!lat_cols_added && lat_rows.count > 0) {
@@ -2435,12 +2446,19 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
 
 int db_exec_sql(struct database *db, const char *sql, struct rows *result)
 {
+    static __thread int subquery_depth = 0;
+    if (subquery_depth >= 32) {
+        fprintf(stderr, "subquery nesting depth exceeded (max 32)\n");
+        return -1;
+    }
     struct query q = {0};
     if (query_parse(sql, &q) != 0) {
         query_free(&q);
         return -1;
     }
+    subquery_depth++;
     int rc = db_exec(db, &q, result, NULL);
+    subquery_depth--;
     query_free(&q);
     return rc;
 }
