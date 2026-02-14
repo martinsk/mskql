@@ -613,7 +613,14 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
                         } else if (cv->type == COLUMN_TYPE_FLOAT) {
                             wp += (size_t)snprintf(rewritten + wp, rewritten_cap - wp, "%g", cv->value.as_float);
                         } else if (column_type_is_text(cv->type) && cv->value.as_text) {
-                            wp += (size_t)snprintf(rewritten + wp, rewritten_cap - wp, "'%s'", cv->value.as_text);
+                            if (wp < rewritten_cap - 1) rewritten[wp++] = '\'';
+                            for (const char *tp = cv->value.as_text; *tp && wp < rewritten_cap - 2; tp++) {
+                                if (*tp == '\'') {
+                                    if (wp < rewritten_cap - 2) rewritten[wp++] = '\'';
+                                }
+                                if (wp < rewritten_cap - 2) rewritten[wp++] = *tp;
+                            }
+                            if (wp < rewritten_cap - 1) rewritten[wp++] = '\'';
                         } else {
                             wp += (size_t)snprintf(rewritten + wp, rewritten_cap - wp, "NULL");
                         }

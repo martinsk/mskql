@@ -236,7 +236,16 @@ static int cell_to_sql_literal(const struct cell *cv, char *buf, size_t bufsize)
     } else if (cv->type == COLUMN_TYPE_BOOLEAN) {
         snprintf(buf, bufsize, "%s", cv->value.as_bool ? "TRUE" : "FALSE");
     } else if (column_type_is_text(cv->type) && cv->value.as_text) {
-        snprintf(buf, bufsize, "'%s'", cv->value.as_text);
+        size_t pos = 0;
+        if (pos < bufsize - 1) buf[pos++] = '\'';
+        for (const char *p = cv->value.as_text; *p && pos < bufsize - 2; p++) {
+            if (*p == '\'') {
+                if (pos < bufsize - 2) buf[pos++] = '\'';
+            }
+            if (pos < bufsize - 2) buf[pos++] = *p;
+        }
+        if (pos < bufsize - 1) buf[pos++] = '\'';
+        buf[pos] = '\0';
     } else {
         return -1;
     }
