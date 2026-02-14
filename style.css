@@ -45,6 +45,9 @@ h1 {
     font-size: 2.6rem;
     line-height: 1.15;
     margin-bottom: 0.4rem;
+    font-variant: small-caps;
+    text-transform: lowercase;
+    letter-spacing: 0.06em;
 }
 
 .subtitle {
