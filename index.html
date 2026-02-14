@@ -179,6 +179,36 @@
             .ai-split { flex-direction: column; }
         }
 
+        /* ── Hero metrics ────────────────────────────────────── */
+        .hero-metrics {
+            display: flex;
+            gap: 2.5rem;
+            margin: 1.4rem 0 0.8rem 0;
+        }
+        .hero-metric {
+            display: flex;
+            flex-direction: column;
+        }
+        .hero-metric .num {
+            font-size: 2.2rem;
+            font-weight: 400;
+            line-height: 1.1;
+            font-variant-numeric: tabular-nums;
+            color: var(--fg);
+        }
+        .hero-metric .label {
+            font-size: 0.85rem;
+            font-variant: small-caps;
+            text-transform: lowercase;
+            letter-spacing: 0.04em;
+            color: var(--fg-dim);
+            margin-top: 0.15rem;
+        }
+        @media (max-width: 700px) {
+            .hero-metrics { gap: 1.5rem; }
+            .hero-metric .num { font-size: 1.6rem; }
+        }
+
         /* ── Benchmark summary ───────────────────────────────── */
         .bench-faster { color: #1a7a1a; font-weight: 600; }
         .bench-slower { color: var(--accent); font-weight: 600; }
@@ -191,16 +221,39 @@
 <!-- ═══════════════════════════════════════════════════════════ -->
 
 <h1>mskql</h1>
-<span class="subtitle">A lightweight, in-memory SQL database engine written in&nbsp;C</span>
+<span class="subtitle">An in-memory SQL engine that outperforms PostgreSQL&mdash;built entirely by&nbsp;AI</span>
+
+<div class="hero-metrics">
+    <div class="hero-metric">
+        <span class="num">9&times;</span>
+        <span class="label">faster aggregates than PostgreSQL</span>
+    </div>
+    <div class="hero-metric">
+        <span class="num">960+</span>
+        <span class="label">tests, every one memory-checked</span>
+    </div>
+    <div class="hero-metric">
+        <span class="num">0</span>
+        <span class="label">external dependencies</span>
+    </div>
+</div>
+
 <p class="byline">
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
     &ensp;&middot;&ensp;
     <a href="tutorials/index.html">Tutorials</a>
-    &ensp;&middot;&ensp; ~24,000 lines of C11 &ensp;&middot;&ensp; 960+ test cases &ensp;&middot;&ensp; zero dependencies
 </p>
 <hr class="title-rule">
+
+<p>
+    <strong>~24K lines of C. Faster than PostgreSQL on all 19
+    batch workloads.</strong> Every test runs under a memory-safety checker.
+    No human wrote any C code or SQL test&mdash;three AI agents built it
+    in iterative rounds. Connect with <code>psql</code> or try it in the browser
+    via a 312KB WebAssembly binary.
+</p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--  Navigation strip                                           -->
@@ -220,13 +273,6 @@
 <a href="grammar.html">Grammar</a>
 <a href="tutorials/index.html">Tutorials</a>
 </nav>
-
-<p>
-    <strong>~24K lines of C. Zero dependencies. Faster than PostgreSQL on all 19
-    batch workloads.</strong> 960+ tests, every one under AddressSanitizer.
-    Built entirely by AI agents&mdash;no human wrote any C code.
-    Runs in the browser via a 312KB WebAssembly binary.
-</p>
 
 <div class="epigraph">
     <blockquote>
