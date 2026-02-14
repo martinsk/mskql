@@ -413,6 +413,8 @@ static double bench_transaction(void)
 {
     struct database db;
     db_init(&db, "bench");
+    struct txn_state txn = {0};
+    db.active_txn = &txn;
     exec(&db, "CREATE TABLE t (id INT, val INT)");
 
     for (int i = 0; i < 1000; i++) {
