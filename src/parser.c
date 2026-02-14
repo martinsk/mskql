@@ -786,8 +786,41 @@ static enum column_type parse_cast_type_name(struct lexer *l)
 {
     struct token tok = lexer_next(l);
     enum column_type ct = parse_column_type(tok.value);
-    /* skip optional (n) or (p,s) after type name */
+    /* Handle multi-word type names:
+     *   TIMESTAMP WITH TIME ZONE / TIMESTAMP WITHOUT TIME ZONE
+     *   TIME WITH TIME ZONE / TIME WITHOUT TIME ZONE
+     *   CHARACTER VARYING
+     *   DOUBLE PRECISION
+     * Note: WITHOUT, ZONE, VARYING, PRECISION may be TOK_IDENTIFIER (not in keyword list) */
     struct token peek = lexer_peek(l);
+    if ((peek.type == TOK_KEYWORD || peek.type == TOK_IDENTIFIER) &&
+        (ct == COLUMN_TYPE_TIMESTAMP || ct == COLUMN_TYPE_TIME)) {
+        if (sv_eq_ignorecase_cstr(peek.value, "WITH") ||
+            sv_eq_ignorecase_cstr(peek.value, "WITHOUT")) {
+            int with_tz = sv_eq_ignorecase_cstr(peek.value, "WITH");
+            lexer_next(l); /* consume WITH/WITHOUT */
+            struct token t2 = lexer_peek(l);
+            if ((t2.type == TOK_KEYWORD || t2.type == TOK_IDENTIFIER) &&
+                sv_eq_ignorecase_cstr(t2.value, "TIME")) {
+                lexer_next(l); /* consume TIME */
+                struct token t3 = lexer_peek(l);
+                if ((t3.type == TOK_KEYWORD || t3.type == TOK_IDENTIFIER) &&
+                    sv_eq_ignorecase_cstr(t3.value, "ZONE")) {
+                    lexer_next(l); /* consume ZONE */
+                    if (with_tz && ct == COLUMN_TYPE_TIMESTAMP)
+                        ct = COLUMN_TYPE_TIMESTAMPTZ;
+                }
+            }
+        }
+    } else if ((peek.type == TOK_KEYWORD || peek.type == TOK_IDENTIFIER) &&
+               ct == COLUMN_TYPE_TEXT && sv_eq_ignorecase_cstr(peek.value, "VARYING")) {
+        lexer_next(l); /* consume VARYING — CHARACTER VARYING → TEXT */
+    } else if ((peek.type == TOK_KEYWORD || peek.type == TOK_IDENTIFIER) &&
+               ct == COLUMN_TYPE_FLOAT && sv_eq_ignorecase_cstr(peek.value, "PRECISION")) {
+        lexer_next(l); /* consume PRECISION — DOUBLE PRECISION → FLOAT */
+    }
+    /* skip optional (n) or (p,s) after type name */
+    peek = lexer_peek(l);
     if (peek.type == TOK_LPAREN) {
         lexer_next(l); /* consume ( */
         for (;;) {
