@@ -580,7 +580,7 @@ static struct workload_def workload_aggregate(void)
 /* --- join: equi-join between two tables --- */
 
 static const char *g_join_q[] = {
-    "SELECT users.name, orders.total FROM bench_users "
+    "SELECT bench_users.name, bench_orders.total FROM bench_users "
     "JOIN bench_orders ON bench_users.id = bench_orders.user_id"
 };
 

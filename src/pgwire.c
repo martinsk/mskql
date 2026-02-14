@@ -12,6 +12,7 @@
 #include <strings.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 
 /* ---- helpers: write big-endian integers ---- */
 
@@ -45,8 +46,13 @@ static int send_all(int fd, const void *buf, size_t len)
     while (len > 0) {
         ssize_t n = write(fd, p, len);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+                int pr = poll(&pfd, 1, 5000);
+                if (pr <= 0) return -1;
                 continue;
+            }
             return -1;
         }
         if (n == 0) return -1;
@@ -932,6 +938,8 @@ struct rcache_entry {
     uint64_t generation;       /* sum of all table generations at cache time */
     uint8_t *wire_data;        /* RowDescription + DataRows (heap-allocated) */
     size_t   wire_len;
+    uint8_t *full_reply;       /* wire_data + CommandComplete + ReadyForQuery */
+    size_t   full_reply_len;
     int      row_count;
     int      valid;
 };
@@ -962,6 +970,8 @@ static void rcache_invalidate_all(void)
         if (g_rcache[i].valid) {
             free(g_rcache[i].wire_data);
             g_rcache[i].wire_data = NULL;
+            free(g_rcache[i].full_reply);
+            g_rcache[i].full_reply = NULL;
             g_rcache[i].valid = 0;
         }
     }
@@ -1262,7 +1272,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
 
     /* Store in result cache if small enough */
     if (cache_buf.len > 0 && cache_buf.len <= RCACHE_MAX_BYTES && n_cte_temps == 0) {
-        if (rce->valid) free(rce->wire_data);
+        if (rce->valid) { free(rce->wire_data); free(rce->full_reply); }
         rce->wire_data = (uint8_t *)malloc(cache_buf.len);
         if (rce->wire_data) {
             memcpy(rce->wire_data, cache_buf.data, cache_buf.len);
@@ -1271,6 +1281,29 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
             rce->generation = rc_gen;
             rce->row_count = (int)total_rows;
             rce->valid = 1;
+            /* Pre-build full reply: wire_data + CommandComplete + ReadyForQuery */
+            char tag[128];
+            int tag_len = snprintf(tag, sizeof(tag), "SELECT %d", (int)total_rows);
+            size_t cc_body = (size_t)tag_len + 1;
+            size_t full_len = cache_buf.len + 5 + cc_body + 6;
+            rce->full_reply = (uint8_t *)malloc(full_len);
+            if (rce->full_reply) {
+                size_t off = 0;
+                memcpy(rce->full_reply + off, cache_buf.data, cache_buf.len);
+                off += cache_buf.len;
+                rce->full_reply[off++] = 'C';
+                put_u32(rce->full_reply + off, (uint32_t)(cc_body + 4));
+                off += 4;
+                memcpy(rce->full_reply + off, tag, (size_t)tag_len + 1);
+                off += (size_t)tag_len + 1;
+                rce->full_reply[off++] = 'Z';
+                put_u32(rce->full_reply + off, 5);
+                off += 4;
+                rce->full_reply[off++] = 'I';
+                rce->full_reply_len = off;
+            } else {
+                rce->full_reply_len = 0;
+            }
         }
     }
     msgbuf_free(&cache_buf);
@@ -1556,8 +1589,26 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
         return 0;
     }
 
+    /* Fast result cache check — skip parse entirely on cache hit */
+    if (!skip_row_desc) {
+        uint32_t rc_hash = rcache_hash_sql(sql, sql_len);
+        uint32_t rc_slot = rc_hash & (RCACHE_SLOTS - 1);
+        uint64_t rc_gen = rcache_db_generation(db);
+        struct rcache_entry *rce = &g_rcache[rc_slot];
+        if (rce->valid && rce->sql_hash == rc_hash && rce->generation == rc_gen) {
+            if (send_all(fd, rce->wire_data, rce->wire_len) == 0) {
+                char tag[128];
+                snprintf(tag, sizeof(tag), "SELECT %d", rce->row_count);
+                send_command_complete(fd, m, tag);
+                return 0;
+            }
+        }
+    }
+
     /* Try system catalog interception before parsing */
-    {
+    if (!strstr(sql, "pg_") && !strstr(sql, "information_schema")) {
+        /* fast skip — no system catalog references */
+    } else {
         int cat_rows = try_system_catalog(fd, db, sql, m, skip_row_desc);
         if (cat_rows >= 0) {
             char tag[128];
@@ -1919,6 +1970,22 @@ static void copy_in_process_line(struct client_state *c, const char *line, size_
 static int handle_query_sq(struct client_state *c, struct database *db,
                            const char *sql)
 {
+    /* Ultra-fast cache hit path: send pre-built full reply in one write().
+     * The full_reply contains wire_data + CommandComplete + ReadyForQuery,
+     * pre-built at cache store time. Zero malloc, zero memcpy, one syscall. */
+    if (!c->txn.in_transaction) {
+        size_t sql_len = strlen(sql);
+        uint32_t rc_hash = rcache_hash_sql(sql, sql_len);
+        uint32_t rc_slot = rc_hash & (RCACHE_SLOTS - 1);
+        uint64_t rc_gen = rcache_db_generation(db);
+        struct rcache_entry *rce = &g_rcache[rc_slot];
+        if (rce->valid && rce->sql_hash == rc_hash && rce->generation == rc_gen &&
+            rce->full_reply && rce->full_reply_len > 0) {
+            if (send_all(c->fd, rce->full_reply, rce->full_reply_len) == 0)
+                return 0;
+        }
+    }
+
     db->active_txn = &c->txn;
     int rc = handle_query_inner(c->fd, db, sql, &c->send_buf, &c->arena, 0);
     db->active_txn = NULL;
@@ -2764,6 +2831,7 @@ int pgwire_run(struct pgwire_server *srv)
                     continue;
                 }
                 set_nonblocking(client_fd);
+                { int one = 1; setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
                 client_init(&clients[nclients], client_fd);
                 nclients++;
             }
