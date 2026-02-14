@@ -77,10 +77,10 @@
 <hr class="title-rule">
 
 <p>
-    <strong>mskql is faster than PostgreSQL in 16 of 19 batch workloads.
-    Aggregates run 8&times; faster. Inserts 3&times;.</strong>
+    <strong>mskql is faster than PostgreSQL in all 19 batch workloads.
+    Aggregates run 9&times; faster. Inserts 3&times;.</strong>
     Under concurrent load, mskql wins 5 of 7 workloads&mdash;aggregate
-    throughput is 9.2&times; higher. PostgreSQL wins on full table scans
+    throughput is 9.4&times; higher. PostgreSQL wins on full table scans
     and filtered scans where the network dominates.
 </p>
 
@@ -154,96 +154,96 @@
         <tr class="group-label"><td colspan="5">reads</td></tr>
         <tr>
             <td><strong>select_full_scan</strong></td>
-            <td class="num">282</td>
-            <td class="num">414</td>
-            <td class="num"><span class="faster">0.68&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:68%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">294</td>
+            <td class="num">451</td>
+            <td class="num"><span class="faster">0.65&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:65%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>select_where</strong></td>
-            <td class="num">343</td>
-            <td class="num">574</td>
-            <td class="num"><span class="faster">0.60&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:60%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">352</td>
+            <td class="num">610</td>
+            <td class="num"><span class="faster">0.58&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:58%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>index_lookup</strong></td>
-            <td class="num">105</td>
+            <td class="num">103</td>
             <td class="num">107</td>
-            <td class="num"><span class="faster">0.98&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:98%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num"><span class="faster">0.96&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:96%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>order_by</strong></td>
-            <td class="num">192</td>
-            <td class="num">387</td>
-            <td class="num"><span class="faster">0.49&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:49%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">194</td>
+            <td class="num">372</td>
+            <td class="num"><span class="faster">0.52&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:52%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>multi_sort</strong></td>
-            <td class="num">265</td>
-            <td class="num">498</td>
-            <td class="num"><span class="faster">0.53&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:53%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">271</td>
+            <td class="num">506</td>
+            <td class="num"><span class="faster">0.54&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:54%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>distinct</strong></td>
             <td class="num">37</td>
-            <td class="num">246</td>
-            <td class="num"><span class="faster">0.15&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:15%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">257</td>
+            <td class="num"><span class="faster">0.14&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:14%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr class="group-label"><td colspan="5">writes</td></tr>
         <tr>
             <td><strong>insert_bulk</strong></td>
-            <td class="num">318</td>
-            <td class="num">959</td>
-            <td class="num"><span class="faster">0.33&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:33%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">325</td>
+            <td class="num">872</td>
+            <td class="num"><span class="faster">0.37&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:37%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>update</strong></td>
-            <td class="num">48</td>
-            <td class="num">241</td>
+            <td class="num">46</td>
+            <td class="num">231</td>
             <td class="num"><span class="faster">0.20&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:20%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>delete</strong></td>
-            <td class="num">2,932</td>
-            <td class="num">8,233</td>
-            <td class="num"><span class="faster">0.36&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:36%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">2,964</td>
+            <td class="num">7,976</td>
+            <td class="num"><span class="faster">0.37&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:37%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>transaction</strong></td>
-            <td class="num">215</td>
-            <td class="num">192</td>
-            <td class="num"><span class="slower">1.12&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:89%"></span></div></td>
+            <td class="num">180</td>
+            <td class="num">191</td>
+            <td class="num"><span class="faster">0.94&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:94%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr class="group-label"><td colspan="5">advanced queries</td></tr>
         <tr>
             <td><strong>aggregate</strong></td>
-            <td class="num">32</td>
-            <td class="num">267</td>
-            <td class="num"><span class="faster">0.12&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:12%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">31</td>
+            <td class="num">274</td>
+            <td class="num"><span class="faster">0.11&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:11%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>join</strong></td>
-            <td class="num">27</td>
+            <td class="num">26</td>
             <td class="num">58</td>
-            <td class="num"><span class="faster">0.47&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:47%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num"><span class="faster">0.45&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:45%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>window_functions</strong></td>
-            <td class="num">48</td>
-            <td class="num">85</td>
-            <td class="num"><span class="faster">0.57&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:57%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">50</td>
+            <td class="num">88</td>
+            <td class="num"><span class="faster">0.56&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:56%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>subquery</strong></td>
@@ -254,45 +254,45 @@
         </tr>
         <tr>
             <td><strong>cte</strong></td>
-            <td class="num">120</td>
-            <td class="num">112</td>
-            <td class="num"><span class="slower">1.07&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:93%"></span></div></td>
+            <td class="num">50</td>
+            <td class="num">113</td>
+            <td class="num"><span class="faster">0.44&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:44%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>set_ops</strong></td>
             <td class="num">52</td>
-            <td class="num">99</td>
-            <td class="num"><span class="faster">0.52&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:52%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">98</td>
+            <td class="num"><span class="faster">0.53&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:53%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>generate_series</strong></td>
-            <td class="num">202</td>
-            <td class="num">817</td>
-            <td class="num"><span class="faster">0.25&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:25%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">212</td>
+            <td class="num">710</td>
+            <td class="num"><span class="faster">0.30&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:30%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>scalar_functions</strong></td>
-            <td class="num">346</td>
-            <td class="num">894</td>
-            <td class="num"><span class="faster">0.39&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:39%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">358</td>
+            <td class="num">944</td>
+            <td class="num"><span class="faster">0.38&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:38%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>expression_agg</strong></td>
-            <td class="num">300</td>
-            <td class="num">300</td>
-            <td class="num"><span class="faster">1.00&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">304</td>
+            <td class="num">313</td>
+            <td class="num"><span class="faster">0.97&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:97%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
     </tbody>
 </table>
 
 <p>
-    <strong>16 of 19 workloads faster.</strong>&ensp;PostgreSQL wins on transactions
-    (1.12&times;) and CTEs (1.07&times;). Expression aggregates tie at 1.00&times;.
+    <strong>All 19 workloads faster.</strong>&ensp;The closest results are expression
+    aggregates (0.97&times;), transactions (0.94&times;), and index lookups (0.96&times;).
 </p>
 
 <h2>3. Concurrent Throughput (4 threads, 5&nbsp;seconds)</h2>
@@ -330,66 +330,66 @@
     <tbody>
         <tr>
             <td><strong>point_read</strong></td>
-            <td class="num">52,407</td>
-            <td class="num">47,400</td>
-            <td class="num"><span class="tp-higher">1.11&times;</span></td>
-            <td class="num">0.073&thinsp;ms</td>
-            <td class="num">0.084&thinsp;ms</td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:90%"></span></div></td>
+            <td class="num">51,786</td>
+            <td class="num">46,882</td>
+            <td class="num"><span class="tp-higher">1.10&times;</span></td>
+            <td class="num">0.074&thinsp;ms</td>
+            <td class="num">0.085&thinsp;ms</td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:91%"></span></div></td>
         </tr>
         <tr>
             <td><strong>full_scan</strong></td>
-            <td class="num">249</td>
-            <td class="num">274</td>
-            <td class="num"><span class="tp-lower">0.91&times;</span></td>
-            <td class="num">14.1&thinsp;ms</td>
-            <td class="num">13.6&thinsp;ms</td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:91%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">240</td>
+            <td class="num">270</td>
+            <td class="num"><span class="tp-lower">0.89&times;</span></td>
+            <td class="num">14.9&thinsp;ms</td>
+            <td class="num">13.7&thinsp;ms</td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:89%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>filtered_scan</strong></td>
-            <td class="num">496</td>
-            <td class="num">554</td>
-            <td class="num"><span class="tp-lower">0.90&times;</span></td>
+            <td class="num">484</td>
+            <td class="num">548</td>
+            <td class="num"><span class="tp-lower">0.88&times;</span></td>
             <td class="num">6.7&thinsp;ms</td>
             <td class="num">6.7&thinsp;ms</td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:90%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:88%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>aggregate</strong></td>
-            <td class="num">52,670</td>
-            <td class="num">5,720</td>
-            <td class="num"><span class="tp-higher">9.21&times;</span></td>
+            <td class="num">52,319</td>
+            <td class="num">5,539</td>
+            <td class="num"><span class="tp-higher">9.44&times;</span></td>
             <td class="num">0.073&thinsp;ms</td>
-            <td class="num">0.711&thinsp;ms</td>
+            <td class="num">0.727&thinsp;ms</td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:11%"></span></div></td>
         </tr>
         <tr>
             <td><strong>join</strong></td>
-            <td class="num">1,241</td>
-            <td class="num">696</td>
-            <td class="num"><span class="tp-higher">1.78&times;</span></td>
+            <td class="num">1,311</td>
+            <td class="num">651</td>
+            <td class="num"><span class="tp-higher">2.01&times;</span></td>
             <td class="num">2.8&thinsp;ms</td>
             <td class="num">5.4&thinsp;ms</td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:56%"></span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:50%"></span></div></td>
         </tr>
         <tr>
             <td><strong>insert</strong></td>
-            <td class="num">56,658</td>
-            <td class="num">27,520</td>
+            <td class="num">57,217</td>
+            <td class="num">27,840</td>
             <td class="num"><span class="tp-higher">2.06&times;</span></td>
-            <td class="num">0.068&thinsp;ms</td>
-            <td class="num">0.138&thinsp;ms</td>
+            <td class="num">0.067&thinsp;ms</td>
+            <td class="num">0.135&thinsp;ms</td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:49%"></span></div></td>
         </tr>
         <tr>
             <td><strong>mixed_rw</strong></td>
-            <td class="num">42,633</td>
-            <td class="num">40,807</td>
-            <td class="num"><span class="tp-higher">1.04&times;</span></td>
+            <td class="num">45,473</td>
+            <td class="num">42,892</td>
+            <td class="num"><span class="tp-higher">1.06&times;</span></td>
+            <td class="num">0.083&thinsp;ms</td>
             <td class="num">0.085&thinsp;ms</td>
-            <td class="num">0.089&thinsp;ms</td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:96%"></span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:94%"></span></div></td>
         </tr>
     </tbody>
 </table>
@@ -403,41 +403,37 @@
 <h3>Where mskql wins</h3>
 
 <p>
-    <strong>Aggregate: 0.12&times; (8&times; faster).</strong>
-    <strong>Distinct: 0.15&times; (7&times; faster).</strong>
+    <strong>Aggregate: 0.11&times; (9&times; faster).</strong>
+    <strong>Distinct: 0.14&times; (7&times; faster).</strong>
     Both driven by the block-oriented plan executor&mdash;1,024-row column blocks
     serialized directly to the wire without row materialization.
 </p>
 
 <p>
     Write workloads benefit from zero durability overhead: no fsync, no WAL.
-    Updates at 0.20&times; and inserts at 0.33&times; reflect the in-memory advantage.
+    Updates at 0.20&times; and inserts at 0.37&times; reflect the in-memory advantage.
+    Transactions now run at 0.94&times; thanks to lazy copy-on-write snapshots.
 </p>
 
 <p>
-    Under concurrent load, aggregate throughput is 9.2&times; PostgreSQL&rsquo;s
-    (52,670 vs 5,720 QPS). Insert throughput is 2.06&times;.
-    Point reads, joins, and mixed R/W all favor mskql.
+    Under concurrent load, aggregate throughput is 9.4&times; PostgreSQL&rsquo;s
+    (52,319 vs 5,539 QPS). Insert throughput is 2.06&times;. Join throughput is 2.01&times;.
+    Point reads and mixed R/W also favor mskql.
 </p>
 
-<h3>Where mskql loses</h3>
+<h3>Where PostgreSQL is close</h3>
 
 <p>
-    <strong>Full scans and filtered scans: 0.91&times; / 0.90&times;.</strong>
-    Both databases are network-bound&mdash;serializing thousands of rows over
-    the wire. The scan itself is fast in both.
-</p>
-
-<p>
-    <strong>Transactions: 1.12&times;.</strong>
-    PostgreSQL&rsquo;s WAL-based commit is optimized for batched fsync.
-    mskql deep-copies table state on <code>BEGIN</code> for rollback.
+    <strong>Full scans and filtered scans: 0.89&times; / 0.88&times; throughput.</strong>
+    Both databases are network-bound under concurrent load&mdash;serializing
+    thousands of rows over the wire. The scan itself is fast in both.
+    In batch mode mskql still wins (0.65&times; / 0.58&times;).
 </p>
 
 <p>
-    <strong>CTEs: 1.07&times;.</strong>
-    mskql materializes a temp table per <code>WITH</code> clause.
-    PostgreSQL can sometimes inline CTEs.
+    <strong>Expression aggregates: 0.97&times;.</strong>
+    Complex expressions in aggregates are evaluated per-row in both engines.
+    The gap is narrow.
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -448,7 +444,7 @@
 
 <p>
     The remaining throughput gaps (full_scan, filtered_scan) are network-bound.
-    The batch losses (transactions, CTEs) are small. The query engine itself
+    The batch results show mskql faster across all 19 workloads. The query engine
     is competitive or faster across the board.
 </p>
 

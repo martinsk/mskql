@@ -140,7 +140,7 @@
     flex-direction: column;
     gap: 0;
 }
-.query-pair.interactive pre {
+.query-pair.interactive > pre {
     /* hide original static pre — replaced by editor-wrap */
     display: none;
 }
