@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1771108453767,
+  "lastUpdate": 1771110324345,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -4753,6 +4753,150 @@ window.BENCHMARK_DATA = {
             "value": 2015.684,
             "unit": "ms",
             "extra": "iters=50  min=40.054  p50=40.282  p95=40.560  p99=40.842  max=40.893"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "d7f419398a4bf84c3e7420c1692ed4661a47716c",
+          "message": "fix extended protocol RowDescription handling for JDBC compatibility and add test infrastructure improvements: send RowDescription from Execute instead of only from Describe (skip_row_desc=0) so JDBC drivers always receive field metadata before DataRows, add wait_for_port_free and kill_stale_servers functions to prevent port conflicts from previous test runs, add port availability checks before starting C test suites (concurrent on 15400, extended on 15401), write test-failures.log with timestamp",
+          "timestamp": "2026-02-14T15:04:33-08:00",
+          "tree_id": "efedf7716bec4043e804f11e65bf06fdd1fc4dc5",
+          "url": "https://github.com/martinsk/mskql/commit/d7f419398a4bf84c3e7420c1692ed4661a47716c"
+        },
+        "date": 1771110323167,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 16.336,
+            "unit": "ms",
+            "extra": "iters=10000  min=0.001  p50=0.001  p95=0.002  p99=0.003  max=0.054"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 83.984,
+            "unit": "ms",
+            "extra": "iters=200  min=0.403  p50=0.413  p95=0.434  p99=0.587  max=0.978"
+          },
+          {
+            "name": "select_where",
+            "value": 108.065,
+            "unit": "ms",
+            "extra": "iters=500  min=0.209  p50=0.211  p95=0.231  p99=0.290  max=0.378"
+          },
+          {
+            "name": "aggregate",
+            "value": 202.366,
+            "unit": "ms",
+            "extra": "iters=500  min=0.393  p50=0.402  p95=0.424  p99=0.450  max=0.643"
+          },
+          {
+            "name": "order_by",
+            "value": 165.983,
+            "unit": "ms",
+            "extra": "iters=200  min=0.741  p50=0.824  p95=0.857  p99=0.875  max=1.265"
+          },
+          {
+            "name": "join",
+            "value": 35.41,
+            "unit": "ms",
+            "extra": "iters=50  min=0.694  p50=0.705  p95=0.727  p99=0.760  max=0.761"
+          },
+          {
+            "name": "update",
+            "value": 28.114,
+            "unit": "ms",
+            "extra": "iters=200  min=0.138  p50=0.138  p95=0.149  p99=0.164  max=0.180"
+          },
+          {
+            "name": "delete",
+            "value": 132.534,
+            "unit": "ms",
+            "extra": "iters=50  min=2.630  p50=2.645  p95=2.692  p99=2.720  max=2.726"
+          },
+          {
+            "name": "parser",
+            "value": 333.45,
+            "unit": "ms",
+            "extra": "iters=50000  min=0.001  p50=0.005  p95=0.017  p99=0.017  max=0.054"
+          },
+          {
+            "name": "index_lookup",
+            "value": 6.648,
+            "unit": "ms",
+            "extra": "iters=2000  min=0.003  p50=0.003  p95=0.003  p99=0.005  max=0.023"
+          },
+          {
+            "name": "transaction",
+            "value": 20.188,
+            "unit": "ms",
+            "extra": "iters=100  min=0.102  p50=0.200  p95=0.292  p99=0.296  max=0.296"
+          },
+          {
+            "name": "window_functions",
+            "value": 22.94,
+            "unit": "ms",
+            "extra": "iters=20  min=1.115  p50=1.145  p95=1.187  p99=1.205  max=1.210"
+          },
+          {
+            "name": "distinct",
+            "value": 65.769,
+            "unit": "ms",
+            "extra": "iters=500  min=0.127  p50=0.128  p95=0.142  p99=0.163  max=0.199"
+          },
+          {
+            "name": "subquery",
+            "value": 2266.761,
+            "unit": "ms",
+            "extra": "iters=50  min=45.213  p50=45.328  p95=45.449  p99=45.489  max=45.517"
+          },
+          {
+            "name": "cte",
+            "value": 123.302,
+            "unit": "ms",
+            "extra": "iters=200  min=0.601  p50=0.615  p95=0.634  p99=0.660  max=0.726"
+          },
+          {
+            "name": "generate_series",
+            "value": 140.734,
+            "unit": "ms",
+            "extra": "iters=200  min=0.686  p50=0.699  p95=0.723  p99=0.790  max=0.960"
+          },
+          {
+            "name": "scalar_functions",
+            "value": 271.255,
+            "unit": "ms",
+            "extra": "iters=200  min=1.337  p50=1.351  p95=1.380  p99=1.453  max=1.613"
+          },
+          {
+            "name": "expression_agg",
+            "value": 408.802,
+            "unit": "ms",
+            "extra": "iters=500  min=0.801  p50=0.816  p95=0.831  p99=0.867  max=1.038"
+          },
+          {
+            "name": "multi_sort",
+            "value": 120.818,
+            "unit": "ms",
+            "extra": "iters=200  min=0.591  p50=0.602  p95=0.615  p99=0.680  max=0.852"
+          },
+          {
+            "name": "set_ops",
+            "value": 2021.511,
+            "unit": "ms",
+            "extra": "iters=50  min=40.129  p50=40.363  p95=40.665  p99=42.616  max=43.255"
           }
         ]
       }
