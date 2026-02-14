@@ -303,6 +303,7 @@ struct client_state {
     size_t recv_len;
     size_t recv_cap;
     struct query_arena arena;   /* connection-scoped arena, reset per request */
+    struct txn_state txn;       /* per-connection transaction state */
     /* Extended Query Protocol state */
     struct prepared_stmt prepared[MAX_PREPARED];
     struct portal portals[MAX_PORTALS];
@@ -501,6 +502,8 @@ static void client_init(struct client_state *c, int fd)
     c->recv_len = 0;
     c->recv_cap = 0;
     query_arena_init(&c->arena);
+    c->txn.in_transaction = 0;
+    c->txn.snapshot = NULL;
     memset(c->prepared, 0, sizeof(c->prepared));
     memset(c->portals, 0, sizeof(c->portals));
     c->extended_error = 0;
@@ -525,12 +528,14 @@ static void client_free(struct client_state *c)
 /* rollback any open transaction when a client disconnects, then free */
 static void client_disconnect(struct client_state *c, struct database *db)
 {
-    if (db->in_transaction) {
+    if (c->txn.in_transaction) {
+        db->active_txn = &c->txn;
         struct query q = {0};
         q.query_type = QUERY_TYPE_ROLLBACK;
         struct rows r = {0};
         db_exec(db, &q, &r, NULL);
         rows_free(&r);
+        db->active_txn = NULL;
     }
     client_free(c);
 }
@@ -1753,7 +1758,9 @@ static void copy_in_process_line(struct client_state *c, const char *line, size_
 static int handle_query_sq(struct client_state *c, struct database *db,
                            const char *sql)
 {
+    db->active_txn = &c->txn;
     int rc = handle_query_inner(c->fd, db, sql, &c->send_buf, &c->arena, 0);
+    db->active_txn = NULL;
     if (rc == 1) {
         /* COPY FROM STDIN initiated — parse the query again to get table info */
         struct query q = {0};
@@ -1767,7 +1774,7 @@ static int handle_query_sq(struct client_state *c, struct database *db,
         }
         return 1;
     }
-    send_ready_for_query(c->fd, &c->send_buf, db->in_transaction ? 'T' : 'I');
+    send_ready_for_query(c->fd, &c->send_buf, c->txn.in_transaction ? 'T' : 'I');
     return 0;
 }
 
@@ -2249,8 +2256,10 @@ static int handle_execute(struct client_state *c, struct database *db,
     /* Execute the bound SQL (no ReadyForQuery — that comes from Sync).
      * skip_row_desc=1: in extended protocol, RowDescription was already
      * sent by Describe, or the client doesn't expect it from Execute. */
+    db->active_txn = &c->txn;
     handle_query_inner(c->fd, db, c->portals[idx].sql,
                        &c->send_buf, &c->arena, 1);
+    db->active_txn = NULL;
     return 0;
 }
 
@@ -2410,7 +2419,7 @@ static int process_messages(struct client_state *c, struct database *db)
                     snprintf(tag, sizeof(tag), "COPY %zu", c->copy_in_row_count);
                     send_command_complete(c->fd, &c->send_buf, tag);
                     send_ready_for_query(c->fd, &c->send_buf,
-                                         db->in_transaction ? 'T' : 'I');
+                                         c->txn.in_transaction ? 'T' : 'I');
                     c->copy_in_active = 0;
                     c->copy_in_table = NULL;
                 }
@@ -2422,7 +2431,7 @@ static int process_messages(struct client_state *c, struct database *db)
                     c->copy_in_table = NULL;
                     send_error(c->fd, &c->send_buf, "ERROR", "57014", "COPY FROM cancelled");
                     send_ready_for_query(c->fd, &c->send_buf,
-                                         db->in_transaction ? 'T' : 'I');
+                                         c->txn.in_transaction ? 'T' : 'I');
                 }
                 break;
             }
@@ -2460,7 +2469,7 @@ static int process_messages(struct client_state *c, struct database *db)
             case 'S': { /* Sync — end of extended query pipeline */
                 c->extended_error = 0; /* clear error state */
                 send_ready_for_query(c->fd, &c->send_buf,
-                                     db->in_transaction ? 'T' : 'I');
+                                     c->txn.in_transaction ? 'T' : 'I');
                 break;
             }
             case 'C': { /* Close (statement or portal) */

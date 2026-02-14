@@ -586,6 +586,15 @@ struct query_show {
     sv parameter;        /* parameter name for SHOW */
 };
 
+/* Returns 1 if the query type is read-only (no database mutation). */
+static inline int query_is_read_only(enum query_type qt)
+{
+    return qt == QUERY_TYPE_SELECT
+        || qt == QUERY_TYPE_SHOW
+        || qt == QUERY_TYPE_SET
+        || qt == QUERY_TYPE_EXPLAIN;
+}
+
 struct query {
     enum query_type query_type;
     struct query_arena arena;

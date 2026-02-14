@@ -20,6 +20,13 @@ struct db_snapshot {
     DYNAMIC_ARRAY(struct sequence) sequences;
 };
 
+/* Per-connection transaction state.  Owned by client_state in pgwire.c;
+ * the database holds a pointer to the currently-active one. */
+struct txn_state {
+    int in_transaction;
+    struct db_snapshot *snapshot;
+};
+
 struct database {
     // TODO: STRINGVIEW OPPORTUNITY: name is strdup'd from a string literal in main.c;
     // could be sv if the caller guaranteed lifetime.
@@ -27,8 +34,10 @@ struct database {
     DYNAMIC_ARRAY(struct table) tables;
     DYNAMIC_ARRAY(struct enum_type) types;
     DYNAMIC_ARRAY(struct sequence) sequences;
-    int in_transaction;
-    struct db_snapshot *snapshot;
+    /* Points to the txn_state of the client whose query is currently executing.
+     * Set by pgwire before each query, cleared after.  NULL when idle.
+     * Safe because the server is single-threaded. */
+    struct txn_state *active_txn;
 };
 
 void db_init(struct database *db, const char *name);

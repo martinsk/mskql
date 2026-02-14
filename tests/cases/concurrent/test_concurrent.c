@@ -613,6 +613,80 @@ static void test_multi_query_same_connection(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Test 9: Per-connection transaction isolation                        */
+/*                                                                     */
+/*  Two simultaneous connections have independent transaction state.    */
+/*  Connection A's BEGIN does not put connection B into a transaction.  */
+/*  Connection B can read/write while A has an open transaction.        */
+/* ------------------------------------------------------------------ */
+
+static void test_per_connection_txn_isolation(void)
+{
+    printf("  test: per_connection_txn_isolation\n");
+
+    /* Setup: create table via a temporary connection */
+    int setup = tcp_connect();
+    if (setup < 0) { check("txn_iso: connect setup", 0); return; }
+    if (pg_startup(setup) != 0) { check("txn_iso: startup setup", 0); close(setup); return; }
+    pg_query(setup, "CREATE TABLE txn_iso (id INT, val TEXT)", NULL, 0);
+    pg_query(setup, "INSERT INTO txn_iso (id, val) VALUES (1, 'initial')", NULL, 0);
+    pg_close(setup);
+
+    /* Open two simultaneous connections */
+    int a = tcp_connect();
+    if (a < 0) { check("txn_iso: connect A", 0); return; }
+    if (pg_startup(a) != 0) { check("txn_iso: startup A", 0); close(a); return; }
+
+    int b = tcp_connect();
+    if (b < 0) { check("txn_iso: connect B", 0); close(a); return; }
+    if (pg_startup(b) != 0) { check("txn_iso: startup B", 0); close(a); close(b); return; }
+
+    /* A: BEGIN transaction — only A should be in a transaction */
+    int status_a = pg_query(a, "BEGIN", NULL, 0);
+    check("txn_iso: A is in transaction after BEGIN", status_a == 'T');
+
+    /* B: should NOT be in a transaction (A's BEGIN is independent) */
+    int status_b = pg_query(b, "SELECT * FROM txn_iso", NULL, 0);
+    check("txn_iso: B is idle (not in A's transaction)", status_b == 'I');
+
+    /* B: can BEGIN its own transaction independently */
+    status_b = pg_query(b, "BEGIN", NULL, 0);
+    check("txn_iso: B can BEGIN independently", status_b == 'T');
+
+    /* Both are now in transactions — verify status bytes */
+    status_a = pg_query(a, "SELECT 1", NULL, 0);
+    check("txn_iso: A still in transaction", status_a == 'T');
+    status_b = pg_query(b, "SELECT 1", NULL, 0);
+    check("txn_iso: B still in transaction", status_b == 'T');
+
+    /* A: COMMIT — only A should leave transaction */
+    status_a = pg_query(a, "COMMIT", NULL, 0);
+    check("txn_iso: A is idle after COMMIT", status_a == 'I');
+
+    /* B: should still be in its own transaction */
+    status_b = pg_query(b, "SELECT 1", NULL, 0);
+    check("txn_iso: B still in transaction after A committed", status_b == 'T');
+
+    /* B: ROLLBACK — B leaves its transaction */
+    status_b = pg_query(b, "ROLLBACK", NULL, 0);
+    check("txn_iso: B is idle after ROLLBACK", status_b == 'I');
+
+    /* Both idle — verify both can still query */
+    char data_a[4096] = {0};
+    status_a = pg_query(a, "SELECT * FROM txn_iso", data_a, sizeof(data_a));
+    check("txn_iso: A can query after both committed", status_a == 'I');
+    check("txn_iso: A sees data", strstr(data_a, "initial") != NULL);
+
+    char data_b[4096] = {0};
+    status_b = pg_query(b, "SELECT * FROM txn_iso", data_b, sizeof(data_b));
+    check("txn_iso: B can query after both committed", status_b == 'I');
+    check("txn_iso: B sees data", strstr(data_b, "initial") != NULL);
+
+    pg_close(a);
+    pg_close(b);
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -630,6 +704,7 @@ int main(void)
     test_ready_for_query_status();
     test_txn_disconnect_no_rollback();
     test_txn_state_leak_across_connections();
+    test_per_connection_txn_isolation();
     test_zero_length_query();
     test_rapid_connect_disconnect();
     test_oversized_message();

@@ -19,4 +19,7 @@ test-concurrent: all
 bench: release
 	$(MAKE) -C src bench
 
-.PHONY: all clean release test test-concurrent bench
+bench-throughput: release
+	$(MAKE) -C src bench-throughput
+
+.PHONY: all clean release test test-concurrent bench bench-throughput

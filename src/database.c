@@ -16,8 +16,7 @@ void db_init(struct database *db, const char *name)
     da_init(&db->tables);
     da_init(&db->types);
     da_init(&db->sequences);
-    db->in_transaction = 0;
-    db->snapshot = NULL;
+    db->active_txn = NULL;
 }
 
 struct enum_type *db_find_type(struct database *db, const char *name)
@@ -1216,35 +1215,37 @@ void remove_temp_table(struct database *db, struct table *t)
 
 int db_exec(struct database *db, struct query *q, struct rows *result, struct bump_alloc *rb)
 {
-    /* handle transaction statements first */
+    /* handle transaction statements first (uses per-connection txn_state) */
+    struct txn_state *txn = db->active_txn; /* may be NULL (wasm / internal) */
     if (q->query_type == QUERY_TYPE_BEGIN) {
-        if (db->in_transaction) {
+        if (!txn) { arena_set_error(&q->arena, "25000", "no connection context for transaction"); return -1; }
+        if (txn->in_transaction) {
             arena_set_error(&q->arena, "25001", "WARNING: already in a transaction");
             return 0;
         }
-        db->in_transaction = 1;
-        db->snapshot = snapshot_create(db);
+        txn->in_transaction = 1;
+        txn->snapshot = snapshot_create(db);
         return 0;
     }
     if (q->query_type == QUERY_TYPE_COMMIT) {
-        if (!db->in_transaction) {
+        if (!txn || !txn->in_transaction) {
             arena_set_error(&q->arena, "25P01", "WARNING: no transaction in progress");
             return 0;
         }
-        db->in_transaction = 0;
-        snapshot_free(db->snapshot);
-        db->snapshot = NULL;
+        txn->in_transaction = 0;
+        snapshot_free(txn->snapshot);
+        txn->snapshot = NULL;
         return 0;
     }
     if (q->query_type == QUERY_TYPE_ROLLBACK) {
-        if (!db->in_transaction) {
+        if (!txn || !txn->in_transaction) {
             arena_set_error(&q->arena, "25P01", "WARNING: no transaction in progress");
             return 0;
         }
-        snapshot_restore(db, db->snapshot);
-        snapshot_free(db->snapshot);
-        db->snapshot = NULL;
-        db->in_transaction = 0;
+        snapshot_restore(db, txn->snapshot);
+        snapshot_free(txn->snapshot);
+        txn->snapshot = NULL;
+        txn->in_transaction = 0;
         return 0;
     }
 
@@ -2465,8 +2466,6 @@ int db_exec_sql(struct database *db, const char *sql, struct rows *result)
 
 void db_free(struct database *db)
 {
-    if (db->snapshot)
-        snapshot_free(db->snapshot);
     free(db->name);
     for (size_t i = 0; i < db->tables.count; i++) {
         table_free(&db->tables.items[i]);

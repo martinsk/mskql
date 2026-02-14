@@ -24,6 +24,9 @@ release: $(RELEASE_OBJS)
 bench: $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_bench.o
 	$(CC) $(RELEASE_CFLAGS) -o $(BENCH) $^ -lm
 
+bench-throughput: | $(BUILDDIR)
+	$(CC) -Wall -Wextra -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -g -pthread -o $(BUILDDIR)/mskql_bench_tp ../bench/bench_throughput.c
+
 $(BUILDDIR)/rel_bench.o: ../bench/bench.c | $(BUILDDIR)
 	$(CC) $(RELEASE_CFLAGS) -c -o $@ $<
 
@@ -71,4 +74,4 @@ wasm-stubs: | $(BUILDDIR)
 $(WASM_TARGET): $(WASM_SRCS) | $(BUILDDIR)
 	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $(WASM_SRCS)
 
-.PHONY: all clean release bench wasm
+.PHONY: all clean release bench bench-throughput wasm
