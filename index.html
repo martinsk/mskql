@@ -221,6 +221,30 @@
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Table of contents                                          -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<nav class="toc">
+<div class="toc-heading">Contents</div>
+<ul class="toc-section">
+    <li><a href="#wire-compat">Wire-protocol compatible</a></li>
+    <li><a href="#performance">Performance vs PostgreSQL</a></li>
+    <li><a href="#ai-built">Built by AI agents</a></li>
+    <li><a href="#try-it">Try it in the browser</a></li>
+</ul>
+<hr class="toc-rule">
+<ul class="toc-section">
+    <li><a href="getting-started.html">Getting Started</a></li>
+    <li><a href="architecture.html">Architecture</a></li>
+    <li><a href="sql-reference.html">SQL Reference</a></li>
+    <li><a href="bench-vs-pg.html">Benchmarks vs PostgreSQL</a></li>
+    <li><a href="testing.html">Testing</a></li>
+    <li><a href="grammar.html">Grammar</a></li>
+    <li><a href="tutorials/index.html">Tutorials</a></li>
+</ul>
+</nav>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
 <!--  SO WHAT: Three proof points                                -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
@@ -238,25 +262,26 @@
 <pre><code class="language-bash">make && ./build/mskql                         # build & start
 psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 
-<h2 id="performance">Competitive performance</h2>
+<h2 id="performance">Performance vs PostgreSQL</h2>
 
 <p>
-    Identical workloads run against both mskql and PostgreSQL over the wire.
-    Ratio &lt;&nbsp;1.0 means mskql was faster.
+    Two benchmarks tell the story: batch latency (single client, sequential) and
+    concurrent throughput (10 threads, 5&nbsp;seconds). The contrast reveals where
+    an in-memory engine wins and where production engineering matters.
 </p>
 
 <table>
     <thead>
-        <tr><th>Workload</th><th>Ratio</th><th></th></tr>
+        <tr><th>Workload</th><th>Type</th><th>Ratio</th><th></th></tr>
     </thead>
     <tbody>
-        <tr><td>insert_bulk</td><td class="bench-faster">0.44&times;</td><td>mskql 2.3&times; faster</td></tr>
-        <tr><td>select_full_scan</td><td class="bench-faster">0.68&times;</td><td>mskql 1.5&times; faster</td></tr>
-        <tr><td>aggregate</td><td class="bench-faster">0.64&times;</td><td>mskql 1.6&times; faster</td></tr>
-        <tr><td>join</td><td class="bench-faster">0.52&times;</td><td>mskql 1.9&times; faster</td></tr>
-        <tr><td>window_functions</td><td class="bench-faster">0.67&times;</td><td>mskql 1.5&times; faster</td></tr>
-        <tr><td>order_by</td><td class="bench-faster">0.98&times;</td><td>~matching</td></tr>
-        <tr><td>index_lookup</td><td class="bench-slower">1.38&times;</td><td>PostgreSQL faster</td></tr>
+        <tr><td>aggregate</td><td>batch</td><td class="bench-faster">0.16&times;</td><td>mskql 6&times; faster</td></tr>
+        <tr><td>distinct</td><td>batch</td><td class="bench-faster">0.18&times;</td><td>mskql 5.5&times; faster</td></tr>
+        <tr><td>join</td><td>batch</td><td class="bench-faster">0.47&times;</td><td>mskql 2&times; faster</td></tr>
+        <tr><td>order_by</td><td>batch</td><td class="bench-faster">0.53&times;</td><td>mskql 2&times; faster</td></tr>
+        <tr><td>aggregate</td><td>throughput</td><td class="bench-faster">2.55&times; QPS</td><td>mskql wins under load</td></tr>
+        <tr><td>point_read</td><td>throughput</td><td class="bench-slower">0.74&times; QPS</td><td>PG wins under load</td></tr>
+        <tr><td>join</td><td>throughput</td><td class="bench-slower">0.01&times; QPS</td><td>single-threaded bottleneck</td></tr>
     </tbody>
 </table>
 

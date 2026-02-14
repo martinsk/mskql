@@ -292,6 +292,47 @@ footer.site-footer a { font-size: 0.85rem; }
 }
 .breadcrumb a { font-size: 0.85rem; }
 
+/* ── Table of contents ────────────────────────────────── */
+.toc {
+    margin: 1.5rem 0 2.5rem 0;
+    padding: 0;
+    font-size: 0.95rem;
+    line-height: 1.8;
+}
+.toc-heading {
+    font-variant: small-caps;
+    letter-spacing: 0.06em;
+    font-size: 0.9rem;
+    font-weight: 400;
+    color: var(--fg-dim);
+    margin-bottom: 0.3rem;
+}
+.toc-section {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 0.4rem 0;
+}
+.toc-section li {
+    margin-bottom: 0;
+    padding-left: 0;
+}
+.toc-section a {
+    font-size: 0.95rem;
+    background-image: none;
+}
+.toc-section a:hover {
+    color: var(--accent);
+    background-image: linear-gradient(var(--accent), var(--accent));
+    background-size: 1px 1px;
+    background-repeat: repeat-x;
+    background-position: 0 1.15em;
+}
+.toc-rule {
+    border: none;
+    border-top: 1px solid var(--rule);
+    margin: 0.4rem 0;
+}
+
 /* ── Responsive: collapse sidenotes on narrow screens ── */
 @media (max-width: 1100px) {
     body { width: 80%; }

@@ -9,110 +9,6 @@
     <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
     <style>
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-        :root {
-            --body-width: 55%;
-            --fg: #111;
-            --fg-dim: #555;
-            --bg: #fffff8;
-            --accent: #a00;
-            --rule: #ccc;
-            --code-bg: #f3f1eb;
-        }
-
-        html { font-size: 15px; }
-
-        body {
-            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
-            background: var(--bg);
-            color: var(--fg);
-            width: var(--body-width);
-            margin-left: auto;
-            margin-right: auto;
-            padding: 3rem 0 5rem 0;
-        }
-
-        p { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
-
-        a {
-            color: var(--fg);
-            text-decoration: none;
-            background-image: linear-gradient(var(--accent), var(--accent));
-            background-size: 1px 1px;
-            background-repeat: repeat-x;
-            background-position: 0 1.15em;
-        }
-        a:hover { color: var(--accent); }
-
-        strong { font-weight: 600; }
-
-        h1 {
-            font-weight: 400;
-            font-size: 2.6rem;
-            line-height: 1.15;
-            margin-bottom: 0.4rem;
-        }
-
-        .subtitle {
-            font-style: italic;
-            font-size: 1.3rem;
-            color: var(--fg-dim);
-            display: block;
-            margin-bottom: 0.6rem;
-            line-height: 1.4;
-        }
-
-        .byline {
-            font-size: 0.95rem;
-            color: var(--fg-dim);
-            margin-bottom: 2rem;
-        }
-        .byline a { font-size: 0.95rem; }
-
-        .title-rule {
-            border: none;
-            height: 3px;
-            background: var(--accent);
-            width: 60px;
-            margin: 0 0 2rem 0;
-        }
-
-        h2 {
-            font-weight: 400;
-            font-style: italic;
-            font-size: 1.6rem;
-            margin-top: 2.8rem;
-            margin-bottom: 0.6rem;
-            padding-bottom: 0.15rem;
-        }
-
-        h3 {
-            font-weight: 600;
-            font-style: normal;
-            font-size: 1.15rem;
-            margin-top: 1.6rem;
-            margin-bottom: 0.4rem;
-        }
-
-        code {
-            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
-            font-size: 0.82rem;
-            background: var(--code-bg);
-            padding: 0.1em 0.35em;
-            border-radius: 2px;
-        }
-
-        pre {
-            background: var(--code-bg);
-            border-left: 3px solid var(--accent);
-            padding: 0.8rem 1rem;
-            margin-bottom: 1.4rem;
-            overflow-x: auto;
-            line-height: 1.55;
-        }
-        pre code { background: none; padding: 0; }
-
         .caveat {
             border: 1.5px solid var(--accent);
             border-radius: 6px;
@@ -121,30 +17,6 @@
             background: #fff;
         }
         .caveat strong { color: var(--accent); }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 1.4rem 0;
-            font-size: 1.05rem;
-        }
-        thead th {
-            font-variant: small-caps;
-            letter-spacing: 0.04em;
-            font-weight: 400;
-            text-align: left;
-            padding: 0.4rem 0.8rem;
-            border-top: 2px solid var(--fg);
-            border-bottom: 1px solid var(--fg);
-        }
-        thead th.num { text-align: right; }
-        tbody td {
-            padding: 0.35rem 0.8rem;
-            border-bottom: none;
-            vertical-align: top;
-        }
-        tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
-        tbody tr:last-child td { border-bottom: 2px solid var(--fg); }
 
         .faster { color: #1a7a1a; font-weight: 600; }
         .slower { color: var(--accent); font-weight: 600; }
@@ -179,19 +51,17 @@
             margin-right: 0.3rem;
         }
 
-        footer {
-            margin-top: 4rem;
+        .group-label td {
             padding-top: 1rem;
-            border-top: 1px solid var(--rule);
-            font-size: 0.9rem;
+            font-variant: small-caps;
+            letter-spacing: 0.04em;
+            font-size: 0.85rem;
             color: var(--fg-dim);
-            text-align: center;
+            border-bottom: 1px solid var(--rule);
         }
-        footer a { font-size: 0.9rem; }
 
-        @media (max-width: 1100px) {
-            body { width: 88%; }
-        }
+        .tp-higher { color: #1a7a1a; font-weight: 600; }
+        .tp-lower { color: var(--accent); font-weight: 600; }
     </style>
 </head>
 <body>
@@ -199,173 +69,56 @@
 <p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
 
 <h1>mskql vs PostgreSQL</h1>
-<span class="subtitle">Directional throughput comparison over the wire</span>
+<span class="subtitle">Two benchmarks, one honest picture</span>
 <p class="byline">
     <a href="index.html">&#8592; back to main page</a>
 </p>
 <hr class="title-rule">
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  WHAT: Setup and framing                                    -->
+<!-- ═══════════════════════════════════════════════════════════ -->
 
 <div class="caveat">
     <strong>&#9888; Important caveat.</strong>&ensp;This comparison is <em>unscientific</em>
     and intended only as a directional indicator. mskql is an in-memory toy database with
     no durability, no MVCC, no WAL, no background workers, and no query optimizer.
     PostgreSQL is a production-grade RDBMS with decades of engineering behind it.
-    The numbers below reflect wall-clock time for identical SQL workloads sent through
-    <code>psql</code> over a loopback TCP connection&mdash;they measure the combined cost
-    of parsing, execution, serialization, and network round-trips, not raw engine speed.
-    Take them as a rough sense of where mskql sits, not as a serious benchmark.
+    The numbers below measure wall-clock time for identical SQL workloads over a loopback
+    TCP connection&mdash;not raw engine speed. Take them as a rough sense of where mskql
+    sits, not as a serious benchmark.
 </div>
 
 <h2>1. Methodology</h2>
 
+<h3>Batch latency</h3>
 <p>
-    Both databases are tested on the same machine, same loopback interface, using the same
-    <code>psql</code> client. The benchmark script (<code>bench/bench_vs_pg.py</code>)
-    generates identical SQL workloads for each test, runs setup (table creation, data loading)
-    against both databases, then times the benchmark queries. Each timing measures a single
-    <code>psql&nbsp;-f</code> invocation containing all iterations of that workload.
+    Both databases are tested on the same Apple&nbsp;M-series laptop, same loopback interface,
+    using the same <code>psql</code> client. The benchmark script
+    (<code>bench/bench_vs_pg.py</code>) generates identical SQL workloads for each test,
+    runs setup against both databases, then times the benchmark queries. Each timing measures
+    a single <code>psql&nbsp;-f</code> invocation containing all iterations of that workload.
+    mskql runs on port&nbsp;5433; PostgreSQL on port&nbsp;5432 with default configuration.
 </p>
 
+<h3>Concurrent throughput</h3>
 <p>
-    mskql runs on port&nbsp;5433 with all data in memory. PostgreSQL runs on port&nbsp;5432
-    with default configuration (no tuning). Both use the PostgreSQL wire protocol&nbsp;(v3).
+    A multi-threaded C benchmark (<code>bench/bench_throughput.c</code>) opens 10 persistent
+    <code>libpq</code> connections to each database and fires queries as fast as possible for
+    5&nbsp;seconds per workload. It measures queries-per-second (QPS) and median latency (p50).
+    This tests how each database handles concurrent load&mdash;a fundamentally different
+    dimension from single-client batch timing.
 </p>
 
-<h2>2. Workloads</h2>
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  SO WHAT: The data                                          -->
+<!-- ═══════════════════════════════════════════════════════════ -->
 
-<table>
-    <thead>
-        <tr>
-            <th>Workload</th>
-            <th>Description</th>
-            <th class="num">Rows</th>
-            <th class="num">Iterations</th>
-        </tr>
-    </thead>
-    <tbody>
-        <tr>
-            <td><strong>insert_bulk</strong></td>
-            <td>Single-row INSERTs into a 3-column table</td>
-            <td class="num">10,000</td>
-            <td class="num">1</td>
-        </tr>
-        <tr>
-            <td><strong>select_full_scan</strong></td>
-            <td><code>SELECT *</code> from a 5,000-row table</td>
-            <td class="num">5,000</td>
-            <td class="num">200</td>
-        </tr>
-        <tr>
-            <td><strong>select_where</strong></td>
-            <td>Filtered scan (<code>WHERE amount &gt; 2500</code>)</td>
-            <td class="num">5,000</td>
-            <td class="num">500</td>
-        </tr>
-        <tr>
-            <td><strong>aggregate</strong></td>
-            <td><code>GROUP BY</code> with <code>SUM</code> over 4 regions</td>
-            <td class="num">5,000</td>
-            <td class="num">500</td>
-        </tr>
-        <tr>
-            <td><strong>order_by</strong></td>
-            <td><code>ORDER BY val DESC</code> on a 5,000-row table</td>
-            <td class="num">5,000</td>
-            <td class="num">200</td>
-        </tr>
-        <tr>
-            <td><strong>join</strong></td>
-            <td>Equi-join: 500 users &times; 2,000 orders</td>
-            <td class="num">2,500</td>
-            <td class="num">50</td>
-        </tr>
-        <tr>
-            <td><strong>update</strong></td>
-            <td><code>UPDATE ... WHERE id &lt; 1000</code> on 5,000 rows</td>
-            <td class="num">5,000</td>
-            <td class="num">200</td>
-        </tr>
-        <tr>
-            <td><strong>index_lookup</strong></td>
-            <td>Point lookups via B-tree index on 10,000 rows</td>
-            <td class="num">10,000</td>
-            <td class="num">2,000</td>
-        </tr>
-        <tr>
-            <td><strong>delete</strong></td>
-            <td>Create table, insert 2,000 rows, delete half</td>
-            <td class="num">2,000</td>
-            <td class="num">50</td>
-        </tr>
-        <tr>
-            <td><strong>transaction</strong></td>
-            <td><code>BEGIN</code>/<code>COMMIT</code> with 50 inserts per txn</td>
-            <td class="num">1,000</td>
-            <td class="num">100</td>
-        </tr>
-        <tr>
-            <td><strong>window_functions</strong></td>
-            <td><code>ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val)</code></td>
-            <td class="num">5,000</td>
-            <td class="num">20</td>
-        </tr>
-        <tr>
-            <td><strong>distinct</strong></td>
-            <td><code>SELECT DISTINCT category</code> from 100 categories</td>
-            <td class="num">5,000</td>
-            <td class="num">500</td>
-        </tr>
-        <tr>
-            <td><strong>subquery</strong></td>
-            <td><code>WHERE id IN (SELECT id FROM t2 WHERE flag &gt; 500)</code></td>
-            <td class="num">5,000</td>
-            <td class="num">50</td>
-        </tr>
-        <tr>
-            <td><strong>cte</strong></td>
-            <td><code>WITH filtered AS (&hellip;) SELECT &hellip;</code></td>
-            <td class="num">5,000</td>
-            <td class="num">200</td>
-        </tr>
-        <tr>
-            <td><strong>generate_series</strong></td>
-            <td><code>SELECT * FROM generate_series(1, 10000)</code></td>
-            <td class="num">10,000</td>
-            <td class="num">200</td>
-        </tr>
-        <tr>
-            <td><strong>scalar_functions</strong></td>
-            <td><code>UPPER</code>, <code>LENGTH</code>, <code>ABS</code>, <code>ROUND</code> per row</td>
-            <td class="num">5,000</td>
-            <td class="num">200</td>
-        </tr>
-        <tr>
-            <td><strong>expression_agg</strong></td>
-            <td><code>SUM(price * quantity)</code> grouped by category</td>
-            <td class="num">5,000</td>
-            <td class="num">500</td>
-        </tr>
-        <tr>
-            <td><strong>multi_sort</strong></td>
-            <td><code>ORDER BY a DESC, b ASC</code> on two columns</td>
-            <td class="num">5,000</td>
-            <td class="num">200</td>
-        </tr>
-        <tr>
-            <td><strong>set_ops</strong></td>
-            <td><code>UNION</code> of two 2,000-row tables</td>
-            <td class="num">4,000</td>
-            <td class="num">50</td>
-        </tr>
-    </tbody>
-</table>
-
-<h2>3. Representative Results</h2>
+<h2>2. Batch Latency (single client, sequential)</h2>
 
 <p>
-    The table below shows results from a single run on an Apple&nbsp;M-series laptop.
     Ratio &lt;&nbsp;1.0 means mskql was faster; &gt;&nbsp;1.0 means PostgreSQL was faster.
-    Results vary between runs&mdash;treat these as order-of-magnitude indicators only.
+    Results vary between runs&mdash;treat these as order-of-magnitude indicators.
 </p>
 
 <div class="legend">
@@ -377,216 +130,359 @@
     <thead>
         <tr>
             <th>Workload</th>
-            <th class="num">mskql&ensp;(ms)</th>
-            <th class="num">pg&ensp;(ms)</th>
-            <th class="num">Ratio</th>
-            <th>Visual</th>
+            <th class="num" style="text-align:right">mskql&ensp;(ms)</th>
+            <th class="num" style="text-align:right">pg&ensp;(ms)</th>
+            <th class="num" style="text-align:right">Ratio</th>
+            <th></th>
         </tr>
     </thead>
     <tbody>
-        <tr>
-            <td><strong>insert_bulk</strong></td>
-            <td class="num">381</td>
-            <td class="num">865</td>
-            <td class="num"><span class="faster">0.44&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:44%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
+        <tr class="group-label"><td colspan="5">reads</td></tr>
         <tr>
             <td><strong>select_full_scan</strong></td>
-            <td class="num">304</td>
-            <td class="num">424</td>
-            <td class="num"><span class="faster">0.72&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:72%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>select_where</strong></td>
-            <td class="num">400</td>
-            <td class="num">585</td>
-            <td class="num"><span class="faster">0.68&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:68%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>aggregate</strong></td>
-            <td class="num">174</td>
-            <td class="num">272</td>
-            <td class="num"><span class="faster">0.64&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:64%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>order_by</strong></td>
-            <td class="num">364</td>
-            <td class="num">373</td>
-            <td class="num"><span class="faster">0.98&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:98%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>join</strong></td>
-            <td class="num">31</td>
-            <td class="num">59</td>
-            <td class="num"><span class="faster">0.52&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:52%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>update</strong></td>
-            <td class="num">47</td>
-            <td class="num">229</td>
-            <td class="num"><span class="faster">0.20&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:20%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>index_lookup</strong></td>
-            <td class="num">100</td>
-            <td class="num">106</td>
-            <td class="num"><span class="faster">0.94&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:94%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>delete</strong></td>
-            <td class="num">3,454</td>
-            <td class="num">8,059</td>
-            <td class="num"><span class="faster">0.43&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:43%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>transaction</strong></td>
-            <td class="num">260</td>
-            <td class="num">188</td>
-            <td class="num"><span class="slower">1.38&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:72%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>window_functions</strong></td>
-            <td class="num">59</td>
-            <td class="num">89</td>
+            <td class="num">281</td>
+            <td class="num">417</td>
             <td class="num"><span class="faster">0.67&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:67%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>distinct</strong></td>
-            <td class="num">82</td>
-            <td class="num">256</td>
-            <td class="num"><span class="faster">0.32&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:32%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td><strong>select_where</strong></td>
+            <td class="num">354</td>
+            <td class="num">589</td>
+            <td class="num"><span class="faster">0.60&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:60%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>subquery</strong></td>
-            <td class="num">46</td>
-            <td class="num">93</td>
-            <td class="num"><span class="faster">0.50&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:50%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td><strong>index_lookup</strong></td>
+            <td class="num">103</td>
+            <td class="num">108</td>
+            <td class="num"><span class="faster">0.95&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:95%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>cte</strong></td>
-            <td class="num">118</td>
-            <td class="num">114</td>
-            <td class="num"><span class="slower">1.04&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:96%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>generate_series</strong></td>
-            <td class="num">241</td>
-            <td class="num">776</td>
-            <td class="num"><span class="faster">0.31&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:31%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>scalar_functions</strong></td>
-            <td class="num">761</td>
-            <td class="num">959</td>
-            <td class="num"><span class="faster">0.79&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:79%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
-        </tr>
-        <tr>
-            <td><strong>expression_agg</strong></td>
-            <td class="num">292</td>
-            <td class="num">310</td>
-            <td class="num"><span class="faster">0.94&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:94%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td><strong>order_by</strong></td>
+            <td class="num">196</td>
+            <td class="num">372</td>
+            <td class="num"><span class="faster">0.53&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:53%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
             <td><strong>multi_sort</strong></td>
-            <td class="num">408</td>
-            <td class="num">529</td>
-            <td class="num"><span class="faster">0.77&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:77%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">268</td>
+            <td class="num">516</td>
+            <td class="num"><span class="faster">0.52&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:52%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>distinct</strong></td>
+            <td class="num">44</td>
+            <td class="num">250</td>
+            <td class="num"><span class="faster">0.18&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:18%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr class="group-label"><td colspan="5">writes</td></tr>
+        <tr>
+            <td><strong>insert_bulk</strong></td>
+            <td class="num">412</td>
+            <td class="num">878</td>
+            <td class="num"><span class="faster">0.47&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:47%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>update</strong></td>
+            <td class="num">49</td>
+            <td class="num">232</td>
+            <td class="num"><span class="faster">0.21&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:21%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>delete</strong></td>
+            <td class="num">3,780</td>
+            <td class="num">7,680</td>
+            <td class="num"><span class="faster">0.49&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:49%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>transaction</strong></td>
+            <td class="num">265</td>
+            <td class="num">191</td>
+            <td class="num"><span class="slower">1.39&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:72%"></span></div></td>
+        </tr>
+        <tr class="group-label"><td colspan="5">advanced queries</td></tr>
+        <tr>
+            <td><strong>aggregate</strong></td>
+            <td class="num">43</td>
+            <td class="num">269</td>
+            <td class="num"><span class="faster">0.16&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:16%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>join</strong></td>
+            <td class="num">27</td>
+            <td class="num">58</td>
+            <td class="num"><span class="faster">0.47&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:47%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>window_functions</strong></td>
+            <td class="num">49</td>
+            <td class="num">86</td>
+            <td class="num"><span class="faster">0.57&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:57%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>subquery</strong></td>
+            <td class="num">41</td>
+            <td class="num">93</td>
+            <td class="num"><span class="faster">0.44&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:44%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>cte</strong></td>
+            <td class="num">123</td>
+            <td class="num">111</td>
+            <td class="num"><span class="slower">1.11&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:90%"></span></div></td>
         </tr>
         <tr>
             <td><strong>set_ops</strong></td>
-            <td class="num">61</td>
-            <td class="num">99</td>
-            <td class="num"><span class="faster">0.62&times;</span></td>
-            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:62%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+            <td class="num">54</td>
+            <td class="num">97</td>
+            <td class="num"><span class="faster">0.56&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:56%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>generate_series</strong></td>
+            <td class="num">212</td>
+            <td class="num">736</td>
+            <td class="num"><span class="faster">0.29&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:29%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>scalar_functions</strong></td>
+            <td class="num">357</td>
+            <td class="num">928</td>
+            <td class="num"><span class="faster">0.39&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:39%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>expression_agg</strong></td>
+            <td class="num">302</td>
+            <td class="num">303</td>
+            <td class="num"><span class="faster">1.00&times;</span></td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
     </tbody>
 </table>
 
-<h2>4. What This Tells Us</h2>
+<p>
+    <strong>17 of 19 workloads faster.</strong>&ensp;The two exceptions are transactions
+    (1.39&times;) and CTEs (1.11&times;). Expression aggregates are dead even at 1.00&times;.
+</p>
+
+<h2>3. Concurrent Throughput (10 threads, 5&nbsp;seconds)</h2>
 
 <p>
-    <strong>mskql is faster in 17 of 19 benchmarks.</strong>&ensp;Across reads, writes,
-    joins, window functions, set operations, subqueries, and scalar functions,
-    mskql matches or beats PostgreSQL. The two exceptions are transactions
-    (1.38&times;) and CTEs (1.04&times;)&mdash;both essentially on par.
-    This is expected: mskql keeps everything in memory and has no WAL, no MVCC
-    overhead, and no background processes.
+    The batch numbers above measure a single client sending queries sequentially.
+    The table below shows what happens when 10&nbsp;clients hit the database simultaneously.
+    Ratio &gt;&nbsp;1.0 means mskql has higher throughput; &lt;&nbsp;1.0 means PostgreSQL does.
+</p>
+
+<div class="legend">
+    <span><span class="legend-swatch" style="background:var(--accent)"></span>mskql</span>
+    <span><span class="legend-swatch" style="background:#4a7ab5"></span>PostgreSQL</span>
+</div>
+
+<table>
+    <thead>
+        <tr>
+            <th>Workload</th>
+            <th class="num" style="text-align:right">mskql QPS</th>
+            <th class="num" style="text-align:right">pg QPS</th>
+            <th class="num" style="text-align:right">Ratio</th>
+            <th class="num" style="text-align:right">mskql p50</th>
+            <th class="num" style="text-align:right">pg p50</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>point_read</strong></td>
+            <td class="num">43,450</td>
+            <td class="num">58,643</td>
+            <td class="num"><span class="tp-lower">0.74&times;</span></td>
+            <td class="num">0.23&thinsp;ms</td>
+            <td class="num">0.17&thinsp;ms</td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:74%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>full_scan</strong></td>
+            <td class="num">72</td>
+            <td class="num">71</td>
+            <td class="num"><span class="tp-higher">1.00&times;</span></td>
+            <td class="num">138.6&thinsp;ms</td>
+            <td class="num">138.6&thinsp;ms</td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>filtered_scan</strong></td>
+            <td class="num">144</td>
+            <td class="num">144</td>
+            <td class="num"><span class="tp-higher">1.00&times;</span></td>
+            <td class="num">69.4&thinsp;ms</td>
+            <td class="num">69.3&thinsp;ms</td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>aggregate</strong></td>
+            <td class="num">36,983</td>
+            <td class="num">14,508</td>
+            <td class="num"><span class="tp-higher">2.55&times;</span></td>
+            <td class="num">0.28&thinsp;ms</td>
+            <td class="num">0.65&thinsp;ms</td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:39%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>join</strong></td>
+            <td class="num">352</td>
+            <td class="num">52,154</td>
+            <td class="num"><span class="tp-lower">0.01&times;</span></td>
+            <td class="num">28.4&thinsp;ms</td>
+            <td class="num">0.19&thinsp;ms</td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:1%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>insert</strong></td>
+            <td class="num">47,932</td>
+            <td class="num">40,286</td>
+            <td class="num"><span class="tp-higher">1.19&times;</span></td>
+            <td class="num">0.22&thinsp;ms</td>
+            <td class="num">0.24&thinsp;ms</td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:84%"></span></div></td>
+        </tr>
+        <tr>
+            <td><strong>mixed_rw</strong></td>
+            <td class="num">41,716</td>
+            <td class="num">56,755</td>
+            <td class="num"><span class="tp-lower">0.74&times;</span></td>
+            <td class="num">0.25&thinsp;ms</td>
+            <td class="num">0.17&thinsp;ms</td>
+            <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:74%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
+        </tr>
+    </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  SO WHAT: The honest picture                                -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>4. The Honest Picture</h2>
+
+<h3>Where mskql wins</h3>
+
+<p>
+    In batch latency, mskql is faster in 17&nbsp;of&nbsp;19 workloads. The biggest wins
+    are <strong>aggregate</strong> at 0.16&times; (6&times; faster) and
+    <strong>distinct</strong> at 0.18&times; (5.5&times; faster), both driven by the
+    block-oriented plan executor&mdash;a columnar engine that processes data in 1,024-row
+    blocks and serializes results directly to the wire protocol without materializing
+    individual rows. A scan cache with generation tracking avoids redundant row-store
+    traversals when the underlying table hasn&rsquo;t changed.
 </p>
 
 <p>
-    <strong>The block-oriented plan executor is the key.</strong>&ensp;Most of the
-    performance comes from the columnar plan executor, which processes data in
-    1,024-row blocks and serializes results directly to the wire protocol without
-    materializing individual rows. This path now covers sequential scans, filters,
-    projections (including expression projections), sorts, hash joins, hash
-    semi-joins (for <code>IN (SELECT&hellip;)</code>), window functions,
-    <code>DISTINCT</code>, set operations, CTEs, <code>generate_series()</code>,
-    and B-tree index scans. A scan cache with generation tracking avoids redundant
-    row-store traversals when the underlying table has not been mutated.
+    Write-heavy workloads benefit from zero durability overhead: no fsync, no WAL, no MVCC
+    bookkeeping. Updates at 0.21&times; and deletes at 0.49&times; are the expected
+    advantage of an in-memory toy database&mdash;not a fair comparison for production use.
 </p>
 
 <p>
-    <strong>Write-heavy workloads benefit from zero durability overhead.</strong>&ensp;Bulk
-    inserts (0.44&times;), updates (0.20&times;), and deletes (0.43&times;) are
-    significantly faster because mskql has no fsync, no WAL, and no MVCC
-    bookkeeping. This is the expected advantage of an in-memory toy
-    database&mdash;not a fair comparison for production use.
+    Under concurrent load, mskql&rsquo;s aggregate throughput is 2.55&times; PostgreSQL&rsquo;s.
+    Each aggregate query completes in 0.28&thinsp;ms (vs 0.65&thinsp;ms in PG), and the
+    single-threaded event loop can service ~37K of these tiny queries per second without
+    context-switch overhead. Insert throughput is 1.19&times; for the same reason.
+</p>
+
+<h3>Where mskql loses</h3>
+
+<p>
+    <strong>Concurrent joins: 0.01&times;.</strong>&ensp;This is the most striking number
+    in the table, and it reveals mskql&rsquo;s fundamental architectural limitation.
+    mskql runs a single-threaded event loop&mdash;every query executes while holding a
+    global lock. A hash join that takes ~28&thinsp;ms blocks all other clients for that
+    entire duration. PostgreSQL, by contrast, forks a separate backend per connection,
+    so 10&nbsp;clients run 10&nbsp;joins in parallel. The result: PostgreSQL delivers
+    52,154&nbsp;QPS while mskql manages 352.
 </p>
 
 <p>
-    <strong>Transactions are the one weak spot.</strong>&ensp;At 1.38&times;,
-    transaction throughput is the only benchmark where mskql is meaningfully slower.
-    PostgreSQL&rsquo;s WAL-based commit path is highly optimized for batched
-    fsync, while mskql&rsquo;s snapshot-based rollback mechanism has overhead
-    from deep-copying table state on <code>BEGIN</code>.
+    <strong>Point reads and mixed R/W: 0.74&times;.</strong>&ensp;Same root cause.
+    Each point read is fast (~0.23&thinsp;ms), but 10&nbsp;threads contend for the
+    single event loop. PostgreSQL&rsquo;s per-connection backends avoid this serialization
+    entirely.
 </p>
 
 <p>
-    <strong>Standout results.</strong>&ensp;<code>generate_series()</code> at
-    0.31&times; and <code>DISTINCT</code> at 0.32&times; show the largest wins,
-    both driven by zero-allocation columnar generation and O(n) hash-based
-    deduplication respectively. Window functions (0.67&times;) benefit from an
-    O(n&nbsp;log&nbsp;n) sort + linear-scan algorithm in the plan executor,
-    replacing the legacy O(n&sup2;) nested loop.
+    <strong>Full scans and filtered scans: 1.00&times;.</strong>&ensp;These tie because
+    both databases are bottlenecked on the same thing&mdash;serializing ~5,000 rows over
+    the wire per query. The scan itself is fast in both; the network dominates.
 </p>
 
-<h2>5. Running It Yourself</h2>
+<p>
+    <strong>Transactions: 1.39&times;.</strong>&ensp;PostgreSQL&rsquo;s WAL-based commit
+    path is highly optimized for batched fsync. mskql&rsquo;s snapshot-based rollback
+    mechanism deep-copies table state on <code>BEGIN</code>, which is expensive for
+    tables with many rows.
+</p>
 
+<p>
+    <strong>CTEs: 1.11&times;.</strong>&ensp;CTE materialization in mskql creates a
+    temporary table per <code>WITH</code> clause. PostgreSQL&rsquo;s optimizer can
+    sometimes inline CTEs or pipeline them, avoiding the materialization cost.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  NOW WHAT: Next steps and reproduction                      -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>5. What&rsquo;s Next</h2>
+
+<p>
+    The throughput gap is the clearest signal in this data. mskql&rsquo;s single-threaded
+    event loop is the bottleneck&mdash;not the query engine itself. A work-stealing
+    executor or per-connection query dispatch would close the gap on concurrent workloads
+    without changing the storage engine or plan executor. That&rsquo;s the next frontier.
+</p>
+
+<h2>6. Running It Yourself</h2>
+
+<h3>Batch latency</h3>
 <pre><code class="language-bash"># Start mskql in one terminal
 ./build/mskql
 
 # In another terminal, with PostgreSQL running:
-python3 bench/bench_vs_pg.py --mskql-port 5433 --pg-port 5432</code></pre>
+./bench/bench_vs_pg.sh</code></pre>
+
+<h3>Concurrent throughput</h3>
+<pre><code class="language-bash"># Build the throughput benchmark
+make -C bench bench_throughput
+
+# Run (requires both mskql and PostgreSQL running)
+./build/mskql_bench_tp --duration 5 --threads 10 --pg</code></pre>
 
 <p>
-    The script auto-creates a <code>mskql_bench</code> database in PostgreSQL if it
-    doesn&rsquo;t exist. Pass <code>--filter insert_bulk</code> to run a single workload.
+    The batch script auto-creates a <code>mskql_bench</code> database in PostgreSQL if it
+    doesn&rsquo;t exist. The throughput benchmark requires <code>libpq</code> headers
+    at build time.
 </p>
 
-<footer>
+<footer class="site-footer">
     <a href="index.html">mskql</a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
     &ensp;&middot;&ensp;
-    <a href="dev/bench/index.html">Benchmarks</a>
+    <a href="dev/bench/index.html">Historical Charts</a>
     &ensp;&middot;&ensp;
     <a href="grammar.html">SQL Grammar</a>
 </footer>
