@@ -184,7 +184,14 @@ enum expr_op {
     OP_DIV,             /* / */
     OP_MOD,             /* % */
     OP_CONCAT,          /* || */
-    OP_NEG              /* unary minus */
+    OP_NEG,             /* unary minus */
+    OP_EXP,             /* ^ exponentiation */
+    OP_EQ,              /* = */
+    OP_NE,              /* <> or != */
+    OP_LT,              /* < */
+    OP_GT,              /* > */
+    OP_LE,              /* <= */
+    OP_GE               /* >= */
 };
 
 enum expr_func {
@@ -247,7 +254,13 @@ enum expr_func {
     FUNC_ARRAY_TO_STRING,
     FUNC_CURRENT_SCHEMA,
     FUNC_CURRENT_SCHEMAS,
-    FUNC_PG_IS_IN_RECOVERY
+    FUNC_PG_IS_IN_RECOVERY,
+    /* aggregate functions (used when aggregates appear inside expressions) */
+    FUNC_AGG_SUM,
+    FUNC_AGG_COUNT,
+    FUNC_AGG_AVG,
+    FUNC_AGG_MIN,
+    FUNC_AGG_MAX
 };
 
 struct case_when_branch {
@@ -310,6 +323,7 @@ struct expr {
         struct {
             uint32_t operand;          /* index into arena.exprs */
             enum column_type target;   /* target type */
+            int scale;                 /* for NUMERIC(p,s): number of decimal places, -1 = unset */
         } cast;
 
         /* EXPR_EXISTS */
@@ -369,7 +383,8 @@ enum alter_action {
     ALTER_ADD_COLUMN,
     ALTER_DROP_COLUMN,
     ALTER_RENAME_COLUMN,
-    ALTER_COLUMN_TYPE
+    ALTER_COLUMN_TYPE,
+    ALTER_RENAME_TABLE
 };
 
 struct join_info {
@@ -505,6 +520,8 @@ struct query_insert {
     int on_conflict_do_update;
     uint32_t conflict_set_start; /* index into arena.set_clauses (consecutive) */
     uint32_t conflict_set_count;
+    /* DEFAULT VALUES */
+    int is_default_values;
     /* CTE support for WITH ... INSERT INTO ... SELECT */
     uint32_t cte_name;      /* index into arena.strings, or IDX_NONE */
     uint32_t cte_sql;       /* index into arena.strings, or IDX_NONE */

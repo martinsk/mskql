@@ -3062,8 +3062,10 @@ static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             st->row_count--;
                     }
                 } else if (op == 1) {
-                    /* INTERSECT / INTERSECT ALL: mark ALL LHS rows that match this RHS row.
-                     * Legacy behavior: keeps all LHS rows with any match in RHS. */
+                    /* INTERSECT / INTERSECT ALL: mark LHS rows that match this RHS row.
+                     * For ALL: mark only ONE unmarked LHS row per RHS row.
+                     * For non-ALL: mark all matching LHS rows. */
+                    int set_all = pn->set_op.set_all;
                     uint32_t h = 2166136261u;
                     for (uint16_t c2 = 0; c2 < st->ncols; c2++) {
                         struct col_block *cb = &rhs_block.cols[c2];
@@ -3095,13 +3097,21 @@ static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                     if (strcmp(sa, sb) != 0) { eq = 0; break; }
                                 }
                             }
-                            if (eq) st->matched[entry] = 1;
+                            if (eq) {
+                                if (set_all && !st->matched[entry]) {
+                                    st->matched[entry] = 1;
+                                    break; /* only mark one per RHS row */
+                                }
+                                st->matched[entry] = 1;
+                            }
                         }
                         entry = st->ht.nexts[entry];
                     }
                 } else {
-                    /* EXCEPT / EXCEPT ALL: mark ALL matching LHS rows to remove.
-                     * Legacy behavior: removes all LHS rows with any match in RHS. */
+                    /* EXCEPT / EXCEPT ALL: mark matching LHS rows to remove.
+                     * For ALL: mark only ONE unmarked LHS row per RHS row.
+                     * For non-ALL: mark all matching LHS rows. */
+                    int set_all = pn->set_op.set_all;
                     uint32_t h = 2166136261u;
                     for (uint16_t c2 = 0; c2 < st->ncols; c2++) {
                         struct col_block *cb = &rhs_block.cols[c2];
@@ -3133,7 +3143,13 @@ static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                     if (strcmp(sa, sb) != 0) { eq = 0; break; }
                                 }
                             }
-                            if (eq) st->matched[entry] = 1;
+                            if (eq) {
+                                if (set_all && !st->matched[entry]) {
+                                    st->matched[entry] = 1;
+                                    break; /* only remove one per RHS row */
+                                }
+                                st->matched[entry] = 1;
+                            }
                         }
                         entry = st->ht.nexts[entry];
                     }

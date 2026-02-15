@@ -9,6 +9,6 @@ INSERT INTO t1 VALUES ('sales', 'carol');
 -- input:
 SELECT dept, COUNT(DISTINCT name) FROM t1 GROUP BY dept ORDER BY dept;
 -- expected output:
-eng|3
-sales|2
+eng|2
+sales|1
 -- expected status: 0

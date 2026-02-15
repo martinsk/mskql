@@ -1,11 +1,21 @@
-CC       ?= cc
+# Auto-detect Homebrew LLVM clang on macOS (user can override with CC=...)
+ifeq ($(origin CC),default)
+  UNAME_S := $(shell uname -s)
+  ifeq ($(UNAME_S),Darwin)
+    HOMEBREW_CLANG := /opt/homebrew/opt/llvm/bin/clang
+    ifeq ($(wildcard $(HOMEBREW_CLANG)),)
+      $(error Homebrew LLVM clang not found at $(HOMEBREW_CLANG). Install with: brew install llvm)
+    endif
+    CC := $(HOMEBREW_CLANG)
+  endif
+endif
 CFLAGS  ?= -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O1 -g -fsanitize=address -fno-omit-frame-pointer
 BUILDDIR = ../build
 SRCS     = main.c database.c table.c query.c row.c parser.c pgwire.c index.c column.c plan.c catalog.c
 OBJS     = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
 LIB_SRCS = database.c table.c query.c row.c parser.c index.c column.c plan.c catalog.c
 LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/%.o,$(LIB_SRCS))
-TARGET   = $(BUILDDIR)/mskql
+TARGET   = $(BUILDDIR)/mskql_debug
 BENCH    = $(BUILDDIR)/mskql_bench
 
 # ── Release flags (for benchmarks / production) ──────────────────
@@ -18,8 +28,10 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+RELEASE_TARGET = $(BUILDDIR)/mskql
+
 release: $(RELEASE_OBJS)
-	$(CC) $(RELEASE_CFLAGS) -o $(TARGET) $^ -lm
+	$(CC) $(RELEASE_CFLAGS) -o $(RELEASE_TARGET) $^ -lm
 
 bench: $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_bench.o
 	$(CC) $(RELEASE_CFLAGS) -o $(BENCH) $^ -lm

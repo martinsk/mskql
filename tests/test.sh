@@ -143,7 +143,7 @@ start_server() {
     local lsan_opts="suppressions=$LSAN_SUPP"
     ASAN_OPTIONS="detect_leaks=1:exitcode=0" \
         LSAN_OPTIONS="$lsan_opts" \
-        MSKQL_PORT="$port" "$PROJECT_DIR/build/mskql" >/dev/null 2>"$worker_dir/asan.log" &
+        MSKQL_PORT="$port" "$PROJECT_DIR/build/mskql_debug" >/dev/null 2>"$worker_dir/asan.log" &
     local srv_pid=$!
     echo "$srv_pid" > "$pidfile"
     # wait until the server is accepting connections
@@ -523,7 +523,7 @@ for ctest_dir in "$TESTCASE_DIR"/*/; do
             continue
         fi
     fi
-    # run from project root (the binary does execl("./build/mskql", ...))
+    # run from project root (the binary does execl("./build/mskql_debug", ...))
     if ctest_out=$( cd "$PROJECT_DIR" && "$ctest_bin" 2>&1 ); then
         # count individual checks from "All N tests passed"
         n=$(echo "$ctest_out" | grep -oE 'All [0-9]+ tests passed' | grep -oE '[0-9]+')

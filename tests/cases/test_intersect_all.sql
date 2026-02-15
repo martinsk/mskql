@@ -13,6 +13,5 @@ INSERT INTO t2 VALUES (4);
 SELECT id FROM t1 INTERSECT ALL SELECT id FROM t2;
 -- expected output:
 2
-2
 3
 -- expected status: 0

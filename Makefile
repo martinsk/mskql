@@ -2,6 +2,9 @@
 
 all:
 	$(MAKE) -C src
+	$(MAKE) -C src release
+	$(MAKE) -C src bench
+	$(MAKE) -C src bench-throughput
 
 release:
 	$(MAKE) -C src release

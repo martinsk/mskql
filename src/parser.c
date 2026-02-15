@@ -31,6 +31,7 @@ enum token_type {
     TOK_DOUBLE_COLON,
     TOK_TILDE,
     TOK_BANG_TILDE,
+    TOK_CARET,
     TOK_EOF,
     TOK_UNKNOWN
 };
@@ -91,12 +92,14 @@ static int is_keyword(sv word)
         "UPPER", "LOWER", "LENGTH", "SUBSTRING", "TRIM",
         "ANY", "SOME", "ARRAY",
         "ROWS", "RANGE", "UNBOUNDED", "PRECEDING", "FOLLOWING", "CURRENT",
+        "LEADING", "TRAILING", "BOTH",
+        "GENERATED", "ALWAYS", "IDENTITY",
         "ROLLUP", "CUBE", "GROUPING", "SETS",
         "SEQUENCE", "VIEW", "REPLACE", "START", "INCREMENT",
         "MINVALUE", "MAXVALUE", "REFERENCES", "CASCADE",
         "NEXTVAL", "CURRVAL",
         "CAST",
-        "EXTRACT", "CURRENT_TIMESTAMP",
+        "EXTRACT", "CURRENT_TIMESTAMP", "CURRENT_DATE",
         "TRUNCATE",
         "EXPLAIN", "ANALYZE", "COPY", "STDIN", "STDOUT", "CSV", "HEADER",
         "ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "POWER", "SQRT", "MOD", "SIGN", "RANDOM",
@@ -209,6 +212,12 @@ static struct token lexer_next(struct lexer *l)
     }
     if (c == '~') {
         tok.type = TOK_TILDE;
+        tok.value = sv_from(&l->input[l->pos], 1);
+        l->pos++;
+        return tok;
+    }
+    if (c == '^') {
+        tok.type = TOK_CARET;
         tok.value = sv_from(&l->input[l->pos], 1);
         l->pos++;
         return tok;
@@ -481,6 +490,18 @@ static int parse_over_clause(struct lexer *l, struct query_arena *a, struct win_
             }
             w->has_partition = 1;
             w->partition_col = consume_identifier(l, tok);
+            /* handle multi-column PARTITION BY: PARTITION BY a, b, c */
+            for (;;) {
+                struct token comma_peek = lexer_peek(l);
+                if (comma_peek.type != TOK_COMMA) break;
+                lexer_next(l); /* consume , */
+                struct token next_col = lexer_next(l);
+                if (next_col.type != TOK_IDENTIFIER && next_col.type != TOK_KEYWORD) break;
+                sv next_sv = consume_identifier(l, next_col);
+                /* extend partition_col to cover from first col to end of last col */
+                w->partition_col = sv_from(w->partition_col.data,
+                    (size_t)((next_sv.data + next_sv.len) - w->partition_col.data));
+            }
         } else if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "ORDER")) {
             lexer_next(l); /* ORDER */
             tok = lexer_next(l); /* BY */
@@ -621,6 +642,7 @@ static enum cmp_op cmp_from_token(enum token_type t)
         case TOK_PERCENT:
         case TOK_PIPE_PIPE:
         case TOK_DOUBLE_COLON:
+        case TOK_CARET:
         case TOK_EOF:
         case TOK_UNKNOWN:
             return CMP_EQ;
@@ -707,7 +729,13 @@ static int is_expr_func_keyword(sv name)
            sv_eq_ignorecase_cstr(name, "array_to_string") ||
            sv_eq_ignorecase_cstr(name, "current_schema") ||
            sv_eq_ignorecase_cstr(name, "current_schemas") ||
-           sv_eq_ignorecase_cstr(name, "pg_is_in_recovery");
+           sv_eq_ignorecase_cstr(name, "pg_is_in_recovery") ||
+           /* aggregate functions — needed for inline evaluation in expressions */
+           sv_eq_ignorecase_cstr(name, "SUM") ||
+           sv_eq_ignorecase_cstr(name, "COUNT") ||
+           sv_eq_ignorecase_cstr(name, "AVG") ||
+           sv_eq_ignorecase_cstr(name, "MIN") ||
+           sv_eq_ignorecase_cstr(name, "MAX");
 }
 
 static enum expr_func expr_func_from_name(sv name)
@@ -767,6 +795,12 @@ static enum expr_func expr_func_from_name(sv name)
     if (sv_eq_ignorecase_cstr(name, "current_schema"))   return FUNC_CURRENT_SCHEMA;
     if (sv_eq_ignorecase_cstr(name, "current_schemas"))  return FUNC_CURRENT_SCHEMAS;
     if (sv_eq_ignorecase_cstr(name, "pg_is_in_recovery")) return FUNC_PG_IS_IN_RECOVERY;
+    /* aggregate functions — used when aggregates appear inside expressions */
+    if (sv_eq_ignorecase_cstr(name, "SUM"))   return FUNC_AGG_SUM;
+    if (sv_eq_ignorecase_cstr(name, "COUNT")) return FUNC_AGG_COUNT;
+    if (sv_eq_ignorecase_cstr(name, "AVG"))   return FUNC_AGG_AVG;
+    if (sv_eq_ignorecase_cstr(name, "MIN"))   return FUNC_AGG_MIN;
+    if (sv_eq_ignorecase_cstr(name, "MAX"))   return FUNC_AGG_MAX;
     return FUNC_COALESCE; /* fallback, should not happen */
 }
 
@@ -836,8 +870,9 @@ static int is_expr_terminator_keyword(sv name)
 static enum column_type parse_column_type(sv type_name);
 
 /* parse a SQL type name token and return the column_type */
-static enum column_type parse_cast_type_name(struct lexer *l)
+static enum column_type parse_cast_type_name_scale(struct lexer *l, int *out_scale)
 {
+    if (out_scale) *out_scale = -1;
     struct token tok = lexer_next(l);
     /* Handle schema-qualified type: pg_catalog.regtype → skip schema */
     struct token dot_peek = lexer_peek(l);
@@ -879,13 +914,20 @@ static enum column_type parse_cast_type_name(struct lexer *l)
                ct == COLUMN_TYPE_FLOAT && sv_eq_ignorecase_cstr(peek.value, "PRECISION")) {
         lexer_next(l); /* consume PRECISION — DOUBLE PRECISION → FLOAT */
     }
-    /* skip optional (n) or (p,s) after type name */
+    /* skip optional (n) or (p,s) after type name, capturing scale */
     peek = lexer_peek(l);
     if (peek.type == TOK_LPAREN) {
         lexer_next(l); /* consume ( */
+        int saw_comma = 0;
         for (;;) {
             struct token t = lexer_next(l);
             if (t.type == TOK_RPAREN || t.type == TOK_EOF) break;
+            if (t.type == TOK_COMMA) { saw_comma = 1; continue; }
+            if (saw_comma && t.type == TOK_NUMBER && out_scale) {
+                *out_scale = 0;
+                for (size_t k = 0; k < t.value.len; k++)
+                    *out_scale = *out_scale * 10 + (t.value.data[k] - '0');
+            }
         }
     }
     return ct;
@@ -908,7 +950,8 @@ static uint32_t parse_cast_expr(struct lexer *l, struct query_arena *a)
         arena_set_error(a, "42601", "expected AS in CAST");
         return IDX_NONE;
     }
-    enum column_type target = parse_cast_type_name(l);
+    int scale = -1;
+    enum column_type target = parse_cast_type_name_scale(l, &scale);
     struct token rp = lexer_next(l); /* consume ) */
     if (rp.type != TOK_RPAREN) {
         arena_set_error(a, "42601", "expected ')' after CAST type");
@@ -916,6 +959,7 @@ static uint32_t parse_cast_expr(struct lexer *l, struct query_arena *a)
     uint32_t ei = expr_alloc(a, EXPR_CAST);
     EXPR(a, ei).cast.operand = operand;
     EXPR(a, ei).cast.target = target;
+    EXPR(a, ei).cast.scale = scale;
     return ei;
 }
 
@@ -1001,8 +1045,7 @@ static uint32_t parse_case_expr(struct lexer *l, struct query_arena *a)
 {
     lexer_next(l); /* consume CASE */
     uint32_t ei = expr_alloc(a, EXPR_CASE_WHEN);
-    uint32_t branches_start = (uint32_t)a->branches.count;
-    uint32_t branches_count = 0;
+    uint32_t branches_start = 0;
     EXPR(a, ei).case_when.else_expr = IDX_NONE;
     EXPR(a, ei).case_when.operand = IDX_NONE;
 
@@ -1015,6 +1058,11 @@ static uint32_t parse_case_expr(struct lexer *l, struct query_arena *a)
         EXPR(a, ei).case_when.operand = parse_expr(l, a);
         is_simple = 1;
     }
+
+    /* collect branches in a local array first, then push them all at the end
+     * to avoid interleaving with inner CASE branches */
+    struct case_when_branch local_branches[64];
+    uint32_t local_count = 0;
 
     for (;;) {
         struct token tok = lexer_peek(l);
@@ -1059,9 +1107,11 @@ static uint32_t parse_case_expr(struct lexer *l, struct query_arena *a)
                 return ei;
             }
             uint32_t then_idx = parse_expr(l, a);
-            struct case_when_branch branch = { .cond_idx = cond_idx, .then_expr_idx = then_idx };
-            arena_push_branch(a, branch);
-            branches_count++;
+            if (local_count < 64) {
+                local_branches[local_count].cond_idx = cond_idx;
+                local_branches[local_count].then_expr_idx = then_idx;
+                local_count++;
+            }
         } else if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "ELSE")) {
             lexer_next(l); /* consume ELSE */
             EXPR(a, ei).case_when.else_expr = parse_expr(l, a);
@@ -1073,8 +1123,12 @@ static uint32_t parse_case_expr(struct lexer *l, struct query_arena *a)
             break;
         }
     }
+    /* push all collected branches contiguously now that inner CASEs are done */
+    branches_start = (uint32_t)a->branches.count;
+    for (uint32_t b = 0; b < local_count; b++)
+        arena_push_branch(a, local_branches[b]);
     EXPR(a, ei).case_when.branches_start = branches_start;
-    EXPR(a, ei).case_when.branches_count = branches_count;
+    EXPR(a, ei).case_when.branches_count = local_count;
     return ei;
 }
 
@@ -1090,7 +1144,44 @@ static uint32_t parse_func_call_expr(struct lexer *l, struct query_arena *a,
     uint32_t args_count = 0;
     int is_position = sv_eq_ignorecase_cstr(func_tok.value, "POSITION");
     int is_substring = sv_eq_ignorecase_cstr(func_tok.value, "SUBSTRING");
+    int is_trim = sv_eq_ignorecase_cstr(func_tok.value, "TRIM");
     struct token p = lexer_peek(l);
+    /* TRIM(LEADING|TRAILING|BOTH [chars] FROM str) */
+    if (is_trim && p.type == TOK_KEYWORD &&
+        (sv_eq_ignorecase_cstr(p.value, "LEADING") ||
+         sv_eq_ignorecase_cstr(p.value, "TRAILING") ||
+         sv_eq_ignorecase_cstr(p.value, "BOTH"))) {
+        int mode = 0; /* 0=both, 1=leading, 2=trailing */
+        if (sv_eq_ignorecase_cstr(p.value, "LEADING")) mode = 1;
+        else if (sv_eq_ignorecase_cstr(p.value, "TRAILING")) mode = 2;
+        lexer_next(l); /* consume LEADING/TRAILING/BOTH */
+        /* optional trim characters */
+        uint32_t trim_char_idx = IDX_NONE;
+        p = lexer_peek(l);
+        if (!(p.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(p.value, "FROM"))) {
+            trim_char_idx = parse_expr(l, a);
+        }
+        p = lexer_peek(l);
+        if (p.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(p.value, "FROM"))
+            lexer_next(l); /* consume FROM */
+        /* parse the string to trim */
+        uint32_t str_idx = parse_expr(l, a);
+        /* build: TRIM(str) with mode and optional trim chars encoded as extra args */
+        /* arg0 = str, arg1 = mode literal, arg2 = trim chars (optional) */
+        arg_indices[0] = str_idx;
+        args_count = 1;
+        /* encode mode as literal int */
+        uint32_t mode_ei = expr_alloc(a, EXPR_LITERAL);
+        EXPR(a, mode_ei).literal.type = COLUMN_TYPE_INT;
+        EXPR(a, mode_ei).literal.value.as_int = mode;
+        arg_indices[1] = mode_ei;
+        args_count = 2;
+        if (trim_char_idx != IDX_NONE) {
+            arg_indices[2] = trim_char_idx;
+            args_count = 3;
+        }
+        goto trim_done;
+    }
     if (p.type != TOK_RPAREN) {
         for (;;) {
             uint32_t arg_idx = parse_expr(l, a);
@@ -1118,6 +1209,7 @@ static uint32_t parse_func_call_expr(struct lexer *l, struct query_arena *a,
             }
         }
     }
+trim_done:;
     /* Store arg root indices in arena.arg_indices (consecutive). */
     uint32_t ei = expr_alloc(a, EXPR_FUNC_CALL);
     EXPR(a, ei).func_call.func = expr_func_from_name(func_tok.value);
@@ -1192,13 +1284,20 @@ static uint32_t parse_expr_atom(struct lexer *l, struct query_arena *a)
         EXPR(a, ei).func_call.args_count = 0;
         return ei;
     }
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "CURRENT_DATE")) {
+        lexer_next(l);
+        uint32_t ei = expr_alloc(a, EXPR_FUNC_CALL);
+        EXPR(a, ei).func_call.func = FUNC_CURRENT_DATE;
+        EXPR(a, ei).func_call.args_start = 0;
+        EXPR(a, ei).func_call.args_count = 0;
+        return ei;
+    }
     if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "CURRENT")) {
         /* look ahead for _DATE or _TIMESTAMP — but CURRENT is also used in window frames */
         size_t saved = l->pos;
         lexer_next(l); /* consume CURRENT */
-        /* CURRENT_DATE is a single keyword, but our lexer splits on _ boundaries?
-         * Actually no — our lexer keeps underscores in identifiers. So CURRENT_TIMESTAMP
-         * would be one token. This path handles bare CURRENT which might be CURRENT ROW. */
+        /* CURRENT_DATE is a single keyword, but our lexer keeps underscores in identifiers.
+         * This path handles bare CURRENT which might be CURRENT ROW. */
         l->pos = saved;
         /* fall through to column ref handling */
     }
@@ -1258,9 +1357,31 @@ static uint32_t parse_expr_atom(struct lexer *l, struct query_arena *a)
             EXPR(a, ei).subquery.sql_idx = arena_store_string(a, sq_start, sq_len);
             return ei;
         }
-        /* parenthesized expression */
+        /* parenthesized expression — may contain comparison operators */
         uint32_t inner = parse_expr(l, a);
         if (inner == IDX_NONE) return IDX_NONE;
+        /* check for comparison operator inside parens: (a > b) */
+        peek = lexer_peek(l);
+        if (peek.type == TOK_EQUALS || peek.type == TOK_NOT_EQUALS ||
+            peek.type == TOK_LESS || peek.type == TOK_GREATER ||
+            peek.type == TOK_LESS_EQ || peek.type == TOK_GREATER_EQ) {
+            enum expr_op op;
+            if (peek.type == TOK_EQUALS)          op = OP_EQ;
+            else if (peek.type == TOK_NOT_EQUALS) op = OP_NE;
+            else if (peek.type == TOK_LESS)       op = OP_LT;
+            else if (peek.type == TOK_GREATER)    op = OP_GT;
+            else if (peek.type == TOK_LESS_EQ)    op = OP_LE;
+            else                                   op = OP_GE;
+            lexer_next(l); /* consume operator */
+            uint32_t right = parse_expr(l, a);
+            if (right != IDX_NONE) {
+                uint32_t bin = expr_alloc(a, EXPR_BINARY_OP);
+                EXPR(a, bin).binary.op = op;
+                EXPR(a, bin).binary.left = inner;
+                EXPR(a, bin).binary.right = right;
+                inner = bin;
+            }
+        }
         tok = lexer_next(l); /* consume ) */
         if (tok.type != TOK_RPAREN) {
             arena_set_error(a, "42601", "expected ')' after expression");
@@ -1370,16 +1491,18 @@ static uint32_t maybe_parse_postfix_cast(struct lexer *l, struct query_arena *a,
         struct token peek = lexer_peek(l);
         if (peek.type != TOK_DOUBLE_COLON) break;
         lexer_next(l); /* consume :: */
-        enum column_type target = parse_cast_type_name(l);
+        int scale = -1;
+        enum column_type target = parse_cast_type_name_scale(l, &scale);
         uint32_t ei = expr_alloc(a, EXPR_CAST);
         EXPR(a, ei).cast.operand = node;
         EXPR(a, ei).cast.target = target;
+        EXPR(a, ei).cast.scale = scale;
         node = ei;
     }
     return node;
 }
 
-/* multiplicative: atom (('*' | '/' | '%') atom)* */
+/* multiplicative: atom (('^' | '*' | '/' | '%') atom)* */
 static uint32_t parse_expr_mul(struct lexer *l, struct query_arena *a)
 {
     uint32_t left = parse_expr_atom(l, a);
@@ -1389,7 +1512,8 @@ static uint32_t parse_expr_mul(struct lexer *l, struct query_arena *a)
     for (;;) {
         struct token tok = lexer_peek(l);
         enum expr_op op;
-        if (tok.type == TOK_STAR)        op = OP_MUL;
+        if (tok.type == TOK_CARET)       op = OP_EXP;
+        else if (tok.type == TOK_STAR)   op = OP_MUL;
         else if (tok.type == TOK_SLASH)  op = OP_DIV;
         else if (tok.type == TOK_PERCENT) op = OP_MOD;
         else break;
@@ -1985,13 +2109,39 @@ static uint32_t parse_single_cond(struct lexer *l, struct query_arena *a)
         return bci;
     }
 
+    uint32_t ci;
+    struct token op_tok;
+
+    /* numeric literal as LHS (e.g. CASE WHEN 1 > 0 THEN ...) */
+    if (tok.type == TOK_NUMBER || tok.type == TOK_STRING) {
+        l->pos = tok.value.data - l->input;
+        ci = arena_alloc_cond(a);
+        COND(a, ci).type = COND_COMPARE;
+        COND(a, ci).left = IDX_NONE;
+        COND(a, ci).right = IDX_NONE;
+        COND(a, ci).subquery_sql = IDX_NONE;
+        COND(a, ci).scalar_subquery_sql = IDX_NONE;
+        COND(a, ci).in_values_start = 0;
+        COND(a, ci).in_values_count = 0;
+        COND(a, ci).array_values_start = 0;
+        COND(a, ci).array_values_count = 0;
+        COND(a, ci).multi_columns_start = 0;
+        COND(a, ci).multi_columns_count = 0;
+        COND(a, ci).multi_values_start = 0;
+        COND(a, ci).multi_values_count = 0;
+        COND(a, ci).lhs_expr = parse_expr(l, a);
+        COND(a, ci).column = sv_from(NULL, 0);
+        op_tok = lexer_next(l);
+        goto parse_operator;
+    }
+
     /* accept identifiers and keywords as column names (e.g. sum, count, avg in HAVING) */
     if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
         arena_set_error(a, "42601", "expected column name in WHERE/HAVING");
         return IDX_NONE;
     }
 
-    uint32_t ci = arena_alloc_cond(a);
+    ci = arena_alloc_cond(a);
     COND(a, ci).type = COND_COMPARE;
     COND(a, ci).lhs_expr = IDX_NONE;
     COND(a, ci).left = IDX_NONE;
@@ -2007,22 +2157,17 @@ static uint32_t parse_single_cond(struct lexer *l, struct query_arena *a)
     COND(a, ci).multi_values_start = 0;
     COND(a, ci).multi_values_count = 0;
 
-    struct token op_tok;
-
-    /* check if LHS is an aggregate call in HAVING (e.g. COUNT(*) > 1) */
+    /* check if LHS is an aggregate call (e.g. COUNT(*) > 1 in HAVING,
+     * or SUM(val) > 50 inside CASE WHEN expressions).
+     * We set both the virtual column name (for HAVING lookup) and lhs_expr
+     * (for inline evaluation in CASE WHEN and other expression contexts). */
     if (is_agg_keyword(tok.value)) {
         struct token peek_lp = lexer_peek(l);
         if (peek_lp.type == TOK_LPAREN) {
-            /* consume the aggregate call: FUNC( ... ) */
-            lexer_next(l); /* ( */
-            int depth = 1;
-            while (depth > 0) {
-                struct token t = lexer_next(l);
-                if (t.type == TOK_LPAREN) depth++;
-                else if (t.type == TOK_RPAREN) depth--;
-                else if (t.type == TOK_EOF) break;
-            }
-            /* use the lowercase function name as the virtual column name */
+            /* back up and parse as expression so FUNC_AGG_SUM etc. are used */
+            l->pos = tok.value.data - l->input;
+            COND(a, ci).lhs_expr = parse_expr(l, a);
+            /* also set virtual column name for HAVING compatibility */
             const char *agg_name = "?";
             if (sv_eq_ignorecase_cstr(tok.value, "COUNT")) agg_name = "count";
             else if (sv_eq_ignorecase_cstr(tok.value, "SUM")) agg_name = "sum";
@@ -3471,6 +3616,12 @@ static int parse_select(struct lexer *l, struct query *out, struct query_arena *
                         }
                         arena_push_agg(a, agg);
                         agg_count++;
+                    } else if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "CASE")) {
+                        /* CASE expression in mixed agg list — bail to expression path
+                         * so eval_expr can evaluate the full CASE WHEN ... END */
+                        l->pos = col_start_pos;
+                        a->aggregates.count = agg_start;
+                        goto parse_expr_columns;
                     } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
                         sv id = consume_identifier(l, tok);
                         col_end = id.data + id.len;
@@ -3520,10 +3671,16 @@ static int parse_select(struct lexer *l, struct query *out, struct query_arena *
         }
     }
 
+    /* Helper: walk expression tree and convert aggregate FUNC_CALL nodes
+     * (SUM, COUNT, AVG, MIN, MAX) into agg_expr registrations + replace
+     * the EXPR_FUNC_CALL with EXPR_COLUMN_REF to a synthetic column
+     * "_agg<N>" so query_group_by can resolve them from the result row. */
+
     if (tok.type == TOK_STAR) {
         s->columns = tok.value;
     } else {
-        /* general column list: restore lexer and parse each column as an
+parse_expr_columns:
+        ; /* general column list: restore lexer and parse each column as an
          * expression AST with optional AS alias */
         l->pos = col_start_pos;
         uint32_t pc_start = (uint32_t)a->select_cols.count;
@@ -3637,18 +3794,33 @@ parse_table_name:
         while (sq_end > sq_start && (sq_end[-1] == ' ' || sq_end[-1] == '\n')) sq_end--;
         size_t sq_len = (size_t)(sq_end - sq_start);
         s->from_subquery_sql = arena_store_string(a, sq_start, sq_len);
-        /* require AS alias */
+        /* require alias (with optional AS keyword) */
         struct token as_tok = lexer_next(l);
         if (as_tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(as_tok.value, "AS")) {
             tok = lexer_next(l);
             s->from_subquery_alias = tok.value;
             /* use alias as table name so downstream code can find it */
             s->table = tok.value;
+        } else if (as_tok.type == TOK_IDENTIFIER || (as_tok.type == TOK_KEYWORD &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "WHERE") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "ORDER") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "GROUP") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "LIMIT") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "JOIN") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "LEFT") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "RIGHT") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "INNER") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "CROSS") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "FULL") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "ON") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "UNION") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "INTERSECT") &&
+                   !sv_eq_ignorecase_cstr(as_tok.value, "EXCEPT"))) {
+            /* bare alias without AS keyword */
+            s->from_subquery_alias = as_tok.value;
+            s->table = as_tok.value;
         } else {
-            arena_set_error(a, "42601", "expected AS alias after FROM subquery");
-            // NOTE: from_subquery_sql was just malloc'd above. Safe as long as the
-            // caller always calls query_free on failure (query_type is QUERY_TYPE_SELECT
-            // here, so query_select_free will free it). All current callers do this.
+            arena_set_error(a, "42601", "expected alias after FROM subquery");
             return -1;
         }
     } else if ((tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) &&
@@ -3913,6 +4085,31 @@ static int parse_value_tuple(struct lexer *l, struct row *r, struct query_arena 
             }
         }
         if (tok.type == TOK_NUMBER) {
+            /* check if next token is an operator — if so, this is an expression */
+            struct token peek_op = lexer_peek(l);
+            if (peek_op.type == TOK_PLUS || peek_op.type == TOK_MINUS ||
+                peek_op.type == TOK_STAR || peek_op.type == TOK_SLASH ||
+                peek_op.type == TOK_PERCENT || peek_op.type == TOK_CARET ||
+                peek_op.type == TOK_PIPE_PIPE || peek_op.type == TOK_DOUBLE_COLON) {
+                /* back up and parse as full expression */
+                l->pos = tok.value.data - l->input;
+                uint32_t ei = parse_expr(l, a);
+                if (ei == IDX_NONE) {
+                    arena_set_error(a, "42601", "failed to parse expression in VALUES");
+                    return -1;
+                }
+                c.type = COLUMN_TYPE_INT;
+                c.is_null = 2; /* sentinel: value.as_int is an expr index */
+                c.value.as_int = (int)ei;
+                da_push(&r->cells, c);
+                tok = lexer_next(l);
+                if (tok.type == TOK_RPAREN) break;
+                if (tok.type != TOK_COMMA) {
+                    arena_set_error(a, "42601", "expected ',' or ')'");
+                    return -1;
+                }
+                continue;
+            }
             if (sv_contains_char(tok.value, '.')) {
                 c.type = COLUMN_TYPE_FLOAT;
                 c.value.as_float = sv_atof(tok.value);
@@ -3932,6 +4129,25 @@ static int parse_value_tuple(struct lexer *l, struct row *r, struct query_arena 
                     c.value.as_int = (int)v;
                 }
             }
+        } else if (tok.type == TOK_LPAREN) {
+            /* parenthesized expression in VALUES: (2+3) */
+            l->pos = tok.value.data - l->input;
+            uint32_t ei = parse_expr(l, a);
+            if (ei == IDX_NONE) {
+                arena_set_error(a, "42601", "failed to parse expression in VALUES");
+                return -1;
+            }
+            c.type = COLUMN_TYPE_INT;
+            c.is_null = 2;
+            c.value.as_int = (int)ei;
+            da_push(&r->cells, c);
+            tok = lexer_next(l);
+            if (tok.type == TOK_RPAREN) break;
+            if (tok.type != TOK_COMMA) {
+                arena_set_error(a, "42601", "expected ',' or ')'");
+                return -1;
+            }
+            continue;
         } else if (tok.type == TOK_STRING) {
             c.type = COLUMN_TYPE_TEXT;
             c.value.as_text = bump_strndup(&a->bump, tok.value.data, tok.value.len);
@@ -3972,15 +4188,14 @@ static void parse_returning_clause(struct lexer *l, int *has_returning, sv *retu
         } else {
             const char *start = tok.value.data;
             const char *end = tok.value.data + tok.value.len;
+            int depth = 0;
             for (;;) {
                 struct token p = lexer_peek(l);
-                if (p.type == TOK_COMMA) {
-                    lexer_next(l);
-                    tok = lexer_next(l);
-                    end = tok.value.data + tok.value.len;
-                } else {
-                    break;
-                }
+                if (p.type == TOK_EOF || p.type == TOK_SEMICOLON) break;
+                if (p.type == TOK_LPAREN) depth++;
+                if (p.type == TOK_RPAREN) { if (depth > 0) depth--; else break; }
+                lexer_next(l);
+                end = p.value.data + p.value.len;
             }
             *returning_columns = sv_from(start, (size_t)(end - start));
         }
@@ -4046,6 +4261,24 @@ static int parse_insert(struct lexer *l, struct query *out)
             sel_len--;
         ins->insert_select_sql = arena_store_string(&out->arena, sel_start, sel_len);
         return 0;
+    }
+
+    /* INSERT INTO t DEFAULT VALUES */
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "DEFAULT")) {
+        struct token vt = lexer_peek(l);
+        if (vt.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(vt.value, "VALUES")) {
+            lexer_next(l); /* consume VALUES */
+            /* create a single row with zero cells — database.c will fill defaults */
+            uint32_t ir_start = (uint32_t)out->arena.rows.count;
+            struct row r = {0};
+            da_init(&r.cells);
+            da_push(&out->arena.rows, r);
+            ins->insert_rows_start = ir_start;
+            ins->insert_rows_count = 1;
+            ins->is_default_values = 1;
+            parse_returning_clause(l, &ins->has_returning, &ins->returning_columns);
+            return 0;
+        }
     }
 
     if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "VALUES")) {
@@ -4421,6 +4654,29 @@ static int parse_create_table(struct lexer *l, struct query *out)
                     if (is_delete) col.fk_on_delete = fka;
                     else if (is_update) col.fk_on_update = fka;
                 }
+            } else if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "GENERATED")) {
+                lexer_next(l); /* consume GENERATED */
+                /* GENERATED ALWAYS AS IDENTITY or GENERATED BY DEFAULT AS IDENTITY */
+                struct token g2 = lexer_peek(l);
+                if (g2.type == TOK_KEYWORD && (sv_eq_ignorecase_cstr(g2.value, "ALWAYS") ||
+                    sv_eq_ignorecase_cstr(g2.value, "BY"))) {
+                    lexer_next(l); /* consume ALWAYS or BY */
+                    if (sv_eq_ignorecase_cstr(g2.value, "BY")) {
+                        struct token def = lexer_peek(l);
+                        if (def.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(def.value, "DEFAULT"))
+                            lexer_next(l); /* consume DEFAULT */
+                    }
+                }
+                struct token as_tok = lexer_peek(l);
+                if (as_tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(as_tok.value, "AS"))
+                    lexer_next(l); /* consume AS */
+                struct token id_tok = lexer_peek(l);
+                if ((id_tok.type == TOK_IDENTIFIER || id_tok.type == TOK_KEYWORD) &&
+                    sv_eq_ignorecase_cstr(id_tok.value, "IDENTITY"))
+                    lexer_next(l); /* consume IDENTITY */
+                col.is_serial = 1;
+                col.serial_next = 1;
+                col.not_null = 1;
             } else if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "CHECK")) {
                 lexer_next(l); /* consume CHECK */
                 /* capture CHECK(...) expression text */
@@ -4926,9 +5182,17 @@ static int parse_alter(struct lexer *l, struct query *out)
     }
 
     if (sv_eq_ignorecase_cstr(tok.value, "RENAME")) {
-        /* ALTER TABLE t RENAME [COLUMN] old_name TO new_name */
-        a->alter_action = ALTER_RENAME_COLUMN;
+        /* ALTER TABLE t RENAME TO new_name  (table rename)
+         * ALTER TABLE t RENAME [COLUMN] old_name TO new_name  (column rename) */
         tok = lexer_next(l);
+        if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "TO")) {
+            /* table rename: RENAME TO new_name */
+            a->alter_action = ALTER_RENAME_TABLE;
+            tok = lexer_next(l);
+            a->alter_new_name = tok.value;
+            return 0;
+        }
+        a->alter_action = ALTER_RENAME_COLUMN;
         if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "COLUMN"))
             tok = lexer_next(l);
         a->alter_column = tok.value;

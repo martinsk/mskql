@@ -12,4 +12,5 @@ INSERT INTO t2 VALUES (3);
 SELECT id FROM t1 EXCEPT ALL SELECT id FROM t2;
 -- expected output:
 1
+2
 -- expected status: 0

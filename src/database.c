@@ -1370,11 +1370,66 @@ static void snapshot_restore(struct database *db, struct db_snapshot *snap)
 struct table *materialize_subquery(struct database *db, const char *sql,
                                   const char *table_name)
 {
+    /* Buffer for rewritten SQL (must outlive sq since parser stores pointers into it) */
+    char gs_rewritten[4096];
     struct query sq = {0};
     if (query_parse(sql, &sq) != 0) {
         query_free(&sq);
+        /* Retry: rewrite "SELECT generate_series(...) ..." →
+         * "SELECT * FROM generate_series(...) ..." so the parser can handle it */
+        const char *gs = NULL;
+        for (const char *sp = sql; *sp; sp++) {
+            if (strncasecmp(sp, "generate_series", 15) == 0) { gs = sp; break; }
+        }
+        if (gs) {
+            const char *p = sql;
+            while (*p == ' ' || *p == '\t') p++;
+            if (strncasecmp(p, "SELECT", 6) == 0) {
+                /* Find the closing ')' of generate_series(...) */
+                const char *gs_end = gs + 15; /* skip "generate_series" */
+                while (*gs_end && *gs_end != '(') gs_end++;
+                if (*gs_end == '(') {
+                    int depth = 1;
+                    gs_end++;
+                    while (*gs_end && depth > 0) {
+                        if (*gs_end == '(') depth++;
+                        else if (*gs_end == ')') depth--;
+                        gs_end++;
+                    }
+                }
+                /* Check for "AS alias" after generate_series(...) */
+                const char *ap = gs_end;
+                while (*ap == ' ' || *ap == '\t') ap++;
+                char col_alias[128] = {0};
+                if (strncasecmp(ap, "as", 2) == 0 && (ap[2] == ' ' || ap[2] == '\t')) {
+                    ap += 2;
+                    while (*ap == ' ' || *ap == '\t') ap++;
+                    size_t alen = 0;
+                    while (ap[alen] && ap[alen] != ' ' && ap[alen] != '\t' &&
+                           ap[alen] != ',' && ap[alen] != ')' && ap[alen] != ';') alen++;
+                    if (alen > 0 && alen < sizeof(col_alias))
+                        snprintf(col_alias, sizeof(col_alias), "%.*s", (int)alen, ap);
+                }
+                /* Build: SELECT * FROM generate_series(...) AS gs_tbl(col_alias) */
+                size_t gs_call_len = (size_t)(gs_end - gs);
+                if (col_alias[0])
+                    snprintf(gs_rewritten, sizeof(gs_rewritten),
+                             "SELECT * FROM %.*s AS _gs(%s)",
+                             (int)gs_call_len, gs, col_alias);
+                else
+                    snprintf(gs_rewritten, sizeof(gs_rewritten),
+                             "SELECT * FROM %.*s", (int)gs_call_len, gs);
+                memset(&sq, 0, sizeof(sq));
+                if (query_parse(gs_rewritten, &sq) != 0) {
+                    query_free(&sq);
+                    return NULL;
+                }
+                goto parse_ok;
+            }
+        }
         return NULL;
     }
+    parse_ok: (void)0;
     struct rows sq_rows = {0};
 
     /* Try plan executor fast path for simple SELECTs */
@@ -1409,6 +1464,17 @@ struct table *materialize_subquery(struct database *db, const char *sql,
     /* infer column names */
     if (sq.query_type == QUERY_TYPE_SELECT && sq_rows.count > 0) {
         size_t ncells = sq_rows.data[0].cells.count;
+        /* For generate_series queries, use the column alias directly */
+        if (sq.select.has_generate_series && ncells == 1) {
+            struct column col = {0};
+            if (sq.select.gs_col_alias.len > 0)
+                col.name = sv_to_cstr(sq.select.gs_col_alias);
+            else
+                col.name = strdup("generate_series");
+            col.type = sq_rows.data[0].cells.items[0].type;
+            da_push(&ct.columns, col);
+            goto columns_done;
+        }
         struct table *src_t = db_find_table_sv(db, sq.select.table);
         if (src_t && sv_eq_cstr(sq.select.columns, "*")) {
             for (size_t c = 0; c < src_t->columns.count; c++) {
@@ -1477,6 +1543,7 @@ struct table *materialize_subquery(struct database *db, const char *sql,
                 da_push(&ct.columns, col);
             }
         }
+        columns_done: (void)0;
     }
     /* move rows — transfer ownership, no cell_copy/strdup needed */
     for (size_t i = 0; i < sq_rows.count; i++)
@@ -2255,6 +2322,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 }
                 resolve_subqueries(db, &q->arena, s->where.where_cond, outer_tbl[0] ? outer_tbl : NULL);
             }
+            /* resolve subqueries in HAVING */
+            if (s->has_having && s->having_cond != IDX_NONE)
+                resolve_subqueries(db, &q->arena, s->having_cond, NULL);
             int sel_rc;
             if (s->table.len == 0 && s->parsed_columns_count > 0 && result) {
                 /* SELECT <expr>, ... — no table, evaluate expression ASTs */
@@ -2343,12 +2413,19 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                 rhs_rows.data[i].cells.count = 0;
                             }
                         } else if (s->set_op == 1) {
-                            /* INTERSECT — keep only rows in both */
+                            /* INTERSECT [ALL] — keep only rows in both.
+                             * For ALL: each RHS row can match at most one LHS row. */
+                            uint8_t *rhs_used = calloc(rhs_rows.count, 1);
                             size_t w = 0;
                             for (size_t i = 0; i < result->count; i++) {
                                 int found = 0;
                                 for (size_t j = 0; j < rhs_rows.count; j++) {
-                                    if (row_equal_nullsafe(&result->data[i], &rhs_rows.data[j])) { found = 1; break; }
+                                    if (rhs_used[j]) continue;
+                                    if (row_equal_nullsafe(&result->data[i], &rhs_rows.data[j])) {
+                                        found = 1;
+                                        if (s->set_all) rhs_used[j] = 1;
+                                        break;
+                                    }
                                 }
                                 if (found) {
                                     if (w != i) result->data[w] = result->data[i];
@@ -2361,13 +2438,21 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                 }
                             }
                             result->count = w;
+                            free(rhs_used);
                         } else if (s->set_op == 2) {
-                            /* EXCEPT — keep LHS rows not in RHS */
+                            /* EXCEPT [ALL] — keep LHS rows not in RHS.
+                             * For ALL: each RHS row removes at most one LHS row. */
+                            uint8_t *rhs_used = calloc(rhs_rows.count, 1);
                             size_t w = 0;
                             for (size_t i = 0; i < result->count; i++) {
                                 int found = 0;
                                 for (size_t j = 0; j < rhs_rows.count; j++) {
-                                    if (row_equal_nullsafe(&result->data[i], &rhs_rows.data[j])) { found = 1; break; }
+                                    if (rhs_used[j]) continue;
+                                    if (row_equal_nullsafe(&result->data[i], &rhs_rows.data[j])) {
+                                        found = 1;
+                                        if (s->set_all) rhs_used[j] = 1;
+                                        break;
+                                    }
                                 }
                                 if (!found) {
                                     if (w != i) result->data[w] = result->data[i];
@@ -2380,6 +2465,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                 }
                             }
                             result->count = w;
+                            free(rhs_used);
                         }
                         for (size_t i = 0; i < rhs_rows.count; i++) {
                             if (rhs_rows.arena_owns_text)
@@ -2989,6 +3075,13 @@ skip_conflict_nothing:
                             r->cells.count--;
                         }
                     }
+                    return 0;
+                }
+                case ALTER_RENAME_TABLE: {
+                    free(t->name);
+                    t->name = sv_to_cstr(a->alter_new_name);
+                    /* invalidate scan cache since table identity changed */
+                    t->generation++;
                     return 0;
                 }
                 case ALTER_RENAME_COLUMN: {

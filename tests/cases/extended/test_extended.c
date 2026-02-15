@@ -542,7 +542,7 @@ static void start_server(void)
         char port_str[16];
         snprintf(port_str, sizeof(port_str), "%d", SERVER_PORT);
         setenv("MSKQL_PORT", port_str, 1);
-        execl("./build/mskql", "mskql", NULL);
+        execl("./build/mskql_debug", "mskql_debug", NULL);
         perror("execl");
         _exit(1);
     }
