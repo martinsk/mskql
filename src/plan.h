@@ -79,6 +79,8 @@ struct plan_node {
             uint32_t  agg_start;     /* index into arena->aggregates */
             uint32_t  agg_count;
             int       agg_before_cols; /* layout flag */
+            int      *agg_col_indices; /* bump-allocated: pre-resolved column index per aggregate (-1=COUNT(*), -2=expr) */
+            struct table *table;     /* source table — needed for eval_expr on expression aggregates */
         } hash_agg;
         struct {
             uint32_t agg_start;
@@ -171,6 +173,9 @@ struct hash_agg_state {
     uint32_t  group_cap;
     int       input_done;
     uint32_t  emit_cursor;
+    /* temp row for expression-based aggregates */
+    struct row tmp_row;
+    int       tmp_row_inited;
 };
 
 struct sort_state {

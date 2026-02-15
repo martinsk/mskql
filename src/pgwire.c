@@ -1001,13 +1001,6 @@ static uint32_t rcache_hash_sql(const char *sql, size_t len)
     return h;
 }
 
-static uint64_t rcache_db_generation(struct database *db)
-{
-    uint64_t g = 0;
-    for (size_t i = 0; i < db->tables.count; i++)
-        g += db->tables.items[i].generation;
-    return g;
-}
 
 static void rcache_invalidate_all(void)
 {
@@ -1036,7 +1029,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     /* ---- Result cache lookup ---- */
     uint32_t rc_hash = rcache_hash_sql(sql, sql_len);
     uint32_t rc_slot = rc_hash & (RCACHE_SLOTS - 1);
-    uint64_t rc_gen = rcache_db_generation(db);
+    uint64_t rc_gen = db->total_generation;
     struct rcache_entry *rce = &g_rcache[rc_slot];
     if (rce->valid && rce->sql_hash == rc_hash && rce->generation == rc_gen) {
         /* Cache hit — replay wire bytes */
@@ -1417,7 +1410,7 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     if (!skip_row_desc) {
         uint32_t rc_hash = rcache_hash_sql(sql, sql_len);
         uint32_t rc_slot = rc_hash & (RCACHE_SLOTS - 1);
-        uint64_t rc_gen = rcache_db_generation(db);
+        uint64_t rc_gen = db->total_generation;
         struct rcache_entry *rce = &g_rcache[rc_slot];
         if (rce->valid && rce->sql_hash == rc_hash && rce->generation == rc_gen) {
             if (send_all(fd, rce->wire_data, rce->wire_len) == 0) {
@@ -1572,12 +1565,6 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
         return 1;
     }
 
-    /* Invalidate result cache for write queries — but not inside transactions
-     * (mutations aren't visible until COMMIT; we invalidate there instead) */
-    if (q.query_type != QUERY_TYPE_SELECT && q.query_type != QUERY_TYPE_EXPLAIN &&
-        !(db->active_txn && db->active_txn->in_transaction))
-        rcache_invalidate_all();
-
     struct rows *result = &conn_arena->result;
     result->arena_owns_text = 1;
     int rc = db_exec(db, &q, result, &conn_arena->result_text);
@@ -1705,7 +1692,6 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
             break;
         case QUERY_TYPE_COMMIT:
             snprintf(tag, sizeof(tag), "COMMIT");
-            rcache_invalidate_all();
             break;
         case QUERY_TYPE_ROLLBACK:
             snprintf(tag, sizeof(tag), "ROLLBACK");
@@ -1745,7 +1731,7 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
 }
 
 /* Process a single line of COPY FROM data, inserting a row into the table. */
-static void copy_in_process_line(struct client_state *c, const char *line, size_t len)
+static void copy_in_process_line(struct client_state *c, struct database *db, const char *line, size_t len)
 {
     struct table *ct = c->copy_in_table;
     if (!ct) return;
@@ -1801,6 +1787,7 @@ static void copy_in_process_line(struct client_state *c, const char *line, size_
     }
     da_push(&ct->rows, new_row);
     ct->generation++;
+    db->total_generation++;
     c->copy_in_row_count++;
 }
 
@@ -1816,7 +1803,7 @@ static int handle_query_sq(struct client_state *c, struct database *db,
         size_t sql_len = strlen(sql);
         uint32_t rc_hash = rcache_hash_sql(sql, sql_len);
         uint32_t rc_slot = rc_hash & (RCACHE_SLOTS - 1);
-        uint64_t rc_gen = rcache_db_generation(db);
+        uint64_t rc_gen = db->total_generation;
         struct rcache_entry *rce = &g_rcache[rc_slot];
         if (rce->valid && rce->sql_hash == rc_hash && rce->generation == rc_gen &&
             rce->full_reply && rce->full_reply_len > 0) {
@@ -2458,7 +2445,7 @@ static int process_messages(struct client_state *c, struct database *db)
                                 c->copy_in_line_overflow = 0;
                             } else {
                                 c->copy_in_linebuf[c->copy_in_linelen] = '\0';
-                                copy_in_process_line(c, c->copy_in_linebuf, c->copy_in_linelen);
+                                copy_in_process_line(c, db, c->copy_in_linebuf, c->copy_in_linelen);
                             }
                             c->copy_in_linelen = 0;
                         } else if (!c->copy_in_line_overflow) {
@@ -2477,7 +2464,7 @@ static int process_messages(struct client_state *c, struct database *db)
                     /* flush any remaining partial line */
                     if (c->copy_in_linelen > 0) {
                         c->copy_in_linebuf[c->copy_in_linelen] = '\0';
-                        copy_in_process_line(c, c->copy_in_linebuf, c->copy_in_linelen);
+                        copy_in_process_line(c, db, c->copy_in_linebuf, c->copy_in_linelen);
                         c->copy_in_linelen = 0;
                     }
                     /* Invalidate scan cache */

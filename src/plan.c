@@ -1586,22 +1586,76 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 /* Accumulate aggregates */
                 st->grp_counts[group_idx]++;
                 for (uint32_t a = 0; a < agg_n; a++) {
-                    struct agg_expr *ae = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
-                    int ac = -1;
-                    if (!sv_eq_cstr(ae->column, "*")) {
-                        /* Find column index by name */
-                        struct plan_node *scan = &PLAN_NODE(ctx->arena, pn->left);
-                        if (scan->op == PLAN_SEQ_SCAN) {
-                            struct table *t = scan->seq_scan.table;
-                            ac = table_find_column_sv(t, ae->column);
+                    int ac = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
+                    if (ac == -1) continue; /* COUNT(*) — only grp_counts matters */
+
+                    size_t idx = a * st->group_cap + group_idx;
+
+                    if (ac == -2) {
+                        /* Expression-based aggregate: reconstruct temp row, eval expr */
+                        struct agg_expr *ae = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
+                        if (!st->tmp_row_inited) {
+                            st->tmp_row.cells.count = child_ncols;
+                            st->tmp_row.cells.items = (struct cell *)bump_alloc(
+                                &ctx->arena->scratch, child_ncols * sizeof(struct cell));
+                            st->tmp_row_inited = 1;
                         }
+                        for (uint16_t c = 0; c < child_ncols; c++) {
+                            struct col_block *cb = &input.cols[c];
+                            struct cell *cell = &st->tmp_row.cells.items[c];
+                            cell->type = cb->type;
+                            if (cb->nulls[ri]) {
+                                cell->is_null = 1;
+                                memset(&cell->value, 0, sizeof(cell->value));
+                            } else {
+                                cell->is_null = 0;
+                                if (cb->type == COLUMN_TYPE_SMALLINT)
+                                    cell->value.as_smallint = cb->data.i16[ri];
+                                else if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN)
+                                    cell->value.as_int = cb->data.i32[ri];
+                                else if (cb->type == COLUMN_TYPE_BIGINT)
+                                    cell->value.as_bigint = cb->data.i64[ri];
+                                else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC)
+                                    cell->value.as_float = cb->data.f64[ri];
+                                else
+                                    cell->value.as_text = cb->data.str[ri];
+                            }
+                        }
+                        struct cell cv = eval_expr(ae->expr_idx, ctx->arena,
+                                                   pn->hash_agg.table, &st->tmp_row,
+                                                   ctx->db, &ctx->arena->scratch);
+                        if (cv.is_null) continue;
+                        st->nonnull[idx]++;
+                        double v = 0.0;
+                        switch (cv.type) {
+                            case COLUMN_TYPE_SMALLINT: v = (double)cv.value.as_smallint; break;
+                            case COLUMN_TYPE_INT:      v = (double)cv.value.as_int; break;
+                            case COLUMN_TYPE_BIGINT:   v = (double)cv.value.as_bigint; break;
+                            case COLUMN_TYPE_FLOAT:
+                            case COLUMN_TYPE_NUMERIC:  v = cv.value.as_float; break;
+                            case COLUMN_TYPE_BOOLEAN:  v = (double)cv.value.as_bool; break;
+                            case COLUMN_TYPE_TEXT:
+                            case COLUMN_TYPE_ENUM:
+                            case COLUMN_TYPE_DATE:
+                            case COLUMN_TYPE_TIME:
+                            case COLUMN_TYPE_TIMESTAMP:
+                            case COLUMN_TYPE_TIMESTAMPTZ:
+                            case COLUMN_TYPE_INTERVAL:
+                            case COLUMN_TYPE_UUID:
+                                break;
+                        }
+                        st->sums[idx] += v;
+                        if (!st->minmax_init[idx] || v < st->mins[idx])
+                            st->mins[idx] = v;
+                        if (!st->minmax_init[idx] || v > st->maxs[idx])
+                            st->maxs[idx] = v;
+                        st->minmax_init[idx] = 1;
+                        continue;
                     }
-                    if (ac < 0) continue;
 
                     struct col_block *acb = &input.cols[ac];
                     if (acb->nulls[ri]) continue;
 
-                    size_t idx = a * st->group_cap + group_idx;
                     st->nonnull[idx]++;
                     double v = cb_to_double(acb, ri);
                     st->sums[idx] += v;
@@ -4457,15 +4511,20 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
 
         /* Validate: all aggregates must be simple SUM/COUNT/AVG/MIN/MAX on column refs */
         int agg_ok = 1;
+        int *agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
         for (uint32_t a = 0; a < s->aggregates_count; a++) {
             struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
             if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
                 { agg_ok = 0; break; }
-            if (ae->expr_idx != IDX_NONE) { agg_ok = 0; break; }
             if (ae->has_distinct) { agg_ok = 0; break; }
-            if (!sv_eq_cstr(ae->column, "*")) {
+            if (ae->expr_idx != IDX_NONE) {
+                agg_col_idxs[a] = -2; /* expression-based aggregate */
+            } else if (sv_eq_cstr(ae->column, "*")) {
+                agg_col_idxs[a] = -1; /* COUNT(*) */
+            } else {
                 int ci = table_find_column_sv(t, ae->column);
                 if (ci < 0) { agg_ok = 0; break; }
+                agg_col_idxs[a] = ci;
             }
         }
 
@@ -4498,6 +4557,8 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
             PLAN_NODE(arena, agg_idx).hash_agg.agg_start = s->aggregates_start;
             PLAN_NODE(arena, agg_idx).hash_agg.agg_count = s->aggregates_count;
             PLAN_NODE(arena, agg_idx).hash_agg.agg_before_cols = s->agg_before_cols;
+            PLAN_NODE(arena, agg_idx).hash_agg.agg_col_indices = agg_col_idxs;
+            PLAN_NODE(arena, agg_idx).hash_agg.table = t;
 
             uint32_t current = agg_idx;
 

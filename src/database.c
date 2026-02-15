@@ -18,6 +18,7 @@ void db_init(struct database *db, const char *name)
     da_init(&db->types);
     da_init(&db->sequences);
     db->active_txn = NULL;
+    db->total_generation = 0;
 }
 
 struct enum_type *db_find_type(struct database *db, const char *name)
@@ -1944,6 +1945,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 row_free(&t->rows.items[i]);
             t->rows.count = 0;
             t->generation++;
+            db->total_generation++;
             /* reset SERIAL counters */
             for (size_t i = 0; i < t->columns.count; i++) {
                 if (t->columns.items[i].is_serial)
@@ -2092,6 +2094,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                 row_free(&ct->rows.items[ri]);
                             ct->rows.count = 0;
                             ct->generation++;
+                            db->total_generation++;
 
                             for (size_t ri = 0; ri < rec_rows.count; ri++) {
                                 /* add to accumulator */
@@ -2653,6 +2656,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                     }
                     da_push(&t->rows, r);
                     t->generation++;
+                    db->total_generation++;
                 }
                 int cnt = (int)sel_rows.count;
                 for (size_t i = 0; i < sel_rows.count; i++) row_free(&sel_rows.data[i]);
@@ -2877,6 +2881,7 @@ skip_conflict_nothing:
                         dt->rows.count--;
                         deleted++;
                         dt->generation++;
+                        db->total_generation++;
                     }
                 }
                 free(to_delete);
@@ -3082,6 +3087,7 @@ skip_conflict_nothing:
                     t->name = sv_to_cstr(a->alter_new_name);
                     /* invalidate scan cache since table identity changed */
                     t->generation++;
+                    db->total_generation++;
                     return 0;
                 }
                 case ALTER_RENAME_COLUMN: {
@@ -3159,6 +3165,7 @@ skip_conflict_nothing:
                             }
                         }
                         t->generation++;
+                        db->total_generation++;
                     }
                     return 0;
                 }

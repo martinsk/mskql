@@ -5727,6 +5727,7 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct que
             t->rows.count--;
             deleted++;
             t->generation++;
+            db->total_generation++;
         } else {
             i++;
         }
@@ -5877,6 +5878,7 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
     /* bump generation (no full index rebuild needed — indexes updated incrementally) */
     if (updated > 0) {
         t->generation++;
+        db->total_generation++;
         /* patch scan cache in-place for each updated row (avoids full rebuild) */
         if (t->scan_cache.col_data && t->scan_cache.nrows == t->rows.count) {
             size_t scan2_count = use_index_scan ? idx_row_count : t->rows.count;
@@ -5974,12 +5976,14 @@ static int fk_enforce_delete(struct database *db, struct table *parent_t,
                                 (child_t->rows.count - r - 1) * sizeof(struct row));
                         child_t->rows.count--;
                         child_t->generation++;
+                        db->total_generation++;
                         continue; /* don't increment r */
                     case FK_SET_NULL:
                         cell_free_text(child_val);
                         memset(&child_val->value, 0, sizeof(child_val->value));
                         child_val->is_null = 1;
                         child_t->generation++;
+                        db->total_generation++;
                         r++;
                         break;
                     case FK_SET_DEFAULT:
@@ -5991,6 +5995,7 @@ static int fk_enforce_delete(struct database *db, struct table *parent_t,
                             child_val->is_null = 1;
                         }
                         child_t->generation++;
+                        db->total_generation++;
                         r++;
                         break;
                 }
@@ -6037,12 +6042,14 @@ static int fk_enforce_update(struct database *db, struct table *parent_t,
                         cell_free_text(child_val);
                         cell_copy(child_val, new_val);
                         child_t->generation++;
+                        db->total_generation++;
                         break;
                     case FK_SET_NULL:
                         cell_free_text(child_val);
                         memset(&child_val->value, 0, sizeof(child_val->value));
                         child_val->is_null = 1;
                         child_t->generation++;
+                        db->total_generation++;
                         break;
                     case FK_SET_DEFAULT:
                         cell_free_text(child_val);
@@ -6053,6 +6060,7 @@ static int fk_enforce_update(struct database *db, struct table *parent_t,
                             child_val->is_null = 1;
                         }
                         child_t->generation++;
+                        db->total_generation++;
                         break;
                 }
             }
@@ -6306,6 +6314,7 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
         }
         da_push(&t->rows, copy);
         t->generation++;
+        db->total_generation++;
 
         /* update indexes */
         size_t new_row_id = t->rows.count - 1;

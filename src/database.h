@@ -46,6 +46,7 @@ struct database {
      * Set by pgwire before each query, cleared after.  NULL when idle.
      * Safe because the server is single-threaded. */
     struct txn_state *active_txn;
+    uint64_t total_generation; /* sum of all table generations — bumped alongside t->generation++ */
 };
 
 void db_init(struct database *db, const char *name);
