@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1771110324345,
+  "lastUpdate": 1771114849059,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -4897,6 +4897,150 @@ window.BENCHMARK_DATA = {
             "value": 2021.511,
             "unit": "ms",
             "extra": "iters=50  min=40.129  p50=40.363  p95=40.665  p99=42.616  max=43.255"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "3011d8bffc5ffcc7bdcdf5ba5b2f7c051afdfa72",
+          "message": "add system catalog implementation with pg_namespace, pg_type, pg_class, pg_attribute, pg_index, pg_attrdef, pg_constraint, pg_database, pg_tables, pg_views, information_schema.tables, information_schema.columns, information_schema.schemata support: create catalog.c/catalog.h with table builders that populate catalog tables from user table metadata, add helper functions for OID/type mapping (col_type_to_oid, col_type_to_len, col_type_pg_name, col_type_to_typname), implement catalog_rebuild to regener",
+          "timestamp": "2026-02-14T16:19:59-08:00",
+          "tree_id": "07599e4d5ea5567edaf0c3afbcc79a5c7d78c6f6",
+          "url": "https://github.com/martinsk/mskql/commit/3011d8bffc5ffcc7bdcdf5ba5b2f7c051afdfa72"
+        },
+        "date": 1771114847748,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 13.207,
+            "unit": "ms",
+            "extra": "iters=10000  min=0.001  p50=0.001  p95=0.002  p99=0.003  max=0.045"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 71.937,
+            "unit": "ms",
+            "extra": "iters=200  min=0.347  p50=0.353  p95=0.370  p99=0.472  max=0.721"
+          },
+          {
+            "name": "select_where",
+            "value": 91.107,
+            "unit": "ms",
+            "extra": "iters=500  min=0.176  p50=0.181  p95=0.188  p99=0.195  max=0.257"
+          },
+          {
+            "name": "aggregate",
+            "value": 182.103,
+            "unit": "ms",
+            "extra": "iters=500  min=0.349  p50=0.358  p95=0.391  p99=0.496  max=0.596"
+          },
+          {
+            "name": "order_by",
+            "value": 140.971,
+            "unit": "ms",
+            "extra": "iters=200  min=0.685  p50=0.701  p95=0.719  p99=0.776  max=1.118"
+          },
+          {
+            "name": "join",
+            "value": 31.022,
+            "unit": "ms",
+            "extra": "iters=50  min=0.599  p50=0.610  p95=0.682  p99=0.816  max=0.890"
+          },
+          {
+            "name": "update",
+            "value": 23.443,
+            "unit": "ms",
+            "extra": "iters=200  min=0.114  p50=0.116  p95=0.122  p99=0.137  max=0.167"
+          },
+          {
+            "name": "delete",
+            "value": 98.413,
+            "unit": "ms",
+            "extra": "iters=50  min=1.956  p50=1.963  p95=1.977  p99=2.065  max=2.149"
+          },
+          {
+            "name": "parser",
+            "value": 241.351,
+            "unit": "ms",
+            "extra": "iters=50000  min=0.001  p50=0.004  p95=0.013  p99=0.013  max=0.046"
+          },
+          {
+            "name": "index_lookup",
+            "value": 5.233,
+            "unit": "ms",
+            "extra": "iters=2000  min=0.002  p50=0.003  p95=0.003  p99=0.003  max=0.010"
+          },
+          {
+            "name": "transaction",
+            "value": 17.948,
+            "unit": "ms",
+            "extra": "iters=100  min=0.092  p50=0.175  p95=0.267  p99=0.276  max=0.281"
+          },
+          {
+            "name": "window_functions",
+            "value": 19.063,
+            "unit": "ms",
+            "extra": "iters=20  min=0.939  p50=0.949  p95=0.970  p99=1.008  max=1.018"
+          },
+          {
+            "name": "distinct",
+            "value": 61.286,
+            "unit": "ms",
+            "extra": "iters=500  min=0.119  p50=0.121  p95=0.129  p99=0.150  max=0.214"
+          },
+          {
+            "name": "subquery",
+            "value": 1760.824,
+            "unit": "ms",
+            "extra": "iters=50  min=34.694  p50=35.175  p95=35.643  p99=36.342  max=36.788"
+          },
+          {
+            "name": "cte",
+            "value": 108.718,
+            "unit": "ms",
+            "extra": "iters=200  min=0.530  p50=0.543  p95=0.551  p99=0.593  max=0.628"
+          },
+          {
+            "name": "generate_series",
+            "value": 135.005,
+            "unit": "ms",
+            "extra": "iters=200  min=0.658  p50=0.674  p95=0.685  p99=0.703  max=0.873"
+          },
+          {
+            "name": "scalar_functions",
+            "value": 227.356,
+            "unit": "ms",
+            "extra": "iters=200  min=1.121  p50=1.131  p95=1.153  p99=1.227  max=1.452"
+          },
+          {
+            "name": "expression_agg",
+            "value": 348.444,
+            "unit": "ms",
+            "extra": "iters=500  min=0.679  p50=0.694  p95=0.731  p99=0.756  max=0.799"
+          },
+          {
+            "name": "multi_sort",
+            "value": 117.983,
+            "unit": "ms",
+            "extra": "iters=200  min=0.577  p50=0.588  p95=0.607  p99=0.665  max=0.721"
+          },
+          {
+            "name": "set_ops",
+            "value": 2026.591,
+            "unit": "ms",
+            "extra": "iters=50  min=40.003  p50=40.417  p95=41.365  p99=42.416  max=42.621"
           }
         ]
       }
