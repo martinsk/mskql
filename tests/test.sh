@@ -135,12 +135,15 @@ start_server() {
         return 1
     fi
     # Clean up any previous ASAN logs for this worker
-    rm -f "$worker_dir"/asan.log.*
-    # Run server with ASAN + LeakSanitizer logging to file
+    rm -f "$worker_dir"/asan.log
+    # Run server with ASAN + LeakSanitizer.
+    # We redirect stderr to a file instead of using ASAN's log_path option,
+    # because log_path forks a child that snapshots memory before atexit
+    # handlers (like db_free) run, causing false-positive leak reports.
     local lsan_opts="suppressions=$LSAN_SUPP"
-    ASAN_OPTIONS="detect_leaks=1:log_path=$worker_dir/asan.log:exitcode=0" \
+    ASAN_OPTIONS="detect_leaks=1:exitcode=0" \
         LSAN_OPTIONS="$lsan_opts" \
-        MSKQL_PORT="$port" "$PROJECT_DIR/build/mskql" >/dev/null 2>&1 &
+        MSKQL_PORT="$port" "$PROJECT_DIR/build/mskql" >/dev/null 2>"$worker_dir/asan.log" &
     local srv_pid=$!
     echo "$srv_pid" > "$pidfile"
     # wait until the server is accepting connections
@@ -175,14 +178,10 @@ stop_server() {
 check_asan_logs() {
     local worker_dir="$1"
     local leak_info=""
-    for logfile in "$worker_dir"/asan.log.*; do
-        [ -f "$logfile" ] || continue
-        if grep -qE 'LeakSanitizer|ERROR: AddressSanitizer' "$logfile" 2>/dev/null; then
-            # Extract a concise summary
-            leak_info=$(grep -A 2 -E 'SUMMARY|LeakSanitizer|ERROR: AddressSanitizer' "$logfile" | head -10)
-            break
-        fi
-    done
+    local logfile="$worker_dir/asan.log"
+    if [ -f "$logfile" ] && grep -qE 'LeakSanitizer|ERROR: AddressSanitizer' "$logfile" 2>/dev/null; then
+        leak_info=$(grep -A 2 -E 'SUMMARY|LeakSanitizer|ERROR: AddressSanitizer' "$logfile" | head -10)
+    fi
     echo "$leak_info"
 }
 

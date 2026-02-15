@@ -2,4 +2,4 @@
 -- input:
 SELECT * FROM pg_catalog.pg_type WHERE typname = 'int4'
 -- expected output:
-23|int4|11|4
+23|int4|11|4|b|0|-1|f|0|0

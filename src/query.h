@@ -108,7 +108,9 @@ enum cmp_op {
     CMP_IS_DISTINCT,
     CMP_IS_NOT_DISTINCT,
     CMP_EXISTS,
-    CMP_NOT_EXISTS
+    CMP_NOT_EXISTS,
+    CMP_REGEX_MATCH,
+    CMP_REGEX_NOT_MATCH
 };
 
 enum cond_type {
@@ -227,7 +229,24 @@ enum expr_func {
     FUNC_RIGHT,
     FUNC_REPEAT,
     FUNC_REVERSE,
-    FUNC_INITCAP
+    FUNC_INITCAP,
+    /* pg_catalog functions */
+    FUNC_PG_GET_USERBYID,
+    FUNC_PG_TABLE_IS_VISIBLE,
+    FUNC_FORMAT_TYPE,
+    FUNC_PG_GET_EXPR,
+    FUNC_OBJ_DESCRIPTION,
+    FUNC_COL_DESCRIPTION,
+    FUNC_PG_ENCODING_TO_CHAR,
+    FUNC_SHOBJ_DESCRIPTION,
+    FUNC_HAS_TABLE_PRIVILEGE,
+    FUNC_HAS_DATABASE_PRIVILEGE,
+    FUNC_PG_GET_CONSTRAINTDEF,
+    FUNC_PG_GET_INDEXDEF,
+    FUNC_ARRAY_TO_STRING,
+    FUNC_CURRENT_SCHEMA,
+    FUNC_CURRENT_SCHEMAS,
+    FUNC_PG_IS_IN_RECOVERY
 };
 
 struct case_when_branch {
@@ -272,6 +291,7 @@ struct expr {
             uint32_t branches_start; /* index into arena.branches (consecutive) */
             uint32_t branches_count;
             uint32_t else_expr;      /* index into arena.exprs, or IDX_NONE */
+            uint32_t operand;        /* simple CASE operand expr, or IDX_NONE */
         } case_when;
 
         /* EXPR_SUBQUERY */

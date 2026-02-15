@@ -517,10 +517,44 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                                   cond->op == CMP_ILIKE);
                 goto cond_cleanup;
             }
+            /* ~ / !~ regex match (simple stub supporting ^, $, and () groups) */
+            if (cond->op == CMP_REGEX_MATCH || cond->op == CMP_REGEX_NOT_MATCH) {
+                if (!column_type_is_text(c->type) || !c->value.as_text)
+                    goto cond_cleanup;
+                if (!cond->value.value.as_text) goto cond_cleanup;
+                const char *pat = cond->value.value.as_text;
+                const char *str = c->value.as_text;
+                /* strip anchors and parentheses to get a simplified pattern */
+                char simpat[256];
+                size_t si = 0;
+                int anchored_start = 0, anchored_end = 0;
+                for (const char *p = pat; *p && si < sizeof(simpat) - 1; p++) {
+                    if (p == pat && *p == '^') { anchored_start = 1; continue; }
+                    if (*p == '$' && *(p+1) == '\0') { anchored_end = 1; continue; }
+                    if (*p == '(' || *p == ')') continue;
+                    if (*p == '.' && *(p+1) == '*') { p++; continue; } /* .* = skip */
+                    simpat[si++] = *p;
+                }
+                simpat[si] = '\0';
+                int match = 0;
+                if (anchored_start && anchored_end) {
+                    match = (strcmp(str, simpat) == 0);
+                } else if (anchored_start) {
+                    match = (strncmp(str, simpat, si) == 0);
+                } else if (anchored_end) {
+                    size_t slen = strlen(str);
+                    match = (slen >= si && strcmp(str + slen - si, simpat) == 0);
+                } else {
+                    match = (strstr(str, simpat) != NULL);
+                }
+                cond_result = (cond->op == CMP_REGEX_MATCH) ? match : !match;
+                goto cond_cleanup;
+            }
             /* ANY/ALL/SOME: col op ANY(ARRAY[...]) */
             if (cond->is_any || cond->is_all) {
                 if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
                     goto cond_cleanup;
+                int all_matched = 1;
                 for (uint32_t i = 0; i < cond->array_values_count; i++) {
                     struct cell *av = &ACELL(arena, cond->array_values_start + i);
                     int r = cell_compare(c, av);
@@ -544,13 +578,15 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                             case CMP_IS_NOT_DISTINCT:
                             case CMP_EXISTS:
                             case CMP_NOT_EXISTS:
+                            case CMP_REGEX_MATCH:
+                            case CMP_REGEX_NOT_MATCH:
                                 break;
                         }
                     }
-                    if (cond->is_any && match) { cond_result = 1; goto cond_cleanup; }
-                    if (cond->is_all && !match) { cond_result = 0; goto cond_cleanup; }
+                    if (cond->is_any && match) { cond_result = 1; break; }
+                    if (cond->is_all && !match) { all_matched = 0; break; }
                 }
-                cond_result = cond->is_all ? 1 : 0;
+                if (cond->is_all) cond_result = all_matched;
                 goto cond_cleanup;
             }
             /* column-to-column comparison (JOIN ON conditions) */
@@ -582,6 +618,8 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                     case CMP_IS_NOT_DISTINCT:
                     case CMP_EXISTS:
                     case CMP_NOT_EXISTS:
+                    case CMP_REGEX_MATCH:
+                    case CMP_REGEX_NOT_MATCH:
                         break;
                 }
                 goto cond_cleanup;
@@ -624,6 +662,8 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                                     case CMP_IS_NOT_DISTINCT:
                                     case CMP_EXISTS:
                                     case CMP_NOT_EXISTS:
+                                    case CMP_REGEX_MATCH:
+                                    case CMP_REGEX_NOT_MATCH:
                                         break;
                                 }
                             }
@@ -661,6 +701,8 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                         case CMP_IS_NOT_DISTINCT:
                         case CMP_EXISTS:
                         case CMP_NOT_EXISTS:
+                        case CMP_REGEX_MATCH:
+                        case CMP_REGEX_NOT_MATCH:
                             break;
                     }
                 }
@@ -2603,6 +2645,112 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             return str;
         }
 
+        /* ---- pg_catalog stub functions ---- */
+
+        if (fn == FUNC_PG_GET_USERBYID) {
+            /* pg_get_userbyid(oid) -> role name; return db name as owner */
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_TEXT;
+            r.value.as_text = strdup(db ? db->name : "mskql");
+            return r;
+        }
+
+        if (fn == FUNC_PG_TABLE_IS_VISIBLE) {
+            /* pg_table_is_visible(oid) -> true for all public tables */
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_BOOLEAN;
+            r.value.as_bool = 1;
+            return r;
+        }
+
+        if (fn == FUNC_FORMAT_TYPE) {
+            /* format_type(type_oid, typemod) -> type name string */
+            if (nargs < 1) return cell_make_null();
+            struct cell oid_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+            int type_oid = 0;
+            if (oid_c.type == COLUMN_TYPE_INT) type_oid = oid_c.value.as_int;
+            else if (oid_c.type == COLUMN_TYPE_BIGINT) type_oid = (int)oid_c.value.as_bigint;
+            else if (column_type_is_text(oid_c.type) && oid_c.value.as_text) {
+                type_oid = atoi(oid_c.value.as_text);
+                cell_release(&oid_c);
+            }
+            const char *name = "unknown";
+            switch (type_oid) {
+                case 16:   name = "boolean"; break;
+                case 20:   name = "bigint"; break;
+                case 21:   name = "smallint"; break;
+                case 23:   name = "integer"; break;
+                case 25:   name = "text"; break;
+                case 701:  name = "double precision"; break;
+                case 1043: name = "character varying"; break;
+                case 1082: name = "date"; break;
+                case 1083: name = "time without time zone"; break;
+                case 1114: name = "timestamp without time zone"; break;
+                case 1184: name = "timestamp with time zone"; break;
+                case 1186: name = "interval"; break;
+                case 1700: name = "numeric"; break;
+                case 2950: name = "uuid"; break;
+            }
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_TEXT;
+            r.value.as_text = strdup(name);
+            return r;
+        }
+
+        if (fn == FUNC_PG_GET_EXPR || fn == FUNC_OBJ_DESCRIPTION ||
+            fn == FUNC_COL_DESCRIPTION || fn == FUNC_SHOBJ_DESCRIPTION) {
+            return cell_make_null();
+        }
+
+        if (fn == FUNC_PG_ENCODING_TO_CHAR) {
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_TEXT;
+            r.value.as_text = strdup("UTF8");
+            return r;
+        }
+
+        if (fn == FUNC_HAS_TABLE_PRIVILEGE || fn == FUNC_HAS_DATABASE_PRIVILEGE) {
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_BOOLEAN;
+            r.value.as_bool = 1;
+            return r;
+        }
+
+        if (fn == FUNC_PG_GET_CONSTRAINTDEF || fn == FUNC_PG_GET_INDEXDEF) {
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_TEXT;
+            r.value.as_text = strdup("");
+            return r;
+        }
+
+        if (fn == FUNC_ARRAY_TO_STRING) {
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_TEXT;
+            r.value.as_text = strdup("");
+            return r;
+        }
+
+        if (fn == FUNC_CURRENT_SCHEMA) {
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_TEXT;
+            r.value.as_text = strdup("public");
+            return r;
+        }
+
+        if (fn == FUNC_CURRENT_SCHEMAS) {
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_TEXT;
+            r.value.as_text = strdup("{pg_catalog,public}");
+            return r;
+        }
+
+        if (fn == FUNC_PG_IS_IN_RECOVERY) {
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_BOOLEAN;
+            r.value.as_bool = 0;
+            return r;
+        }
+
         return cell_make_null();
     }
 
@@ -2620,6 +2768,7 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
     case EXPR_SUBQUERY: {
         if (!db || e->subquery.sql_idx == IDX_NONE) return cell_make_null();
         const char *orig_sql = ASTRING(arena, e->subquery.sql_idx);
+        if (!orig_sql || !*orig_sql) return cell_make_null();
         /* correlated subquery: substitute outer column refs with literals */
         char sql_buf[2048];
         size_t sql_len = strlen(orig_sql);

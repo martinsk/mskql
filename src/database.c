@@ -2,6 +2,7 @@
 #include "parser.h"
 #include "query.h"
 #include "plan.h"
+#include "catalog.h"
 #include "stringview.h"
 #include <string.h>
 #include <strings.h>
@@ -302,6 +303,8 @@ static int join_cmp_match(const struct cell *a, const struct cell *b, enum cmp_o
         case CMP_IS_NOT_DISTINCT:
         case CMP_EXISTS:
         case CMP_NOT_EXISTS:
+        case CMP_REGEX_MATCH:
+        case CMP_REGEX_NOT_MATCH:
             return r == 0;
     }
     return 0;
@@ -2762,6 +2765,11 @@ int db_exec_sql(struct database *db, const char *sql, struct rows *result)
         fprintf(stderr, "subquery nesting depth exceeded (max 32)\n");
         return -1;
     }
+    /* Refresh catalog tables if the query references system schemas.
+     * Skip if we're already inside a subquery (catalog tables already populated). */
+    if (subquery_depth == 0 &&
+        (strstr(sql, "pg_") || strstr(sql, "information_schema")))
+        catalog_refresh(db);
     struct query q = {0};
     if (query_parse(sql, &q) != 0) {
         query_free(&q);
@@ -2776,6 +2784,7 @@ int db_exec_sql(struct database *db, const char *sql, struct rows *result)
 
 void db_free(struct database *db)
 {
+    catalog_cleanup(db);
     free(db->name);
     for (size_t i = 0; i < db->tables.count; i++) {
         table_free(&db->tables.items[i]);

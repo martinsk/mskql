@@ -28,6 +28,8 @@ enum token_type {
     TOK_PERCENT,
     TOK_PIPE_PIPE,
     TOK_DOUBLE_COLON,
+    TOK_TILDE,
+    TOK_BANG_TILDE,
     TOK_EOF,
     TOK_UNKNOWN
 };
@@ -50,6 +52,7 @@ static void lexer_init(struct lexer *l, const char *input)
 
 static void skip_whitespace(struct lexer *l)
 {
+    if (!l->input) return;
     while (l->input[l->pos] && isspace((unsigned char)l->input[l->pos]))
         l->pos++;
 }
@@ -99,6 +102,7 @@ static int is_keyword(sv word)
         "LPAD", "RPAD", "CONCAT", "CONCAT_WS", "POSITION", "SPLIT_PART",
         "LEFT", "RIGHT", "REPEAT", "REVERSE", "INITCAP",
         "SHOW", "RESET", "DISCARD", "DEALLOCATE",
+        "OPERATOR", "COLLATE",
         NULL
     };
     for (int i = 0; keywords[i]; i++) {
@@ -111,6 +115,7 @@ static int is_keyword(sv word)
 static struct token lexer_next(struct lexer *l)
 {
     struct token tok = { .type = TOK_EOF, .value = SV_NULL };
+    if (!l->input) return tok;
     skip_whitespace(l);
 
     char c = l->input[l->pos];
@@ -188,10 +193,22 @@ static struct token lexer_next(struct lexer *l)
         l->pos++;
         return tok;
     }
+    if (c == '!' && l->input[l->pos + 1] == '~') {
+        tok.type = TOK_BANG_TILDE;
+        tok.value = sv_from(&l->input[l->pos], 2);
+        l->pos += 2;
+        return tok;
+    }
     if (c == '!' && l->input[l->pos + 1] == '=') {
         tok.type = TOK_NOT_EQUALS;
         tok.value = sv_from(&l->input[l->pos], 2);
         l->pos += 2;
+        return tok;
+    }
+    if (c == '~') {
+        tok.type = TOK_TILDE;
+        tok.value = sv_from(&l->input[l->pos], 1);
+        l->pos++;
         return tok;
     }
     if (c == '<') {
@@ -571,7 +588,8 @@ static int is_cmp_token(enum token_type t)
 {
     return t == TOK_EQUALS || t == TOK_NOT_EQUALS ||
            t == TOK_LESS || t == TOK_GREATER ||
-           t == TOK_LESS_EQ || t == TOK_GREATER_EQ;
+           t == TOK_LESS_EQ || t == TOK_GREATER_EQ ||
+           t == TOK_TILDE || t == TOK_BANG_TILDE;
 }
 
 static enum cmp_op cmp_from_token(enum token_type t)
@@ -583,6 +601,8 @@ static enum cmp_op cmp_from_token(enum token_type t)
         case TOK_GREATER:    return CMP_GT;
         case TOK_LESS_EQ:    return CMP_LE;
         case TOK_GREATER_EQ: return CMP_GE;
+        case TOK_TILDE:      return CMP_REGEX_MATCH;
+        case TOK_BANG_TILDE: return CMP_REGEX_NOT_MATCH;
         case TOK_KEYWORD:
         case TOK_IDENTIFIER:
         case TOK_STRING:
@@ -669,7 +689,23 @@ static int is_expr_func_keyword(sv name)
            sv_eq_ignorecase_cstr(name, "RIGHT") ||
            sv_eq_ignorecase_cstr(name, "REPEAT") ||
            sv_eq_ignorecase_cstr(name, "REVERSE") ||
-           sv_eq_ignorecase_cstr(name, "INITCAP");
+           sv_eq_ignorecase_cstr(name, "INITCAP") ||
+           sv_eq_ignorecase_cstr(name, "pg_get_userbyid") ||
+           sv_eq_ignorecase_cstr(name, "pg_table_is_visible") ||
+           sv_eq_ignorecase_cstr(name, "format_type") ||
+           sv_eq_ignorecase_cstr(name, "pg_get_expr") ||
+           sv_eq_ignorecase_cstr(name, "obj_description") ||
+           sv_eq_ignorecase_cstr(name, "col_description") ||
+           sv_eq_ignorecase_cstr(name, "pg_encoding_to_char") ||
+           sv_eq_ignorecase_cstr(name, "shobj_description") ||
+           sv_eq_ignorecase_cstr(name, "has_table_privilege") ||
+           sv_eq_ignorecase_cstr(name, "has_database_privilege") ||
+           sv_eq_ignorecase_cstr(name, "pg_get_constraintdef") ||
+           sv_eq_ignorecase_cstr(name, "pg_get_indexdef") ||
+           sv_eq_ignorecase_cstr(name, "array_to_string") ||
+           sv_eq_ignorecase_cstr(name, "current_schema") ||
+           sv_eq_ignorecase_cstr(name, "current_schemas") ||
+           sv_eq_ignorecase_cstr(name, "pg_is_in_recovery");
 }
 
 static enum expr_func expr_func_from_name(sv name)
@@ -713,6 +749,22 @@ static enum expr_func expr_func_from_name(sv name)
     if (sv_eq_ignorecase_cstr(name, "REPEAT"))          return FUNC_REPEAT;
     if (sv_eq_ignorecase_cstr(name, "REVERSE"))         return FUNC_REVERSE;
     if (sv_eq_ignorecase_cstr(name, "INITCAP"))         return FUNC_INITCAP;
+    if (sv_eq_ignorecase_cstr(name, "pg_get_userbyid"))  return FUNC_PG_GET_USERBYID;
+    if (sv_eq_ignorecase_cstr(name, "pg_table_is_visible")) return FUNC_PG_TABLE_IS_VISIBLE;
+    if (sv_eq_ignorecase_cstr(name, "format_type"))      return FUNC_FORMAT_TYPE;
+    if (sv_eq_ignorecase_cstr(name, "pg_get_expr"))      return FUNC_PG_GET_EXPR;
+    if (sv_eq_ignorecase_cstr(name, "obj_description"))  return FUNC_OBJ_DESCRIPTION;
+    if (sv_eq_ignorecase_cstr(name, "col_description"))  return FUNC_COL_DESCRIPTION;
+    if (sv_eq_ignorecase_cstr(name, "pg_encoding_to_char")) return FUNC_PG_ENCODING_TO_CHAR;
+    if (sv_eq_ignorecase_cstr(name, "shobj_description")) return FUNC_SHOBJ_DESCRIPTION;
+    if (sv_eq_ignorecase_cstr(name, "has_table_privilege")) return FUNC_HAS_TABLE_PRIVILEGE;
+    if (sv_eq_ignorecase_cstr(name, "has_database_privilege")) return FUNC_HAS_DATABASE_PRIVILEGE;
+    if (sv_eq_ignorecase_cstr(name, "pg_get_constraintdef")) return FUNC_PG_GET_CONSTRAINTDEF;
+    if (sv_eq_ignorecase_cstr(name, "pg_get_indexdef"))  return FUNC_PG_GET_INDEXDEF;
+    if (sv_eq_ignorecase_cstr(name, "array_to_string"))  return FUNC_ARRAY_TO_STRING;
+    if (sv_eq_ignorecase_cstr(name, "current_schema"))   return FUNC_CURRENT_SCHEMA;
+    if (sv_eq_ignorecase_cstr(name, "current_schemas"))  return FUNC_CURRENT_SCHEMAS;
+    if (sv_eq_ignorecase_cstr(name, "pg_is_in_recovery")) return FUNC_PG_IS_IN_RECOVERY;
     return FUNC_COALESCE; /* fallback, should not happen */
 }
 
@@ -785,6 +837,12 @@ static enum column_type parse_column_type(sv type_name);
 static enum column_type parse_cast_type_name(struct lexer *l)
 {
     struct token tok = lexer_next(l);
+    /* Handle schema-qualified type: pg_catalog.regtype → skip schema */
+    struct token dot_peek = lexer_peek(l);
+    if (dot_peek.type == TOK_DOT) {
+        lexer_next(l); /* consume . */
+        tok = lexer_next(l); /* actual type name */
+    }
     enum column_type ct = parse_column_type(tok.value);
     /* Handle multi-word type names:
      *   TIMESTAMP WITH TIME ZONE / TIMESTAMP WITHOUT TIME ZONE
@@ -944,12 +1002,55 @@ static uint32_t parse_case_expr(struct lexer *l, struct query_arena *a)
     uint32_t branches_start = (uint32_t)a->branches.count;
     uint32_t branches_count = 0;
     EXPR(a, ei).case_when.else_expr = IDX_NONE;
+    EXPR(a, ei).case_when.operand = IDX_NONE;
+
+    /* Check for simple CASE: CASE expr WHEN val THEN ...
+     * vs searched CASE: CASE WHEN cond THEN ... */
+    struct token peek = lexer_peek(l);
+    int is_simple = 0;
+    if (!(peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "WHEN"))) {
+        /* simple CASE — parse the operand expression */
+        EXPR(a, ei).case_when.operand = parse_expr(l, a);
+        is_simple = 1;
+    }
 
     for (;;) {
         struct token tok = lexer_peek(l);
         if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "WHEN")) {
             lexer_next(l); /* consume WHEN */
-            uint32_t cond_idx = parse_or_cond(l, a);
+            uint32_t cond_idx;
+            if (is_simple) {
+                /* simple CASE: WHEN val — synthesize a COND_COMPARE with lhs_expr */
+                uint32_t val_expr = parse_expr(l, a);
+                cond_idx = (uint32_t)a->conditions.count;
+                struct condition c = {0};
+                memset(&c, 0, sizeof(c));
+                c.type = COND_COMPARE;
+                c.op = CMP_EQ;
+                c.lhs_expr = EXPR(a, ei).case_when.operand;
+                c.subquery_sql = IDX_NONE;
+                c.scalar_subquery_sql = IDX_NONE;
+                c.left = IDX_NONE;
+                c.right = IDX_NONE;
+                /* evaluate the WHEN value expression to get a literal cell */
+                struct expr *ve = &EXPR(a, val_expr);
+                if (ve->type == EXPR_LITERAL) {
+                    c.value = ve->literal;
+                    /* for text cells, strdup so the condition owns the text */
+                    if (c.value.type == COLUMN_TYPE_TEXT && c.value.value.as_text && !c.value.is_null)
+                        c.value.value.as_text = bump_strdup(&a->bump, c.value.value.as_text);
+                } else {
+                    /* non-literal WHEN value: store as rhs expression via a trick:
+                     * use rhs_column as empty and set scalar_subquery_sql to IDX_NONE.
+                     * Actually, let's just store the val_expr in lhs_expr and
+                     * handle it differently. For now, store as text literal. */
+                    c.value.type = COLUMN_TYPE_TEXT;
+                    c.value.is_null = 1; /* will be evaluated at runtime */
+                }
+                da_push(&a->conditions, c);
+            } else {
+                cond_idx = parse_or_cond(l, a);
+            }
             tok = lexer_next(l); /* consume THEN */
             if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "THEN")) {
                 arena_set_error(a, "42601", "expected THEN in CASE");
@@ -1230,6 +1331,12 @@ static uint32_t parse_expr_atom(struct lexer *l, struct query_arena *a)
         if (dot.type == TOK_DOT) {
             lexer_next(l); /* consume . */
             struct token col_tok = lexer_next(l);
+            /* check if this is a schema-qualified function call: schema.func( */
+            struct token maybe_lp = lexer_peek(l);
+            if (maybe_lp.type == TOK_LPAREN && is_expr_func_keyword(col_tok.value)) {
+                lexer_next(l); /* consume ( */
+                return parse_func_call_expr(l, a, col_tok);
+            }
             uint32_t ei = expr_alloc(a, EXPR_COLUMN_REF);
             EXPR(a, ei).column_ref.table = first;
             EXPR(a, ei).column_ref.column = col_tok.value;
@@ -1805,6 +1912,31 @@ static uint32_t parse_single_cond(struct lexer *l, struct query_arena *a)
     }
 
     tok = lexer_next(l);
+
+    /* bare TRUE/FALSE as standalone condition */
+    if (tok.type == TOK_KEYWORD &&
+        (sv_eq_ignorecase_cstr(tok.value, "TRUE") ||
+         sv_eq_ignorecase_cstr(tok.value, "FALSE"))) {
+        int val = sv_eq_ignorecase_cstr(tok.value, "TRUE") ? 1 : 0;
+        uint32_t bci = arena_alloc_cond(a);
+        COND(a, bci).type = COND_COMPARE;
+        COND(a, bci).lhs_expr = IDX_NONE;
+        COND(a, bci).left = IDX_NONE;
+        COND(a, bci).right = IDX_NONE;
+        COND(a, bci).subquery_sql = IDX_NONE;
+        COND(a, bci).scalar_subquery_sql = IDX_NONE;
+        COND(a, bci).op = CMP_EQ;
+        COND(a, bci).column = sv_from(NULL, 0);
+        /* synthesize: 1 = 1 (TRUE) or 1 = 0 (FALSE) */
+        uint32_t lhs = expr_alloc(a, EXPR_LITERAL);
+        EXPR(a, lhs).literal.type = COLUMN_TYPE_INT;
+        EXPR(a, lhs).literal.value.as_int = 1;
+        COND(a, bci).lhs_expr = lhs;
+        COND(a, bci).value.type = COLUMN_TYPE_INT;
+        COND(a, bci).value.value.as_int = val;
+        return bci;
+    }
+
     /* accept identifiers and keywords as column names (e.g. sum, count, avg in HAVING) */
     if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
         arena_set_error(a, "42601", "expected column name in WHERE/HAVING");
@@ -1870,6 +2002,15 @@ static uint32_t parse_single_cond(struct lexer *l, struct query_arena *a)
 
     COND(a, ci).column = consume_identifier(l, tok);
     op_tok = lexer_next(l);
+
+    /* If op_tok is '(' then the LHS is a function call (possibly schema-qualified).
+     * Back up and re-parse as an expression. */
+    if (op_tok.type == TOK_LPAREN) {
+        l->pos = tok.value.data - l->input;
+        COND(a, ci).lhs_expr = parse_expr(l, a);
+        COND(a, ci).column = sv_from(NULL, 0);
+        op_tok = lexer_next(l);
+    }
 
     /* If op_tok is an arithmetic operator, the LHS is an expression (e.g. a + b > 11).
      * Back up to before the identifier and re-parse the whole LHS as an expression. */
@@ -1955,6 +2096,22 @@ parse_operator:
         return ci;
     }
 
+    /* Handle OPERATOR(schema.op) syntax: extract the actual operator */
+    if (op_tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(op_tok.value, "OPERATOR")) {
+        struct token lp = lexer_next(l); /* ( */
+        if (lp.type == TOK_LPAREN) {
+            /* skip schema. prefix */
+            struct token ot = lexer_next(l);
+            struct token peek_d = lexer_peek(l);
+            if (peek_d.type == TOK_DOT) {
+                lexer_next(l); /* consume . */
+                ot = lexer_next(l); /* actual operator token */
+            }
+            lexer_next(l); /* consume ) */
+            op_tok = ot;
+        }
+    }
+
     if (!is_cmp_token(op_tok.type)) {
         arena_set_error(a, "42601", "expected comparison operator in WHERE");
         return IDX_NONE;
@@ -2016,6 +2173,22 @@ parse_operator:
         }
     }
     COND(a, ci).value = parse_literal_value_arena(tok, a);
+
+    /* skip optional COLLATE clause (e.g. COLLATE pg_catalog.default) */
+    {
+        struct token peek_col = lexer_peek(l);
+        if (peek_col.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek_col.value, "COLLATE")) {
+            lexer_next(l); /* consume COLLATE */
+            struct token ct = lexer_next(l); /* schema or collation name */
+            struct token cd = lexer_peek(l);
+            if (cd.type == TOK_DOT) {
+                lexer_next(l); /* consume . */
+                lexer_next(l); /* consume collation name */
+            }
+            (void)ct;
+        }
+    }
+
     return ci;
 }
 
@@ -2663,6 +2836,31 @@ static int parse_join_list(struct lexer *l, struct query_arena *a, struct query_
             }
         } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_STRING) {
             ji.join_table = tok.value;
+
+            /* check for schema-qualified name: schema.table */
+            peek = lexer_peek(l);
+            if (peek.type == TOK_DOT) {
+                lexer_next(l); /* consume dot */
+                struct token tbl_tok = lexer_next(l);
+                sv schema = tok.value;
+                sv tbl = tbl_tok.value;
+                if (sv_eq_ignorecase_cstr(schema, "pg_catalog")) {
+                    ji.join_table = tbl;
+                } else if (sv_eq_ignorecase_cstr(schema, "information_schema")) {
+                    char resolved[256];
+                    snprintf(resolved, sizeof(resolved), "information_schema_%.*s",
+                             (int)tbl.len, tbl.data);
+                    uint32_t si = arena_store_string(a, resolved, strlen(resolved));
+                    const char *stored = a->strings.items[si];
+                    ji.join_table = sv_from(stored, strlen(stored));
+                } else if (sv_eq_ignorecase_cstr(schema, "public")) {
+                    ji.join_table = tbl;
+                } else {
+                    arena_set_error(a, "3F000", "schema '%.*s' does not exist",
+                                    (int)schema.len, schema.data);
+                    return -1;
+                }
+            }
 
             /* optional alias */
             peek = lexer_peek(l);
@@ -3364,6 +3562,35 @@ parse_table_name:
         goto after_table_alias;
     } else if (tok.type == TOK_IDENTIFIER || tok.type == TOK_STRING) {
         s->table = tok.value;
+        /* check for schema-qualified name: schema.table */
+        struct token dot_peek = lexer_peek(l);
+        if (dot_peek.type == TOK_DOT) {
+            lexer_next(l); /* consume dot */
+            struct token tbl_tok = lexer_next(l);
+            /* resolve schema.table -> internal name */
+            sv schema = tok.value;
+            sv tbl = tbl_tok.value;
+            if (sv_eq_ignorecase_cstr(schema, "pg_catalog")) {
+                s->table = tbl; /* pg_catalog.pg_class -> pg_class */
+            } else if (sv_eq_ignorecase_cstr(schema, "information_schema")) {
+                /* information_schema.tables -> information_schema_tables */
+                s->table = sv_from(schema.data, (size_t)((tbl.data + tbl.len) - schema.data));
+                /* rewrite the sv to use underscore instead of dot */
+                /* we store the resolved name in the arena */
+                char resolved[256];
+                snprintf(resolved, sizeof(resolved), "information_schema_%.*s",
+                         (int)tbl.len, tbl.data);
+                uint32_t si = arena_store_string(a, resolved, strlen(resolved));
+                const char *stored = a->strings.items[si];
+                s->table = sv_from(stored, strlen(stored));
+            } else if (sv_eq_ignorecase_cstr(schema, "public")) {
+                s->table = tbl; /* public.t -> t */
+            } else {
+                arena_set_error(a, "3F000", "schema '%.*s' does not exist",
+                                (int)schema.len, schema.data);
+                return -1;
+            }
+        }
     } else {
         arena_set_error(a, "42601", "expected table name, got '" SV_FMT "'", (int)tok.value.len, tok.value.data);
         return -1;

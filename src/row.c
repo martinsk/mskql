@@ -74,6 +74,27 @@ int cell_compare(const struct cell *a, const struct cell *b)
             int cmp = strcmp(a->value.as_text, b->value.as_text);
             return (cmp < 0) ? -1 : (cmp > 0) ? 1 : 0;
         }
+        /* INT/BIGINT vs TEXT: coerce text to number for comparison */
+        int a_num = (a->type == COLUMN_TYPE_INT || a->type == COLUMN_TYPE_SMALLINT || a->type == COLUMN_TYPE_BIGINT);
+        int b_num = (b->type == COLUMN_TYPE_INT || b->type == COLUMN_TYPE_SMALLINT || b->type == COLUMN_TYPE_BIGINT);
+        if (a_num && column_type_is_text(b->type) && b->value.as_text) {
+            long long va = (a->type == COLUMN_TYPE_BIGINT) ? (long long)a->value.as_bigint :
+                           (a->type == COLUMN_TYPE_SMALLINT) ? (long long)a->value.as_smallint :
+                           (long long)a->value.as_int;
+            long long vb = atoll(b->value.as_text);
+            if (va < vb) return -1;
+            if (va > vb) return  1;
+            return 0;
+        }
+        if (b_num && column_type_is_text(a->type) && a->value.as_text) {
+            long long va = atoll(a->value.as_text);
+            long long vb = (b->type == COLUMN_TYPE_BIGINT) ? (long long)b->value.as_bigint :
+                           (b->type == COLUMN_TYPE_SMALLINT) ? (long long)b->value.as_smallint :
+                           (long long)b->value.as_int;
+            if (va < vb) return -1;
+            if (va > vb) return  1;
+            return 0;
+        }
         return -2; /* incompatible types */
     }
     switch (a->type) {
