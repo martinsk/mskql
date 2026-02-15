@@ -975,7 +975,7 @@ static int send_row_desc_plan(int fd, struct table *t, struct table *t2,
 
 /* ---- Result cache: replay cached wire bytes for identical SELECT queries ---- */
 
-#define RCACHE_SLOTS 256
+#define RCACHE_SLOTS 8192
 #define RCACHE_MAX_BYTES (512 * 1024) /* max cached wire data per entry */
 
 struct rcache_entry {
@@ -2659,6 +2659,11 @@ int pgwire_run(struct pgwire_server *srv)
                 }
                 set_nonblocking(client_fd);
                 { int one = 1; setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
+#if defined(TCP_NOPUSH)
+                { int one = 1; setsockopt(client_fd, IPPROTO_TCP, TCP_NOPUSH, &one, sizeof(one)); }
+#elif defined(TCP_CORK)
+                { int one = 1; setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &one, sizeof(one)); }
+#endif
                 client_init(&clients[nclients], client_fd);
                 nclients++;
             }
