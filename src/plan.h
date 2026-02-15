@@ -70,6 +70,7 @@ struct plan_node {
         struct {
             int     *sort_cols;      /* bump-allocated: column indices to sort by */
             int     *sort_descs;     /* bump-allocated: 1=DESC, 0=ASC per column */
+            int     *sort_nulls_first; /* bump-allocated: -1=default, 0=NULLS LAST, 1=NULLS FIRST */
             uint16_t nsort_cols;
         } sort;
         struct {

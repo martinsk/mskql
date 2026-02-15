@@ -10,7 +10,7 @@ ALTER TABLE users DROP COLUMN active;
 SELECT id, display_name, email, role FROM users ORDER BY id;
 -- expected output:
 1|Alice|alice@example.com|admin
-2|Bob|bob@example.com|
-3|Carol|carol@example.com|
-4|Dave|dave@example.com|
+2|Bob|bob@example.com|user
+3|Carol|carol@example.com|user
+4|Dave|dave@example.com|user
 -- expected status: 0

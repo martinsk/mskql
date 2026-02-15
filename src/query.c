@@ -550,10 +550,51 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                 cond_result = (cond->op == CMP_REGEX_MATCH) ? match : !match;
                 goto cond_cleanup;
             }
-            /* ANY/ALL/SOME: col op ANY(ARRAY[...]) */
+            /* ANY/ALL/SOME: col op ANY(SELECT ...) or col op ANY(ARRAY[...]) */
             if (cond->is_any || cond->is_all) {
                 if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
                     goto cond_cleanup;
+                /* subquery variant: ANY/ALL (SELECT ...) */
+                if (cond->subquery_sql != IDX_NONE && db) {
+                    const char *sq_sql = ASTRING(arena, cond->subquery_sql);
+                    char sql_buf[4096];
+                    strncpy(sql_buf, sq_sql, sizeof(sql_buf) - 1);
+                    sql_buf[sizeof(sql_buf) - 1] = '\0';
+                    if (t && row)
+                        subst_correlated_refs(sql_buf, sizeof(sql_buf), t, row);
+                    struct query sq = {0};
+                    if (query_parse(sql_buf, &sq) == 0) {
+                        struct rows sq_result = {0};
+                        if (db_exec(db, &sq, &sq_result, NULL) == 0) {
+                            int all_m = 1;
+                            for (size_t ri = 0; ri < sq_result.count; ri++) {
+                                if (sq_result.data[ri].cells.count == 0) continue;
+                                struct cell *sv = &sq_result.data[ri].cells.items[0];
+                                int r = cell_compare(c, sv);
+                                int match = 0;
+                                if (r != -2) {
+                                    switch (cond->op) {
+                                        case CMP_EQ: match = (r == 0); break;
+                                        case CMP_NE: match = (r != 0); break;
+                                        case CMP_LT: match = (r < 0); break;
+                                        case CMP_GT: match = (r > 0); break;
+                                        case CMP_LE: match = (r <= 0); break;
+                                        case CMP_GE: match = (r >= 0); break;
+                                        default: break;
+                                    }
+                                }
+                                if (cond->is_any && match) { cond_result = 1; break; }
+                                if (cond->is_all && !match) { all_m = 0; break; }
+                            }
+                            if (cond->is_all) cond_result = all_m;
+                            for (size_t ri = 0; ri < sq_result.count; ri++)
+                                row_free(&sq_result.data[ri]);
+                            free(sq_result.data);
+                        }
+                    }
+                    query_free(&sq);
+                    goto cond_cleanup;
+                }
                 int all_matched = 1;
                 for (uint32_t i = 0; i < cond->array_values_count; i++) {
                     struct cell *av = &ACELL(arena, cond->array_values_start + i);
@@ -1508,6 +1549,7 @@ static double cell_to_double_val(const struct cell *c)
     if (c->type == COLUMN_TYPE_INT)    return (double)c->value.as_int;
     if (c->type == COLUMN_TYPE_FLOAT)  return c->value.as_float;
     if (c->type == COLUMN_TYPE_BIGINT) return (double)c->value.as_bigint;
+    if (c->type == COLUMN_TYPE_NUMERIC) return c->value.as_float;
     return 0.0;
 }
 
@@ -3479,6 +3521,7 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
 struct sort_ctx {
     int *cols;
     int *descs;
+    int *nulls_first;      /* per-column: -1=default, 0=NULLS LAST, 1=NULLS FIRST */
     size_t ncols;
     struct rows *rows;     /* for sorting rows directly */
     struct table *table;   /* for sorting indices into table rows */
@@ -3496,7 +3539,19 @@ static int cmp_rows_multi(const void *a, const void *b)
     for (size_t k = 0; k < _sort_ctx.ncols; k++) {
         int ci = _sort_ctx.cols[k];
         if (ci < 0) continue;
-        int cmp = cell_compare(&ra->cells.items[ci], &rb->cells.items[ci]);
+        const struct cell *ca = &ra->cells.items[ci];
+        const struct cell *cb = &rb->cells.items[ci];
+        int a_null = ca->is_null || (column_type_is_text(ca->type) && !ca->value.as_text);
+        int b_null = cb->is_null || (column_type_is_text(cb->type) && !cb->value.as_text);
+        if (a_null || b_null) {
+            if (a_null && b_null) continue;
+            int nf = _sort_ctx.nulls_first ? _sort_ctx.nulls_first[k] : -1;
+            /* default: ASC → NULLS LAST, DESC → NULLS FIRST */
+            int nulls_go_first = (nf == 1) || (nf == -1 && _sort_ctx.descs[k]);
+            if (a_null) return nulls_go_first ? -1 : 1;
+            else        return nulls_go_first ? 1 : -1;
+        }
+        int cmp = cell_compare(ca, cb);
         if (_sort_ctx.descs[k]) cmp = -cmp;
         if (cmp != 0) return cmp;
     }
@@ -3512,8 +3567,18 @@ static int cmp_indices_multi(const void *a, const void *b)
     for (size_t k = 0; k < _sort_ctx.ncols; k++) {
         int ci = _sort_ctx.cols[k];
         if (ci < 0) continue;
-        int cmp = cell_compare(&t->rows.items[ia].cells.items[ci],
-                               &t->rows.items[ib].cells.items[ci]);
+        const struct cell *ca = &t->rows.items[ia].cells.items[ci];
+        const struct cell *cb = &t->rows.items[ib].cells.items[ci];
+        int a_null = ca->is_null || (column_type_is_text(ca->type) && !ca->value.as_text);
+        int b_null = cb->is_null || (column_type_is_text(cb->type) && !cb->value.as_text);
+        if (a_null || b_null) {
+            if (a_null && b_null) continue;
+            int nf = _sort_ctx.nulls_first ? _sort_ctx.nulls_first[k] : -1;
+            int nulls_go_first = (nf == 1) || (nf == -1 && _sort_ctx.descs[k]);
+            if (a_null) return nulls_go_first ? -1 : 1;
+            else        return nulls_go_first ? 1 : -1;
+        }
+        int cmp = cell_compare(ca, cb);
         if (_sort_ctx.descs[k]) cmp = -cmp;
         if (cmp != 0) return cmp;
     }
@@ -3828,8 +3893,8 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                 case WIN_SUM:
                 case WIN_COUNT:
                 case WIN_AVG: {
-                    if (!se->win.has_frame) {
-                        /* no frame: compute partition total in one pass */
+                    if (!se->win.has_frame && !se->win.has_order) {
+                        /* no frame, no ORDER BY: compute partition total in one pass */
                         double part_sum = 0.0;
                         int part_nn = 0;
                         int part_count = (int)psize;
@@ -3857,6 +3922,40 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                                 win_is_dbl[e] = 1;
                                 if (part_nn > 0) {
                                     win_dbl_vals[i * nexprs + e] = part_sum / (double)part_nn;
+                                } else {
+                                    win_is_null[i * nexprs + e] = 1;
+                                }
+                            }
+                        }
+                    } else if (!se->win.has_frame && se->win.has_order) {
+                        /* ORDER BY without explicit frame: implicit UNBOUNDED PRECEDING TO CURRENT ROW
+                         * — compute cumulative running values */
+                        double running_sum = 0.0;
+                        int running_nn = 0;
+                        int running_count = 0;
+                        for (size_t i = ps; i < pe; i++) {
+                            if (arg_idx[e] >= 0) {
+                                struct cell *ac = &t->rows.items[sorted_idx[i]].cells.items[arg_idx[e]];
+                                if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text)) {
+                                    running_sum += cell_to_double(ac);
+                                    running_nn++;
+                                }
+                            }
+                            running_count++;
+                            if (se->win.func == WIN_SUM) {
+                                if (arg_idx[e] >= 0 &&
+                                    t->columns.items[arg_idx[e]].type == COLUMN_TYPE_FLOAT) {
+                                    win_is_dbl[e] = 1;
+                                    win_dbl_vals[i * nexprs + e] = running_sum;
+                                } else {
+                                    win_int_vals[i * nexprs + e] = (int)running_sum;
+                                }
+                            } else if (se->win.func == WIN_COUNT) {
+                                win_int_vals[i * nexprs + e] = (arg_idx[e] >= 0) ? running_nn : running_count;
+                            } else { /* WIN_AVG */
+                                win_is_dbl[e] = 1;
+                                if (running_nn > 0) {
+                                    win_dbl_vals[i * nexprs + e] = running_sum / (double)running_nn;
                                 } else {
                                     win_is_null[i * nexprs + e] = 1;
                                 }
@@ -4596,14 +4695,16 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
     if (s->has_order_by && s->order_by_count > 0 && result->count > 1) {
         int ord_res[32];
         int ord_descs[32];
+        int ord_nf[32];
         size_t nord = s->order_by_count < 32 ? s->order_by_count : 32;
         for (size_t k = 0; k < nord; k++) {
             struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
             ord_res[k] = grp_find_result_col(t, grp_cols, ngrp, s, arena,
                                              obi->column);
             ord_descs[k] = obi->desc;
+            ord_nf[k] = obi->nulls_first;
         }
-        _sort_ctx = (struct sort_ctx){ .cols = ord_res, .descs = ord_descs, .ncols = nord };
+        _sort_ctx = (struct sort_ctx){ .cols = ord_res, .descs = ord_descs, .nulls_first = ord_nf, .ncols = nord };
         qsort(result->data, result->count, sizeof(struct row), cmp_rows_multi);
     }
 
@@ -4853,15 +4954,18 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
     int order_on_result = 0; /* set to 1 if we need to sort projected rows */
     int result_ord_cols[32];
     int result_ord_descs[32];
+    int result_ord_nf[32];
     size_t result_nord = 0;
     if (s->has_order_by && s->order_by_count > 0) {
         /* resolve column indices for all ORDER BY items */
         int ord_cols[32];
         int ord_descs[32];
+        int ord_nf[32];
         size_t nord = s->order_by_count < 32 ? s->order_by_count : 32;
         int all_resolved = 1;
         for (size_t k = 0; k < nord; k++) {
             struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
+            ord_nf[k] = obi->nulls_first;
             /* expression-based ORDER BY: find matching output column */
             if (obi->expr_idx != IDX_NONE) {
                 ord_cols[k] = -1;
@@ -4873,6 +4977,7 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                             scp->expr_idx == obi->expr_idx) {
                             result_ord_cols[k] = (int)pc;
                             result_ord_descs[k] = obi->desc;
+                            result_ord_nf[k] = obi->nulls_first;
                             order_on_result = 1;
                             ord_cols[k] = -2;
                             break;
@@ -4885,6 +4990,7 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                     order_on_result = 1;
                     ord_cols[k] = -3; /* mark as expr-eval needed */
                     result_ord_descs[k] = obi->desc;
+                    result_ord_nf[k] = obi->nulls_first;
                 }
                 ord_descs[k] = obi->desc;
                 continue;
@@ -4902,6 +5008,7 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                         sv_eq_ignorecase(obi->column, scp->alias)) {
                         result_ord_cols[k] = (int)pc;
                         result_ord_descs[k] = obi->desc;
+                        result_ord_nf[k] = obi->nulls_first;
                         order_on_result = 1;
                         ord_cols[k] = -2; /* mark as alias-resolved */
                         break;
@@ -4920,6 +5027,7 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                     /* expression-based ORDER BY — find matching output column by alias */
                     result_ord_cols[k] = -1;
                     result_ord_descs[k] = ord_descs[k];
+                    result_ord_nf[k] = ord_nf[k];
                     continue;
                 }
                 /* table column — find its position in parsed_columns output */
@@ -4932,10 +5040,11 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                     }
                 }
                 result_ord_descs[k] = ord_descs[k];
+                result_ord_nf[k] = ord_nf[k];
             }
         } else if (all_resolved) {
             _sort_ctx = (struct sort_ctx){ .cols = ord_cols, .descs = ord_descs,
-                                           .ncols = nord, .table = t };
+                                           .nulls_first = ord_nf, .ncols = nord, .table = t };
             qsort(match_items, match_count, sizeof(size_t), cmp_indices_multi);
         }
     }
@@ -4967,7 +5076,7 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
             }
         }
         _sort_ctx = (struct sort_ctx){ .cols = result_ord_cols, .descs = result_ord_descs,
-                                       .ncols = result_nord };
+                                       .nulls_first = result_ord_nf, .ncols = result_nord };
         qsort(tmp.data, tmp.count, sizeof(struct row), cmp_rows_multi);
         /* remove temp columns */
         if (added_temp_cols > 0) {

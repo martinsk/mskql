@@ -21,6 +21,6 @@ SELECT display_name, role FROM users ORDER BY id;
 -- expected output:
 Alice|admin
 Bob|moderator
-Carol|
-Dave|
+Carol|user
+Dave|user
 -- expected status: 0

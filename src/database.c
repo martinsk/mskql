@@ -645,37 +645,83 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
                 struct query lat_q = {0};
                 int lat_parsed = (query_parse(ASTRING(a, ji->lateral_subquery_sql), &lat_q) == 0);
                 if (lat_parsed) {
-                    /* parse the SELECT column list to get names */
-                    sv cols = lat_q.select.columns;
                     size_t ci = 0;
-                    while (cols.len > 0 && ci < lat_rows.data[0].cells.count) {
-                        while (cols.len > 0 && (cols.data[0] == ' ' || cols.data[0] == '\t'))
-                            { cols.data++; cols.len--; }
-                        size_t end = 0;
-                        while (end < cols.len && cols.data[end] != ',') end++;
-                        sv col_sv = sv_from(cols.data, end);
-                        while (col_sv.len > 0 && (col_sv.data[col_sv.len-1] == ' ' || col_sv.data[col_sv.len-1] == '\t'))
-                            col_sv.len--;
-                        /* strip table prefix */
-                        sv col_name = col_sv;
-                        for (size_t k = 0; k < col_name.len; k++) {
-                            if (col_name.data[k] == '.') {
-                                col_name = sv_from(col_name.data + k + 1, col_name.len - k - 1);
-                                break;
+                    /* Try parsed_columns aliases first (works for expression/aggregate queries) */
+                    if (lat_q.select.parsed_columns_count > 0) {
+                        for (uint32_t pc = 0; pc < lat_q.select.parsed_columns_count && ci < lat_rows.data[0].cells.count; pc++) {
+                            struct select_column *sc = &lat_q.arena.select_cols.items[lat_q.select.parsed_columns_start + pc];
+                            struct column col = {0};
+                            char buf[256];
+                            sv col_name = sc->alias.len > 0 ? sc->alias : (sv){0};
+                            if (col_name.len == 0 && sc->expr_idx != IDX_NONE) {
+                                struct expr *e = &EXPR(&lat_q.arena, sc->expr_idx);
+                                if (e->type == EXPR_COLUMN_REF) col_name = e->column_ref.column;
                             }
+                            if (col_name.len > 0) {
+                                if (lat_alias_buf[0])
+                                    snprintf(buf, sizeof(buf), "%s.%.*s", lat_alias_buf, (int)col_name.len, col_name.data);
+                                else
+                                    snprintf(buf, sizeof(buf), "%.*s", (int)col_name.len, col_name.data);
+                            } else {
+                                snprintf(buf, sizeof(buf), "col%zu", ci + 1);
+                            }
+                            col.name = strdup(buf);
+                            col.type = lat_rows.data[0].cells.items[ci].type;
+                            da_push(&merged_t.columns, col);
+                            ci++;
                         }
-                        struct column col = {0};
-                        char buf[256];
-                        if (lat_alias_buf[0])
-                            snprintf(buf, sizeof(buf), "%s.%.*s", lat_alias_buf, (int)col_name.len, col_name.data);
-                        else
-                            snprintf(buf, sizeof(buf), "%.*s", (int)col_name.len, col_name.data);
-                        col.name = strdup(buf);
-                        col.type = lat_rows.data[0].cells.items[ci].type;
-                        da_push(&merged_t.columns, col);
-                        ci++;
-                        if (end < cols.len) { cols.data += end + 1; cols.len -= end + 1; }
-                        else break;
+                    }
+                    /* Try aggregate aliases */
+                    if (ci == 0 && lat_q.select.aggregates_count > 0) {
+                        for (uint32_t ai = 0; ai < lat_q.select.aggregates_count && ci < lat_rows.data[0].cells.count; ai++) {
+                            struct agg_expr *ae = &lat_q.arena.aggregates.items[lat_q.select.aggregates_start + ai];
+                            struct column col = {0};
+                            char buf[256];
+                            if (ae->alias.len > 0) {
+                                if (lat_alias_buf[0])
+                                    snprintf(buf, sizeof(buf), "%s.%.*s", lat_alias_buf, (int)ae->alias.len, ae->alias.data);
+                                else
+                                    snprintf(buf, sizeof(buf), "%.*s", (int)ae->alias.len, ae->alias.data);
+                            } else {
+                                snprintf(buf, sizeof(buf), "col%zu", ci + 1);
+                            }
+                            col.name = strdup(buf);
+                            col.type = lat_rows.data[0].cells.items[ci].type;
+                            da_push(&merged_t.columns, col);
+                            ci++;
+                        }
+                    }
+                    /* Try raw columns text */
+                    if (ci == 0) {
+                        sv cols = lat_q.select.columns;
+                        while (cols.len > 0 && ci < lat_rows.data[0].cells.count) {
+                            while (cols.len > 0 && (cols.data[0] == ' ' || cols.data[0] == '\t'))
+                                { cols.data++; cols.len--; }
+                            size_t end = 0;
+                            while (end < cols.len && cols.data[end] != ',') end++;
+                            sv col_sv = sv_from(cols.data, end);
+                            while (col_sv.len > 0 && (col_sv.data[col_sv.len-1] == ' ' || col_sv.data[col_sv.len-1] == '\t'))
+                                col_sv.len--;
+                            sv col_name = col_sv;
+                            for (size_t k = 0; k < col_name.len; k++) {
+                                if (col_name.data[k] == '.') {
+                                    col_name = sv_from(col_name.data + k + 1, col_name.len - k - 1);
+                                    break;
+                                }
+                            }
+                            struct column col = {0};
+                            char buf[256];
+                            if (lat_alias_buf[0])
+                                snprintf(buf, sizeof(buf), "%s.%.*s", lat_alias_buf, (int)col_name.len, col_name.data);
+                            else
+                                snprintf(buf, sizeof(buf), "%.*s", (int)col_name.len, col_name.data);
+                            col.name = strdup(buf);
+                            col.type = lat_rows.data[0].cells.items[ci].type;
+                            da_push(&merged_t.columns, col);
+                            ci++;
+                            if (end < cols.len) { cols.data += end + 1; cols.len -= end + 1; }
+                            else break;
+                        }
                     }
                     /* fallback for remaining columns */
                     for (; ci < lat_rows.data[0].cells.count; ci++) {
@@ -2307,10 +2353,73 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 for (size_t i = 0; i < sel_rows.count; i++) {
                     struct row r = {0};
                     da_init(&r.cells);
-                    for (size_t c = 0; c < sel_rows.data[i].cells.count; c++) {
-                        struct cell cp;
-                        cell_copy(&cp, &sel_rows.data[i].cells.items[c]);
-                        da_push(&r.cells, cp);
+                    if (ins->insert_columns_count > 0) {
+                        /* column list provided: build full-width row with defaults/NULLs */
+                        for (size_t ci = 0; ci < t->columns.count; ci++) {
+                            if (t->columns.items[ci].has_default && t->columns.items[ci].default_value) {
+                                struct cell dup;
+                                cell_copy(&dup, t->columns.items[ci].default_value);
+                                da_push(&r.cells, dup);
+                            } else {
+                                struct cell null_cell = {0};
+                                null_cell.type = t->columns.items[ci].type;
+                                null_cell.is_null = 1;
+                                da_push(&r.cells, null_cell);
+                            }
+                        }
+                        for (uint32_t vi = 0; vi < ins->insert_columns_count && vi < (uint32_t)sel_rows.data[i].cells.count; vi++) {
+                            sv col_name = ASV(&q->arena, ins->insert_columns_start + vi);
+                            int ci = table_find_column_sv(t, col_name);
+                            if (ci < 0) continue;
+                            cell_free_text(&r.cells.items[ci]);
+                            cell_copy(&r.cells.items[ci], &sel_rows.data[i].cells.items[vi]);
+                        }
+                    } else {
+                        for (size_t c = 0; c < sel_rows.data[i].cells.count; c++) {
+                            struct cell cp;
+                            cell_copy(&cp, &sel_rows.data[i].cells.items[c]);
+                            da_push(&r.cells, cp);
+                        }
+                        /* pad with DEFAULT or NULL if fewer values than columns */
+                        while (r.cells.count < t->columns.count) {
+                            size_t ci = r.cells.count;
+                            if (t->columns.items[ci].has_default && t->columns.items[ci].default_value) {
+                                struct cell dup;
+                                cell_copy(&dup, t->columns.items[ci].default_value);
+                                da_push(&r.cells, dup);
+                            } else {
+                                struct cell null_cell = {0};
+                                null_cell.type = t->columns.items[ci].type;
+                                null_cell.is_null = 1;
+                                da_push(&r.cells, null_cell);
+                            }
+                        }
+                    }
+                    /* auto-increment SERIAL/BIGSERIAL columns */
+                    for (size_t ci = 0; ci < t->columns.count && ci < r.cells.count; ci++) {
+                        if (t->columns.items[ci].is_serial) {
+                            struct cell *c = &r.cells.items[ci];
+                            int is_null = c->is_null || (column_type_is_text(c->type) && !c->value.as_text);
+                            if (is_null) {
+                                long long val = t->columns.items[ci].serial_next++;
+                                c->is_null = 0;
+                                if (t->columns.items[ci].type == COLUMN_TYPE_BIGINT) {
+                                    c->type = COLUMN_TYPE_BIGINT;
+                                    c->value.as_bigint = val;
+                                } else if (t->columns.items[ci].type == COLUMN_TYPE_SMALLINT) {
+                                    c->type = COLUMN_TYPE_SMALLINT;
+                                    c->value.as_smallint = (int16_t)val;
+                                } else {
+                                    c->type = COLUMN_TYPE_INT;
+                                    c->value.as_int = (int)val;
+                                }
+                            } else {
+                                long long v = (c->type == COLUMN_TYPE_BIGINT) ? c->value.as_bigint :
+                                              (c->type == COLUMN_TYPE_SMALLINT) ? (long long)c->value.as_smallint : c->value.as_int;
+                                if (v >= t->columns.items[ci].serial_next)
+                                    t->columns.items[ci].serial_next = v + 1;
+                            }
+                        }
                     }
                     da_push(&t->rows, r);
                     t->generation++;
@@ -2593,13 +2702,23 @@ skip_conflict_nothing:
             switch (a->alter_action) {
                 case ALTER_ADD_COLUMN: {
                     table_add_column(t, &a->alter_new_col);
-                    /* pad existing rows with NULL for the new column */
+                    /* table_add_column deep-copies default_value — free the parser's copy */
+                    if (a->alter_new_col.default_value) {
+                        free(a->alter_new_col.default_value);
+                        a->alter_new_col.default_value = NULL;
+                    }
+                    /* pad existing rows with default value (or NULL) for the new column */
                     size_t new_idx = t->columns.count - 1;
+                    struct column *new_col = &t->columns.items[new_idx];
                     for (size_t i = 0; i < t->rows.count; i++) {
-                        struct cell null_cell = {0};
-                        null_cell.type = t->columns.items[new_idx].type;
-                        null_cell.is_null = 1;
-                        da_push(&t->rows.items[i].cells, null_cell);
+                        struct cell pad_cell = {0};
+                        if (new_col->has_default && new_col->default_value) {
+                            cell_copy(&pad_cell, new_col->default_value);
+                        } else {
+                            pad_cell.type = new_col->type;
+                            pad_cell.is_null = 1;
+                        }
+                        da_push(&t->rows.items[i].cells, pad_cell);
                     }
                     return 0;
                 }

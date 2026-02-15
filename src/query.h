@@ -396,6 +396,7 @@ struct order_by_item {
     sv column;
     int desc;
     uint32_t expr_idx;  /* index into arena.exprs, or IDX_NONE for simple column */
+    int nulls_first;    /* -1=unspecified (default), 0=NULLS LAST, 1=NULLS FIRST */
 };
 
 /* WHERE clause fields shared by SELECT, UPDATE, DELETE */

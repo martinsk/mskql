@@ -9,7 +9,7 @@ UPDATE users SET role = 'admin' WHERE display_name = 'Alice';
 SELECT display_name, role FROM users ORDER BY id;
 -- expected output:
 Alice|admin
-Bob|
-Carol|
-Dave|
+Bob|user
+Carol|user
+Dave|user
 -- expected status: 0

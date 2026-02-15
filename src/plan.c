@@ -1640,6 +1640,7 @@ struct block_sort_ctx {
     uint32_t          rows_per_block;
     int              *sort_cols;
     int              *sort_descs;
+    int              *sort_nulls_first; /* per-key: -1=default, 0=NULLS LAST, 1=NULLS FIRST */
     uint16_t          nsort_cols;
     /* Flat arrays for fast comparator (one per sort key) */
     void             *flat_keys[32];   /* contiguous typed array per sort key */
@@ -1662,8 +1663,12 @@ static int sort_flat_cmp(const void *a, const void *b)
         uint8_t na = _bsort_ctx.flat_nulls[k][ia];
         uint8_t nb = _bsort_ctx.flat_nulls[k][ib];
         if (na && nb) { continue; }
-        if (na) { return _bsort_ctx.sort_descs[k] ? -1 : 1; }
-        if (nb) { return _bsort_ctx.sort_descs[k] ? 1 : -1; }
+        if (na || nb) {
+            int nf = _bsort_ctx.sort_nulls_first ? _bsort_ctx.sort_nulls_first[k] : -1;
+            int nulls_go_first = (nf == 1) || (nf == -1 && _bsort_ctx.sort_descs[k]);
+            if (na) return nulls_go_first ? -1 : 1;
+            else    return nulls_go_first ? 1 : -1;
+        }
 
         int cmp = 0;
         enum column_type kt = _bsort_ctx.key_types[k];
@@ -1765,6 +1770,7 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         _bsort_ctx.rows_per_block = BLOCK_CAPACITY;
         _bsort_ctx.sort_cols = pn->sort.sort_cols;
         _bsort_ctx.sort_descs = pn->sort.sort_descs;
+        _bsort_ctx.sort_nulls_first = pn->sort.sort_nulls_first;
         _bsort_ctx.nsort_cols = pn->sort.nsort_cols;
 
         _bsort_ctx.all_cols = (struct col_block *)bump_alloc(&ctx->arena->scratch,
@@ -2285,7 +2291,8 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 case WIN_SUM:
                 case WIN_COUNT:
                 case WIN_AVG: {
-                    if (!pn->window.win_has_frame[w]) {
+                    if (!pn->window.win_has_frame[w] && oc < 0) {
+                        /* no frame, no ORDER BY: partition total */
                         double part_sum = 0.0;
                         int part_nn = 0;
                         for (uint32_t i = ps; i < pe; i++) {
@@ -2310,6 +2317,33 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             } else {
                                 st->win_is_dbl[w] = 1;
                                 if (part_nn > 0) st->win_f64[i * nw + w] = part_sum / (double)part_nn;
+                                else st->win_null[i * nw + w] = 1;
+                            }
+                        }
+                    } else if (!pn->window.win_has_frame[w] && oc >= 0) {
+                        /* ORDER BY without explicit frame: implicit UNBOUNDED PRECEDING TO CURRENT ROW */
+                        double running_sum = 0.0;
+                        int running_nn = 0;
+                        int running_count = 0;
+                        for (uint32_t i = ps; i < pe; i++) {
+                            uint32_t si = st->sorted[i];
+                            if (ac >= 0 && !st->flat_nulls[ac][si]) {
+                                running_sum += flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                running_nn++;
+                            }
+                            running_count++;
+                            if (wf == WIN_SUM) {
+                                if (ac >= 0 && (st->flat_types[ac] == COLUMN_TYPE_FLOAT || st->flat_types[ac] == COLUMN_TYPE_NUMERIC)) {
+                                    st->win_is_dbl[w] = 1;
+                                    st->win_f64[i * nw + w] = running_sum;
+                                } else {
+                                    st->win_i32[i * nw + w] = (int32_t)running_sum;
+                                }
+                            } else if (wf == WIN_COUNT) {
+                                st->win_i32[i * nw + w] = (ac >= 0) ? running_nn : running_count;
+                            } else {
+                                st->win_is_dbl[w] = 1;
+                                if (running_nn > 0) st->win_f64[i * nw + w] = running_sum / (double)running_nn;
                                 else st->win_null[i * nw + w] = 1;
                             }
                         }
@@ -3975,6 +4009,17 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
             }
         }
 
+        /* Add LIMIT/OFFSET if present */
+        if (s->has_limit || s->has_offset) {
+            uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
+            PLAN_NODE(arena, limit_idx).left = current;
+            PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
+            PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
+            PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
+            PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
+            current = limit_idx;
+        }
+
         return current;
     }
 
@@ -3983,6 +4028,7 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         !s->has_group_by && s->aggregates_count == 0 && s->ctes_count == 0 &&
         s->cte_sql == IDX_NONE && s->from_subquery_sql == IDX_NONE &&
         !s->has_recursive_cte && s->select_exprs_count == 0 &&
+        !s->where.has_where &&
         t && db && s->insert_rows_count == 0) {
 
         /* Parse the RHS SQL */
@@ -4439,12 +4485,14 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
     /* Pre-validate ORDER BY columns BEFORE allocating plan nodes */
     int  sort_cols_buf[32];
     int  sort_descs_buf[32];
+    int  sort_nf_buf[32];
     uint16_t sort_nord = 0;
     if (s->has_order_by && s->order_by_count > 0) {
         sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
         for (uint16_t k = 0; k < sort_nord; k++) {
             struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
             sort_descs_buf[k] = obi->desc;
+            sort_nf_buf[k] = obi->nulls_first;
             sort_cols_buf[k] = table_find_column_sv(t, obi->column);
             if (sort_cols_buf[k] < 0 && need_project) {
                 for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
@@ -4734,13 +4782,16 @@ append_sort_project_limit:
     if (sort_nord > 0) {
         int *sort_cols = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
         int *sort_descs = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
+        int *sort_nf = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
         memcpy(sort_cols, sort_cols_buf, sort_nord * sizeof(int));
         memcpy(sort_descs, sort_descs_buf, sort_nord * sizeof(int));
+        memcpy(sort_nf, sort_nf_buf, sort_nord * sizeof(int));
 
         uint32_t sort_idx = plan_alloc_node(arena, PLAN_SORT);
         PLAN_NODE(arena, sort_idx).left = current;
         PLAN_NODE(arena, sort_idx).sort.sort_cols = sort_cols;
         PLAN_NODE(arena, sort_idx).sort.sort_descs = sort_descs;
+        PLAN_NODE(arena, sort_idx).sort.sort_nulls_first = sort_nf;
         PLAN_NODE(arena, sort_idx).sort.nsort_cols = sort_nord;
         current = sort_idx;
     }

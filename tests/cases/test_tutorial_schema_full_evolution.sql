@@ -22,6 +22,6 @@ SELECT * FROM users ORDER BY id;
 -- expected output:
 1|Alice|alice@example.com|2025-01-01|admin
 2|Bob|bob@example.com|2025-01-01|moderator
-3|Carol|carol@example.com|2025-01-01|
-4|Dave|dave@example.com|2025-01-01|
+3|Carol|carol@example.com|2025-01-01|user
+4|Dave|dave@example.com|2025-01-01|user
 -- expected status: 0
