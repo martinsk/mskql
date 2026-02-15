@@ -3718,873 +3718,868 @@ int plan_explain(struct query_arena *arena, uint32_t node_idx, char *buf, int bu
     return written;
 }
 
-/* ---- Plan builder ---- */
+/* ---- Plan builder helpers ---- */
 
-/* Try to build a block-oriented plan for a simple single-table SELECT.
- * Returns root plan node index, or IDX_NONE if the query is too complex
- * and should fall back to the legacy executor. */
-uint32_t plan_build_select(struct table *t, struct query_select *s,
-                           struct query_arena *arena, struct database *db)
+/* Append a PLAN_LIMIT node if the query has LIMIT/OFFSET.
+ * Returns the (possibly new) current node index. */
+static uint32_t build_limit(uint32_t current, struct query_select *s,
+                             struct query_arena *arena)
 {
-    /* ---- Generate series fast path ---- */
-    if (s->has_generate_series && s->gs_start_expr != IDX_NONE &&
-        s->gs_stop_expr != IDX_NONE) {
-        /* Only handle simple SELECT * integer series via plan executor */
-        if (s->has_join || s->has_group_by || s->aggregates_count > 0 ||
-            s->has_set_op || s->ctes_count > 0 || s->has_distinct ||
-            s->select_exprs_count > 0 || s->where.has_where ||
-            s->has_order_by || s->parsed_columns_count > 0)
-            return IDX_NONE;
-        if (!sv_eq_cstr(s->columns, "*"))
-            return IDX_NONE;
+    if (!s->has_limit && !s->has_offset) return current;
+    uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
+    PLAN_NODE(arena, limit_idx).left = current;
+    PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
+    PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
+    PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
+    PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
+    return limit_idx;
+}
 
-        struct cell c_start = eval_expr(s->gs_start_expr, arena, NULL, NULL, db, NULL);
-        struct cell c_stop  = eval_expr(s->gs_stop_expr, arena, NULL, NULL, db, NULL);
-
-        /* Bail out for timestamp/date series — keep on legacy path */
-        if (c_start.type == COLUMN_TYPE_DATE || c_start.type == COLUMN_TYPE_TIMESTAMP ||
-            c_start.type == COLUMN_TYPE_TIMESTAMPTZ)
-            return IDX_NONE;
-        if (c_start.type == COLUMN_TYPE_INTERVAL || c_stop.type == COLUMN_TYPE_INTERVAL)
-            return IDX_NONE;
-
-        long long gs_start = (c_start.type == COLUMN_TYPE_BIGINT) ? c_start.value.as_bigint
-                           : (c_start.type == COLUMN_TYPE_FLOAT)  ? (long long)c_start.value.as_float
-                           : c_start.value.as_int;
-        long long gs_stop  = (c_stop.type == COLUMN_TYPE_BIGINT) ? c_stop.value.as_bigint
-                           : (c_stop.type == COLUMN_TYPE_FLOAT)  ? (long long)c_stop.value.as_float
-                           : c_stop.value.as_int;
-        long long gs_step  = 1;
-        if (s->gs_step_expr != IDX_NONE) {
-            struct cell c_step = eval_expr(s->gs_step_expr, arena, NULL, NULL, db, NULL);
-            if (c_step.type == COLUMN_TYPE_INTERVAL || column_type_is_text(c_step.type))
-                return IDX_NONE; /* timestamp step — bail to legacy */
-            gs_step = (c_step.type == COLUMN_TYPE_BIGINT) ? c_step.value.as_bigint
-                    : (c_step.type == COLUMN_TYPE_FLOAT)  ? (long long)c_step.value.as_float
-                    : c_step.value.as_int;
-        }
-        if (gs_step == 0) gs_step = 1;
-
-        int use_bigint = (c_start.type == COLUMN_TYPE_BIGINT ||
-                          c_stop.type == COLUMN_TYPE_BIGINT ||
-                          gs_start > 2147483647LL || gs_start < -2147483648LL ||
-                          gs_stop > 2147483647LL || gs_stop < -2147483648LL);
-
-        uint32_t gs_idx = plan_alloc_node(arena, PLAN_GENERATE_SERIES);
-        PLAN_NODE(arena, gs_idx).gen_series.start = gs_start;
-        PLAN_NODE(arena, gs_idx).gen_series.stop = gs_stop;
-        PLAN_NODE(arena, gs_idx).gen_series.step = gs_step;
-        PLAN_NODE(arena, gs_idx).gen_series.use_bigint = use_bigint;
-        uint32_t current = gs_idx;
-
-        /* Add LIMIT/OFFSET if present */
-        if (s->has_limit || s->has_offset) {
-            uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
-            PLAN_NODE(arena, limit_idx).left = current;
-            PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
-            PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
-            PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
-            PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
-            current = limit_idx;
-        }
-
-        return current;
+/* Check if a table has mixed cell types (e.g. after ALTER COLUMN TYPE).
+ * Returns 1 if mixed types detected, 0 if safe for plan executor. */
+static int table_has_mixed_types(struct table *tbl)
+{
+    if (tbl->rows.count == 0) return 0;
+    struct row *first = &tbl->rows.items[0];
+    for (size_t c = 0; c < first->cells.count && c < tbl->columns.count; c++) {
+        if (!first->cells.items[c].is_null &&
+            first->cells.items[c].type != tbl->columns.items[c].type)
+            return 1;
     }
-
-    /* ---- Single equi-join fast path ---- */
-    if (s->has_join && s->joins_count == 1 && db) {
-        struct join_info *ji = &arena->joins.items[s->joins_start];
-        /* Only handle: INNER JOIN, equi-join (CMP_EQ), not LATERAL, not NATURAL, not USING */
-        if (ji->join_type != 0) return IDX_NONE;       /* not INNER */
-        if (ji->is_lateral)     return IDX_NONE;
-        if (ji->is_natural)     return IDX_NONE;
-        if (ji->has_using)      return IDX_NONE;
-        /* Bail out for complex queries on joined results */
-        if (s->select_exprs_count > 0) return IDX_NONE; /* window functions */
-        if (s->has_group_by)        return IDX_NONE;
-        if (s->aggregates_count > 0) return IDX_NONE;
-        if (s->has_set_op)          return IDX_NONE;
-        if (s->ctes_count > 0)     return IDX_NONE;
-        if (s->cte_sql != IDX_NONE) return IDX_NONE;
-        if (s->from_subquery_sql != IDX_NONE) return IDX_NONE;
-        if (s->has_recursive_cte)   return IDX_NONE;
-        if (s->has_distinct)        return IDX_NONE;
-        if (s->has_distinct_on)     return IDX_NONE;
-        if (s->where.has_where)     return IDX_NONE;    /* WHERE on joined result — complex */
-        if (s->has_order_by)        return IDX_NONE;    /* ORDER BY on joined result — complex */
-        if (s->insert_rows_count > 0) return IDX_NONE;
-
-        struct table *t1 = t;
-        if (!t1) return IDX_NONE;
-        struct table *t2 = db_find_table_sv(db, ji->join_table);
-        if (!t2) return IDX_NONE;
-        if (t2->view_sql) return IDX_NONE; /* view — need materialization */
-
-        /* Extract join key columns — need simple equi-join on two column refs */
-        int t1_key = -1, t2_key = -1;
-
-        if (ji->join_on_cond != IDX_NONE) {
-            struct condition *cond = &COND(arena, ji->join_on_cond);
-            if (cond->type != COND_COMPARE || cond->op != CMP_EQ)
-                return IDX_NONE;
-            if (cond->lhs_expr != IDX_NONE) return IDX_NONE;
-            if (cond->column.len == 0 || cond->rhs_column.len == 0)
-                return IDX_NONE;
-            /* Try both orderings: col might be in t1 or t2 */
-            int lhs_in_t1 = table_find_column_sv(t1, cond->column);
-            int lhs_in_t2 = table_find_column_sv(t2, cond->column);
-            int rhs_in_t1 = table_find_column_sv(t1, cond->rhs_column);
-            int rhs_in_t2 = table_find_column_sv(t2, cond->rhs_column);
-            if (lhs_in_t1 >= 0 && rhs_in_t2 >= 0) {
-                t1_key = lhs_in_t1; t2_key = rhs_in_t2;
-            } else if (lhs_in_t2 >= 0 && rhs_in_t1 >= 0) {
-                t1_key = rhs_in_t1; t2_key = lhs_in_t2;
-            } else {
-                return IDX_NONE;
-            }
-        } else if (ji->join_left_col.len > 0 && ji->join_right_col.len > 0 &&
-                   ji->join_op == CMP_EQ) {
-            int left_in_t1 = table_find_column_sv(t1, ji->join_left_col);
-            int left_in_t2 = table_find_column_sv(t2, ji->join_left_col);
-            int right_in_t1 = table_find_column_sv(t1, ji->join_right_col);
-            int right_in_t2 = table_find_column_sv(t2, ji->join_right_col);
-            if (left_in_t1 >= 0 && right_in_t2 >= 0) {
-                t1_key = left_in_t1; t2_key = right_in_t2;
-            } else if (left_in_t2 >= 0 && right_in_t1 >= 0) {
-                t1_key = right_in_t1; t2_key = left_in_t2;
-            } else {
-                return IDX_NONE;
-            }
-        } else {
-            return IDX_NONE;
-        }
-
-        /* Resolve projection columns across merged column space [t1 cols | t2 cols] */
-        uint16_t t1_ncols = (uint16_t)t1->columns.count;
-        uint16_t t2_ncols = (uint16_t)t2->columns.count;
-        int select_all_join = sv_eq_cstr(s->columns, "*");
-        int need_project_join = 0;
-        int *proj_map_join = NULL;
-        uint16_t proj_ncols_join = 0;
-
-        if (select_all_join) {
-            /* No projection — return all columns from both tables */
-        } else if (s->parsed_columns_count > 0) {
-            proj_ncols_join = (uint16_t)s->parsed_columns_count;
-            proj_map_join = (int *)bump_alloc(&arena->scratch, proj_ncols_join * sizeof(int));
-            for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
-                struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
-                if (sc->expr_idx == IDX_NONE) return IDX_NONE;
-                struct expr *e = &EXPR(arena, sc->expr_idx);
-                if (e->type != EXPR_COLUMN_REF) return IDX_NONE;
-                /* Try to find in t1 first, then t2 (with offset) */
-                int ci = table_find_column_sv(t1, e->column_ref.column);
-                if (ci >= 0) {
-                    proj_map_join[i] = ci;
-                } else {
-                    ci = table_find_column_sv(t2, e->column_ref.column);
-                    if (ci >= 0) {
-                        proj_map_join[i] = t1_ncols + ci;
-                    } else {
-                        return IDX_NONE;
-                    }
-                }
-            }
-            need_project_join = 1;
-        } else {
-            return IDX_NONE; /* legacy text-based column list */
-        }
-
-        /* Bail out if either table has mixed cell types */
-        if (t1->rows.count > 0) {
-            struct row *first = &t1->rows.items[0];
-            for (size_t c = 0; c < first->cells.count && c < t1->columns.count; c++) {
-                if (!first->cells.items[c].is_null &&
-                    first->cells.items[c].type != t1->columns.items[c].type)
-                    return IDX_NONE;
-            }
-        }
-        if (t2->rows.count > 0) {
-            struct row *first = &t2->rows.items[0];
-            for (size_t c = 0; c < first->cells.count && c < t2->columns.count; c++) {
-                if (!first->cells.items[c].is_null &&
-                    first->cells.items[c].type != t2->columns.items[c].type)
-                    return IDX_NONE;
-            }
-        }
-
-        /* --- All validation passed, build plan nodes --- */
-
-        /* SEQ_SCAN for t1 (outer / left / probe side) */
-        int *col_map1 = (int *)bump_alloc(&arena->scratch, t1_ncols * sizeof(int));
-        for (uint16_t i = 0; i < t1_ncols; i++) col_map1[i] = (int)i;
-        uint32_t scan1 = plan_alloc_node(arena, PLAN_SEQ_SCAN);
-        PLAN_NODE(arena, scan1).seq_scan.table = t1;
-        PLAN_NODE(arena, scan1).seq_scan.ncols = t1_ncols;
-        PLAN_NODE(arena, scan1).seq_scan.col_map = col_map1;
-        PLAN_NODE(arena, scan1).est_rows = (double)t1->rows.count;
-
-        /* SEQ_SCAN for t2 (inner / right / build side) */
-        int *col_map2 = (int *)bump_alloc(&arena->scratch, t2_ncols * sizeof(int));
-        for (uint16_t i = 0; i < t2_ncols; i++) col_map2[i] = (int)i;
-        uint32_t scan2 = plan_alloc_node(arena, PLAN_SEQ_SCAN);
-        PLAN_NODE(arena, scan2).seq_scan.table = t2;
-        PLAN_NODE(arena, scan2).seq_scan.ncols = t2_ncols;
-        PLAN_NODE(arena, scan2).seq_scan.col_map = col_map2;
-        PLAN_NODE(arena, scan2).est_rows = (double)t2->rows.count;
-
-        /* HASH_JOIN node */
-        uint32_t join_idx = plan_alloc_node(arena, PLAN_HASH_JOIN);
-        PLAN_NODE(arena, join_idx).left = scan1;   /* outer (probe) */
-        PLAN_NODE(arena, join_idx).right = scan2;  /* inner (build) */
-        PLAN_NODE(arena, join_idx).hash_join.outer_key_col = t1_key;
-        PLAN_NODE(arena, join_idx).hash_join.inner_key_col = t2_key;
-        PLAN_NODE(arena, join_idx).hash_join.join_type = 0; /* INNER */
-
-        uint32_t current = join_idx;
-
-        /* PROJECT node if specific columns selected */
-        if (need_project_join) {
-            uint32_t proj_idx = plan_alloc_node(arena, PLAN_PROJECT);
-            PLAN_NODE(arena, proj_idx).left = current;
-            PLAN_NODE(arena, proj_idx).project.ncols = proj_ncols_join;
-            PLAN_NODE(arena, proj_idx).project.col_map = proj_map_join;
-            current = proj_idx;
-        }
-
-        /* LIMIT/OFFSET node if present */
-        if (s->has_limit || s->has_offset) {
-            uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
-            PLAN_NODE(arena, limit_idx).left = current;
-            PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
-            PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
-            PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
-            PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
-            current = limit_idx;
-        }
-
-        return current;
-    }
-
-    /* ---- Window function fast path ---- */
-    if (s->select_exprs_count > 0 && !s->has_join && !s->has_group_by &&
-        s->aggregates_count == 0 && !s->has_set_op && s->ctes_count == 0 &&
-        s->cte_sql == IDX_NONE && s->from_subquery_sql == IDX_NONE &&
-        !s->has_recursive_cte && !s->has_distinct && !s->has_distinct_on &&
-        t && s->insert_rows_count == 0) {
-
-        size_t nexprs = s->select_exprs_count;
-        /* Count passthrough and window expressions, resolve column indices */
-        uint16_t n_pass = 0, n_win = 0;
-        for (size_t e = 0; e < nexprs; e++) {
-            struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
-            if (se->kind == SEL_COLUMN) n_pass++;
-            else n_win++;
-        }
-        if (n_win == 0) return IDX_NONE; /* shouldn't happen */
-
-        /* Validate all columns exist and resolve indices */
-        int *pass_cols = (int *)bump_alloc(&arena->scratch, (n_pass ? n_pass : 1) * sizeof(int));
-        int *wpc = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-        int *woc = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-        int *wod = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-        int *wac = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-        int *wfn = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-        int *woff = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-        int *whf = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-        int *wfs = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-        int *wfe = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-        int *wfsn = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-        int *wfen = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
-
-        uint16_t pi = 0, wi = 0;
-        int global_part = -1, global_ord = -1, global_ord_desc = 0;
-        for (size_t e = 0; e < nexprs; e++) {
-            struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
-            if (se->kind == SEL_COLUMN) {
-                int ci = table_find_column_sv(t, se->column);
-                if (ci < 0) return IDX_NONE;
-                pass_cols[pi++] = ci;
-            } else {
-                int pc = -1, oc = -1, ac = -1;
-                if (se->win.has_partition) {
-                    pc = table_find_column_sv(t, se->win.partition_col);
-                    if (pc < 0) return IDX_NONE;
-                    if (global_part < 0) global_part = pc;
-                }
-                if (se->win.has_order) {
-                    oc = table_find_column_sv(t, se->win.order_col);
-                    if (oc < 0) return IDX_NONE;
-                    if (global_ord < 0) { global_ord = oc; global_ord_desc = se->win.order_desc; }
-                }
-                if (se->win.arg_column.len > 0 && !sv_eq_cstr(se->win.arg_column, "*")) {
-                    ac = table_find_column_sv(t, se->win.arg_column);
-                    if (ac < 0) return IDX_NONE;
-                }
-                /* For LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE with text arg columns,
-                 * bail out — plan executor uses double arrays, can't handle text */
-                if (ac >= 0 && column_type_is_text(t->columns.items[ac].type) &&
-                    (se->win.func == WIN_LAG || se->win.func == WIN_LEAD ||
-                     se->win.func == WIN_FIRST_VALUE || se->win.func == WIN_LAST_VALUE ||
-                     se->win.func == WIN_NTH_VALUE))
-                    return IDX_NONE;
-                wpc[wi] = pc;
-                woc[wi] = oc;
-                wod[wi] = se->win.order_desc;
-                wac[wi] = ac;
-                wfn[wi] = (int)se->win.func;
-                woff[wi] = se->win.offset;
-                whf[wi] = se->win.has_frame;
-                wfs[wi] = (int)se->win.frame_start;
-                wfe[wi] = (int)se->win.frame_end;
-                wfsn[wi] = se->win.frame_start_n;
-                wfen[wi] = se->win.frame_end_n;
-                wi++;
-            }
-        }
-
-        /* Bail out if table has mixed cell types */
-        if (t->rows.count > 0) {
-            struct row *first = &t->rows.items[0];
-            for (size_t c = 0; c < first->cells.count && c < t->columns.count; c++) {
-                if (!first->cells.items[c].is_null &&
-                    first->cells.items[c].type != t->columns.items[c].type)
-                    return IDX_NONE;
-            }
-        }
-
-        /* Build scan → (filter →) window (→ sort) plan */
-        uint16_t scan_ncols = (uint16_t)t->columns.count;
-        int *col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
-        for (uint16_t i = 0; i < scan_ncols; i++) col_map[i] = (int)i;
-
-        uint32_t scan_idx = plan_alloc_node(arena, PLAN_SEQ_SCAN);
-        PLAN_NODE(arena, scan_idx).seq_scan.table = t;
-        PLAN_NODE(arena, scan_idx).seq_scan.ncols = scan_ncols;
-        PLAN_NODE(arena, scan_idx).seq_scan.col_map = col_map;
-        PLAN_NODE(arena, scan_idx).est_rows = (double)t->rows.count;
-        uint32_t current = scan_idx;
-
-        /* Add filter if WHERE is simple enough */
-        if (s->where.has_where && s->where.where_cond != IDX_NONE) {
-            struct condition *cond = &COND(arena, s->where.where_cond);
-            if (cond->type == COND_COMPARE && cond->lhs_expr == IDX_NONE &&
-                cond->rhs_column.len == 0 &&
-                cond->scalar_subquery_sql == IDX_NONE &&
-                cond->subquery_sql == IDX_NONE &&
-                cond->in_values_count == 0 && cond->array_values_count == 0 &&
-                !cond->is_any && !cond->is_all && cond->op <= CMP_GE) {
-                int fc = table_find_column_sv(t, cond->column);
-                if (fc >= 0) {
-                    enum column_type ct = t->columns.items[fc].type;
-                    if ((ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN ||
-                         ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC ||
-                         ct == COLUMN_TYPE_BIGINT) &&
-                        (cond->value.is_null || cond->value.type == ct ||
-                         (ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT))) {
-                        if (!(ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)) {
-                            uint32_t filter_idx = plan_alloc_node(arena, PLAN_FILTER);
-                            PLAN_NODE(arena, filter_idx).left = current;
-                            PLAN_NODE(arena, filter_idx).filter.cond_idx = s->where.where_cond;
-                            PLAN_NODE(arena, filter_idx).filter.col_idx = fc;
-                            PLAN_NODE(arena, filter_idx).filter.cmp_op = (int)cond->op;
-                            PLAN_NODE(arena, filter_idx).filter.cmp_val = cond->value;
-                            current = filter_idx;
-                        }
-                    }
-                }
-            }
-        }
-
-        /* Add WINDOW node */
-        uint32_t win_idx = plan_alloc_node(arena, PLAN_WINDOW);
-        PLAN_NODE(arena, win_idx).left = current;
-        PLAN_NODE(arena, win_idx).window.out_ncols = n_pass + n_win;
-        PLAN_NODE(arena, win_idx).window.n_pass = n_pass;
-        PLAN_NODE(arena, win_idx).window.pass_cols = pass_cols;
-        PLAN_NODE(arena, win_idx).window.n_win = n_win;
-        PLAN_NODE(arena, win_idx).window.win_part_col = wpc;
-        PLAN_NODE(arena, win_idx).window.win_ord_col = woc;
-        PLAN_NODE(arena, win_idx).window.win_ord_desc = wod;
-        PLAN_NODE(arena, win_idx).window.win_arg_col = wac;
-        PLAN_NODE(arena, win_idx).window.win_func = wfn;
-        PLAN_NODE(arena, win_idx).window.win_offset = woff;
-        PLAN_NODE(arena, win_idx).window.win_has_frame = whf;
-        PLAN_NODE(arena, win_idx).window.win_frame_start = wfs;
-        PLAN_NODE(arena, win_idx).window.win_frame_end = wfe;
-        PLAN_NODE(arena, win_idx).window.win_frame_start_n = wfsn;
-        PLAN_NODE(arena, win_idx).window.win_frame_end_n = wfen;
-        PLAN_NODE(arena, win_idx).window.sort_part_col = global_part;
-        PLAN_NODE(arena, win_idx).window.sort_ord_col = global_ord;
-        PLAN_NODE(arena, win_idx).window.sort_ord_desc = global_ord_desc;
-        current = win_idx;
-
-        /* Add SORT node if outer ORDER BY is present */
-        if (s->has_order_by && s->order_by_count > 0) {
-            /* The output layout is: passthrough columns first (indices 0..n_pass-1),
-             * then window columns (indices n_pass..n_pass+n_win-1).
-             * We need to map ORDER BY column names to these output indices. */
-            int sort_cols_buf[32];
-            int sort_descs_buf[32];
-            uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
-            int sort_ok = 1;
-            for (uint16_t k = 0; k < sort_nord; k++) {
-                struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
-                sort_cols_buf[k] = -1;
-                sort_descs_buf[k] = obi->desc;
-                /* Walk select_exprs to find the output column index */
-                uint16_t pass_i = 0, win_i = 0;
-                for (size_t e = 0; e < nexprs; e++) {
-                    struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
-                    if (se->kind == SEL_COLUMN) {
-                        sv col = se->column;
-                        sv bare_col = col, bare_ord = obi->column;
-                        for (size_t kk = 0; kk < col.len; kk++)
-                            if (col.data[kk] == '.') { bare_col = sv_from(col.data+kk+1, col.len-kk-1); break; }
-                        for (size_t kk = 0; kk < obi->column.len; kk++)
-                            if (obi->column.data[kk] == '.') { bare_ord = sv_from(obi->column.data+kk+1, obi->column.len-kk-1); break; }
-                        if (sv_eq_ignorecase(bare_col, bare_ord)) { sort_cols_buf[k] = (int)pass_i; break; }
-                        if (se->alias.len > 0 && sv_eq_ignorecase(se->alias, obi->column)) { sort_cols_buf[k] = (int)pass_i; break; }
-                        pass_i++;
-                    } else {
-                        if (se->alias.len > 0 && sv_eq_ignorecase(se->alias, obi->column)) {
-                            sort_cols_buf[k] = (int)(n_pass + win_i);
-                            break;
-                        }
-                        win_i++;
-                    }
-                }
-                if (sort_cols_buf[k] < 0) { sort_ok = 0; break; }
-            }
-            if (sort_ok && sort_nord > 0) {
-                int *sort_cols = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
-                int *sort_descs = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
-                memcpy(sort_cols, sort_cols_buf, sort_nord * sizeof(int));
-                memcpy(sort_descs, sort_descs_buf, sort_nord * sizeof(int));
-                uint32_t sort_idx = plan_alloc_node(arena, PLAN_SORT);
-                PLAN_NODE(arena, sort_idx).left = current;
-                PLAN_NODE(arena, sort_idx).sort.sort_cols = sort_cols;
-                PLAN_NODE(arena, sort_idx).sort.sort_descs = sort_descs;
-                PLAN_NODE(arena, sort_idx).sort.nsort_cols = sort_nord;
-                current = sort_idx;
-            }
-        }
-
-        /* Add LIMIT/OFFSET if present */
-        if (s->has_limit || s->has_offset) {
-            uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
-            PLAN_NODE(arena, limit_idx).left = current;
-            PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
-            PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
-            PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
-            PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
-            current = limit_idx;
-        }
-
-        return current;
-    }
-
-    /* ---- Set operations fast path (UNION / INTERSECT / EXCEPT) ---- */
-    if (s->has_set_op && s->set_rhs_sql != IDX_NONE && !s->has_join &&
-        !s->has_group_by && s->aggregates_count == 0 && s->ctes_count == 0 &&
-        s->cte_sql == IDX_NONE && s->from_subquery_sql == IDX_NONE &&
-        !s->has_recursive_cte && s->select_exprs_count == 0 &&
-        !s->where.has_where &&
-        t && db && s->insert_rows_count == 0) {
-
-        /* Parse the RHS SQL */
-        const char *rhs_sql = ASTRING(arena, s->set_rhs_sql);
-        struct query rhs_q = {0};
-        if (query_parse(rhs_sql, &rhs_q) != 0) return IDX_NONE;
-        if (rhs_q.query_type != QUERY_TYPE_SELECT) { query_free(&rhs_q); return IDX_NONE; }
-
-        struct query_select *rs = &rhs_q.select;
-        /* Only handle simple single-table RHS SELECTs */
-        if (rs->has_join || rs->has_group_by || rs->aggregates_count > 0 ||
-            rs->has_set_op || rs->ctes_count > 0 || rs->has_distinct ||
-            rs->from_subquery_sql != IDX_NONE || rs->has_generate_series ||
-            rs->select_exprs_count > 0) {
-            query_free(&rhs_q);
-            return IDX_NONE;
-        }
-
-        struct table *t2 = db_find_table_sv(db, rs->table);
-        if (!t2 || t2->view_sql) { query_free(&rhs_q); return IDX_NONE; }
-
-        /* Resolve LHS columns */
-        int select_all_lhs = sv_eq_cstr(s->columns, "*");
-        uint16_t lhs_ncols;
-        int *lhs_col_map;
-        if (select_all_lhs) {
-            lhs_ncols = (uint16_t)t->columns.count;
-            lhs_col_map = (int *)bump_alloc(&arena->scratch, lhs_ncols * sizeof(int));
-            for (uint16_t i = 0; i < lhs_ncols; i++) lhs_col_map[i] = (int)i;
-        } else if (s->parsed_columns_count > 0) {
-            lhs_ncols = (uint16_t)s->parsed_columns_count;
-            lhs_col_map = (int *)bump_alloc(&arena->scratch, lhs_ncols * sizeof(int));
-            for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
-                struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
-                if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return IDX_NONE; }
-                struct expr *e = &EXPR(arena, sc->expr_idx);
-                if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return IDX_NONE; }
-                int ci = table_find_column_sv(t, e->column_ref.column);
-                if (ci < 0) { query_free(&rhs_q); return IDX_NONE; }
-                lhs_col_map[i] = ci;
-            }
-        } else {
-            query_free(&rhs_q);
-            return IDX_NONE;
-        }
-
-        /* Resolve RHS columns */
-        int select_all_rhs = sv_eq_cstr(rs->columns, "*");
-        uint16_t rhs_ncols;
-        int *rhs_col_map;
-        if (select_all_rhs) {
-            rhs_ncols = (uint16_t)t2->columns.count;
-            rhs_col_map = (int *)bump_alloc(&arena->scratch, rhs_ncols * sizeof(int));
-            for (uint16_t i = 0; i < rhs_ncols; i++) rhs_col_map[i] = (int)i;
-        } else if (rs->parsed_columns_count > 0) {
-            rhs_ncols = (uint16_t)rs->parsed_columns_count;
-            rhs_col_map = (int *)bump_alloc(&arena->scratch, rhs_ncols * sizeof(int));
-            for (uint32_t i = 0; i < rs->parsed_columns_count; i++) {
-                struct select_column *sc = &rhs_q.arena.select_cols.items[rs->parsed_columns_start + i];
-                if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return IDX_NONE; }
-                struct expr *e = &EXPR(&rhs_q.arena, sc->expr_idx);
-                if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return IDX_NONE; }
-                int ci = table_find_column_sv(t2, e->column_ref.column);
-                if (ci < 0) { query_free(&rhs_q); return IDX_NONE; }
-                rhs_col_map[i] = ci;
-            }
-        } else {
-            /* Try legacy text-based column resolution */
-            if (rs->columns.len > 0 && !sv_eq_cstr(rs->columns, "*")) {
-                /* Parse comma-separated column list from raw text */
-                query_free(&rhs_q);
-                return IDX_NONE;
-            }
-            query_free(&rhs_q);
-            return IDX_NONE;
-        }
-
-        /* Column counts must match */
-        if (lhs_ncols != rhs_ncols) { query_free(&rhs_q); return IDX_NONE; }
-
-        /* Check column type compatibility between LHS and RHS */
-        for (uint16_t i = 0; i < lhs_ncols; i++) {
-            enum column_type lt = t->columns.items[lhs_col_map[i]].type;
-            enum column_type rt = t2->columns.items[rhs_col_map[i]].type;
-            if (lt != rt) { query_free(&rhs_q); return IDX_NONE; }
-        }
-
-        /* Check for mixed cell types in both tables */
-        if (t->rows.count > 0) {
-            struct row *first = &t->rows.items[0];
-            for (size_t c = 0; c < first->cells.count && c < t->columns.count; c++) {
-                if (!first->cells.items[c].is_null &&
-                    first->cells.items[c].type != t->columns.items[c].type) {
-                    query_free(&rhs_q);
-                    return IDX_NONE;
-                }
-            }
-        }
-        if (t2->rows.count > 0) {
-            struct row *first = &t2->rows.items[0];
-            for (size_t c = 0; c < first->cells.count && c < t2->columns.count; c++) {
-                if (!first->cells.items[c].is_null &&
-                    first->cells.items[c].type != t2->columns.items[c].type) {
-                    query_free(&rhs_q);
-                    return IDX_NONE;
-                }
-            }
-        }
-
-        /* Build LHS plan: SEQ_SCAN (→ PROJECT if not SELECT *) */
-        uint16_t lhs_scan_ncols = (uint16_t)t->columns.count;
-        int *lhs_scan_map = (int *)bump_alloc(&arena->scratch, lhs_scan_ncols * sizeof(int));
-        for (uint16_t i = 0; i < lhs_scan_ncols; i++) lhs_scan_map[i] = (int)i;
-
-        uint32_t lhs_scan = plan_alloc_node(arena, PLAN_SEQ_SCAN);
-        PLAN_NODE(arena, lhs_scan).seq_scan.table = t;
-        PLAN_NODE(arena, lhs_scan).seq_scan.ncols = lhs_scan_ncols;
-        PLAN_NODE(arena, lhs_scan).seq_scan.col_map = lhs_scan_map;
-        PLAN_NODE(arena, lhs_scan).est_rows = (double)t->rows.count;
-        uint32_t lhs_current = lhs_scan;
-
-        if (!select_all_lhs) {
-            uint32_t lhs_proj = plan_alloc_node(arena, PLAN_PROJECT);
-            PLAN_NODE(arena, lhs_proj).left = lhs_current;
-            PLAN_NODE(arena, lhs_proj).project.ncols = lhs_ncols;
-            PLAN_NODE(arena, lhs_proj).project.col_map = lhs_col_map;
-            lhs_current = lhs_proj;
-        }
-
-        /* Build RHS plan: SEQ_SCAN (→ FILTER) (→ PROJECT if not SELECT *) */
-        uint16_t rhs_scan_ncols = (uint16_t)t2->columns.count;
-        int *rhs_scan_map = (int *)bump_alloc(&arena->scratch, rhs_scan_ncols * sizeof(int));
-        for (uint16_t i = 0; i < rhs_scan_ncols; i++) rhs_scan_map[i] = (int)i;
-
-        uint32_t rhs_scan = plan_alloc_node(arena, PLAN_SEQ_SCAN);
-        PLAN_NODE(arena, rhs_scan).seq_scan.table = t2;
-        PLAN_NODE(arena, rhs_scan).seq_scan.ncols = rhs_scan_ncols;
-        PLAN_NODE(arena, rhs_scan).seq_scan.col_map = rhs_scan_map;
-        PLAN_NODE(arena, rhs_scan).est_rows = (double)t2->rows.count;
-        uint32_t rhs_current = rhs_scan;
-
-        /* Add filter on RHS if it has a simple WHERE */
-        if (rs->where.has_where && rs->where.where_cond != IDX_NONE) {
-            struct condition *rcond = &COND(&rhs_q.arena, rs->where.where_cond);
-            if (rcond->type == COND_COMPARE && rcond->lhs_expr == IDX_NONE &&
-                rcond->rhs_column.len == 0 && rcond->subquery_sql == IDX_NONE &&
-                rcond->scalar_subquery_sql == IDX_NONE &&
-                rcond->in_values_count == 0 && rcond->array_values_count == 0 &&
-                !rcond->is_any && !rcond->is_all && rcond->op <= CMP_GE) {
-                int fc = table_find_column_sv(t2, rcond->column);
-                if (fc >= 0) {
-                    enum column_type fct = t2->columns.items[fc].type;
-                    if (fct == COLUMN_TYPE_INT || fct == COLUMN_TYPE_BIGINT ||
-                        fct == COLUMN_TYPE_FLOAT || fct == COLUMN_TYPE_NUMERIC ||
-                        fct == COLUMN_TYPE_BOOLEAN) {
-                        uint32_t rhs_filter = plan_alloc_node(arena, PLAN_FILTER);
-                        PLAN_NODE(arena, rhs_filter).left = rhs_current;
-                        PLAN_NODE(arena, rhs_filter).filter.col_idx = fc;
-                        PLAN_NODE(arena, rhs_filter).filter.cmp_op = (int)rcond->op;
-                        PLAN_NODE(arena, rhs_filter).filter.cmp_val = rcond->value;
-                        rhs_current = rhs_filter;
-                    }
-                }
-            }
-        }
-
-        if (!select_all_rhs) {
-            uint32_t rhs_proj = plan_alloc_node(arena, PLAN_PROJECT);
-            PLAN_NODE(arena, rhs_proj).left = rhs_current;
-            PLAN_NODE(arena, rhs_proj).project.ncols = rhs_ncols;
-            PLAN_NODE(arena, rhs_proj).project.col_map = rhs_col_map;
-            rhs_current = rhs_proj;
-        }
-
-        /* Build SET_OP node */
-        uint32_t set_idx = plan_alloc_node(arena, PLAN_SET_OP);
-        PLAN_NODE(arena, set_idx).left = lhs_current;
-        PLAN_NODE(arena, set_idx).right = rhs_current;
-        PLAN_NODE(arena, set_idx).set_op.set_op = s->set_op;
-        PLAN_NODE(arena, set_idx).set_op.set_all = s->set_all;
-        PLAN_NODE(arena, set_idx).set_op.ncols = lhs_ncols;
-        uint32_t current = set_idx;
-
-        /* Add SORT node if set_order_by is present */
-        if (s->set_order_by != IDX_NONE) {
-            const char *ob_sql = ASTRING(arena, s->set_order_by);
-            /* Skip "ORDER BY" prefix */
-            const char *p = ob_sql;
-            while (*p == ' ') p++;
-            if (strncasecmp(p, "ORDER", 5) == 0) p += 5;
-            while (*p == ' ') p++;
-            if (strncasecmp(p, "BY", 2) == 0) p += 2;
-            while (*p == ' ') p++;
-
-            int sort_cols_buf[32];
-            int sort_descs_buf[32];
-            uint16_t sort_nord = 0;
-            int sort_ok = 1;
-
-            while (*p && sort_nord < 32) {
-                while (*p == ' ') p++;
-                if (!*p) break;
-
-                /* Extract column name */
-                const char *start = p;
-                while (*p && *p != ' ' && *p != ',' && *p != '\t' && *p != '\n') p++;
-                sv col_name = sv_from(start, (size_t)(p - start));
-
-                /* Find column index in LHS output */
-                int sci = -1;
-                if (select_all_lhs) {
-                    sci = table_find_column_sv(t, col_name);
-                } else {
-                    for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
-                        struct select_column *scp = &arena->select_cols.items[s->parsed_columns_start + pc];
-                        if (scp->alias.len > 0 && sv_eq_ignorecase(col_name, scp->alias)) { sci = (int)pc; break; }
-                        if (scp->expr_idx != IDX_NONE) {
-                            struct expr *e = &EXPR(arena, scp->expr_idx);
-                            if (e->type == EXPR_COLUMN_REF && sv_eq_ignorecase(col_name, e->column_ref.column)) { sci = (int)pc; break; }
-                        }
-                    }
-                }
-                if (sci < 0) { sort_ok = 0; break; }
-
-                sort_cols_buf[sort_nord] = sci;
-                sort_descs_buf[sort_nord] = 0;
-
-                /* Check for ASC/DESC */
-                while (*p == ' ') p++;
-                if (strncasecmp(p, "DESC", 4) == 0 && (!p[4] || p[4] == ' ' || p[4] == ',')) {
-                    sort_descs_buf[sort_nord] = 1;
-                    p += 4;
-                } else if (strncasecmp(p, "ASC", 3) == 0 && (!p[3] || p[3] == ' ' || p[3] == ',')) {
-                    p += 3;
-                }
-                sort_nord++;
-
-                /* Skip comma */
-                while (*p == ' ') p++;
-                if (*p == ',') { p++; continue; }
-                break;
-            }
-
-            if (sort_ok && sort_nord > 0) {
-                int *sort_cols = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
-                int *sort_descs = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
-                memcpy(sort_cols, sort_cols_buf, sort_nord * sizeof(int));
-                memcpy(sort_descs, sort_descs_buf, sort_nord * sizeof(int));
-                uint32_t sort_idx = plan_alloc_node(arena, PLAN_SORT);
-                PLAN_NODE(arena, sort_idx).left = current;
-                PLAN_NODE(arena, sort_idx).sort.sort_cols = sort_cols;
-                PLAN_NODE(arena, sort_idx).sort.sort_descs = sort_descs;
-                PLAN_NODE(arena, sort_idx).sort.nsort_cols = sort_nord;
-                current = sort_idx;
-            }
-        }
-
-        /* Also handle ORDER BY from the main query (s->has_order_by) */
-        if (s->has_order_by && s->order_by_count > 0) {
-            uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
-            int sort_cols_buf2[32];
-            int sort_descs_buf2[32];
-            int sort_ok = 1;
-            for (uint16_t k = 0; k < sort_nord; k++) {
-                struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
-                sort_descs_buf2[k] = obi->desc;
-                sort_cols_buf2[k] = -1;
-                if (select_all_lhs) {
-                    sort_cols_buf2[k] = table_find_column_sv(t, obi->column);
-                } else {
-                    for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
-                        struct select_column *scp = &arena->select_cols.items[s->parsed_columns_start + pc];
-                        if (scp->alias.len > 0 && sv_eq_ignorecase(obi->column, scp->alias)) { sort_cols_buf2[k] = (int)pc; break; }
-                        if (scp->expr_idx != IDX_NONE) {
-                            struct expr *e = &EXPR(arena, scp->expr_idx);
-                            if (e->type == EXPR_COLUMN_REF && sv_eq_ignorecase(obi->column, e->column_ref.column)) { sort_cols_buf2[k] = (int)pc; break; }
-                        }
-                    }
-                }
-                if (sort_cols_buf2[k] < 0) { sort_ok = 0; break; }
-            }
-            if (sort_ok && sort_nord > 0) {
-                int *sort_cols = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
-                int *sort_descs = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
-                memcpy(sort_cols, sort_cols_buf2, sort_nord * sizeof(int));
-                memcpy(sort_descs, sort_descs_buf2, sort_nord * sizeof(int));
-                uint32_t sort_idx = plan_alloc_node(arena, PLAN_SORT);
-                PLAN_NODE(arena, sort_idx).left = current;
-                PLAN_NODE(arena, sort_idx).sort.sort_cols = sort_cols;
-                PLAN_NODE(arena, sort_idx).sort.sort_descs = sort_descs;
-                PLAN_NODE(arena, sort_idx).sort.nsort_cols = sort_nord;
-                current = sort_idx;
-            }
-        }
-
-        /* Add LIMIT/OFFSET if present */
-        if (s->has_limit || s->has_offset) {
-            uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
-            PLAN_NODE(arena, limit_idx).left = current;
-            PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
-            PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
-            PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
-            PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
-            current = limit_idx;
-        }
-
-        query_free(&rhs_q);
-        return current;
-    }
-
-    /* ---- Single-table GROUP BY + aggregates fast path ---- */
-    if (s->has_group_by && s->aggregates_count > 0 && t && !s->has_join &&
-        !s->has_set_op && s->ctes_count == 0 && s->cte_sql == IDX_NONE &&
-        s->from_subquery_sql == IDX_NONE && !s->has_recursive_cte &&
-        s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
-        !s->has_distinct && !s->has_distinct_on &&
-        !s->group_by_rollup && !s->group_by_cube &&
-        !s->has_having && !s->has_order_by) {
-
-        /* Validate: all aggregates must be simple SUM/COUNT/AVG/MIN/MAX on column refs */
-        int agg_ok = 1;
-        int *agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
-        for (uint32_t a = 0; a < s->aggregates_count; a++) {
-            struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
-            if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
-                { agg_ok = 0; break; }
-            if (ae->has_distinct) { agg_ok = 0; break; }
-            if (ae->expr_idx != IDX_NONE) {
-                agg_col_idxs[a] = -2; /* expression-based aggregate */
-            } else if (sv_eq_cstr(ae->column, "*")) {
-                agg_col_idxs[a] = -1; /* COUNT(*) */
-            } else {
-                int ci = table_find_column_sv(t, ae->column);
-                if (ci < 0) { agg_ok = 0; break; }
-                agg_col_idxs[a] = ci;
-            }
-        }
-
-        /* Validate: GROUP BY columns are resolvable */
-        int *grp_col_idxs = NULL;
-        if (agg_ok && s->group_by_count > 0) {
-            grp_col_idxs = (int *)bump_alloc(&arena->scratch, s->group_by_count * sizeof(int));
-            for (uint32_t g = 0; g < s->group_by_count; g++) {
-                sv gcol = arena->svs.items[s->group_by_start + g];
-                grp_col_idxs[g] = table_find_column_sv(t, gcol);
-                if (grp_col_idxs[g] < 0) { agg_ok = 0; break; }
-            }
-        }
-
-        if (agg_ok) {
-            /* Build: SEQ_SCAN → HASH_AGG */
-            uint16_t scan_ncols = (uint16_t)t->columns.count;
-            int *scan_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
-            for (uint16_t i = 0; i < scan_ncols; i++) scan_map[i] = (int)i;
-
-            uint32_t scan_idx = plan_alloc_node(arena, PLAN_SEQ_SCAN);
-            PLAN_NODE(arena, scan_idx).seq_scan.table = t;
-            PLAN_NODE(arena, scan_idx).seq_scan.ncols = scan_ncols;
-            PLAN_NODE(arena, scan_idx).seq_scan.col_map = scan_map;
-
-            uint32_t agg_idx = plan_alloc_node(arena, PLAN_HASH_AGG);
-            PLAN_NODE(arena, agg_idx).left = scan_idx;
-            PLAN_NODE(arena, agg_idx).hash_agg.ngroup_cols = (uint16_t)s->group_by_count;
-            PLAN_NODE(arena, agg_idx).hash_agg.group_cols = grp_col_idxs;
-            PLAN_NODE(arena, agg_idx).hash_agg.agg_start = s->aggregates_start;
-            PLAN_NODE(arena, agg_idx).hash_agg.agg_count = s->aggregates_count;
-            PLAN_NODE(arena, agg_idx).hash_agg.agg_before_cols = s->agg_before_cols;
-            PLAN_NODE(arena, agg_idx).hash_agg.agg_col_indices = agg_col_idxs;
-            PLAN_NODE(arena, agg_idx).hash_agg.table = t;
-
-            uint32_t current = agg_idx;
-
-            /* Add ORDER BY if present */
-            if (s->has_order_by && s->order_by_count > 0) {
-                /* For now, bail to legacy if ORDER BY is present on aggregates */
-                /* (would need to map ORDER BY columns to agg output columns) */
-            }
-
-            /* Add LIMIT/OFFSET if present */
-            if (s->has_limit || s->has_offset) {
-                uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
-                PLAN_NODE(arena, limit_idx).left = current;
-                PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
-                PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
-                PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
-                PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
-                current = limit_idx;
-            }
-
+    return 0;
+}
+
+/* Append a PLAN_PROJECT node with a pre-resolved column map.
+ * Returns the new node index. */
+static uint32_t append_project_node(uint32_t current, struct query_arena *arena,
+                                     uint16_t ncols, int *col_map)
+{
+    uint32_t proj_idx = plan_alloc_node(arena, PLAN_PROJECT);
+    PLAN_NODE(arena, proj_idx).left = current;
+    PLAN_NODE(arena, proj_idx).project.ncols = ncols;
+    PLAN_NODE(arena, proj_idx).project.col_map = col_map;
+    return proj_idx;
+}
+
+/* Create a PLAN_SEQ_SCAN node for a table with an identity column map.
+ * Returns the new node index. */
+static uint32_t build_seq_scan(struct table *tbl, struct query_arena *arena)
+{
+    uint16_t ncols = (uint16_t)tbl->columns.count;
+    int *col_map = (int *)bump_alloc(&arena->scratch, ncols * sizeof(int));
+    for (uint16_t i = 0; i < ncols; i++) col_map[i] = (int)i;
+    uint32_t scan_idx = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+    PLAN_NODE(arena, scan_idx).seq_scan.table = tbl;
+    PLAN_NODE(arena, scan_idx).seq_scan.ncols = ncols;
+    PLAN_NODE(arena, scan_idx).seq_scan.col_map = col_map;
+    PLAN_NODE(arena, scan_idx).est_rows = (double)tbl->rows.count;
+    return scan_idx;
+}
+
+/* Append a PLAN_FILTER node with pre-validated parameters.
+ * cond_idx may be IDX_NONE (e.g. for RHS/inner filters from parsed subqueries). */
+static uint32_t append_filter_node(uint32_t current, struct query_arena *arena,
+                                    uint32_t cond_idx, int col_idx,
+                                    int cmp_op, struct cell cmp_val)
+{
+    uint32_t filter_idx = plan_alloc_node(arena, PLAN_FILTER);
+    PLAN_NODE(arena, filter_idx).left = current;
+    PLAN_NODE(arena, filter_idx).filter.cond_idx = cond_idx;
+    PLAN_NODE(arena, filter_idx).filter.col_idx = col_idx;
+    PLAN_NODE(arena, filter_idx).filter.cmp_op = cmp_op;
+    PLAN_NODE(arena, filter_idx).filter.cmp_val = cmp_val;
+    return filter_idx;
+}
+
+/* Try to validate and append a simple comparison filter for a WHERE clause.
+ * Handles COND_COMPARE with col op literal (numeric or text).
+ * Returns current unchanged if the WHERE can't be handled as a plan filter.
+ * plan_arena is used for node allocation; cond_arena for condition lookup
+ * (they differ when the condition comes from a parsed sub-query). */
+static uint32_t try_append_simple_filter(uint32_t current, struct table *tbl,
+                                          struct query_arena *plan_arena,
+                                          struct query_arena *cond_arena,
+                                          uint32_t where_cond_idx)
+{
+    if (where_cond_idx == IDX_NONE) return current;
+    struct condition *cond = &COND(cond_arena, where_cond_idx);
+    if (cond->type != COND_COMPARE) return current;
+    if (cond->lhs_expr != IDX_NONE) return current;
+    if (cond->rhs_column.len != 0) return current;
+    if (cond->scalar_subquery_sql != IDX_NONE) return current;
+    if (cond->subquery_sql != IDX_NONE) return current;
+    if (cond->in_values_count > 0) return current;
+    if (cond->array_values_count > 0) return current;
+    if (cond->is_any || cond->is_all) return current;
+    if (cond->op > CMP_GE) return current;
+
+    int fc = table_find_column_sv(tbl, cond->column);
+    if (fc < 0) return current;
+    enum column_type ct = tbl->columns.items[fc].type;
+
+    if (column_type_is_text(ct)) {
+        if (!cond->value.is_null && !column_type_is_text(cond->value.type))
             return current;
+    } else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN ||
+               ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC ||
+               ct == COLUMN_TYPE_BIGINT) {
+        if (!cond->value.is_null && cond->value.type != ct &&
+            !(ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT))
+            return current;
+        if (ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)
+            return current;
+    } else {
+        return current;
+    }
+
+    return append_filter_node(current, plan_arena, where_cond_idx, fc,
+                              (int)cond->op, cond->value);
+}
+
+/* Append a PLAN_SORT node given pre-resolved sort arrays.
+ * sort_nf_buf may be NULL (no NULLS FIRST/LAST info).
+ * Returns the (possibly new) current node index, unchanged if nsort==0. */
+static uint32_t append_sort_node(uint32_t current, struct query_arena *arena,
+                                 const int *cols_buf, const int *descs_buf,
+                                 const int *nf_buf, uint16_t nsort)
+{
+    if (nsort == 0) return current;
+    int *sort_cols = (int *)bump_alloc(&arena->scratch, nsort * sizeof(int));
+    int *sort_descs = (int *)bump_alloc(&arena->scratch, nsort * sizeof(int));
+    memcpy(sort_cols, cols_buf, nsort * sizeof(int));
+    memcpy(sort_descs, descs_buf, nsort * sizeof(int));
+    uint32_t sort_idx = plan_alloc_node(arena, PLAN_SORT);
+    PLAN_NODE(arena, sort_idx).left = current;
+    PLAN_NODE(arena, sort_idx).sort.sort_cols = sort_cols;
+    PLAN_NODE(arena, sort_idx).sort.sort_descs = sort_descs;
+    PLAN_NODE(arena, sort_idx).sort.nsort_cols = nsort;
+    if (nf_buf) {
+        int *sort_nf = (int *)bump_alloc(&arena->scratch, nsort * sizeof(int));
+        memcpy(sort_nf, nf_buf, nsort * sizeof(int));
+        PLAN_NODE(arena, sort_idx).sort.sort_nulls_first = sort_nf;
+    }
+    return sort_idx;
+}
+
+/* ---- Plan builder: join path ---- */
+
+/* Try to build a plan for a single equi-join query.
+ * Returns root plan node index, or IDX_NONE if the query is too complex. */
+static uint32_t build_join(struct table *t, struct query_select *s,
+                            struct query_arena *arena, struct database *db)
+{
+    struct join_info *ji = &arena->joins.items[s->joins_start];
+    /* Only handle: INNER JOIN, equi-join (CMP_EQ), not LATERAL, not NATURAL, not USING */
+    if (ji->join_type != 0) return IDX_NONE;       /* not INNER */
+    if (ji->is_lateral)     return IDX_NONE;
+    if (ji->is_natural)     return IDX_NONE;
+    if (ji->has_using)      return IDX_NONE;
+    /* Bail out for complex queries on joined results */
+    if (s->select_exprs_count > 0) return IDX_NONE; /* window functions */
+    if (s->has_group_by)        return IDX_NONE;
+    if (s->aggregates_count > 0) return IDX_NONE;
+    if (s->has_set_op)          return IDX_NONE;
+    if (s->ctes_count > 0)     return IDX_NONE;
+    if (s->cte_sql != IDX_NONE) return IDX_NONE;
+    if (s->from_subquery_sql != IDX_NONE) return IDX_NONE;
+    if (s->has_recursive_cte)   return IDX_NONE;
+    if (s->has_distinct)        return IDX_NONE;
+    if (s->has_distinct_on)     return IDX_NONE;
+    if (s->where.has_where)     return IDX_NONE;    /* WHERE on joined result — complex */
+    if (s->has_order_by)        return IDX_NONE;    /* ORDER BY on joined result — complex */
+    if (s->insert_rows_count > 0) return IDX_NONE;
+
+    struct table *t1 = t;
+    if (!t1) return IDX_NONE;
+    struct table *t2 = db_find_table_sv(db, ji->join_table);
+    if (!t2) return IDX_NONE;
+    if (t2->view_sql) return IDX_NONE; /* view — need materialization */
+
+    /* Extract join key columns — need simple equi-join on two column refs */
+    int t1_key = -1, t2_key = -1;
+
+    if (ji->join_on_cond != IDX_NONE) {
+        struct condition *cond = &COND(arena, ji->join_on_cond);
+        if (cond->type != COND_COMPARE || cond->op != CMP_EQ)
+            return IDX_NONE;
+        if (cond->lhs_expr != IDX_NONE) return IDX_NONE;
+        if (cond->column.len == 0 || cond->rhs_column.len == 0)
+            return IDX_NONE;
+        /* Try both orderings: col might be in t1 or t2 */
+        int lhs_in_t1 = table_find_column_sv(t1, cond->column);
+        int lhs_in_t2 = table_find_column_sv(t2, cond->column);
+        int rhs_in_t1 = table_find_column_sv(t1, cond->rhs_column);
+        int rhs_in_t2 = table_find_column_sv(t2, cond->rhs_column);
+        if (lhs_in_t1 >= 0 && rhs_in_t2 >= 0) {
+            t1_key = lhs_in_t1; t2_key = rhs_in_t2;
+        } else if (lhs_in_t2 >= 0 && rhs_in_t1 >= 0) {
+            t1_key = rhs_in_t1; t2_key = lhs_in_t2;
+        } else {
+            return IDX_NONE;
+        }
+    } else if (ji->join_left_col.len > 0 && ji->join_right_col.len > 0 &&
+               ji->join_op == CMP_EQ) {
+        int left_in_t1 = table_find_column_sv(t1, ji->join_left_col);
+        int left_in_t2 = table_find_column_sv(t2, ji->join_left_col);
+        int right_in_t1 = table_find_column_sv(t1, ji->join_right_col);
+        int right_in_t2 = table_find_column_sv(t2, ji->join_right_col);
+        if (left_in_t1 >= 0 && right_in_t2 >= 0) {
+            t1_key = left_in_t1; t2_key = right_in_t2;
+        } else if (left_in_t2 >= 0 && right_in_t1 >= 0) {
+            t1_key = right_in_t1; t2_key = left_in_t2;
+        } else {
+            return IDX_NONE;
+        }
+    } else {
+        return IDX_NONE;
+    }
+
+    /* Resolve projection columns across merged column space [t1 cols | t2 cols] */
+    uint16_t t1_ncols = (uint16_t)t1->columns.count;
+    int select_all_join = sv_eq_cstr(s->columns, "*");
+    int need_project_join = 0;
+    int *proj_map_join = NULL;
+    uint16_t proj_ncols_join = 0;
+
+    if (select_all_join) {
+        /* No projection — return all columns from both tables */
+    } else if (s->parsed_columns_count > 0) {
+        proj_ncols_join = (uint16_t)s->parsed_columns_count;
+        proj_map_join = (int *)bump_alloc(&arena->scratch, proj_ncols_join * sizeof(int));
+        for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+            struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
+            if (sc->expr_idx == IDX_NONE) return IDX_NONE;
+            struct expr *e = &EXPR(arena, sc->expr_idx);
+            if (e->type != EXPR_COLUMN_REF) return IDX_NONE;
+            /* Try to find in t1 first, then t2 (with offset) */
+            int ci = table_find_column_sv(t1, e->column_ref.column);
+            if (ci >= 0) {
+                proj_map_join[i] = ci;
+            } else {
+                ci = table_find_column_sv(t2, e->column_ref.column);
+                if (ci >= 0) {
+                    proj_map_join[i] = t1_ncols + ci;
+                } else {
+                    return IDX_NONE;
+                }
+            }
+        }
+        need_project_join = 1;
+    } else {
+        return IDX_NONE; /* legacy text-based column list */
+    }
+
+    /* Bail out if either table has mixed cell types */
+    if (table_has_mixed_types(t1) || table_has_mixed_types(t2))
+        return IDX_NONE;
+
+    /* --- All validation passed, build plan nodes --- */
+
+    /* SEQ_SCAN for t1 (outer / left / probe side) */
+    uint32_t scan1 = build_seq_scan(t1, arena);
+
+    /* SEQ_SCAN for t2 (inner / right / build side) */
+    uint32_t scan2 = build_seq_scan(t2, arena);
+
+    /* HASH_JOIN node */
+    uint32_t join_idx = plan_alloc_node(arena, PLAN_HASH_JOIN);
+    PLAN_NODE(arena, join_idx).left = scan1;   /* outer (probe) */
+    PLAN_NODE(arena, join_idx).right = scan2;  /* inner (build) */
+    PLAN_NODE(arena, join_idx).hash_join.outer_key_col = t1_key;
+    PLAN_NODE(arena, join_idx).hash_join.inner_key_col = t2_key;
+    PLAN_NODE(arena, join_idx).hash_join.join_type = 0; /* INNER */
+
+    uint32_t current = join_idx;
+
+    /* PROJECT node if specific columns selected */
+    if (need_project_join)
+        current = append_project_node(current, arena, proj_ncols_join, proj_map_join);
+
+    current = build_limit(current, s, arena);
+
+    return current;
+}
+
+/* ---- Plan builder: set operations path ---- */
+
+/* Try to build a plan for a UNION/INTERSECT/EXCEPT query.
+ * Returns root plan node index, or IDX_NONE if the query is too complex. */
+static uint32_t build_set_op(struct table *t, struct query_select *s,
+                              struct query_arena *arena, struct database *db)
+{
+    /* Parse the RHS SQL */
+    const char *rhs_sql = ASTRING(arena, s->set_rhs_sql);
+    struct query rhs_q = {0};
+    if (query_parse(rhs_sql, &rhs_q) != 0) return IDX_NONE;
+    if (rhs_q.query_type != QUERY_TYPE_SELECT) { query_free(&rhs_q); return IDX_NONE; }
+
+    struct query_select *rs = &rhs_q.select;
+    /* Only handle simple single-table RHS SELECTs */
+    if (rs->has_join || rs->has_group_by || rs->aggregates_count > 0 ||
+        rs->has_set_op || rs->ctes_count > 0 || rs->has_distinct ||
+        rs->from_subquery_sql != IDX_NONE || rs->has_generate_series ||
+        rs->select_exprs_count > 0) {
+        query_free(&rhs_q);
+        return IDX_NONE;
+    }
+
+    struct table *t2 = db_find_table_sv(db, rs->table);
+    if (!t2 || t2->view_sql) { query_free(&rhs_q); return IDX_NONE; }
+
+    /* Resolve LHS columns */
+    int select_all_lhs = sv_eq_cstr(s->columns, "*");
+    uint16_t lhs_ncols;
+    int *lhs_col_map;
+    if (select_all_lhs) {
+        lhs_ncols = (uint16_t)t->columns.count;
+        lhs_col_map = (int *)bump_alloc(&arena->scratch, lhs_ncols * sizeof(int));
+        for (uint16_t i = 0; i < lhs_ncols; i++) lhs_col_map[i] = (int)i;
+    } else if (s->parsed_columns_count > 0) {
+        lhs_ncols = (uint16_t)s->parsed_columns_count;
+        lhs_col_map = (int *)bump_alloc(&arena->scratch, lhs_ncols * sizeof(int));
+        for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+            struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
+            if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return IDX_NONE; }
+            struct expr *e = &EXPR(arena, sc->expr_idx);
+            if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return IDX_NONE; }
+            int ci = table_find_column_sv(t, e->column_ref.column);
+            if (ci < 0) { query_free(&rhs_q); return IDX_NONE; }
+            lhs_col_map[i] = ci;
+        }
+    } else {
+        query_free(&rhs_q);
+        return IDX_NONE;
+    }
+
+    /* Resolve RHS columns */
+    int select_all_rhs = sv_eq_cstr(rs->columns, "*");
+    uint16_t rhs_ncols;
+    int *rhs_col_map;
+    if (select_all_rhs) {
+        rhs_ncols = (uint16_t)t2->columns.count;
+        rhs_col_map = (int *)bump_alloc(&arena->scratch, rhs_ncols * sizeof(int));
+        for (uint16_t i = 0; i < rhs_ncols; i++) rhs_col_map[i] = (int)i;
+    } else if (rs->parsed_columns_count > 0) {
+        rhs_ncols = (uint16_t)rs->parsed_columns_count;
+        rhs_col_map = (int *)bump_alloc(&arena->scratch, rhs_ncols * sizeof(int));
+        for (uint32_t i = 0; i < rs->parsed_columns_count; i++) {
+            struct select_column *sc = &rhs_q.arena.select_cols.items[rs->parsed_columns_start + i];
+            if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return IDX_NONE; }
+            struct expr *e = &EXPR(&rhs_q.arena, sc->expr_idx);
+            if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return IDX_NONE; }
+            int ci = table_find_column_sv(t2, e->column_ref.column);
+            if (ci < 0) { query_free(&rhs_q); return IDX_NONE; }
+            rhs_col_map[i] = ci;
+        }
+    } else {
+        /* Try legacy text-based column resolution */
+        if (rs->columns.len > 0 && !sv_eq_cstr(rs->columns, "*")) {
+            /* Parse comma-separated column list from raw text */
+            query_free(&rhs_q);
+            return IDX_NONE;
+        }
+        query_free(&rhs_q);
+        return IDX_NONE;
+    }
+
+    /* Column counts must match */
+    if (lhs_ncols != rhs_ncols) { query_free(&rhs_q); return IDX_NONE; }
+
+    /* Check column type compatibility between LHS and RHS */
+    for (uint16_t i = 0; i < lhs_ncols; i++) {
+        enum column_type lt = t->columns.items[lhs_col_map[i]].type;
+        enum column_type rt = t2->columns.items[rhs_col_map[i]].type;
+        if (lt != rt) { query_free(&rhs_q); return IDX_NONE; }
+    }
+
+    /* Check for mixed cell types in both tables */
+    if (table_has_mixed_types(t) || table_has_mixed_types(t2)) {
+        query_free(&rhs_q);
+        return IDX_NONE;
+    }
+
+    /* Build LHS plan: SEQ_SCAN (→ PROJECT if not SELECT *) */
+    uint32_t lhs_current = build_seq_scan(t, arena);
+
+    if (!select_all_lhs)
+        lhs_current = append_project_node(lhs_current, arena, lhs_ncols, lhs_col_map);
+
+    /* Build RHS plan: SEQ_SCAN (→ FILTER) (→ PROJECT if not SELECT *) */
+    uint32_t rhs_current = build_seq_scan(t2, arena);
+
+    /* Add filter on RHS if it has a simple WHERE */
+    if (rs->where.has_where)
+        rhs_current = try_append_simple_filter(rhs_current, t2, arena, &rhs_q.arena, rs->where.where_cond);
+
+    if (!select_all_rhs)
+        rhs_current = append_project_node(rhs_current, arena, rhs_ncols, rhs_col_map);
+
+    /* Build SET_OP node */
+    uint32_t set_idx = plan_alloc_node(arena, PLAN_SET_OP);
+    PLAN_NODE(arena, set_idx).left = lhs_current;
+    PLAN_NODE(arena, set_idx).right = rhs_current;
+    PLAN_NODE(arena, set_idx).set_op.set_op = s->set_op;
+    PLAN_NODE(arena, set_idx).set_op.set_all = s->set_all;
+    PLAN_NODE(arena, set_idx).set_op.ncols = lhs_ncols;
+    uint32_t current = set_idx;
+
+    /* Add SORT node if set_order_by is present */
+    if (s->set_order_by != IDX_NONE) {
+        const char *ob_sql = ASTRING(arena, s->set_order_by);
+        /* Skip "ORDER BY" prefix */
+        const char *p = ob_sql;
+        while (*p == ' ') p++;
+        if (strncasecmp(p, "ORDER", 5) == 0) p += 5;
+        while (*p == ' ') p++;
+        if (strncasecmp(p, "BY", 2) == 0) p += 2;
+        while (*p == ' ') p++;
+
+        int sort_cols_buf[32];
+        int sort_descs_buf[32];
+        uint16_t sort_nord = 0;
+        int sort_ok = 1;
+
+        while (*p && sort_nord < 32) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+
+            /* Extract column name */
+            const char *start = p;
+            while (*p && *p != ' ' && *p != ',' && *p != '\t' && *p != '\n') p++;
+            sv col_name = sv_from(start, (size_t)(p - start));
+
+            /* Find column index in LHS output */
+            int sci = -1;
+            if (select_all_lhs) {
+                sci = table_find_column_sv(t, col_name);
+            } else {
+                for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                    struct select_column *scp = &arena->select_cols.items[s->parsed_columns_start + pc];
+                    if (scp->alias.len > 0 && sv_eq_ignorecase(col_name, scp->alias)) { sci = (int)pc; break; }
+                    if (scp->expr_idx != IDX_NONE) {
+                        struct expr *e = &EXPR(arena, scp->expr_idx);
+                        if (e->type == EXPR_COLUMN_REF && sv_eq_ignorecase(col_name, e->column_ref.column)) { sci = (int)pc; break; }
+                    }
+                }
+            }
+            if (sci < 0) { sort_ok = 0; break; }
+
+            sort_cols_buf[sort_nord] = sci;
+            sort_descs_buf[sort_nord] = 0;
+
+            /* Check for ASC/DESC */
+            while (*p == ' ') p++;
+            if (strncasecmp(p, "DESC", 4) == 0 && (!p[4] || p[4] == ' ' || p[4] == ',')) {
+                sort_descs_buf[sort_nord] = 1;
+                p += 4;
+            } else if (strncasecmp(p, "ASC", 3) == 0 && (!p[3] || p[3] == ' ' || p[3] == ',')) {
+                p += 3;
+            }
+            sort_nord++;
+
+            /* Skip comma */
+            while (*p == ' ') p++;
+            if (*p == ',') { p++; continue; }
+            break;
+        }
+
+        if (sort_ok && sort_nord > 0)
+            current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, NULL, sort_nord);
+    }
+
+    /* Also handle ORDER BY from the main query (s->has_order_by) */
+    if (s->has_order_by && s->order_by_count > 0) {
+        uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+        int sort_cols_buf2[32];
+        int sort_descs_buf2[32];
+        int sort_ok = 1;
+        for (uint16_t k = 0; k < sort_nord; k++) {
+            struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
+            sort_descs_buf2[k] = obi->desc;
+            sort_cols_buf2[k] = -1;
+            if (select_all_lhs) {
+                sort_cols_buf2[k] = table_find_column_sv(t, obi->column);
+            } else {
+                for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                    struct select_column *scp = &arena->select_cols.items[s->parsed_columns_start + pc];
+                    if (scp->alias.len > 0 && sv_eq_ignorecase(obi->column, scp->alias)) { sort_cols_buf2[k] = (int)pc; break; }
+                    if (scp->expr_idx != IDX_NONE) {
+                        struct expr *e = &EXPR(arena, scp->expr_idx);
+                        if (e->type == EXPR_COLUMN_REF && sv_eq_ignorecase(obi->column, e->column_ref.column)) { sort_cols_buf2[k] = (int)pc; break; }
+                    }
+                }
+            }
+            if (sort_cols_buf2[k] < 0) { sort_ok = 0; break; }
+        }
+        if (sort_ok && sort_nord > 0)
+            current = append_sort_node(current, arena, sort_cols_buf2, sort_descs_buf2, NULL, sort_nord);
+    }
+
+    current = build_limit(current, s, arena);
+
+    query_free(&rhs_q);
+    return current;
+}
+
+/* ---- Plan builder: window path ---- */
+
+/* Try to build a plan for a window function query.
+ * Returns root plan node index, or IDX_NONE if the query is too complex. */
+static uint32_t build_window(struct table *t, struct query_select *s,
+                              struct query_arena *arena)
+{
+    size_t nexprs = s->select_exprs_count;
+    /* Count passthrough and window expressions, resolve column indices */
+    uint16_t n_pass = 0, n_win = 0;
+    for (size_t e = 0; e < nexprs; e++) {
+        struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
+        if (se->kind == SEL_COLUMN) n_pass++;
+        else n_win++;
+    }
+    if (n_win == 0) return IDX_NONE; /* shouldn't happen */
+
+    /* Validate all columns exist and resolve indices */
+    int *pass_cols = (int *)bump_alloc(&arena->scratch, (n_pass ? n_pass : 1) * sizeof(int));
+    int *wpc = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *woc = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *wod = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *wac = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *wfn = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *woff = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *whf = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *wfs = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *wfe = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *wfsn = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *wfen = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+
+    uint16_t pi = 0, wi = 0;
+    int global_part = -1, global_ord = -1, global_ord_desc = 0;
+    for (size_t e = 0; e < nexprs; e++) {
+        struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
+        if (se->kind == SEL_COLUMN) {
+            int ci = table_find_column_sv(t, se->column);
+            if (ci < 0) return IDX_NONE;
+            pass_cols[pi++] = ci;
+        } else {
+            int pc = -1, oc = -1, ac = -1;
+            if (se->win.has_partition) {
+                pc = table_find_column_sv(t, se->win.partition_col);
+                if (pc < 0) return IDX_NONE;
+                if (global_part < 0) global_part = pc;
+            }
+            if (se->win.has_order) {
+                oc = table_find_column_sv(t, se->win.order_col);
+                if (oc < 0) return IDX_NONE;
+                if (global_ord < 0) { global_ord = oc; global_ord_desc = se->win.order_desc; }
+            }
+            if (se->win.arg_column.len > 0 && !sv_eq_cstr(se->win.arg_column, "*")) {
+                ac = table_find_column_sv(t, se->win.arg_column);
+                if (ac < 0) return IDX_NONE;
+            }
+            /* For LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE with text arg columns,
+             * bail out — plan executor uses double arrays, can't handle text */
+            if (ac >= 0 && column_type_is_text(t->columns.items[ac].type) &&
+                (se->win.func == WIN_LAG || se->win.func == WIN_LEAD ||
+                 se->win.func == WIN_FIRST_VALUE || se->win.func == WIN_LAST_VALUE ||
+                 se->win.func == WIN_NTH_VALUE))
+                return IDX_NONE;
+            wpc[wi] = pc;
+            woc[wi] = oc;
+            wod[wi] = se->win.order_desc;
+            wac[wi] = ac;
+            wfn[wi] = (int)se->win.func;
+            woff[wi] = se->win.offset;
+            whf[wi] = se->win.has_frame;
+            wfs[wi] = (int)se->win.frame_start;
+            wfe[wi] = (int)se->win.frame_end;
+            wfsn[wi] = se->win.frame_start_n;
+            wfen[wi] = se->win.frame_end_n;
+            wi++;
         }
     }
 
-    /* ---- Single-table path (original) ---- */
+    /* Bail out if table has mixed cell types */
+    if (table_has_mixed_types(t))
+        return IDX_NONE;
 
+    /* Build scan → (filter →) window (→ sort) plan */
+    uint32_t current = build_seq_scan(t, arena);
+
+    /* Add filter if WHERE is simple enough */
+    if (s->where.has_where)
+        current = try_append_simple_filter(current, t, arena, arena, s->where.where_cond);
+
+    /* Add WINDOW node */
+    uint32_t win_idx = plan_alloc_node(arena, PLAN_WINDOW);
+    PLAN_NODE(arena, win_idx).left = current;
+    PLAN_NODE(arena, win_idx).window.out_ncols = n_pass + n_win;
+    PLAN_NODE(arena, win_idx).window.n_pass = n_pass;
+    PLAN_NODE(arena, win_idx).window.pass_cols = pass_cols;
+    PLAN_NODE(arena, win_idx).window.n_win = n_win;
+    PLAN_NODE(arena, win_idx).window.win_part_col = wpc;
+    PLAN_NODE(arena, win_idx).window.win_ord_col = woc;
+    PLAN_NODE(arena, win_idx).window.win_ord_desc = wod;
+    PLAN_NODE(arena, win_idx).window.win_arg_col = wac;
+    PLAN_NODE(arena, win_idx).window.win_func = wfn;
+    PLAN_NODE(arena, win_idx).window.win_offset = woff;
+    PLAN_NODE(arena, win_idx).window.win_has_frame = whf;
+    PLAN_NODE(arena, win_idx).window.win_frame_start = wfs;
+    PLAN_NODE(arena, win_idx).window.win_frame_end = wfe;
+    PLAN_NODE(arena, win_idx).window.win_frame_start_n = wfsn;
+    PLAN_NODE(arena, win_idx).window.win_frame_end_n = wfen;
+    PLAN_NODE(arena, win_idx).window.sort_part_col = global_part;
+    PLAN_NODE(arena, win_idx).window.sort_ord_col = global_ord;
+    PLAN_NODE(arena, win_idx).window.sort_ord_desc = global_ord_desc;
+    current = win_idx;
+
+    /* Add SORT node if outer ORDER BY is present */
+    if (s->has_order_by && s->order_by_count > 0) {
+        /* The output layout is: passthrough columns first (indices 0..n_pass-1),
+         * then window columns (indices n_pass..n_pass+n_win-1).
+         * We need to map ORDER BY column names to these output indices. */
+        int sort_cols_buf[32];
+        int sort_descs_buf[32];
+        uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+        int sort_ok = 1;
+        for (uint16_t k = 0; k < sort_nord; k++) {
+            struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
+            sort_cols_buf[k] = -1;
+            sort_descs_buf[k] = obi->desc;
+            /* Walk select_exprs to find the output column index */
+            uint16_t pass_i = 0, win_i = 0;
+            for (size_t e = 0; e < nexprs; e++) {
+                struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
+                if (se->kind == SEL_COLUMN) {
+                    sv col = se->column;
+                    sv bare_col = col, bare_ord = obi->column;
+                    for (size_t kk = 0; kk < col.len; kk++)
+                        if (col.data[kk] == '.') { bare_col = sv_from(col.data+kk+1, col.len-kk-1); break; }
+                    for (size_t kk = 0; kk < obi->column.len; kk++)
+                        if (obi->column.data[kk] == '.') { bare_ord = sv_from(obi->column.data+kk+1, obi->column.len-kk-1); break; }
+                    if (sv_eq_ignorecase(bare_col, bare_ord)) { sort_cols_buf[k] = (int)pass_i; break; }
+                    if (se->alias.len > 0 && sv_eq_ignorecase(se->alias, obi->column)) { sort_cols_buf[k] = (int)pass_i; break; }
+                    pass_i++;
+                } else {
+                    if (se->alias.len > 0 && sv_eq_ignorecase(se->alias, obi->column)) {
+                        sort_cols_buf[k] = (int)(n_pass + win_i);
+                        break;
+                    }
+                    win_i++;
+                }
+            }
+            if (sort_cols_buf[k] < 0) { sort_ok = 0; break; }
+        }
+        if (sort_ok && sort_nord > 0)
+            current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, NULL, sort_nord);
+    }
+
+    current = build_limit(current, s, arena);
+
+    return current;
+}
+
+/* ---- Plan builder: aggregate path ---- */
+
+/* Try to build a plan for a GROUP BY + aggregates query.
+ * Returns root plan node index, or IDX_NONE if the query is too complex. */
+static uint32_t build_aggregate(struct table *t, struct query_select *s,
+                                 struct query_arena *arena)
+{
+    /* Validate: all aggregates must be simple SUM/COUNT/AVG/MIN/MAX on column refs */
+    int agg_ok = 1;
+    int *agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
+    for (uint32_t a = 0; a < s->aggregates_count; a++) {
+        struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+        if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
+            { agg_ok = 0; break; }
+        if (ae->has_distinct) { agg_ok = 0; break; }
+        if (ae->expr_idx != IDX_NONE) {
+            agg_col_idxs[a] = -2; /* expression-based aggregate */
+        } else if (sv_eq_cstr(ae->column, "*")) {
+            agg_col_idxs[a] = -1; /* COUNT(*) */
+        } else {
+            int ci = table_find_column_sv(t, ae->column);
+            if (ci < 0) { agg_ok = 0; break; }
+            agg_col_idxs[a] = ci;
+        }
+    }
+
+    /* Validate: GROUP BY columns are resolvable */
+    int *grp_col_idxs = NULL;
+    if (agg_ok && s->group_by_count > 0) {
+        grp_col_idxs = (int *)bump_alloc(&arena->scratch, s->group_by_count * sizeof(int));
+        for (uint32_t g = 0; g < s->group_by_count; g++) {
+            sv gcol = arena->svs.items[s->group_by_start + g];
+            grp_col_idxs[g] = table_find_column_sv(t, gcol);
+            if (grp_col_idxs[g] < 0) { agg_ok = 0; break; }
+        }
+    }
+
+    if (!agg_ok) return IDX_NONE;
+
+    /* Build: SEQ_SCAN → HASH_AGG */
+    uint32_t scan_idx = build_seq_scan(t, arena);
+
+    uint32_t agg_idx = plan_alloc_node(arena, PLAN_HASH_AGG);
+    PLAN_NODE(arena, agg_idx).left = scan_idx;
+    PLAN_NODE(arena, agg_idx).hash_agg.ngroup_cols = (uint16_t)s->group_by_count;
+    PLAN_NODE(arena, agg_idx).hash_agg.group_cols = grp_col_idxs;
+    PLAN_NODE(arena, agg_idx).hash_agg.agg_start = s->aggregates_start;
+    PLAN_NODE(arena, agg_idx).hash_agg.agg_count = s->aggregates_count;
+    PLAN_NODE(arena, agg_idx).hash_agg.agg_before_cols = s->agg_before_cols;
+    PLAN_NODE(arena, agg_idx).hash_agg.agg_col_indices = agg_col_idxs;
+    PLAN_NODE(arena, agg_idx).hash_agg.table = t;
+
+    uint32_t current = agg_idx;
+
+    current = build_limit(current, s, arena);
+
+    return current;
+}
+
+/* ---- Semi-join builder ---- */
+
+/* Try to build a hash semi-join plan for an IN-subquery WHERE clause.
+ * Returns the HASH_SEMI_JOIN node index on success, IDX_NONE on failure.
+ * On success, the caller must call query_free on *out_sq after use. */
+static uint32_t build_semi_join(struct table *t, struct query_select *s,
+                                struct query_arena *arena, struct database *db,
+                                struct query *out_sq)
+{
+    struct condition *cond = &COND(arena, s->where.where_cond);
+
+    /* Find outer key column */
+    int semi_outer_key = table_find_column_sv(t, cond->column);
+    if (semi_outer_key < 0) return IDX_NONE;
+
+    /* Parse the subquery */
+    const char *sq_sql = ASTRING(arena, cond->subquery_sql);
+    if (query_parse(sq_sql, out_sq) != 0) return IDX_NONE;
+    if (out_sq->query_type != QUERY_TYPE_SELECT) {
+        query_free(out_sq); return IDX_NONE;
+    }
+
+    struct query_select *isq = &out_sq->select;
+    /* Must be a simple single-table SELECT with one column */
+    if (isq->has_join || isq->has_group_by || isq->aggregates_count > 0 ||
+        isq->has_set_op || isq->ctes_count > 0 || isq->has_distinct ||
+        isq->from_subquery_sql != IDX_NONE || isq->has_generate_series) {
+        query_free(out_sq); return IDX_NONE;
+    }
+
+    /* Find inner table */
+    struct table *semi_inner_t = db_find_table_sv(db, isq->table);
+    if (!semi_inner_t) { query_free(out_sq); return IDX_NONE; }
+    if (semi_inner_t->view_sql) { query_free(out_sq); return IDX_NONE; }
+
+    /* Resolve inner SELECT column — must be a single column ref */
+    int semi_inner_key = -1;
+    if (isq->parsed_columns_count == 1) {
+        struct select_column *sc = &out_sq->arena.select_cols.items[isq->parsed_columns_start];
+        if (sc->expr_idx != IDX_NONE) {
+            struct expr *e = &EXPR(&out_sq->arena, sc->expr_idx);
+            if (e->type == EXPR_COLUMN_REF) {
+                semi_inner_key = table_find_column_sv(semi_inner_t, e->column_ref.column);
+            }
+        }
+    } else if (sv_eq_cstr(isq->columns, "*") && semi_inner_t->columns.count == 1) {
+        semi_inner_key = 0;
+    } else {
+        /* Try legacy column name resolution */
+        if (isq->columns.len > 0 && !sv_eq_cstr(isq->columns, "*")) {
+            semi_inner_key = table_find_column_sv(semi_inner_t, isq->columns);
+        }
+    }
+    if (semi_inner_key < 0) { query_free(out_sq); return IDX_NONE; }
+
+    /* Validate inner WHERE (optional simple numeric filter) */
+    int semi_inner_filter_col = -1;
+    int semi_inner_filter_op = -1;
+    struct cell semi_inner_filter_val = {0};
+    if (isq->where.has_where && isq->where.where_cond != IDX_NONE) {
+        struct condition *icond = &COND(&out_sq->arena, isq->where.where_cond);
+        if (icond->type == COND_COMPARE && icond->lhs_expr == IDX_NONE &&
+            icond->rhs_column.len == 0 && icond->subquery_sql == IDX_NONE &&
+            icond->scalar_subquery_sql == IDX_NONE &&
+            icond->in_values_count == 0 && !icond->is_any && !icond->is_all) {
+            int fc = table_find_column_sv(semi_inner_t, icond->column);
+            if (fc >= 0 && icond->op <= CMP_GE) {
+                enum column_type fct = semi_inner_t->columns.items[fc].type;
+                if (fct == COLUMN_TYPE_INT || fct == COLUMN_TYPE_BIGINT ||
+                    fct == COLUMN_TYPE_FLOAT || fct == COLUMN_TYPE_NUMERIC ||
+                    fct == COLUMN_TYPE_BOOLEAN) {
+                    semi_inner_filter_col = fc;
+                    semi_inner_filter_op = (int)icond->op;
+                    semi_inner_filter_val = icond->value;
+                } else {
+                    query_free(out_sq); return IDX_NONE; /* text WHERE — can't handle */
+                }
+            } else {
+                query_free(out_sq); return IDX_NONE;
+            }
+        } else {
+            query_free(out_sq); return IDX_NONE; /* complex inner WHERE */
+        }
+    }
+
+    /* Check for mixed cell types in inner table */
+    if (table_has_mixed_types(semi_inner_t)) {
+        query_free(out_sq); return IDX_NONE;
+    }
+
+    /* --- Build plan nodes --- */
+
+    /* Build outer scan (left / probe side) */
+    uint16_t scan_ncols = (uint16_t)t->columns.count;
+    int *col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
+    for (uint16_t i = 0; i < scan_ncols; i++)
+        col_map[i] = (int)i;
+
+    uint32_t outer_scan = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+    PLAN_NODE(arena, outer_scan).seq_scan.table = t;
+    PLAN_NODE(arena, outer_scan).seq_scan.ncols = scan_ncols;
+    PLAN_NODE(arena, outer_scan).seq_scan.col_map = col_map;
+    PLAN_NODE(arena, outer_scan).est_rows = (double)t->rows.count;
+
+    /* Build inner scan (right / build side) */
+    uint16_t inner_ncols = (uint16_t)semi_inner_t->columns.count;
+    uint32_t inner_current = build_seq_scan(semi_inner_t, arena);
+
+    /* Add filter on inner side if subquery has WHERE */
+    if (semi_inner_filter_col >= 0)
+        inner_current = append_filter_node(inner_current, arena, IDX_NONE,
+                                           semi_inner_filter_col, semi_inner_filter_op,
+                                           semi_inner_filter_val);
+
+    /* If inner SELECT is a single column (not SELECT *), add projection */
+    if (semi_inner_key != 0 || inner_ncols > 1) {
+        /* Project to just the key column */
+        int *inner_proj = (int *)bump_alloc(&arena->scratch, sizeof(int));
+        inner_proj[0] = semi_inner_key;
+        inner_current = append_project_node(inner_current, arena, 1, inner_proj);
+        semi_inner_key = 0; /* after projection, key is column 0 */
+    }
+
+    /* Build HASH_SEMI_JOIN node */
+    uint32_t semi_idx = plan_alloc_node(arena, PLAN_HASH_SEMI_JOIN);
+    PLAN_NODE(arena, semi_idx).left = outer_scan;
+    PLAN_NODE(arena, semi_idx).right = inner_current;
+    PLAN_NODE(arena, semi_idx).hash_semi_join.outer_key_col = semi_outer_key;
+    PLAN_NODE(arena, semi_idx).hash_semi_join.inner_key_col = semi_inner_key;
+
+    return semi_idx;
+}
+
+/* ---- Single-table plan builder ---- */
+
+/* Build a plan for a single-table SELECT (no joins, no window functions,
+ * no set operations, no aggregates).  Handles simple WHERE filters,
+ * IN-subquery semi-joins, index scans, ORDER BY, projection, DISTINCT,
+ * and LIMIT/OFFSET.
+ * Returns root plan node index, or IDX_NONE for legacy fallback. */
+static uint32_t build_single_table(struct table *t, struct query_select *s,
+                                   struct query_arena *arena, struct database *db)
+{
     /* Bail out for queries we don't handle yet */
     if (s->has_join)            return IDX_NONE;
     if (s->select_exprs_count > 0) return IDX_NONE; /* window functions — handled above */
@@ -4679,14 +4674,8 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
     /* Pre-validate WHERE clause BEFORE allocating plan nodes */
     int filter_col = -1;
     int filter_ok = 0;
-    int semi_join_ok = 0;       /* set to 1 if we can use hash semi-join */
-    int semi_outer_key = -1;    /* outer table column index for semi-join key */
-    struct table *semi_inner_t = NULL;
-    int semi_inner_key = -1;    /* inner table column index for semi-join key */
-    int semi_inner_filter_col = -1;
-    int semi_inner_filter_op = -1;
-    struct cell semi_inner_filter_val = {0};
-    struct query semi_sq = {0}; /* parsed subquery — freed after plan build */
+    int have_source = 0;
+    uint32_t current = IDX_NONE;
 
     if (s->where.has_where) {
         if (s->where.where_cond == IDX_NONE)
@@ -4700,278 +4689,107 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
             cond->subquery_sql != IDX_NONE && db &&
             cond->op == CMP_IN /* NOT IN is more complex — skip for now */) {
 
-            /* Find outer key column */
-            semi_outer_key = table_find_column_sv(t, cond->column);
-            if (semi_outer_key < 0) goto semi_bail;
+            /* Check for mixed cell types in outer table first */
+            if (table_has_mixed_types(t))
+                return IDX_NONE;
 
-            /* Parse the subquery */
-            const char *sq_sql = ASTRING(arena, cond->subquery_sql);
-            if (query_parse(sq_sql, &semi_sq) != 0) goto semi_bail;
-            if (semi_sq.query_type != QUERY_TYPE_SELECT) goto semi_bail;
+            struct query semi_sq = {0};
+            uint32_t semi_plan = build_semi_join(t, s, arena, db, &semi_sq);
+            if (semi_plan == IDX_NONE)
+                return IDX_NONE;
 
-            struct query_select *isq = &semi_sq.select;
-            /* Must be a simple single-table SELECT with one column */
-            if (isq->has_join || isq->has_group_by || isq->aggregates_count > 0 ||
-                isq->has_set_op || isq->ctes_count > 0 || isq->has_distinct ||
-                isq->from_subquery_sql != IDX_NONE || isq->has_generate_series)
-                goto semi_bail;
-
-            /* Find inner table */
-            semi_inner_t = db_find_table_sv(db, isq->table);
-            if (!semi_inner_t) goto semi_bail;
-            if (semi_inner_t->view_sql) goto semi_bail;
-
-            /* Resolve inner SELECT column — must be a single column ref */
-            if (isq->parsed_columns_count == 1) {
-                struct select_column *sc = &semi_sq.arena.select_cols.items[isq->parsed_columns_start];
-                if (sc->expr_idx != IDX_NONE) {
-                    struct expr *e = &EXPR(&semi_sq.arena, sc->expr_idx);
-                    if (e->type == EXPR_COLUMN_REF) {
-                        semi_inner_key = table_find_column_sv(semi_inner_t, e->column_ref.column);
-                    }
-                }
-            } else if (sv_eq_cstr(isq->columns, "*") && semi_inner_t->columns.count == 1) {
-                semi_inner_key = 0;
-            } else {
-                /* Try legacy column name resolution */
-                if (isq->columns.len > 0 && !sv_eq_cstr(isq->columns, "*")) {
-                    semi_inner_key = table_find_column_sv(semi_inner_t, isq->columns);
-                }
-            }
-            if (semi_inner_key < 0) goto semi_bail;
-
-            /* Validate inner WHERE (optional simple numeric filter) */
-            if (isq->where.has_where && isq->where.where_cond != IDX_NONE) {
-                struct condition *icond = &COND(&semi_sq.arena, isq->where.where_cond);
-                if (icond->type == COND_COMPARE && icond->lhs_expr == IDX_NONE &&
-                    icond->rhs_column.len == 0 && icond->subquery_sql == IDX_NONE &&
-                    icond->scalar_subquery_sql == IDX_NONE &&
-                    icond->in_values_count == 0 && !icond->is_any && !icond->is_all) {
-                    int fc = table_find_column_sv(semi_inner_t, icond->column);
-                    if (fc >= 0 && icond->op <= CMP_GE) {
-                        enum column_type fct = semi_inner_t->columns.items[fc].type;
-                        if (fct == COLUMN_TYPE_INT || fct == COLUMN_TYPE_BIGINT ||
-                            fct == COLUMN_TYPE_FLOAT || fct == COLUMN_TYPE_NUMERIC ||
-                            fct == COLUMN_TYPE_BOOLEAN) {
-                            semi_inner_filter_col = fc;
-                            semi_inner_filter_op = (int)icond->op;
-                            semi_inner_filter_val = icond->value;
-                        } else {
-                            goto semi_bail; /* text WHERE — can't handle */
-                        }
-                    } else {
-                        goto semi_bail;
-                    }
-                } else {
-                    goto semi_bail; /* complex inner WHERE */
-                }
-            }
-
-            /* Check for mixed cell types in inner table */
-            if (semi_inner_t->rows.count > 0) {
-                struct row *first = &semi_inner_t->rows.items[0];
-                for (size_t c = 0; c < first->cells.count && c < semi_inner_t->columns.count; c++) {
-                    if (!first->cells.items[c].is_null &&
-                        first->cells.items[c].type != semi_inner_t->columns.items[c].type)
-                        goto semi_bail;
-                }
-            }
-
-            semi_join_ok = 1;
-            goto where_done;
-
-        semi_bail:
+            current = semi_plan;
             query_free(&semi_sq);
-            memset(&semi_sq, 0, sizeof(semi_sq));
-            semi_join_ok = 0;
-            return IDX_NONE; /* fall back to legacy */
-        }
-
-        /* ---- Standard simple comparison filter ---- */
-        if (cond->lhs_expr != IDX_NONE || cond->rhs_column.len != 0)
-            return IDX_NONE;
-        if (cond->scalar_subquery_sql != IDX_NONE) return IDX_NONE;
-        if (cond->subquery_sql != IDX_NONE) return IDX_NONE;
-        if (cond->in_values_count > 0) return IDX_NONE;
-        if (cond->array_values_count > 0) return IDX_NONE;
-        if (cond->is_any || cond->is_all) return IDX_NONE;
-        filter_col = table_find_column_sv(t, cond->column);
-        if (filter_col < 0) return IDX_NONE;
-        enum column_type ct = t->columns.items[filter_col].type;
-        if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BOOLEAN &&
-            ct != COLUMN_TYPE_FLOAT && ct != COLUMN_TYPE_NUMERIC &&
-            ct != COLUMN_TYPE_BIGINT && !column_type_is_text(ct))
-            return IDX_NONE;
-        if (cond->op > CMP_GE) return IDX_NONE;
-        /* For text columns, accept text comparison values */
-        if (column_type_is_text(ct)) {
-            if (!cond->value.is_null && !column_type_is_text(cond->value.type))
-                return IDX_NONE;
+            have_source = 1;
         } else {
-            /* Reject cross-type comparisons (e.g. INT col vs FLOAT value from subquery) */
-            if (!cond->value.is_null && cond->value.type != ct &&
-                !(ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT) &&
-                !(ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT))
+            /* ---- Standard simple comparison filter ---- */
+            if (cond->lhs_expr != IDX_NONE || cond->rhs_column.len != 0)
                 return IDX_NONE;
-            /* If INT column but FLOAT value, reject — fast path can't handle */
-            if (ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)
+            if (cond->scalar_subquery_sql != IDX_NONE) return IDX_NONE;
+            if (cond->subquery_sql != IDX_NONE) return IDX_NONE;
+            if (cond->in_values_count > 0) return IDX_NONE;
+            if (cond->array_values_count > 0) return IDX_NONE;
+            if (cond->is_any || cond->is_all) return IDX_NONE;
+            filter_col = table_find_column_sv(t, cond->column);
+            if (filter_col < 0) return IDX_NONE;
+            enum column_type ct = t->columns.items[filter_col].type;
+            if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BOOLEAN &&
+                ct != COLUMN_TYPE_FLOAT && ct != COLUMN_TYPE_NUMERIC &&
+                ct != COLUMN_TYPE_BIGINT && !column_type_is_text(ct))
                 return IDX_NONE;
-        }
-        filter_ok = 1;
-    }
-where_done:
-
-    /* Bail out if outer table has mixed cell types (e.g. after ALTER COLUMN TYPE) */
-    if (t->rows.count > 0) {
-        struct row *first = &t->rows.items[0];
-        for (size_t c = 0; c < first->cells.count && c < t->columns.count; c++) {
-            if (!first->cells.items[c].is_null &&
-                first->cells.items[c].type != t->columns.items[c].type) {
-                if (semi_join_ok) query_free(&semi_sq);
-                return IDX_NONE;
+            if (cond->op > CMP_GE) return IDX_NONE;
+            /* For text columns, accept text comparison values */
+            if (column_type_is_text(ct)) {
+                if (!cond->value.is_null && !column_type_is_text(cond->value.type))
+                    return IDX_NONE;
+            } else {
+                /* Reject cross-type comparisons (e.g. INT col vs FLOAT value from subquery) */
+                if (!cond->value.is_null && cond->value.type != ct &&
+                    !(ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT) &&
+                    !(ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT))
+                    return IDX_NONE;
+                /* If INT column but FLOAT value, reject — fast path can't handle */
+                if (ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)
+                    return IDX_NONE;
             }
+            filter_ok = 1;
         }
     }
 
-    /* --- All validation passed, now allocate plan nodes --- */
+    /* Build scan source if not already set by semi-join */
+    if (!have_source) {
+        /* Bail out if outer table has mixed cell types (e.g. after ALTER COLUMN TYPE) */
+        if (table_has_mixed_types(t))
+            return IDX_NONE;
 
-    uint16_t scan_ncols = (uint16_t)t->columns.count;
-    int *col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
-    for (uint16_t i = 0; i < scan_ncols; i++)
-        col_map[i] = (int)i;
+        /* --- All validation passed, now allocate plan nodes --- */
 
-    uint32_t current;
-
-    /* ---- Hash semi-join path ---- */
-    if (semi_join_ok) {
-        /* Build outer scan (left / probe side) */
-        uint32_t outer_scan = plan_alloc_node(arena, PLAN_SEQ_SCAN);
-        PLAN_NODE(arena, outer_scan).seq_scan.table = t;
-        PLAN_NODE(arena, outer_scan).seq_scan.ncols = scan_ncols;
-        PLAN_NODE(arena, outer_scan).seq_scan.col_map = col_map;
-        PLAN_NODE(arena, outer_scan).est_rows = (double)t->rows.count;
-
-        /* Build inner scan (right / build side) */
-        uint16_t inner_ncols = (uint16_t)semi_inner_t->columns.count;
-        int *inner_col_map = (int *)bump_alloc(&arena->scratch, inner_ncols * sizeof(int));
-        for (uint16_t i = 0; i < inner_ncols; i++) inner_col_map[i] = (int)i;
-
-        uint32_t inner_scan = plan_alloc_node(arena, PLAN_SEQ_SCAN);
-        PLAN_NODE(arena, inner_scan).seq_scan.table = semi_inner_t;
-        PLAN_NODE(arena, inner_scan).seq_scan.ncols = inner_ncols;
-        PLAN_NODE(arena, inner_scan).seq_scan.col_map = inner_col_map;
-        PLAN_NODE(arena, inner_scan).est_rows = (double)semi_inner_t->rows.count;
-
-        uint32_t inner_current = inner_scan;
-
-        /* Add filter on inner side if subquery has WHERE */
-        if (semi_inner_filter_col >= 0) {
-            uint32_t inner_filter = plan_alloc_node(arena, PLAN_FILTER);
-            PLAN_NODE(arena, inner_filter).left = inner_current;
-            PLAN_NODE(arena, inner_filter).filter.col_idx = semi_inner_filter_col;
-            PLAN_NODE(arena, inner_filter).filter.cmp_op = semi_inner_filter_op;
-            PLAN_NODE(arena, inner_filter).filter.cmp_val = semi_inner_filter_val;
-            inner_current = inner_filter;
-        }
-
-        /* If inner SELECT is a single column (not SELECT *), add projection */
-        if (semi_inner_key != 0 || inner_ncols > 1) {
-            /* Project to just the key column */
-            int *inner_proj = (int *)bump_alloc(&arena->scratch, sizeof(int));
-            inner_proj[0] = semi_inner_key;
-            uint32_t inner_proj_node = plan_alloc_node(arena, PLAN_PROJECT);
-            PLAN_NODE(arena, inner_proj_node).left = inner_current;
-            PLAN_NODE(arena, inner_proj_node).project.ncols = 1;
-            PLAN_NODE(arena, inner_proj_node).project.col_map = inner_proj;
-            inner_current = inner_proj_node;
-            semi_inner_key = 0; /* after projection, key is column 0 */
-        }
-
-        /* Build HASH_SEMI_JOIN node */
-        uint32_t semi_idx = plan_alloc_node(arena, PLAN_HASH_SEMI_JOIN);
-        PLAN_NODE(arena, semi_idx).left = outer_scan;
-        PLAN_NODE(arena, semi_idx).right = inner_current;
-        PLAN_NODE(arena, semi_idx).hash_semi_join.outer_key_col = semi_outer_key;
-        PLAN_NODE(arena, semi_idx).hash_semi_join.inner_key_col = semi_inner_key;
-
-        current = semi_idx;
-
-        query_free(&semi_sq);
-        goto append_sort_project_limit;
-    }
-
-    /* Try index scan for equality WHERE on an indexed column */
-    int used_index = 0;
-    if (filter_ok && filter_col >= 0) {
-        struct condition *cond = &COND(arena, s->where.where_cond);
-        if (cond->op == CMP_EQ) {
-            for (size_t ix = 0; ix < t->indexes.count; ix++) {
-                if (strcmp(t->indexes.items[ix].column_name,
-                           t->columns.items[filter_col].name) == 0) {
-                    uint32_t idx_node = plan_alloc_node(arena, PLAN_INDEX_SCAN);
-                    PLAN_NODE(arena, idx_node).index_scan.table = t;
-                    PLAN_NODE(arena, idx_node).index_scan.idx = &t->indexes.items[ix];
-                    PLAN_NODE(arena, idx_node).index_scan.cond_idx = s->where.where_cond;
-                    PLAN_NODE(arena, idx_node).index_scan.ncols = scan_ncols;
-                    PLAN_NODE(arena, idx_node).index_scan.col_map = col_map;
-                    PLAN_NODE(arena, idx_node).est_rows = 1.0;
-                    current = idx_node;
-                    used_index = 1;
-                    break;
+        /* Try index scan for equality WHERE on an indexed column */
+        int used_index = 0;
+        if (filter_ok && filter_col >= 0) {
+            struct condition *cond = &COND(arena, s->where.where_cond);
+            if (cond->op == CMP_EQ) {
+                uint16_t scan_ncols = (uint16_t)t->columns.count;
+                int *col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
+                for (uint16_t i = 0; i < scan_ncols; i++)
+                    col_map[i] = (int)i;
+                for (size_t ix = 0; ix < t->indexes.count; ix++) {
+                    if (strcmp(t->indexes.items[ix].column_name,
+                               t->columns.items[filter_col].name) == 0) {
+                        uint32_t idx_node = plan_alloc_node(arena, PLAN_INDEX_SCAN);
+                        PLAN_NODE(arena, idx_node).index_scan.table = t;
+                        PLAN_NODE(arena, idx_node).index_scan.idx = &t->indexes.items[ix];
+                        PLAN_NODE(arena, idx_node).index_scan.cond_idx = s->where.where_cond;
+                        PLAN_NODE(arena, idx_node).index_scan.ncols = scan_ncols;
+                        PLAN_NODE(arena, idx_node).index_scan.col_map = col_map;
+                        PLAN_NODE(arena, idx_node).est_rows = 1.0;
+                        current = idx_node;
+                        used_index = 1;
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    if (!used_index) {
-        uint32_t scan_idx = plan_alloc_node(arena, PLAN_SEQ_SCAN);
-        PLAN_NODE(arena, scan_idx).seq_scan.table = t;
-        PLAN_NODE(arena, scan_idx).seq_scan.ncols = scan_ncols;
-        PLAN_NODE(arena, scan_idx).seq_scan.col_map = col_map;
-        PLAN_NODE(arena, scan_idx).est_rows = (double)t->rows.count;
-        current = scan_idx;
+        if (!used_index) {
+            current = build_seq_scan(t, arena);
 
-        /* Add filter node if WHERE clause was validated */
-        if (filter_ok) {
-            struct condition *cond = &COND(arena, s->where.where_cond);
-            uint32_t filter_idx = plan_alloc_node(arena, PLAN_FILTER);
-            PLAN_NODE(arena, filter_idx).left = current;
-            PLAN_NODE(arena, filter_idx).filter.cond_idx = s->where.where_cond;
-            PLAN_NODE(arena, filter_idx).filter.col_idx = filter_col;
-            PLAN_NODE(arena, filter_idx).filter.cmp_op = (int)cond->op;
-            PLAN_NODE(arena, filter_idx).filter.cmp_val = cond->value;
-            current = filter_idx;
+            /* Add filter node if WHERE clause was validated */
+            if (filter_ok) {
+                struct condition *cond = &COND(arena, s->where.where_cond);
+                current = append_filter_node(current, arena, s->where.where_cond,
+                                             filter_col, (int)cond->op, cond->value);
+            }
         }
     }
-
-append_sort_project_limit:
 
     /* Add SORT node if ORDER BY was validated */
-    if (sort_nord > 0) {
-        int *sort_cols = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
-        int *sort_descs = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
-        int *sort_nf = (int *)bump_alloc(&arena->scratch, sort_nord * sizeof(int));
-        memcpy(sort_cols, sort_cols_buf, sort_nord * sizeof(int));
-        memcpy(sort_descs, sort_descs_buf, sort_nord * sizeof(int));
-        memcpy(sort_nf, sort_nf_buf, sort_nord * sizeof(int));
-
-        uint32_t sort_idx = plan_alloc_node(arena, PLAN_SORT);
-        PLAN_NODE(arena, sort_idx).left = current;
-        PLAN_NODE(arena, sort_idx).sort.sort_cols = sort_cols;
-        PLAN_NODE(arena, sort_idx).sort.sort_descs = sort_descs;
-        PLAN_NODE(arena, sort_idx).sort.sort_nulls_first = sort_nf;
-        PLAN_NODE(arena, sort_idx).sort.nsort_cols = sort_nord;
-        current = sort_idx;
-    }
+    if (sort_nord > 0)
+        current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, sort_nf_buf, sort_nord);
 
     /* Add projection node if specific columns are selected */
-    if (need_project) {
-        uint32_t proj_idx = plan_alloc_node(arena, PLAN_PROJECT);
-        PLAN_NODE(arena, proj_idx).left = current;
-        PLAN_NODE(arena, proj_idx).project.ncols = proj_ncols;
-        PLAN_NODE(arena, proj_idx).project.col_map = proj_map;
-        current = proj_idx;
-    }
+    if (need_project)
+        current = append_project_node(current, arena, proj_ncols, proj_map);
 
     /* Add expression projection node for computed columns */
     if (need_expr_project) {
@@ -4990,16 +4808,117 @@ append_sort_project_limit:
         current = dist_idx;
     }
 
-    /* Add LIMIT/OFFSET node if present */
-    if (s->has_limit || s->has_offset) {
-        uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
-        PLAN_NODE(arena, limit_idx).left = current;
-        PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
-        PLAN_NODE(arena, limit_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
-        PLAN_NODE(arena, limit_idx).limit.has_offset = s->has_offset;
-        PLAN_NODE(arena, limit_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
-        current = limit_idx;
-    }
+    current = build_limit(current, s, arena);
 
     return current;
+}
+
+/* ---- Plan builder ---- */
+
+/* Try to build a block-oriented plan for a simple single-table SELECT.
+ * Returns root plan node index, or IDX_NONE if the query is too complex
+ * and should fall back to the legacy executor. */
+uint32_t plan_build_select(struct table *t, struct query_select *s,
+                           struct query_arena *arena, struct database *db)
+{
+    /* ---- Generate series fast path ---- */
+    if (s->has_generate_series && s->gs_start_expr != IDX_NONE &&
+        s->gs_stop_expr != IDX_NONE) {
+        /* Only handle simple SELECT * integer series via plan executor */
+        if (s->has_join || s->has_group_by || s->aggregates_count > 0 ||
+            s->has_set_op || s->ctes_count > 0 || s->has_distinct ||
+            s->select_exprs_count > 0 || s->where.has_where ||
+            s->has_order_by || s->parsed_columns_count > 0)
+            return IDX_NONE;
+        if (!sv_eq_cstr(s->columns, "*"))
+            return IDX_NONE;
+
+        struct cell c_start = eval_expr(s->gs_start_expr, arena, NULL, NULL, db, NULL);
+        struct cell c_stop  = eval_expr(s->gs_stop_expr, arena, NULL, NULL, db, NULL);
+
+        /* Bail out for timestamp/date series — keep on legacy path */
+        if (c_start.type == COLUMN_TYPE_DATE || c_start.type == COLUMN_TYPE_TIMESTAMP ||
+            c_start.type == COLUMN_TYPE_TIMESTAMPTZ)
+            return IDX_NONE;
+        if (c_start.type == COLUMN_TYPE_INTERVAL || c_stop.type == COLUMN_TYPE_INTERVAL)
+            return IDX_NONE;
+
+        long long gs_start = (c_start.type == COLUMN_TYPE_BIGINT) ? c_start.value.as_bigint
+                           : (c_start.type == COLUMN_TYPE_FLOAT)  ? (long long)c_start.value.as_float
+                           : c_start.value.as_int;
+        long long gs_stop  = (c_stop.type == COLUMN_TYPE_BIGINT) ? c_stop.value.as_bigint
+                           : (c_stop.type == COLUMN_TYPE_FLOAT)  ? (long long)c_stop.value.as_float
+                           : c_stop.value.as_int;
+        long long gs_step  = 1;
+        if (s->gs_step_expr != IDX_NONE) {
+            struct cell c_step = eval_expr(s->gs_step_expr, arena, NULL, NULL, db, NULL);
+            if (c_step.type == COLUMN_TYPE_INTERVAL || column_type_is_text(c_step.type))
+                return IDX_NONE; /* timestamp step — bail to legacy */
+            gs_step = (c_step.type == COLUMN_TYPE_BIGINT) ? c_step.value.as_bigint
+                    : (c_step.type == COLUMN_TYPE_FLOAT)  ? (long long)c_step.value.as_float
+                    : c_step.value.as_int;
+        }
+        if (gs_step == 0) gs_step = 1;
+
+        int use_bigint = (c_start.type == COLUMN_TYPE_BIGINT ||
+                          c_stop.type == COLUMN_TYPE_BIGINT ||
+                          gs_start > 2147483647LL || gs_start < -2147483648LL ||
+                          gs_stop > 2147483647LL || gs_stop < -2147483648LL);
+
+        uint32_t gs_idx = plan_alloc_node(arena, PLAN_GENERATE_SERIES);
+        PLAN_NODE(arena, gs_idx).gen_series.start = gs_start;
+        PLAN_NODE(arena, gs_idx).gen_series.stop = gs_stop;
+        PLAN_NODE(arena, gs_idx).gen_series.step = gs_step;
+        PLAN_NODE(arena, gs_idx).gen_series.use_bigint = use_bigint;
+        uint32_t current = gs_idx;
+
+        current = build_limit(current, s, arena);
+
+        return current;
+    }
+
+    /* ---- Single equi-join fast path ---- */
+    if (s->has_join && s->joins_count == 1 && db) {
+        uint32_t join_plan = build_join(t, s, arena, db);
+        if (join_plan != IDX_NONE) return join_plan;
+        return IDX_NONE;
+    }
+
+    /* ---- Window function fast path ---- */
+    if (s->select_exprs_count > 0 && !s->has_join && !s->has_group_by &&
+        s->aggregates_count == 0 && !s->has_set_op && s->ctes_count == 0 &&
+        s->cte_sql == IDX_NONE && s->from_subquery_sql == IDX_NONE &&
+        !s->has_recursive_cte && !s->has_distinct && !s->has_distinct_on &&
+        t && s->insert_rows_count == 0) {
+        uint32_t win_plan = build_window(t, s, arena);
+        if (win_plan != IDX_NONE) return win_plan;
+        return IDX_NONE;
+    }
+
+    /* ---- Set operations fast path (UNION / INTERSECT / EXCEPT) ---- */
+    if (s->has_set_op && s->set_rhs_sql != IDX_NONE && !s->has_join &&
+        !s->has_group_by && s->aggregates_count == 0 && s->ctes_count == 0 &&
+        s->cte_sql == IDX_NONE && s->from_subquery_sql == IDX_NONE &&
+        !s->has_recursive_cte && s->select_exprs_count == 0 &&
+        !s->where.has_where &&
+        t && db && s->insert_rows_count == 0) {
+        uint32_t set_plan = build_set_op(t, s, arena, db);
+        if (set_plan != IDX_NONE) return set_plan;
+        return IDX_NONE;
+    }
+
+    /* ---- Single-table GROUP BY + aggregates fast path ---- */
+    if (s->has_group_by && s->aggregates_count > 0 && t && !s->has_join &&
+        !s->has_set_op && s->ctes_count == 0 && s->cte_sql == IDX_NONE &&
+        s->from_subquery_sql == IDX_NONE && !s->has_recursive_cte &&
+        s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
+        !s->has_distinct && !s->has_distinct_on &&
+        !s->group_by_rollup && !s->group_by_cube &&
+        !s->has_having && !s->has_order_by) {
+        uint32_t agg_plan = build_aggregate(t, s, arena);
+        if (agg_plan != IDX_NONE) return agg_plan;
+    }
+
+    /* ---- Single-table path ---- */
+    return build_single_table(t, s, arena, db);
 }
