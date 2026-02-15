@@ -797,32 +797,46 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
     char buf[64];
     const char *txt;
     size_t len;
-    if (cb->type == COLUMN_TYPE_SMALLINT) {
+    switch (cb->type) {
+    case COLUMN_TYPE_SMALLINT:
         len = fast_i32_to_str((int32_t)cb->data.i16[ri], buf);
         txt = buf;
-    } else if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
-        if (cb->type == COLUMN_TYPE_BOOLEAN) {
-            buf[0] = cb->data.i32[ri] ? 't' : 'f';
-            buf[1] = '\0';
-            len = 1;
-        } else {
-            len = fast_i32_to_str(cb->data.i32[ri], buf);
-        }
+        break;
+    case COLUMN_TYPE_INT:
+        len = fast_i32_to_str(cb->data.i32[ri], buf);
         txt = buf;
-    } else if (cb->type == COLUMN_TYPE_BIGINT) {
+        break;
+    case COLUMN_TYPE_BOOLEAN:
+        buf[0] = cb->data.i32[ri] ? 't' : 'f';
+        buf[1] = '\0';
+        len = 1;
+        txt = buf;
+        break;
+    case COLUMN_TYPE_BIGINT:
         len = fast_i64_to_str(cb->data.i64[ri], buf);
         txt = buf;
-    } else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC) {
+        break;
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:
         len = (size_t)snprintf(buf, sizeof(buf), "%g", cb->data.f64[ri]);
         txt = buf;
-    } else {
-        /* TEXT, ENUM, DATE, TIME, TIMESTAMP, etc. */
+        break;
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:
+    default:
         if (!cb->data.str[ri]) {
             msgbuf_push_u32(m, (uint32_t)-1);
             return;
         }
         txt = cb->data.str[ri];
         len = strlen(txt);
+        break;
     }
     msgbuf_push_u32(m, (uint32_t)len);
     msgbuf_push(m, txt, len);
@@ -1592,7 +1606,12 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     char tag[128];
     switch (q.query_type) {
         case QUERY_TYPE_CREATE:
-            snprintf(tag, sizeof(tag), "CREATE TABLE");
+            if (q.create_table.as_select_sql != IDX_NONE && result->count > 0) {
+                size_t sel_count = (size_t)result->data[0].cells.items[0].value.as_int;
+                snprintf(tag, sizeof(tag), "SELECT %zu", sel_count);
+            } else {
+                snprintf(tag, sizeof(tag), "CREATE TABLE");
+            }
             break;
         case QUERY_TYPE_DROP:
             snprintf(tag, sizeof(tag), "DROP TABLE");

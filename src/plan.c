@@ -46,22 +46,30 @@ static void scan_cache_build(struct table *t)
         sc->col_types[c] = ct;
 
         size_t elem_sz;
-        if (ct == COLUMN_TYPE_SMALLINT)
-            elem_sz = sizeof(int16_t);
-        else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
-            elem_sz = sizeof(int32_t);
-        else if (ct == COLUMN_TYPE_BIGINT)
-            elem_sz = sizeof(int64_t);
-        else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
-            elem_sz = sizeof(double);
-        else
-            elem_sz = sizeof(char *);
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT: elem_sz = sizeof(int16_t); break;
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:  elem_sz = sizeof(int32_t); break;
+        case COLUMN_TYPE_BIGINT:   elem_sz = sizeof(int64_t); break;
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:  elem_sz = sizeof(double); break;
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+        default:                   elem_sz = sizeof(char *); break;
+        }
 
         sc->col_data[c] = calloc(nrows ? nrows : 1, elem_sz);
         sc->col_nulls[c] = (uint8_t *)calloc(nrows ? nrows : 1, 1);
 
         /* Fill from row-store */
-        if (ct == COLUMN_TYPE_SMALLINT) {
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT: {
             int16_t *dst = (int16_t *)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[r].cells.items[c];
@@ -71,7 +79,9 @@ static void scan_cache_build(struct table *t)
                     dst[r] = cell->value.as_smallint;
                 }
             }
-        } else if (ct == COLUMN_TYPE_INT) {
+            break;
+        }
+        case COLUMN_TYPE_INT: {
             int32_t *dst = (int32_t *)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[r].cells.items[c];
@@ -81,7 +91,9 @@ static void scan_cache_build(struct table *t)
                     dst[r] = cell->value.as_int;
                 }
             }
-        } else if (ct == COLUMN_TYPE_FLOAT) {
+            break;
+        }
+        case COLUMN_TYPE_FLOAT: {
             double *dst = (double *)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[r].cells.items[c];
@@ -91,7 +103,9 @@ static void scan_cache_build(struct table *t)
                     dst[r] = cell->value.as_float;
                 }
             }
-        } else if (ct == COLUMN_TYPE_BIGINT) {
+            break;
+        }
+        case COLUMN_TYPE_BIGINT: {
             int64_t *dst = (int64_t *)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[r].cells.items[c];
@@ -101,7 +115,9 @@ static void scan_cache_build(struct table *t)
                     dst[r] = cell->value.as_bigint;
                 }
             }
-        } else if (ct == COLUMN_TYPE_NUMERIC) {
+            break;
+        }
+        case COLUMN_TYPE_NUMERIC: {
             double *dst = (double *)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[r].cells.items[c];
@@ -111,7 +127,9 @@ static void scan_cache_build(struct table *t)
                     dst[r] = cell->value.as_numeric;
                 }
             }
-        } else if (ct == COLUMN_TYPE_BOOLEAN) {
+            break;
+        }
+        case COLUMN_TYPE_BOOLEAN: {
             int32_t *dst = (int32_t *)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[r].cells.items[c];
@@ -121,7 +139,17 @@ static void scan_cache_build(struct table *t)
                     dst[r] = cell->value.as_bool;
                 }
             }
-        } else {
+            break;
+        }
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+        default: {
             /* text types */
             char **dst = (char **)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
@@ -133,6 +161,8 @@ static void scan_cache_build(struct table *t)
                     dst[r] = cell->value.as_text; /* pointer into table — valid as long as table exists */
                 }
             }
+            break;
+        }
         }
     }
 }
@@ -154,21 +184,23 @@ void scan_cache_update_row(struct table *t, size_t row_idx)
         }
         sc->col_nulls[c][row_idx] = 0;
 
-        if (ct == COLUMN_TYPE_SMALLINT) {
-            ((int16_t *)sc->col_data[c])[row_idx] = cell->value.as_smallint;
-        } else if (ct == COLUMN_TYPE_INT) {
-            ((int32_t *)sc->col_data[c])[row_idx] = cell->value.as_int;
-        } else if (ct == COLUMN_TYPE_BIGINT) {
-            ((int64_t *)sc->col_data[c])[row_idx] = cell->value.as_bigint;
-        } else if (ct == COLUMN_TYPE_FLOAT) {
-            ((double *)sc->col_data[c])[row_idx] = cell->value.as_float;
-        } else if (ct == COLUMN_TYPE_NUMERIC) {
-            ((double *)sc->col_data[c])[row_idx] = cell->value.as_numeric;
-        } else if (ct == COLUMN_TYPE_BOOLEAN) {
-            ((int32_t *)sc->col_data[c])[row_idx] = cell->value.as_bool;
-        } else {
-            /* text types — store pointer (valid as long as table row exists) */
-            ((char **)sc->col_data[c])[row_idx] = cell->value.as_text;
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT: ((int16_t *)sc->col_data[c])[row_idx] = cell->value.as_smallint; break;
+        case COLUMN_TYPE_INT:      ((int32_t *)sc->col_data[c])[row_idx] = cell->value.as_int; break;
+        case COLUMN_TYPE_BIGINT:   ((int64_t *)sc->col_data[c])[row_idx] = cell->value.as_bigint; break;
+        case COLUMN_TYPE_FLOAT:    ((double *)sc->col_data[c])[row_idx] = cell->value.as_float; break;
+        case COLUMN_TYPE_NUMERIC:  ((double *)sc->col_data[c])[row_idx] = cell->value.as_numeric; break;
+        case COLUMN_TYPE_BOOLEAN:  ((int32_t *)sc->col_data[c])[row_idx] = cell->value.as_bool; break;
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+        default:
+            ((char **)sc->col_data[c])[row_idx] = cell->value.as_text; break;
         }
     }
     /* Keep cache generation in sync with table */
@@ -201,16 +233,28 @@ static uint16_t scan_cache_read(struct scan_cache *sc, size_t *cursor,
         memcpy(cb->nulls, sc->col_nulls[tc] + start, nrows);
 
         enum column_type ct = sc->col_types[tc];
-        if (ct == COLUMN_TYPE_SMALLINT)
-            memcpy(cb->data.i16, (int16_t *)sc->col_data[tc] + start, nrows * sizeof(int16_t));
-        else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
-            memcpy(cb->data.i32, (int32_t *)sc->col_data[tc] + start, nrows * sizeof(int32_t));
-        else if (ct == COLUMN_TYPE_BIGINT)
-            memcpy(cb->data.i64, (int64_t *)sc->col_data[tc] + start, nrows * sizeof(int64_t));
-        else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
-            memcpy(cb->data.f64, (double *)sc->col_data[tc] + start, nrows * sizeof(double));
-        else
-            memcpy(cb->data.str, (char **)sc->col_data[tc] + start, nrows * sizeof(char *));
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT:
+            memcpy(cb->data.i16, (int16_t *)sc->col_data[tc] + start, nrows * sizeof(int16_t)); break;
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+            memcpy(cb->data.i32, (int32_t *)sc->col_data[tc] + start, nrows * sizeof(int32_t)); break;
+        case COLUMN_TYPE_BIGINT:
+            memcpy(cb->data.i64, (int64_t *)sc->col_data[tc] + start, nrows * sizeof(int64_t)); break;
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:
+            memcpy(cb->data.f64, (double *)sc->col_data[tc] + start, nrows * sizeof(double)); break;
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+        default:
+            memcpy(cb->data.str, (char **)sc->col_data[tc] + start, nrows * sizeof(char *)); break;
+        }
     }
 
     *cursor = end;
@@ -223,16 +267,22 @@ static inline void cb_copy_value(struct col_block *dst, uint32_t dst_i,
                                  const struct col_block *src, uint16_t src_i)
 {
     dst->nulls[dst_i] = src->nulls[src_i];
-    if (src->type == COLUMN_TYPE_SMALLINT) {
-        dst->data.i16[dst_i] = src->data.i16[src_i];
-    } else if (column_type_is_text(src->type)) {
-        dst->data.str[dst_i] = src->data.str[src_i];
-    } else if (src->type == COLUMN_TYPE_BIGINT) {
-        dst->data.i64[dst_i] = src->data.i64[src_i];
-    } else if (src->type == COLUMN_TYPE_FLOAT || src->type == COLUMN_TYPE_NUMERIC) {
-        dst->data.f64[dst_i] = src->data.f64[src_i];
-    } else {
-        dst->data.i32[dst_i] = src->data.i32[src_i];
+    switch (src->type) {
+    case COLUMN_TYPE_SMALLINT: dst->data.i16[dst_i] = src->data.i16[src_i]; break;
+    case COLUMN_TYPE_BIGINT:   dst->data.i64[dst_i] = src->data.i64[src_i]; break;
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:  dst->data.f64[dst_i] = src->data.f64[src_i]; break;
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:     dst->data.str[dst_i] = src->data.str[src_i]; break;
+    case COLUMN_TYPE_INT:
+    case COLUMN_TYPE_BOOLEAN:
+    default:                   dst->data.i32[dst_i] = src->data.i32[src_i]; break;
     }
 }
 
@@ -241,27 +291,45 @@ static inline void cb_bulk_copy(struct col_block *dst,
                                 const struct col_block *src, uint32_t count)
 {
     memcpy(dst->nulls, src->nulls, count);
-    if (src->type == COLUMN_TYPE_SMALLINT) {
-        memcpy(dst->data.i16, src->data.i16, count * sizeof(int16_t));
-    } else if (column_type_is_text(src->type)) {
-        memcpy(dst->data.str, src->data.str, count * sizeof(char *));
-    } else if (src->type == COLUMN_TYPE_BIGINT) {
-        memcpy(dst->data.i64, src->data.i64, count * sizeof(int64_t));
-    } else if (src->type == COLUMN_TYPE_FLOAT || src->type == COLUMN_TYPE_NUMERIC) {
-        memcpy(dst->data.f64, src->data.f64, count * sizeof(double));
-    } else {
-        memcpy(dst->data.i32, src->data.i32, count * sizeof(int32_t));
+    switch (src->type) {
+    case COLUMN_TYPE_SMALLINT: memcpy(dst->data.i16, src->data.i16, count * sizeof(int16_t)); break;
+    case COLUMN_TYPE_BIGINT:   memcpy(dst->data.i64, src->data.i64, count * sizeof(int64_t)); break;
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:  memcpy(dst->data.f64, src->data.f64, count * sizeof(double)); break;
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:     memcpy(dst->data.str, src->data.str, count * sizeof(char *)); break;
+    case COLUMN_TYPE_INT:
+    case COLUMN_TYPE_BOOLEAN:
+    default:                   memcpy(dst->data.i32, src->data.i32, count * sizeof(int32_t)); break;
     }
 }
 
 /* Helper: get a double value from a col_block at index i. */
 static inline double cb_to_double(const struct col_block *cb, uint16_t i)
 {
-    if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC)
-        return cb->data.f64[i];
-    if (cb->type == COLUMN_TYPE_BIGINT)
-        return (double)cb->data.i64[i];
-    return (double)cb->data.i32[i];
+    switch (cb->type) {
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:  return cb->data.f64[i];
+    case COLUMN_TYPE_BIGINT:   return (double)cb->data.i64[i];
+    case COLUMN_TYPE_SMALLINT: return (double)cb->data.i16[i];
+    case COLUMN_TYPE_INT:
+    case COLUMN_TYPE_BOOLEAN:
+    default:                   return (double)cb->data.i32[i];
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:     return 0.0;
+    }
 }
 
 /* Helper: get output column count for a plan node. */
@@ -269,31 +337,32 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
 {
     if (node_idx == IDX_NONE) return 0;
     struct plan_node *pn = &PLAN_NODE(arena, node_idx);
-    if (pn->op == PLAN_SEQ_SCAN) return pn->seq_scan.ncols;
-    if (pn->op == PLAN_INDEX_SCAN) return pn->index_scan.ncols;
-    if (pn->op == PLAN_PROJECT) return pn->project.ncols;
-    if (pn->op == PLAN_HASH_JOIN) {
+    switch (pn->op) {
+    case PLAN_SEQ_SCAN:       return pn->seq_scan.ncols;
+    case PLAN_INDEX_SCAN:     return pn->index_scan.ncols;
+    case PLAN_PROJECT:        return pn->project.ncols;
+    case PLAN_HASH_JOIN: {
         uint16_t lc = plan_node_ncols(arena, pn->left);
         uint16_t rc = plan_node_ncols(arena, pn->right);
         return lc + rc;
     }
-    if (pn->op == PLAN_HASH_AGG)
+    case PLAN_HASH_AGG:
         return pn->hash_agg.ngroup_cols + (uint16_t)pn->hash_agg.agg_count;
-    if (pn->op == PLAN_SORT)
+    case PLAN_WINDOW:         return pn->window.out_ncols;
+    case PLAN_SET_OP:         return pn->set_op.ncols;
+    case PLAN_GENERATE_SERIES: return 1;
+    case PLAN_EXPR_PROJECT:   return pn->expr_project.ncols;
+    case PLAN_SORT:
+    case PLAN_HASH_SEMI_JOIN:
+    case PLAN_DISTINCT:
+    case PLAN_FILTER:
+    case PLAN_LIMIT:
         return plan_node_ncols(arena, pn->left);
-    if (pn->op == PLAN_WINDOW)
-        return pn->window.out_ncols;
-    if (pn->op == PLAN_HASH_SEMI_JOIN)
+    case PLAN_NESTED_LOOP:
+    case PLAN_SIMPLE_AGG:
+        /* not yet implemented — fall through to child */
         return plan_node_ncols(arena, pn->left);
-    if (pn->op == PLAN_DISTINCT)
-        return plan_node_ncols(arena, pn->left);
-    if (pn->op == PLAN_SET_OP)
-        return pn->set_op.ncols;
-    if (pn->op == PLAN_GENERATE_SERIES)
-        return 1;
-    if (pn->op == PLAN_EXPR_PROJECT)
-        return pn->expr_project.ncols;
-    /* For pass-through nodes, recurse to child */
+    }
     return plan_node_ncols(arena, pn->left);
 }
 
@@ -373,8 +442,9 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
         }
         cb->count = nrows;
 
-        /* Fast path for SMALLINT columns */
-        if (col_type == COLUMN_TYPE_SMALLINT) {
+        /* Fast paths for common column types */
+        switch (col_type) {
+        case COLUMN_TYPE_SMALLINT:
             for (uint16_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[start + r].cells.items[tc];
                 if (cell->is_null || cell->type != COLUMN_TYPE_SMALLINT) {
@@ -384,7 +454,8 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
                     cb->data.i16[r] = cell->value.as_smallint;
                 }
             }
-        } else if (col_type == COLUMN_TYPE_INT) {
+            break;
+        case COLUMN_TYPE_INT:
             for (uint16_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[start + r].cells.items[tc];
                 if (cell->is_null || cell->type != COLUMN_TYPE_INT) {
@@ -394,7 +465,8 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
                     cb->data.i32[r] = cell->value.as_int;
                 }
             }
-        } else if (col_type == COLUMN_TYPE_FLOAT) {
+            break;
+        case COLUMN_TYPE_FLOAT:
             for (uint16_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[start + r].cells.items[tc];
                 if (cell->is_null || cell->type != COLUMN_TYPE_FLOAT) {
@@ -404,7 +476,8 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
                     cb->data.f64[r] = cell->value.as_float;
                 }
             }
-        } else if (col_type == COLUMN_TYPE_BIGINT) {
+            break;
+        case COLUMN_TYPE_BIGINT:
             for (uint16_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[start + r].cells.items[tc];
                 if (cell->is_null || cell->type != COLUMN_TYPE_BIGINT) {
@@ -414,7 +487,18 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
                     cb->data.i64[r] = cell->value.as_bigint;
                 }
             }
-        } else {
+            break;
+        case COLUMN_TYPE_NUMERIC:
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+        default: {
             /* Generic path for all other types */
             for (uint16_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[start + r].cells.items[tc];
@@ -455,6 +539,8 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
                         break;
                 }
             }
+            break;
+        }
         }
     }
 
@@ -3281,21 +3367,26 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     if (node_idx == IDX_NONE) return -1;
     struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
 
-    if (pn->op == PLAN_SEQ_SCAN)    return seq_scan_next(ctx, node_idx, out);
-    if (pn->op == PLAN_INDEX_SCAN)   return index_scan_next(ctx, node_idx, out);
-    if (pn->op == PLAN_FILTER)       return filter_next(ctx, node_idx, out);
-    if (pn->op == PLAN_PROJECT)      return project_next(ctx, node_idx, out);
-    if (pn->op == PLAN_LIMIT)        return limit_next(ctx, node_idx, out);
-    if (pn->op == PLAN_HASH_JOIN)    return hash_join_next(ctx, node_idx, out);
-    if (pn->op == PLAN_HASH_AGG)     return hash_agg_next(ctx, node_idx, out);
-    if (pn->op == PLAN_SORT)         return sort_next(ctx, node_idx, out);
-    if (pn->op == PLAN_WINDOW)       return window_next(ctx, node_idx, out);
-    if (pn->op == PLAN_HASH_SEMI_JOIN) return hash_semi_join_next(ctx, node_idx, out);
-    if (pn->op == PLAN_SET_OP)       return set_op_next(ctx, node_idx, out);
-    if (pn->op == PLAN_DISTINCT)     return distinct_next(ctx, node_idx, out);
-    if (pn->op == PLAN_GENERATE_SERIES) return gen_series_next(ctx, node_idx, out);
-    if (pn->op == PLAN_EXPR_PROJECT) return expr_project_next(ctx, node_idx, out);
-    /* Not yet implemented */
+    switch (pn->op) {
+    case PLAN_SEQ_SCAN:        return seq_scan_next(ctx, node_idx, out);
+    case PLAN_INDEX_SCAN:      return index_scan_next(ctx, node_idx, out);
+    case PLAN_FILTER:          return filter_next(ctx, node_idx, out);
+    case PLAN_PROJECT:         return project_next(ctx, node_idx, out);
+    case PLAN_LIMIT:           return limit_next(ctx, node_idx, out);
+    case PLAN_HASH_JOIN:       return hash_join_next(ctx, node_idx, out);
+    case PLAN_HASH_AGG:        return hash_agg_next(ctx, node_idx, out);
+    case PLAN_SORT:            return sort_next(ctx, node_idx, out);
+    case PLAN_WINDOW:          return window_next(ctx, node_idx, out);
+    case PLAN_HASH_SEMI_JOIN:  return hash_semi_join_next(ctx, node_idx, out);
+    case PLAN_SET_OP:          return set_op_next(ctx, node_idx, out);
+    case PLAN_DISTINCT:        return distinct_next(ctx, node_idx, out);
+    case PLAN_GENERATE_SERIES: return gen_series_next(ctx, node_idx, out);
+    case PLAN_EXPR_PROJECT:    return expr_project_next(ctx, node_idx, out);
+    case PLAN_NESTED_LOOP:
+    case PLAN_SIMPLE_AGG:
+        /* not yet implemented */
+        return -1;
+    }
     return -1;
 }
 
@@ -3331,6 +3422,32 @@ int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
 
 /* ---- EXPLAIN ---- */
 
+/* Format a cell value into buf for EXPLAIN output. Returns bytes written. */
+static int cell_value_to_str(const struct cell *c, char *buf, int buflen)
+{
+    if (c->is_null) return snprintf(buf, buflen, "NULL");
+    switch (c->type) {
+    case COLUMN_TYPE_INT:      return snprintf(buf, buflen, "%d", c->value.as_int);
+    case COLUMN_TYPE_SMALLINT: return snprintf(buf, buflen, "%d", (int)c->value.as_smallint);
+    case COLUMN_TYPE_BIGINT:   return snprintf(buf, buflen, "%lld", c->value.as_bigint);
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:  return snprintf(buf, buflen, "%g", c->value.as_float);
+    case COLUMN_TYPE_BOOLEAN:  return snprintf(buf, buflen, "%s", c->value.as_bool ? "true" : "false");
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:
+        if (c->value.as_text)
+            return snprintf(buf, buflen, "'%s'", c->value.as_text);
+        return snprintf(buf, buflen, "?");
+    }
+    return snprintf(buf, buflen, "?");
+}
+
 static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
                               char *buf, int buflen, int depth)
 {
@@ -3358,20 +3475,7 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
                 cond->op == CMP_LT ? "<" : cond->op == CMP_GT ? ">" :
                 cond->op == CMP_LE ? "<=" : cond->op == CMP_GE ? ">=" : "?";
             char vbuf[64] = "";
-            if (!cond->value.is_null) {
-                if (cond->value.type == COLUMN_TYPE_INT)
-                    snprintf(vbuf, sizeof(vbuf), "%d", cond->value.value.as_int);
-                else if (cond->value.type == COLUMN_TYPE_SMALLINT)
-                    snprintf(vbuf, sizeof(vbuf), "%d", (int)cond->value.value.as_smallint);
-                else if (cond->value.type == COLUMN_TYPE_BIGINT)
-                    snprintf(vbuf, sizeof(vbuf), "%lld", cond->value.value.as_bigint);
-                else if (cond->value.type == COLUMN_TYPE_FLOAT || cond->value.type == COLUMN_TYPE_NUMERIC)
-                    snprintf(vbuf, sizeof(vbuf), "%g", cond->value.value.as_float);
-                else if (column_type_is_text(cond->value.type) && cond->value.value.as_text)
-                    snprintf(vbuf, sizeof(vbuf), "'%s'", cond->value.value.as_text);
-                else
-                    snprintf(vbuf, sizeof(vbuf), "?");
-            }
+            cell_value_to_str(&cond->value, vbuf, sizeof(vbuf));
             n = snprintf(buf + written, buflen - written,
                          "Index Scan on %s (" SV_FMT " %s %s)\n",
                          tname, (int)cond->column.len, cond->column.data, op_str, vbuf);
@@ -3389,20 +3493,7 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
                 cond->op == CMP_LT ? "<" : cond->op == CMP_GT ? ">" :
                 cond->op == CMP_LE ? "<=" : cond->op == CMP_GE ? ">=" : "?";
             char vbuf[64] = "";
-            if (!cond->value.is_null) {
-                if (cond->value.type == COLUMN_TYPE_INT)
-                    snprintf(vbuf, sizeof(vbuf), "%d", cond->value.value.as_int);
-                else if (cond->value.type == COLUMN_TYPE_SMALLINT)
-                    snprintf(vbuf, sizeof(vbuf), "%d", (int)cond->value.value.as_smallint);
-                else if (cond->value.type == COLUMN_TYPE_BIGINT)
-                    snprintf(vbuf, sizeof(vbuf), "%lld", cond->value.value.as_bigint);
-                else if (cond->value.type == COLUMN_TYPE_FLOAT || cond->value.type == COLUMN_TYPE_NUMERIC)
-                    snprintf(vbuf, sizeof(vbuf), "%g", cond->value.value.as_float);
-                else if (column_type_is_text(cond->value.type) && cond->value.value.as_text)
-                    snprintf(vbuf, sizeof(vbuf), "'%s'", cond->value.value.as_text);
-                else
-                    snprintf(vbuf, sizeof(vbuf), "?");
-            }
+            cell_value_to_str(&cond->value, vbuf, sizeof(vbuf));
             n = snprintf(buf + written, buflen - written,
                          "Filter: (" SV_FMT " %s %s)\n",
                          (int)cond->column.len, cond->column.data, op_str, vbuf);

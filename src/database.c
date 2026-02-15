@@ -250,14 +250,22 @@ static uint32_t cell_hash(const struct cell *c)
         case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_NUMERIC: {
             double dv;
-            if (c->type == COLUMN_TYPE_SMALLINT)
-                dv = (double)c->value.as_smallint;
-            else if (c->type == COLUMN_TYPE_INT || c->type == COLUMN_TYPE_BOOLEAN)
-                dv = (double)c->value.as_int;
-            else if (c->type == COLUMN_TYPE_BIGINT)
-                dv = (double)c->value.as_bigint;
-            else
-                dv = c->value.as_float;
+            switch (c->type) {
+            case COLUMN_TYPE_SMALLINT: dv = (double)c->value.as_smallint; break;
+            case COLUMN_TYPE_INT:
+            case COLUMN_TYPE_BOOLEAN:  dv = (double)c->value.as_int; break;
+            case COLUMN_TYPE_BIGINT:   dv = (double)c->value.as_bigint; break;
+            case COLUMN_TYPE_FLOAT:
+            case COLUMN_TYPE_NUMERIC:  dv = c->value.as_float; break;
+            case COLUMN_TYPE_TEXT:
+            case COLUMN_TYPE_ENUM:
+            case COLUMN_TYPE_DATE:
+            case COLUMN_TYPE_TIME:
+            case COLUMN_TYPE_TIMESTAMP:
+            case COLUMN_TYPE_TIMESTAMPTZ:
+            case COLUMN_TYPE_INTERVAL:
+            case COLUMN_TYPE_UUID:     dv = 0.0; break;
+            }
             uint8_t *p = (uint8_t *)&dv;
             for (int i = 0; i < 8; i++) { h ^= p[i]; h *= 16777619u; }
             break;
@@ -758,11 +766,21 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
             free(lat_rows.data);
         }
     } else {
+        /* materialize non-lateral subquery join as temp table */
+        struct table *sq_temp = NULL;
+        if (!ji->is_lateral && ji->lateral_subquery_sql != IDX_NONE && ji->join_alias.len > 0) {
+            const char *sq_sql = ASTRING(a, ji->lateral_subquery_sql);
+            char alias_buf[128];
+            snprintf(alias_buf, sizeof(alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
+            sq_temp = materialize_subquery(db, sq_sql, alias_buf);
+            ji->join_table = ji->join_alias;
+        }
         struct table *t2 = db_find_table_sv(db, ji->join_table);
         if (!t2) {
             arena_set_error(&q->arena, "42P01", "table '%.*s' not found", (int)ji->join_table.len, ji->join_table.data);
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
+            if (sq_temp) remove_temp_table(db, sq_temp);
             return -1;
         }
         resolve_join_cols(ji, t1, t2);
@@ -777,8 +795,10 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
                            ji->join_op, &merged, &merged_t, a, ji->join_on_cond, NULL) != 0) {
             free_merged_rows(&merged);
             free_merged_columns(&merged_t);
+            if (sq_temp) remove_temp_table(db, sq_temp);
             return -1;
         }
+        if (sq_temp) remove_temp_table(db, sq_temp);
     }
 
     /* subsequent joins: build a temp table from merged results, join with next */
@@ -1530,6 +1550,130 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             struct query_create_table *crt = &q->create_table;
             if (crt->if_not_exists && db_find_table_sv(db, crt->table))
                 return 0;
+            /* CREATE TABLE ... AS SELECT */
+            if (crt->as_select_sql != IDX_NONE) {
+                const char *sel_sql = ASTRING(&q->arena, crt->as_select_sql);
+                struct query sel_q;
+                if (query_parse(sel_sql, &sel_q) != 0) {
+                    arena_set_error(&q->arena, "42601", "CREATE TABLE AS: invalid SELECT");
+                    return -1;
+                }
+                struct rows sel_rows = {0};
+                if (db_exec(db, &sel_q, &sel_rows, NULL) != 0) {
+                    query_free(&sel_q);
+                    arena_set_error(&q->arena, "42601", "CREATE TABLE AS: SELECT failed");
+                    return -1;
+                }
+                struct table t;
+                table_init_own(&t, sv_to_cstr(crt->table));
+                /* infer columns from SELECT result */
+                if (sel_rows.count > 0 && sel_rows.data[0].cells.count > 0) {
+                    /* try to get column names from the select query */
+                    sv cols = sel_q.select.columns;
+                    size_t ncols = sel_rows.data[0].cells.count;
+                    for (size_t ci = 0; ci < ncols; ci++) {
+                        struct column col = {0};
+                        col.type = sel_rows.data[0].cells.items[ci].type;
+                        /* extract column name from raw columns text */
+                        char colname[128];
+                        int got_name = 0;
+                        if (cols.len > 0 && ci == 0) {
+                            /* parse comma-separated column names */
+                            sv remaining = cols;
+                            for (size_t k = 0; k <= ci && remaining.len > 0; k++) {
+                                while (remaining.len > 0 && remaining.data[0] == ' ')
+                                    { remaining.data++; remaining.len--; }
+                                size_t end = 0;
+                                int depth = 0;
+                                while (end < remaining.len) {
+                                    if (remaining.data[end] == '(') depth++;
+                                    else if (remaining.data[end] == ')') depth--;
+                                    else if (remaining.data[end] == ',' && depth == 0) break;
+                                    end++;
+                                }
+                                if (k == ci) {
+                                    sv cn = sv_from(remaining.data, end);
+                                    while (cn.len > 0 && cn.data[cn.len-1] == ' ') cn.len--;
+                                    /* check for AS alias */
+                                    for (size_t p = 0; p + 2 < cn.len; p++) {
+                                        if ((cn.data[p] == ' ') &&
+                                            (cn.data[p+1] == 'A' || cn.data[p+1] == 'a') &&
+                                            (cn.data[p+2] == 'S' || cn.data[p+2] == 's') &&
+                                            (p+3 >= cn.len || cn.data[p+3] == ' ')) {
+                                            cn = sv_from(cn.data + p + 3, cn.len - p - 3);
+                                            while (cn.len > 0 && cn.data[0] == ' ')
+                                                { cn.data++; cn.len--; }
+                                            break;
+                                        }
+                                    }
+                                    snprintf(colname, sizeof(colname), "%.*s", (int)cn.len, cn.data);
+                                    got_name = 1;
+                                }
+                                if (end < remaining.len) { remaining.data += end + 1; remaining.len -= end + 1; }
+                                else break;
+                            }
+                        }
+                        if (!got_name || ci > 0) {
+                            /* for subsequent columns, re-parse from cols */
+                            sv remaining = cols;
+                            size_t col_idx = 0;
+                            while (remaining.len > 0 && col_idx <= ci) {
+                                while (remaining.len > 0 && remaining.data[0] == ' ')
+                                    { remaining.data++; remaining.len--; }
+                                size_t end = 0;
+                                int depth = 0;
+                                while (end < remaining.len) {
+                                    if (remaining.data[end] == '(') depth++;
+                                    else if (remaining.data[end] == ')') depth--;
+                                    else if (remaining.data[end] == ',' && depth == 0) break;
+                                    end++;
+                                }
+                                if (col_idx == ci) {
+                                    sv cn = sv_from(remaining.data, end);
+                                    while (cn.len > 0 && cn.data[cn.len-1] == ' ') cn.len--;
+                                    snprintf(colname, sizeof(colname), "%.*s", (int)cn.len, cn.data);
+                                    got_name = 1;
+                                }
+                                col_idx++;
+                                if (end < remaining.len) { remaining.data += end + 1; remaining.len -= end + 1; }
+                                else break;
+                            }
+                        }
+                        if (!got_name)
+                            snprintf(colname, sizeof(colname), "col%zu", ci + 1);
+                        col.name = strdup(colname);
+                        table_add_column(&t, &col);
+                        free(col.name);
+                    }
+                }
+                /* copy rows */
+                for (size_t ri = 0; ri < sel_rows.count; ri++) {
+                    struct row nr = {0};
+                    da_init(&nr.cells);
+                    for (size_t ci = 0; ci < sel_rows.data[ri].cells.count; ci++) {
+                        struct cell cp;
+                        cell_copy(&cp, &sel_rows.data[ri].cells.items[ci]);
+                        da_push(&nr.cells, cp);
+                    }
+                    da_push(&t.rows, nr);
+                }
+                da_push(&db->tables, t);
+                /* store row count in result for command tag */
+                if (result) {
+                    struct row r = {0};
+                    da_init(&r.cells);
+                    struct cell c = { .type = COLUMN_TYPE_INT };
+                    c.value.as_int = (int)sel_rows.count;
+                    da_push(&r.cells, c);
+                    rows_push(result, r);
+                }
+                /* free select results */
+                for (size_t ri = 0; ri < sel_rows.count; ri++)
+                    row_free(&sel_rows.data[ri]);
+                free(sel_rows.data);
+                query_free(&sel_q);
+                return 0;
+            }
             struct table t;
             table_init_own(&t, sv_to_cstr(crt->table));
             for (uint32_t i = 0; i < crt->columns_count; i++) {
@@ -2467,9 +2611,23 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                     int ci = table_find_column_sv(t, scp->column);
                                     if (ci < 0) continue;
                                     struct cell val;
-                                    if (scp->expr_idx != IDX_NONE)
-                                        val = eval_expr(scp->expr_idx, &q->arena, t, &t->rows.items[conflict_row], db, NULL);
-                                    else
+                                    if (scp->expr_idx != IDX_NONE) {
+                                        /* check if expression is EXCLUDED.col — resolve from new row */
+                                        struct expr *se = &EXPR(&q->arena, scp->expr_idx);
+                                        if (se->type == EXPR_COLUMN_REF && se->column_ref.table.len > 0 &&
+                                            sv_eq_ignorecase_cstr(se->column_ref.table, "excluded")) {
+                                            int ecol = table_find_column_sv(t, se->column_ref.column);
+                                            if (ecol >= 0 && (size_t)ecol < ir_items[ri].cells.count)
+                                                cell_copy(&val, &ir_items[ri].cells.items[ecol]);
+                                            else {
+                                                memset(&val, 0, sizeof(val));
+                                                val.type = COLUMN_TYPE_INT;
+                                                val.is_null = 1;
+                                            }
+                                        } else {
+                                            val = eval_expr(scp->expr_idx, &q->arena, t, &t->rows.items[conflict_row], db, NULL);
+                                        }
+                                    } else
                                         cell_copy(&val, &scp->value);
                                     struct cell *dst = &t->rows.items[conflict_row].cells.items[ci];
                                     if (column_type_is_text(dst->type) && dst->value.as_text)
@@ -2569,6 +2727,87 @@ skip_conflict_nothing:
             /* resolve subqueries in WHERE */
             if (q->del.where.has_where && q->del.where.where_cond != IDX_NONE)
                 resolve_subqueries(db, &q->arena, q->del.where.where_cond, NULL);
+            /* DELETE ... USING: build merged table to evaluate cross-table WHERE */
+            if (q->del.using_table.len > 0 && q->del.where.has_where && q->del.where.where_cond != IDX_NONE) {
+                struct table *dt = db_find_table_sv(db, q->del.table);
+                struct table *ut = db_find_table_sv(db, q->del.using_table);
+                if (!dt || !ut) {
+                    arena_set_error(&q->arena, "42P01", "DELETE USING: table not found");
+                    return -1;
+                }
+                /* COW trigger */
+                if (db->active_txn && db->active_txn->in_transaction && db->active_txn->snapshot)
+                    snapshot_cow_table(db->active_txn->snapshot, db, dt->name);
+                /* build merged column metadata: t1 cols (qualified) + t2 cols (qualified) */
+                struct table merged = {0};
+                da_init(&merged.columns);
+                da_init(&merged.rows);
+                da_init(&merged.indexes);
+                char t1name[128], t2name[128];
+                snprintf(t1name, sizeof(t1name), "%.*s", (int)q->del.table.len, q->del.table.data);
+                snprintf(t2name, sizeof(t2name), "%.*s", (int)q->del.using_table.len, q->del.using_table.data);
+                for (size_t c = 0; c < dt->columns.count; c++) {
+                    struct column col = {0};
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "%s.%s", t1name, dt->columns.items[c].name);
+                    col.name = strdup(buf);
+                    col.type = dt->columns.items[c].type;
+                    da_push(&merged.columns, col);
+                }
+                for (size_t c = 0; c < ut->columns.count; c++) {
+                    struct column col = {0};
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "%s.%s", t2name, ut->columns.items[c].name);
+                    col.name = strdup(buf);
+                    col.type = ut->columns.items[c].type;
+                    da_push(&merged.columns, col);
+                }
+                /* find which target rows match any USING row */
+                size_t dt_ncols = dt->columns.count;
+                size_t ut_ncols = ut->columns.count;
+                int *to_delete = calloc(dt->rows.count, sizeof(int));
+                for (size_t i = 0; i < dt->rows.count; i++) {
+                    for (size_t j = 0; j < ut->rows.count; j++) {
+                        /* build merged row */
+                        struct row mr = {0};
+                        da_init(&mr.cells);
+                        for (size_t c = 0; c < dt_ncols; c++)
+                            da_push(&mr.cells, dt->rows.items[i].cells.items[c]);
+                        for (size_t c = 0; c < ut_ncols; c++)
+                            da_push(&mr.cells, ut->rows.items[j].cells.items[c]);
+                        int match = eval_condition(q->del.where.where_cond, &q->arena, &mr, &merged, NULL);
+                        da_free(&mr.cells);
+                        if (match) { to_delete[i] = 1; break; }
+                    }
+                }
+                /* delete matched rows (iterate backwards to avoid index shifting issues) */
+                size_t deleted = 0;
+                for (size_t i = dt->rows.count; i > 0; i--) {
+                    size_t idx = i - 1;
+                    if (to_delete[idx]) {
+                        row_free(&dt->rows.items[idx]);
+                        for (size_t k = idx; k + 1 < dt->rows.count; k++)
+                            dt->rows.items[k] = dt->rows.items[k + 1];
+                        dt->rows.count--;
+                        deleted++;
+                        dt->generation++;
+                    }
+                }
+                free(to_delete);
+                for (size_t c = 0; c < merged.columns.count; c++) free(merged.columns.items[c].name);
+                da_free(&merged.columns);
+                /* indexes are rebuilt via generation change */
+                /* store deleted count */
+                if (result) {
+                    struct row r = {0};
+                    da_init(&r.cells);
+                    struct cell c = { .type = COLUMN_TYPE_INT };
+                    c.value.as_int = (int)deleted;
+                    da_push(&r.cells, c);
+                    rows_push(result, r);
+                }
+                return 0;
+            }
             return db_table_exec_query(db, q->del.table, q, result, rb);
         case QUERY_TYPE_UPDATE: {
             struct query_update *u = &q->update;

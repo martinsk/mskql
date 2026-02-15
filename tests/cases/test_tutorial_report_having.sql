@@ -7,9 +7,9 @@ INSERT INTO deals (rep_id, customer, amount, stage, closed) VALUES (1, 'Acme Cor
 -- input:
 SELECT r.name, SUM(d.amount) AS pipeline FROM deals d JOIN reps r ON d.rep_id = r.id GROUP BY r.name HAVING SUM(d.amount) > 60000 ORDER BY pipeline DESC;
 -- expected output:
-Eve|65000
 Alice|95000
 Bob|95000
 Carol|95000
 Dave|95000
+Eve|65000
 -- expected status: 0

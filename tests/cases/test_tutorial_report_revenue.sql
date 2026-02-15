@@ -7,9 +7,9 @@ INSERT INTO deals (rep_id, customer, amount, stage, closed) VALUES (1, 'Acme Cor
 -- input:
 SELECT r.name, COUNT(*) AS deals_won, SUM(d.amount) AS revenue FROM deals d JOIN reps r ON d.rep_id = r.id WHERE d.stage = 'won' GROUP BY r.name ORDER BY revenue DESC;
 -- expected output:
-Alice|2|75000
-Bob|1|55000
-Carol|1|60000
 Dave|2|95000
+Alice|2|75000
+Carol|1|60000
+Bob|1|55000
 Eve|1|50000
 -- expected status: 0

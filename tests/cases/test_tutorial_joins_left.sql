@@ -7,9 +7,9 @@ INSERT INTO orders (customer_id, ordered_at) VALUES (1, '2025-01-05'), (1, '2025
 -- input:
 SELECT c.name, c.city, COUNT(o.id) AS orders FROM customers c LEFT JOIN orders o ON c.id = o.customer_id GROUP BY c.name, c.city ORDER BY orders, c.name;
 -- expected output:
-Alice|Portland|2
-Bob|Seattle|1
-Carol|Portland|1
 Dave||0
 Eve|Denver|0
+Bob|Seattle|1
+Carol|Portland|1
+Alice|Portland|2
 -- expected status: 0

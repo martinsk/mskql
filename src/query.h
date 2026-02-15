@@ -28,6 +28,7 @@ struct agg_expr {
     int has_distinct; /* COUNT(DISTINCT col) */
     uint32_t expr_idx; /* index into arena.exprs, or IDX_NONE — when set, evaluate expression instead of bare column */
     sv separator; /* STRING_AGG delimiter (empty for ARRAY_AGG) */
+    uint32_t filter_cond; /* index into arena.conditions, or IDX_NONE — FILTER (WHERE ...) */
 };
 
 enum win_func {
@@ -529,6 +530,8 @@ struct query_update {
 
 struct query_delete {
     sv table;
+    /* USING */
+    sv using_table;
     /* WHERE */
     struct where_clause where;
     /* RETURNING */
@@ -541,6 +544,7 @@ struct query_create_table {
     uint32_t columns_start; /* index into arena.columns (consecutive) */
     uint32_t columns_count;
     int if_not_exists;
+    uint32_t as_select_sql; /* index into arena.strings, or IDX_NONE — CREATE TABLE ... AS SELECT */
 };
 
 struct query_drop_table {

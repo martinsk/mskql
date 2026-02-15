@@ -8,7 +8,7 @@ INSERT INTO kv VALUES ('d', 4) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.
 SELECT * FROM kv ORDER BY key;
 -- expected output:
 a|1
-b|2
+b|20
 c|3
 d|4
 -- expected status: 0

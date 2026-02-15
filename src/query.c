@@ -580,7 +580,20 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                                         case CMP_GT: match = (r > 0); break;
                                         case CMP_LE: match = (r <= 0); break;
                                         case CMP_GE: match = (r >= 0); break;
-                                        default: break;
+                                        case CMP_IS_NULL:
+                                        case CMP_IS_NOT_NULL:
+                                        case CMP_IN:
+                                        case CMP_NOT_IN:
+                                        case CMP_BETWEEN:
+                                        case CMP_LIKE:
+                                        case CMP_ILIKE:
+                                        case CMP_IS_DISTINCT:
+                                        case CMP_IS_NOT_DISTINCT:
+                                        case CMP_EXISTS:
+                                        case CMP_NOT_EXISTS:
+                                        case CMP_REGEX_MATCH:
+                                        case CMP_REGEX_NOT_MATCH:
+                                            break;
                                     }
                                 }
                                 if (cond->is_any && match) { cond_result = 1; break; }
@@ -1545,11 +1558,23 @@ static int cell_is_null(const struct cell *c)
 
 static double cell_to_double_val(const struct cell *c)
 {
-    if (c->type == COLUMN_TYPE_SMALLINT) return (double)c->value.as_smallint;
-    if (c->type == COLUMN_TYPE_INT)    return (double)c->value.as_int;
-    if (c->type == COLUMN_TYPE_FLOAT)  return c->value.as_float;
-    if (c->type == COLUMN_TYPE_BIGINT) return (double)c->value.as_bigint;
-    if (c->type == COLUMN_TYPE_NUMERIC) return c->value.as_float;
+    switch (c->type) {
+    case COLUMN_TYPE_SMALLINT: return (double)c->value.as_smallint;
+    case COLUMN_TYPE_INT:     return (double)c->value.as_int;
+    case COLUMN_TYPE_FLOAT:   return c->value.as_float;
+    case COLUMN_TYPE_BIGINT:  return (double)c->value.as_bigint;
+    case COLUMN_TYPE_NUMERIC: return c->value.as_float;
+    case COLUMN_TYPE_BOOLEAN:
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:
+        break;
+    }
     return 0.0;
 }
 
@@ -1561,18 +1586,23 @@ static char *cell_to_text(const struct cell *c)
     if (column_type_is_text(c->type) && c->value.as_text)
         return strdup(c->value.as_text);
     char buf[64];
-    if (c->type == COLUMN_TYPE_SMALLINT)
-        snprintf(buf, sizeof(buf), "%d", (int)c->value.as_smallint);
-    else if (c->type == COLUMN_TYPE_INT)
-        snprintf(buf, sizeof(buf), "%d", c->value.as_int);
-    else if (c->type == COLUMN_TYPE_FLOAT)
-        snprintf(buf, sizeof(buf), "%g", c->value.as_float);
-    else if (c->type == COLUMN_TYPE_BIGINT)
-        snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint);
-    else if (c->type == COLUMN_TYPE_BOOLEAN)
-        snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "true" : "false");
-    else
-        buf[0] = '\0';
+    switch (c->type) {
+    case COLUMN_TYPE_SMALLINT: snprintf(buf, sizeof(buf), "%d", (int)c->value.as_smallint); break;
+    case COLUMN_TYPE_INT:      snprintf(buf, sizeof(buf), "%d", c->value.as_int); break;
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:  snprintf(buf, sizeof(buf), "%g", c->value.as_float); break;
+    case COLUMN_TYPE_BIGINT:   snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint); break;
+    case COLUMN_TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "true" : "false"); break;
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:
+        buf[0] = '\0'; break;
+    }
     return strdup(buf);
 }
 
@@ -1584,19 +1614,1358 @@ static char *cell_to_text_rb(const struct cell *c, struct bump_alloc *rb)
     if (column_type_is_text(c->type) && c->value.as_text)
         return bump_strdup(rb, c->value.as_text);
     char buf[64];
-    if (c->type == COLUMN_TYPE_SMALLINT)
-        snprintf(buf, sizeof(buf), "%d", (int)c->value.as_smallint);
-    else if (c->type == COLUMN_TYPE_INT)
-        snprintf(buf, sizeof(buf), "%d", c->value.as_int);
-    else if (c->type == COLUMN_TYPE_FLOAT)
-        snprintf(buf, sizeof(buf), "%g", c->value.as_float);
-    else if (c->type == COLUMN_TYPE_BIGINT)
-        snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint);
-    else if (c->type == COLUMN_TYPE_BOOLEAN)
-        snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "true" : "false");
-    else
-        buf[0] = '\0';
+    switch (c->type) {
+    case COLUMN_TYPE_SMALLINT: snprintf(buf, sizeof(buf), "%d", (int)c->value.as_smallint); break;
+    case COLUMN_TYPE_INT:      snprintf(buf, sizeof(buf), "%d", c->value.as_int); break;
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:  snprintf(buf, sizeof(buf), "%g", c->value.as_float); break;
+    case COLUMN_TYPE_BIGINT:   snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint); break;
+    case COLUMN_TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "true" : "false"); break;
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:
+        buf[0] = '\0'; break;
+    }
     return bump_strdup(rb, buf);
+}
+
+/* ---- Extracted sub-functions for eval_expr ---- */
+
+static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
+                                  struct table *t, struct row *row,
+                                  struct database *db, struct bump_alloc *rb)
+{
+    struct cell lhs = eval_expr(e->binary.left, arena, t, row, db, rb);
+    struct cell rhs = eval_expr(e->binary.right, arena, t, row, db, rb);
+
+    /* string concatenation */
+    if (e->binary.op == OP_CONCAT) {
+        /* SQL standard: NULL || anything = NULL */
+        if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
+            cell_release_rb(&lhs, rb);
+            cell_release_rb(&rhs, rb);
+            return cell_make_null();
+        }
+        char *ls = cell_to_text_rb(&lhs, rb);
+        char *rs = cell_to_text_rb(&rhs, rb);
+        size_t llen = ls ? strlen(ls) : 0;
+        size_t rlen = rs ? strlen(rs) : 0;
+        char *buf = rb ? (char *)bump_alloc(rb, llen + rlen + 1)
+                       : malloc(llen + rlen + 1);
+        if (ls) memcpy(buf, ls, llen);
+        if (rs) memcpy(buf + llen, rs, rlen);
+        buf[llen + rlen] = '\0';
+        if (!rb) { free(ls); free(rs); }
+        cell_release_rb(&lhs, rb);
+        cell_release_rb(&rhs, rb);
+        /* caller owns returned text — see JPL contract at cell_release() */
+        struct cell c = {0};
+        c.type = COLUMN_TYPE_TEXT;
+        c.value.as_text = buf;
+        return c;
+    }
+
+    /* arithmetic: NULL propagation */
+    if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
+        cell_release_rb(&lhs, rb);
+        cell_release_rb(&rhs, rb);
+        struct cell c = {0};
+        c.type = COLUMN_TYPE_INT;
+        c.is_null = 1;
+        return c;
+    }
+
+    /* date/time arithmetic: date/timestamp +/- interval, timestamp - timestamp */
+    {
+        int lhs_is_dt = (lhs.type == COLUMN_TYPE_DATE || lhs.type == COLUMN_TYPE_TIMESTAMP ||
+                         lhs.type == COLUMN_TYPE_TIMESTAMPTZ);
+        int rhs_is_dt = (rhs.type == COLUMN_TYPE_DATE || rhs.type == COLUMN_TYPE_TIMESTAMP ||
+                         rhs.type == COLUMN_TYPE_TIMESTAMPTZ);
+        int lhs_is_interval = (lhs.type == COLUMN_TYPE_INTERVAL);
+        int rhs_is_interval = (rhs.type == COLUMN_TYPE_INTERVAL);
+
+        /* date/timestamp +/- interval */
+        if (lhs_is_dt && rhs_is_interval && (e->binary.op == OP_ADD || e->binary.op == OP_SUB)) {
+            const char *dt_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
+            const char *iv_str = (column_type_is_text(rhs.type) && rhs.value.as_text) ? rhs.value.as_text : "";
+            struct tm tm_val;
+            if (parse_datetime(dt_str, &tm_val)) {
+                double secs = parse_interval_to_seconds(iv_str);
+                time_t t_val = mktime(&tm_val);
+                if (e->binary.op == OP_ADD) t_val += (time_t)secs;
+                else t_val -= (time_t)secs;
+                struct tm *result_tm = localtime(&t_val);
+                char buf[32];
+                if (lhs.type == COLUMN_TYPE_DATE)
+                    format_date(result_tm, buf, sizeof(buf));
+                else
+                    format_timestamp(result_tm, buf, sizeof(buf));
+                cell_release_rb(&lhs, rb);
+                cell_release_rb(&rhs, rb);
+                struct cell r = {0};
+                r.type = lhs.type;
+                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+                return r;
+            }
+        }
+
+        /* interval + date/timestamp */
+        if (lhs_is_interval && rhs_is_dt && e->binary.op == OP_ADD) {
+            const char *iv_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
+            const char *dt_str = (column_type_is_text(rhs.type) && rhs.value.as_text) ? rhs.value.as_text : "";
+            struct tm tm_val;
+            if (parse_datetime(dt_str, &tm_val)) {
+                double secs = parse_interval_to_seconds(iv_str);
+                time_t t_val = mktime(&tm_val);
+                t_val += (time_t)secs;
+                struct tm *result_tm = localtime(&t_val);
+                char buf[32];
+                if (rhs.type == COLUMN_TYPE_DATE)
+                    format_date(result_tm, buf, sizeof(buf));
+                else
+                    format_timestamp(result_tm, buf, sizeof(buf));
+                cell_release_rb(&lhs, rb);
+                cell_release_rb(&rhs, rb);
+                struct cell r = {0};
+                r.type = rhs.type;
+                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+                return r;
+            }
+        }
+
+        /* timestamp - timestamp = interval */
+        if (lhs_is_dt && rhs_is_dt && e->binary.op == OP_SUB) {
+            const char *sa = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
+            const char *sb = (column_type_is_text(rhs.type) && rhs.value.as_text) ? rhs.value.as_text : "";
+            struct tm tm_a, tm_b;
+            if (parse_datetime(sa, &tm_a) && parse_datetime(sb, &tm_b)) {
+                time_t ta = mktime(&tm_a);
+                time_t tb = mktime(&tm_b);
+                double diff = difftime(ta, tb);
+                char buf[128];
+                format_interval(diff, buf, sizeof(buf));
+                cell_release_rb(&lhs, rb);
+                cell_release_rb(&rhs, rb);
+                struct cell r = {0};
+                r.type = COLUMN_TYPE_INTERVAL;
+                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+                return r;
+            }
+        }
+
+        /* date/timestamp + integer days */
+        if (lhs_is_dt && (rhs.type == COLUMN_TYPE_INT || rhs.type == COLUMN_TYPE_BIGINT) &&
+            e->binary.op == OP_ADD) {
+            const char *dt_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
+            struct tm tm_val;
+            if (parse_datetime(dt_str, &tm_val)) {
+                int days = (rhs.type == COLUMN_TYPE_INT) ? rhs.value.as_int : (int)rhs.value.as_bigint;
+                time_t t_val = mktime(&tm_val);
+                t_val += (time_t)days * 86400;
+                struct tm *result_tm = localtime(&t_val);
+                char buf[32];
+                if (lhs.type == COLUMN_TYPE_DATE)
+                    format_date(result_tm, buf, sizeof(buf));
+                else
+                    format_timestamp(result_tm, buf, sizeof(buf));
+                cell_release_rb(&lhs, rb);
+                cell_release_rb(&rhs, rb);
+                struct cell r = {0};
+                r.type = lhs.type;
+                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+                return r;
+            }
+        }
+
+        /* date/timestamp - integer days */
+        if (lhs_is_dt && (rhs.type == COLUMN_TYPE_INT || rhs.type == COLUMN_TYPE_BIGINT) &&
+            e->binary.op == OP_SUB) {
+            const char *dt_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
+            struct tm tm_val;
+            if (parse_datetime(dt_str, &tm_val)) {
+                int days = (rhs.type == COLUMN_TYPE_INT) ? rhs.value.as_int : (int)rhs.value.as_bigint;
+                time_t t_val = mktime(&tm_val);
+                t_val -= (time_t)days * 86400;
+                struct tm *result_tm = localtime(&t_val);
+                char buf[32];
+                if (lhs.type == COLUMN_TYPE_DATE)
+                    format_date(result_tm, buf, sizeof(buf));
+                else
+                    format_timestamp(result_tm, buf, sizeof(buf));
+                cell_release_rb(&lhs, rb);
+                cell_release_rb(&rhs, rb);
+                struct cell r = {0};
+                r.type = lhs.type;
+                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+                return r;
+            }
+        }
+    }
+
+    int use_float = (lhs.type == COLUMN_TYPE_FLOAT || rhs.type == COLUMN_TYPE_FLOAT ||
+                     lhs.type == COLUMN_TYPE_NUMERIC || rhs.type == COLUMN_TYPE_NUMERIC);
+    double lv = cell_to_double_val(&lhs);
+    double rv = cell_to_double_val(&rhs);
+    double result_v = 0.0;
+    switch (e->binary.op) {
+        case OP_ADD: result_v = lv + rv; break;
+        case OP_SUB: result_v = lv - rv; break;
+        case OP_MUL: result_v = lv * rv; break;
+        case OP_DIV:
+            if (rv != 0.0) {
+                if (!use_float)
+                    result_v = (double)((long long)lv / (long long)rv);
+                else
+                    result_v = lv / rv;
+            }
+            break;
+        case OP_MOD: result_v = (rv != 0.0) ? (double)((long long)lv % (long long)rv) : 0.0; break;
+        case OP_CONCAT: break; /* handled above */
+        case OP_NEG: break;    /* not a binary op */
+    }
+    cell_release_rb(&lhs, rb);
+    cell_release_rb(&rhs, rb);
+
+    if (use_float || result_v != (double)(int)result_v)
+        return cell_make_float(result_v);
+    return cell_make_int((int)result_v);
+}
+
+static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t args_start,
+                                  struct query_arena *arena, struct table *t,
+                                  struct row *row, struct database *db,
+                                  struct bump_alloc *rb)
+{
+    switch (fn) {
+    case FUNC_COALESCE: {
+        for (uint32_t i = 0; i < nargs; i++) {
+            struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
+            if (!cell_is_null(&c)) return c; /* ownership transfers to caller */
+            cell_release_rb(&c, rb);
+        }
+        return cell_make_null();
+    }
+
+    case FUNC_NULLIF: {
+        if (nargs < 2) return cell_make_null();
+        struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell b = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (!cell_is_null(&a) && !cell_is_null(&b) && cell_equal(&a, &b)) {
+            cell_release_rb(&a, rb);
+            cell_release_rb(&b, rb);
+            struct cell n = { .type = a.type, .is_null = 1 };
+            return n;
+        }
+        cell_release_rb(&b, rb);
+        return a; /* ownership transfers to caller */
+    }
+
+    case FUNC_GREATEST: case FUNC_LEAST: {
+        int is_greatest = (fn == FUNC_GREATEST);
+        if (nargs == 0) return cell_make_null();
+        struct cell best = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        int best_null = cell_is_null(&best);
+        for (uint32_t i = 1; i < nargs; i++) {
+            struct cell cur = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
+            int cur_null = cell_is_null(&cur);
+            if (best_null) {
+                cell_release_rb(&best, rb);
+                best = cur; best_null = cur_null;
+                continue;
+            }
+            if (cur_null) {
+                cell_release_rb(&cur, rb);
+                continue;
+            }
+            int cmp = cell_compare(&cur, &best);
+            if ((is_greatest && cmp > 0) || (!is_greatest && cmp < 0)) {
+                cell_release_rb(&best, rb);
+                best = cur;
+            } else {
+                cell_release_rb(&cur, rb);
+            }
+        }
+        return best;
+    }
+
+    case FUNC_UPPER: case FUNC_LOWER: {
+        if (nargs == 0) return cell_make_null();
+        struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&arg)) return arg;
+        if (column_type_is_text(arg.type) && arg.value.as_text) {
+            int is_upper = (fn == FUNC_UPPER);
+            for (char *p = arg.value.as_text; *p; p++)
+                *p = is_upper ? toupper((unsigned char)*p) : tolower((unsigned char)*p);
+        }
+        return arg;
+    }
+
+    case FUNC_LENGTH: {
+        if (nargs == 0) return cell_make_null();
+        struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&arg)) {
+            struct cell r = {0}; r.type = COLUMN_TYPE_INT; r.is_null = 1;
+            return r;
+        }
+        if (column_type_is_text(arg.type) && arg.value.as_text) {
+            int len = (int)strlen(arg.value.as_text);
+            cell_release_rb(&arg, rb);
+            return cell_make_int(len);
+        }
+        return cell_make_int(0);
+    }
+
+    case FUNC_TRIM: {
+        if (nargs == 0) return cell_make_null();
+        struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&arg)) return arg;
+        if (column_type_is_text(arg.type) && arg.value.as_text) {
+            char *s = arg.value.as_text;
+            while (*s == ' ' || *s == '\t') s++;
+            char *end = s + strlen(s);
+            while (end > s && (end[-1] == ' ' || end[-1] == '\t')) end--;
+            size_t tlen = (size_t)(end - s);
+            char *trimmed = rb ? (char *)bump_alloc(rb, tlen + 1)
+                               : malloc(tlen + 1);
+            memcpy(trimmed, s, tlen);
+            trimmed[tlen] = '\0';
+            if (!rb) free(arg.value.as_text);
+            arg.value.as_text = trimmed;
+        }
+        return arg; /* ownership transfers to caller */
+    }
+
+    case FUNC_NEXTVAL: case FUNC_CURRVAL: {
+        if (nargs == 0 || !db) return cell_make_null();
+        struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&arg)) return cell_make_null();
+        const char *seq_name = NULL;
+        if (column_type_is_text(arg.type) && arg.value.as_text)
+            seq_name = arg.value.as_text;
+        if (!seq_name) { cell_release_rb(&arg, rb); return cell_make_null(); }
+        /* find sequence in database */
+        struct sequence *seq = NULL;
+        for (size_t si = 0; si < db->sequences.count; si++) {
+            if (strcmp(db->sequences.items[si].name, seq_name) == 0) {
+                seq = &db->sequences.items[si];
+                break;
+            }
+        }
+        cell_release_rb(&arg, rb);
+        if (!seq) {
+            arena_set_error(arena, "42P01", "sequence '%s' not found", seq_name);
+            return cell_make_null();
+        }
+        if (fn == FUNC_NEXTVAL) {
+            long long val;
+            if (!seq->has_been_called) {
+                val = seq->current_value;
+                seq->has_been_called = 1;
+            } else {
+                seq->current_value += seq->increment;
+                val = seq->current_value;
+            }
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_BIGINT;
+            r.value.as_bigint = val;
+            return r;
+        } else {
+            /* currval */
+            if (!seq->has_been_called) {
+                arena_set_error(arena, "55000", "currval: sequence '%s' not yet called", seq_name);
+                return cell_make_null();
+            }
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_BIGINT;
+            r.value.as_bigint = seq->current_value;
+            return r;
+        }
+    }
+
+    case FUNC_GEN_RANDOM_UUID: {
+        /* generate a v4 UUID: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx */
+        static int uuid_seeded = 0;
+        if (!uuid_seeded) { srand((unsigned)time(NULL)); uuid_seeded = 1; }
+        char buf[37];
+        const char *hex = "0123456789abcdef";
+        for (int i = 0; i < 36; i++) {
+            if (i == 8 || i == 13 || i == 18 || i == 23) buf[i] = '-';
+            else if (i == 14) buf[i] = '4'; /* version 4 */
+            else if (i == 19) buf[i] = hex[8 + (rand() & 3)]; /* variant 10xx */
+            else buf[i] = hex[rand() & 15];
+        }
+        buf[36] = '\0';
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_UUID;
+        r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+        return r;
+    }
+
+    /* ---- date/time functions ---- */
+
+    case FUNC_NOW: case FUNC_CURRENT_TIMESTAMP: case FUNC_CURRENT_DATE: {
+        time_t now = time(NULL);
+        struct tm *lt = localtime(&now);
+        char buf[32];
+        if (fn == FUNC_CURRENT_DATE) {
+            format_date(lt, buf, sizeof(buf));
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_DATE;
+            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+            return r;
+        } else {
+            format_timestamp(lt, buf, sizeof(buf));
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_TIMESTAMP;
+            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+            return r;
+        }
+    }
+
+    case FUNC_EXTRACT: case FUNC_DATE_PART: {
+        if (nargs < 2) return cell_make_null();
+        struct cell field_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell src_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&src_c)) {
+            cell_release_rb(&field_c, rb);
+            cell_release_rb(&src_c, rb);
+            struct cell r = {0}; r.type = COLUMN_TYPE_FLOAT; r.is_null = 1;
+            return r;
+        }
+        const char *field = (column_type_is_text(field_c.type) && field_c.value.as_text)
+                            ? field_c.value.as_text : "";
+        const char *src = (column_type_is_text(src_c.type) && src_c.value.as_text)
+                          ? src_c.value.as_text : "";
+        struct tm tm_val;
+        double result_v = 0.0;
+        if (src_c.type == COLUMN_TYPE_INTERVAL) {
+            /* EXTRACT from interval */
+            double secs = parse_interval_to_seconds(src);
+            if (strcasecmp(field, "epoch") == 0) result_v = secs;
+            else if (strcasecmp(field, "hour") == 0) result_v = (int)(secs / 3600) % 24;
+            else if (strcasecmp(field, "minute") == 0) result_v = (int)(secs / 60) % 60;
+            else if (strcasecmp(field, "second") == 0) result_v = (int)secs % 60;
+            else if (strcasecmp(field, "day") == 0) result_v = (int)(secs / 86400);
+        } else if (parse_datetime(src, &tm_val)) {
+            if (strcasecmp(field, "year") == 0) result_v = tm_val.tm_year + 1900;
+            else if (strcasecmp(field, "month") == 0) result_v = tm_val.tm_mon + 1;
+            else if (strcasecmp(field, "day") == 0) result_v = tm_val.tm_mday;
+            else if (strcasecmp(field, "hour") == 0) result_v = tm_val.tm_hour;
+            else if (strcasecmp(field, "minute") == 0) result_v = tm_val.tm_min;
+            else if (strcasecmp(field, "second") == 0) result_v = tm_val.tm_sec;
+            else if (strcasecmp(field, "dow") == 0) {
+                mktime(&tm_val);
+                result_v = tm_val.tm_wday;
+            } else if (strcasecmp(field, "doy") == 0) {
+                mktime(&tm_val);
+                result_v = tm_val.tm_yday + 1;
+            } else if (strcasecmp(field, "epoch") == 0) {
+                result_v = (double)mktime(&tm_val);
+            } else if (strcasecmp(field, "quarter") == 0) {
+                result_v = (tm_val.tm_mon / 3) + 1;
+            } else if (strcasecmp(field, "week") == 0) {
+                mktime(&tm_val);
+                result_v = (tm_val.tm_yday / 7) + 1;
+            }
+        }
+        cell_release_rb(&field_c, rb);
+        cell_release_rb(&src_c, rb);
+        /* EXTRACT returns float in PostgreSQL */
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_FLOAT;
+        r.value.as_float = result_v;
+        return r;
+    }
+
+    case FUNC_DATE_TRUNC: {
+        if (nargs < 2) return cell_make_null();
+        struct cell field_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell src_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&src_c)) {
+            cell_release_rb(&field_c, rb);
+            cell_release_rb(&src_c, rb);
+            return src_c;
+        }
+        const char *field = (column_type_is_text(field_c.type) && field_c.value.as_text)
+                            ? field_c.value.as_text : "";
+        const char *src = (column_type_is_text(src_c.type) && src_c.value.as_text)
+                          ? src_c.value.as_text : "";
+        struct tm tm_val;
+        if (parse_datetime(src, &tm_val)) {
+            if (strcasecmp(field, "year") == 0) {
+                tm_val.tm_mon = 0; tm_val.tm_mday = 1;
+                tm_val.tm_hour = 0; tm_val.tm_min = 0; tm_val.tm_sec = 0;
+            } else if (strcasecmp(field, "month") == 0) {
+                tm_val.tm_mday = 1;
+                tm_val.tm_hour = 0; tm_val.tm_min = 0; tm_val.tm_sec = 0;
+            } else if (strcasecmp(field, "day") == 0) {
+                tm_val.tm_hour = 0; tm_val.tm_min = 0; tm_val.tm_sec = 0;
+            } else if (strcasecmp(field, "hour") == 0) {
+                tm_val.tm_min = 0; tm_val.tm_sec = 0;
+            } else if (strcasecmp(field, "minute") == 0) {
+                tm_val.tm_sec = 0;
+            }
+            /* second: no truncation needed */
+            char buf[32];
+            format_timestamp(&tm_val, buf, sizeof(buf));
+            cell_release_rb(&field_c, rb);
+            cell_release_rb(&src_c, rb);
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_TIMESTAMP;
+            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+            return r;
+        }
+        cell_release_rb(&field_c, rb);
+        cell_release_rb(&src_c, rb);
+        return cell_make_null();
+    }
+
+    case FUNC_AGE: {
+        if (nargs < 1) return cell_make_null();
+        struct cell a_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell b_c;
+        if (nargs >= 2) {
+            b_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        } else {
+            /* AGE(timestamp) = AGE(CURRENT_DATE, timestamp) */
+            time_t now = time(NULL);
+            struct tm *lt = localtime(&now);
+            char buf[32];
+            format_timestamp(lt, buf, sizeof(buf));
+            b_c = a_c;
+            a_c = (struct cell){0};
+            a_c.type = COLUMN_TYPE_TIMESTAMP;
+            a_c.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+        }
+        if (cell_is_null(&a_c) || cell_is_null(&b_c)) {
+            cell_release_rb(&a_c, rb);
+            cell_release_rb(&b_c, rb);
+            struct cell r = {0}; r.type = COLUMN_TYPE_INTERVAL; r.is_null = 1;
+            return r;
+        }
+        struct tm tm_a, tm_b;
+        const char *sa = (column_type_is_text(a_c.type) && a_c.value.as_text) ? a_c.value.as_text : "";
+        const char *sb = (column_type_is_text(b_c.type) && b_c.value.as_text) ? b_c.value.as_text : "";
+        if (parse_datetime(sa, &tm_a) && parse_datetime(sb, &tm_b)) {
+            time_t ta = mktime(&tm_a);
+            time_t tb = mktime(&tm_b);
+            double diff = difftime(ta, tb);
+            char buf[128];
+            format_interval(diff, buf, sizeof(buf));
+            cell_release_rb(&a_c, rb);
+            cell_release_rb(&b_c, rb);
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_INTERVAL;
+            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+            return r;
+        }
+        cell_release_rb(&a_c, rb);
+        cell_release_rb(&b_c, rb);
+        return cell_make_null();
+    }
+
+    case FUNC_TO_CHAR: {
+        if (nargs < 2) return cell_make_null();
+        struct cell src_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell fmt_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&src_c)) {
+            cell_release_rb(&fmt_c, rb);
+            return src_c;
+        }
+        const char *src = (column_type_is_text(src_c.type) && src_c.value.as_text)
+                          ? src_c.value.as_text : "";
+        const char *fmt = (column_type_is_text(fmt_c.type) && fmt_c.value.as_text)
+                          ? fmt_c.value.as_text : "";
+        struct tm tm_val;
+        if (parse_datetime(src, &tm_val)) {
+            /* simple PG format conversion: YYYY, MM, DD, HH24, MI, SS */
+            char buf[256] = {0};
+            char *out = buf;
+            const char *fp = fmt;
+            while (*fp && (size_t)(out - buf) < sizeof(buf) - 10) {
+                if (strncasecmp(fp, "YYYY", 4) == 0) {
+                    out += sprintf(out, "%04d", tm_val.tm_year + 1900);
+                    fp += 4;
+                } else if (strncasecmp(fp, "MM", 2) == 0) {
+                    out += sprintf(out, "%02d", tm_val.tm_mon + 1);
+                    fp += 2;
+                } else if (strncasecmp(fp, "DD", 2) == 0) {
+                    out += sprintf(out, "%02d", tm_val.tm_mday);
+                    fp += 2;
+                } else if (strncasecmp(fp, "HH24", 4) == 0) {
+                    out += sprintf(out, "%02d", tm_val.tm_hour);
+                    fp += 4;
+                } else if (strncasecmp(fp, "HH", 2) == 0) {
+                    out += sprintf(out, "%02d", tm_val.tm_hour);
+                    fp += 2;
+                } else if (strncasecmp(fp, "MI", 2) == 0) {
+                    out += sprintf(out, "%02d", tm_val.tm_min);
+                    fp += 2;
+                } else if (strncasecmp(fp, "SS", 2) == 0) {
+                    out += sprintf(out, "%02d", tm_val.tm_sec);
+                    fp += 2;
+                } else {
+                    *out++ = *fp++;
+                }
+            }
+            *out = '\0';
+            cell_release_rb(&src_c, rb);
+            cell_release_rb(&fmt_c, rb);
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_TEXT;
+            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+            return r;
+        }
+        cell_release_rb(&src_c, rb);
+        cell_release_rb(&fmt_c, rb);
+        return cell_make_null();
+    }
+
+    case FUNC_SUBSTRING: {
+        if (nargs < 2) return cell_make_null();
+        struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell from_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&str)) {
+            cell_release_rb(&from_c, rb);
+            return str;
+        }
+        int from = (int)cell_to_double_val(&from_c);
+        if (from < 1) from = 1;
+        from--; /* convert to 0-based */
+        cell_release_rb(&from_c, rb);
+
+        if (column_type_is_text(str.type) && str.value.as_text) {
+            int slen = (int)strlen(str.value.as_text);
+            int len = slen - from;
+            if (nargs >= 3) {
+                struct cell len_c = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
+                len = (int)cell_to_double_val(&len_c);
+                cell_release_rb(&len_c, rb);
+            }
+            if (from >= slen || len <= 0) {
+                if (!rb) free(str.value.as_text);
+                str.value.as_text = rb ? bump_strdup(rb, "") : strdup("");
+                return str;
+            }
+            if (from + len > slen) len = slen - from;
+            char *sub = rb ? (char *)bump_alloc(rb, (size_t)len + 1)
+                           : malloc((size_t)len + 1);
+            memcpy(sub, str.value.as_text + from, (size_t)len);
+            sub[len] = '\0';
+            if (!rb) free(str.value.as_text);
+            str.value.as_text = sub;
+        }
+        return str;
+    }
+
+    /* ---- math functions ---- */
+
+    case FUNC_ABS: {
+        if (nargs == 0) return cell_make_null();
+        struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&arg)) return arg;
+        if (arg.type == COLUMN_TYPE_INT) {
+            if (arg.value.as_int < 0) arg.value.as_int = -arg.value.as_int;
+            return arg;
+        }
+        if (arg.type == COLUMN_TYPE_BIGINT) {
+            if (arg.value.as_bigint < 0) arg.value.as_bigint = -arg.value.as_bigint;
+            return arg;
+        }
+        double v = cell_to_double_val(&arg);
+        return cell_make_float(v < 0 ? -v : v);
+    }
+
+    case FUNC_CEIL: {
+        if (nargs == 0) return cell_make_null();
+        struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_FLOAT; return arg; }
+        double v = cell_to_double_val(&arg);
+        return cell_make_float(ceil(v));
+    }
+
+    case FUNC_FLOOR: {
+        if (nargs == 0) return cell_make_null();
+        struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_FLOAT; return arg; }
+        double v = cell_to_double_val(&arg);
+        return cell_make_float(floor(v));
+    }
+
+    case FUNC_ROUND: {
+        if (nargs == 0) return cell_make_null();
+        struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_FLOAT; return arg; }
+        double v = cell_to_double_val(&arg);
+        int places = 0;
+        if (nargs >= 2) {
+            struct cell p = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+            places = (int)cell_to_double_val(&p);
+            cell_release_rb(&p, rb);
+        }
+        if (places == 0) {
+            return cell_make_float(round(v));
+        } else {
+            double factor = pow(10.0, (double)places);
+            return cell_make_float(round(v * factor) / factor);
+        }
+    }
+
+    case FUNC_POWER: {
+        if (nargs < 2) return cell_make_null();
+        struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell b = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&a) || cell_is_null(&b)) {
+            cell_release_rb(&a, rb); cell_release_rb(&b, rb);
+            struct cell r = {0}; r.type = COLUMN_TYPE_FLOAT; r.is_null = 1; return r;
+        }
+        double result_v = pow(cell_to_double_val(&a), cell_to_double_val(&b));
+        cell_release_rb(&a, rb); cell_release_rb(&b, rb);
+        return cell_make_float(result_v);
+    }
+
+    case FUNC_SQRT: {
+        if (nargs == 0) return cell_make_null();
+        struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_FLOAT; return arg; }
+        double v = cell_to_double_val(&arg);
+        return cell_make_float(sqrt(v));
+    }
+
+    case FUNC_MOD: {
+        if (nargs < 2) return cell_make_null();
+        struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell b = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&a) || cell_is_null(&b)) {
+            cell_release_rb(&a, rb); cell_release_rb(&b, rb);
+            return cell_make_null();
+        }
+        if (a.type == COLUMN_TYPE_INT && b.type == COLUMN_TYPE_INT) {
+            int bv = b.value.as_int;
+            if (bv == 0) { return cell_make_null(); }
+            return cell_make_int(a.value.as_int % bv);
+        }
+        double av = cell_to_double_val(&a);
+        double bv = cell_to_double_val(&b);
+        if (bv == 0.0) return cell_make_null();
+        return cell_make_float(fmod(av, bv));
+    }
+
+    case FUNC_SIGN: {
+        if (nargs == 0) return cell_make_null();
+        struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_INT; return arg; }
+        double v = cell_to_double_val(&arg);
+        return cell_make_int(v > 0 ? 1 : (v < 0 ? -1 : 0));
+    }
+
+    case FUNC_RANDOM: {
+        static int rand_seeded = 0;
+        if (!rand_seeded) { srand((unsigned)time(NULL)); rand_seeded = 1; }
+        return cell_make_float((double)rand() / ((double)RAND_MAX + 1.0));
+    }
+
+    /* ---- string functions ---- */
+
+    case FUNC_REPLACE: {
+        if (nargs < 3) return cell_make_null();
+        struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell from_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        struct cell to_c = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
+        if (cell_is_null(&str)) {
+            cell_release_rb(&from_c, rb); cell_release_rb(&to_c, rb);
+            return str;
+        }
+        const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
+        const char *from = (column_type_is_text(from_c.type) && from_c.value.as_text) ? from_c.value.as_text : "";
+        const char *to = (column_type_is_text(to_c.type) && to_c.value.as_text) ? to_c.value.as_text : "";
+        size_t from_len = strlen(from);
+        size_t to_len = strlen(to);
+        if (from_len == 0) {
+            cell_release_rb(&from_c, rb); cell_release_rb(&to_c, rb);
+            return str;
+        }
+        /* count occurrences to size output */
+        size_t count = 0;
+        const char *p = s;
+        while ((p = strstr(p, from)) != NULL) { count++; p += from_len; }
+        size_t slen = strlen(s);
+        size_t out_len = slen + count * (to_len - from_len);
+        char *out = rb ? (char *)bump_alloc(rb, out_len + 1) : malloc(out_len + 1);
+        char *wp = out;
+        p = s;
+        while (*p) {
+            if (strncmp(p, from, from_len) == 0) {
+                memcpy(wp, to, to_len); wp += to_len; p += from_len;
+            } else {
+                *wp++ = *p++;
+            }
+        }
+        *wp = '\0';
+        if (!rb) free(str.value.as_text);
+        str.value.as_text = out;
+        if (!column_type_is_text(str.type)) str.type = COLUMN_TYPE_TEXT;
+        cell_release_rb(&from_c, rb); cell_release_rb(&to_c, rb);
+        return str;
+    }
+
+    case FUNC_LPAD: case FUNC_RPAD: {
+        if (nargs < 2) return cell_make_null();
+        struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell len_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&str)) { cell_release_rb(&len_c, rb); return str; }
+        int target_len = (int)cell_to_double_val(&len_c);
+        cell_release_rb(&len_c, rb);
+        const char *fill = " ";
+        struct cell fill_c = {0};
+        if (nargs >= 3) {
+            fill_c = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
+            if (column_type_is_text(fill_c.type) && fill_c.value.as_text)
+                fill = fill_c.value.as_text;
+        }
+        const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
+        int slen = (int)strlen(s);
+        size_t fill_len = strlen(fill);
+        if (target_len <= 0 || fill_len == 0) {
+            if (!rb) free(str.value.as_text);
+            str.value.as_text = rb ? bump_strdup(rb, "") : strdup("");
+            cell_release_rb(&fill_c, rb);
+            return str;
+        }
+        if (slen >= target_len) {
+            /* truncate to target_len */
+            char *out = rb ? (char *)bump_alloc(rb, (size_t)target_len + 1)
+                           : malloc((size_t)target_len + 1);
+            memcpy(out, s, (size_t)target_len);
+            out[target_len] = '\0';
+            if (!rb) free(str.value.as_text);
+            str.value.as_text = out;
+            cell_release_rb(&fill_c, rb);
+            return str;
+        }
+        int pad_needed = target_len - slen;
+        char *out = rb ? (char *)bump_alloc(rb, (size_t)target_len + 1)
+                       : malloc((size_t)target_len + 1);
+        if (fn == FUNC_LPAD) {
+            for (int i = 0; i < pad_needed; i++)
+                out[i] = fill[i % fill_len];
+            memcpy(out + pad_needed, s, (size_t)slen);
+        } else {
+            memcpy(out, s, (size_t)slen);
+            for (int i = 0; i < pad_needed; i++)
+                out[slen + i] = fill[i % fill_len];
+        }
+        out[target_len] = '\0';
+        if (!rb) free(str.value.as_text);
+        str.value.as_text = out;
+        cell_release_rb(&fill_c, rb);
+        return str;
+    }
+
+    case FUNC_CONCAT: {
+        /* CONCAT(a, b, ...) — NULLs treated as empty string */
+        char buf[4096];
+        size_t wp = 0;
+        for (uint32_t i = 0; i < nargs; i++) {
+            struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
+            if (!cell_is_null(&c)) {
+                char *txt = cell_to_text_rb(&c, rb);
+                if (txt) {
+                    size_t tlen = strlen(txt);
+                    if (wp + tlen < sizeof(buf)) {
+                        memcpy(buf + wp, txt, tlen);
+                        wp += tlen;
+                    }
+                    if (!rb) free(txt);
+                }
+            }
+            cell_release_rb(&c, rb);
+        }
+        buf[wp] = '\0';
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+        return r;
+    }
+
+    case FUNC_CONCAT_WS: {
+        /* CONCAT_WS(sep, a, b, ...) — skip NULLs */
+        if (nargs < 1) return cell_make_null();
+        struct cell sep_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&sep_c)) return sep_c;
+        const char *sep = (column_type_is_text(sep_c.type) && sep_c.value.as_text) ? sep_c.value.as_text : "";
+        size_t sep_len = strlen(sep);
+        char buf[4096];
+        size_t wp = 0;
+        int first = 1;
+        for (uint32_t i = 1; i < nargs; i++) {
+            struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
+            if (!cell_is_null(&c)) {
+                char *txt = cell_to_text_rb(&c, rb);
+                if (txt) {
+                    if (!first && wp + sep_len < sizeof(buf)) {
+                        memcpy(buf + wp, sep, sep_len);
+                        wp += sep_len;
+                    }
+                    size_t tlen = strlen(txt);
+                    if (wp + tlen < sizeof(buf)) {
+                        memcpy(buf + wp, txt, tlen);
+                        wp += tlen;
+                    }
+                    first = 0;
+                    if (!rb) free(txt);
+                }
+            }
+            cell_release_rb(&c, rb);
+        }
+        buf[wp] = '\0';
+        cell_release_rb(&sep_c, rb);
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+        return r;
+    }
+
+    case FUNC_POSITION: {
+        /* POSITION(sub IN str) — returns 1-based index, 0 if not found */
+        if (nargs < 2) return cell_make_int(0);
+        struct cell sub_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell str_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&sub_c) || cell_is_null(&str_c)) {
+            cell_release_rb(&sub_c, rb); cell_release_rb(&str_c, rb);
+            struct cell r = {0}; r.type = COLUMN_TYPE_INT; r.is_null = 1; return r;
+        }
+        const char *sub = (column_type_is_text(sub_c.type) && sub_c.value.as_text) ? sub_c.value.as_text : "";
+        const char *s = (column_type_is_text(str_c.type) && str_c.value.as_text) ? str_c.value.as_text : "";
+        const char *found = strstr(s, sub);
+        int pos = found ? (int)(found - s) + 1 : 0;
+        cell_release_rb(&sub_c, rb); cell_release_rb(&str_c, rb);
+        return cell_make_int(pos);
+    }
+
+    case FUNC_SPLIT_PART: {
+        if (nargs < 3) return cell_make_null();
+        struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell delim_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        struct cell part_c = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
+        if (cell_is_null(&str)) {
+            cell_release_rb(&delim_c, rb); cell_release_rb(&part_c, rb);
+            return str;
+        }
+        const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
+        const char *delim = (column_type_is_text(delim_c.type) && delim_c.value.as_text) ? delim_c.value.as_text : "";
+        int part = (int)cell_to_double_val(&part_c);
+        cell_release_rb(&delim_c, rb); cell_release_rb(&part_c, rb);
+        size_t dlen = strlen(delim);
+        if (dlen == 0 || part < 1) {
+            if (!rb) free(str.value.as_text);
+            str.value.as_text = rb ? bump_strdup(rb, "") : strdup("");
+            return str;
+        }
+        const char *start = s;
+        int cur = 1;
+        while (cur < part) {
+            const char *f = strstr(start, delim);
+            if (!f) { start = s + strlen(s); break; }
+            start = f + dlen;
+            cur++;
+        }
+        const char *end = strstr(start, delim);
+        if (!end) end = s + strlen(s);
+        size_t rlen = (size_t)(end - start);
+        char *out = rb ? (char *)bump_alloc(rb, rlen + 1) : malloc(rlen + 1);
+        memcpy(out, start, rlen);
+        out[rlen] = '\0';
+        if (!rb) free(str.value.as_text);
+        str.value.as_text = out;
+        return str;
+    }
+
+    case FUNC_LEFT: {
+        if (nargs < 2) return cell_make_null();
+        struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell n_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&str)) { cell_release_rb(&n_c, rb); return str; }
+        int n = (int)cell_to_double_val(&n_c);
+        cell_release_rb(&n_c, rb);
+        const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
+        int slen = (int)strlen(s);
+        if (n < 0) n = slen + n;
+        if (n < 0) n = 0;
+        if (n > slen) n = slen;
+        char *out = rb ? (char *)bump_alloc(rb, (size_t)n + 1) : malloc((size_t)n + 1);
+        memcpy(out, s, (size_t)n);
+        out[n] = '\0';
+        if (!rb) free(str.value.as_text);
+        str.value.as_text = out;
+        return str;
+    }
+
+    case FUNC_RIGHT: {
+        if (nargs < 2) return cell_make_null();
+        struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell n_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&str)) { cell_release_rb(&n_c, rb); return str; }
+        int n = (int)cell_to_double_val(&n_c);
+        cell_release_rb(&n_c, rb);
+        const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
+        int slen = (int)strlen(s);
+        if (n < 0) n = slen + n;
+        if (n < 0) n = 0;
+        if (n > slen) n = slen;
+        int start = slen - n;
+        char *out = rb ? (char *)bump_alloc(rb, (size_t)n + 1) : malloc((size_t)n + 1);
+        memcpy(out, s + start, (size_t)n);
+        out[n] = '\0';
+        if (!rb) free(str.value.as_text);
+        str.value.as_text = out;
+        return str;
+    }
+
+    case FUNC_REPEAT: {
+        if (nargs < 2) return cell_make_null();
+        struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell n_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&str)) { cell_release_rb(&n_c, rb); return str; }
+        int n = (int)cell_to_double_val(&n_c);
+        cell_release_rb(&n_c, rb);
+        if (n <= 0) {
+            if (!rb) free(str.value.as_text);
+            str.value.as_text = rb ? bump_strdup(rb, "") : strdup("");
+            return str;
+        }
+        const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
+        size_t slen = strlen(s);
+        size_t out_len = slen * (size_t)n;
+        char *out = rb ? (char *)bump_alloc(rb, out_len + 1) : malloc(out_len + 1);
+        for (int i = 0; i < n; i++)
+            memcpy(out + i * slen, s, slen);
+        out[out_len] = '\0';
+        if (!rb) free(str.value.as_text);
+        str.value.as_text = out;
+        return str;
+    }
+
+    case FUNC_REVERSE: {
+        if (nargs == 0) return cell_make_null();
+        struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&str)) return str;
+        if (column_type_is_text(str.type) && str.value.as_text) {
+            size_t slen = strlen(str.value.as_text);
+            char *out = rb ? (char *)bump_alloc(rb, slen + 1) : malloc(slen + 1);
+            for (size_t i = 0; i < slen; i++)
+                out[i] = str.value.as_text[slen - 1 - i];
+            out[slen] = '\0';
+            if (!rb) free(str.value.as_text);
+            str.value.as_text = out;
+        }
+        return str;
+    }
+
+    case FUNC_INITCAP: {
+        if (nargs == 0) return cell_make_null();
+        struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&str)) return str;
+        if (column_type_is_text(str.type) && str.value.as_text) {
+            int at_start = 1;
+            for (char *p = str.value.as_text; *p; p++) {
+                if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
+                    *p == '-' || *p == '_') {
+                    at_start = 1;
+                } else if (at_start) {
+                    *p = toupper((unsigned char)*p);
+                    at_start = 0;
+                } else {
+                    *p = tolower((unsigned char)*p);
+                }
+            }
+        }
+        return str;
+    }
+
+    /* ---- pg_catalog stub functions ---- */
+
+    case FUNC_PG_GET_USERBYID: {
+        /* pg_get_userbyid(oid) -> role name; return db name as owner */
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = strdup(db ? db->name : "mskql");
+        return r;
+    }
+
+    case FUNC_PG_TABLE_IS_VISIBLE: {
+        /* pg_table_is_visible(oid) -> true for all public tables */
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_BOOLEAN;
+        r.value.as_bool = 1;
+        return r;
+    }
+
+    case FUNC_FORMAT_TYPE: {
+        /* format_type(type_oid, typemod) -> type name string */
+        if (nargs < 1) return cell_make_null();
+        struct cell oid_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        int type_oid = 0;
+        if (oid_c.type == COLUMN_TYPE_INT) type_oid = oid_c.value.as_int;
+        else if (oid_c.type == COLUMN_TYPE_BIGINT) type_oid = (int)oid_c.value.as_bigint;
+        else if (column_type_is_text(oid_c.type) && oid_c.value.as_text) {
+            type_oid = atoi(oid_c.value.as_text);
+            cell_release(&oid_c);
+        }
+        const char *name = "unknown";
+        switch (type_oid) {
+            case 16:   name = "boolean"; break;
+            case 20:   name = "bigint"; break;
+            case 21:   name = "smallint"; break;
+            case 23:   name = "integer"; break;
+            case 25:   name = "text"; break;
+            case 701:  name = "double precision"; break;
+            case 1043: name = "character varying"; break;
+            case 1082: name = "date"; break;
+            case 1083: name = "time without time zone"; break;
+            case 1114: name = "timestamp without time zone"; break;
+            case 1184: name = "timestamp with time zone"; break;
+            case 1186: name = "interval"; break;
+            case 1700: name = "numeric"; break;
+            case 2950: name = "uuid"; break;
+        }
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = strdup(name);
+        return r;
+    }
+
+    case FUNC_PG_GET_EXPR:
+    case FUNC_OBJ_DESCRIPTION:
+    case FUNC_COL_DESCRIPTION:
+    case FUNC_SHOBJ_DESCRIPTION:
+        return cell_make_null();
+
+    case FUNC_PG_ENCODING_TO_CHAR: {
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = strdup("UTF8");
+        return r;
+    }
+
+    case FUNC_HAS_TABLE_PRIVILEGE:
+    case FUNC_HAS_DATABASE_PRIVILEGE: {
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_BOOLEAN;
+        r.value.as_bool = 1;
+        return r;
+    }
+
+    case FUNC_PG_GET_CONSTRAINTDEF:
+    case FUNC_PG_GET_INDEXDEF: {
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = strdup("");
+        return r;
+    }
+
+    case FUNC_ARRAY_TO_STRING: {
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = strdup("");
+        return r;
+    }
+
+    case FUNC_CURRENT_SCHEMA: {
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = strdup("public");
+        return r;
+    }
+
+    case FUNC_CURRENT_SCHEMAS: {
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = strdup("{pg_catalog,public}");
+        return r;
+    }
+
+    case FUNC_PG_IS_IN_RECOVERY: {
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_BOOLEAN;
+        r.value.as_bool = 0;
+        return r;
+    }
+
+    } /* end switch */
+    return cell_make_null();
+}
+
+static struct cell eval_cast(struct expr *e, struct query_arena *arena,
+                             struct table *t, struct row *row,
+                             struct database *db, struct bump_alloc *rb)
+{
+    struct cell src = eval_expr(e->cast.operand, arena, t, row, db, rb);
+    if (cell_is_null(&src)) {
+        src.type = e->cast.target;
+        return src;
+    }
+    enum column_type target = e->cast.target;
+
+    /* already the right type? */
+    if (src.type == target) return src;
+
+    /* numeric → numeric conversions */
+    if ((target == COLUMN_TYPE_SMALLINT || target == COLUMN_TYPE_INT || target == COLUMN_TYPE_BIGINT ||
+         target == COLUMN_TYPE_FLOAT || target == COLUMN_TYPE_NUMERIC) &&
+        (src.type == COLUMN_TYPE_SMALLINT || src.type == COLUMN_TYPE_INT || src.type == COLUMN_TYPE_BIGINT ||
+         src.type == COLUMN_TYPE_FLOAT || src.type == COLUMN_TYPE_NUMERIC)) {
+        double v = cell_to_double_val(&src);
+        cell_release_rb(&src, rb);
+        struct cell r = {0};
+        r.type = target;
+        switch (target) {
+        case COLUMN_TYPE_SMALLINT: r.value.as_smallint = (int16_t)v; break;
+        case COLUMN_TYPE_INT:      r.value.as_int = (int)v; break;
+        case COLUMN_TYPE_BIGINT:   r.value.as_bigint = (long long)v; break;
+        case COLUMN_TYPE_FLOAT:    r.value.as_float = v; break;
+        case COLUMN_TYPE_NUMERIC:  r.value.as_float = v; break;
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+            break;
+        }
+        return r;
+    }
+
+    /* numeric → text */
+    if (column_type_is_text(target) &&
+        (src.type == COLUMN_TYPE_SMALLINT || src.type == COLUMN_TYPE_INT || src.type == COLUMN_TYPE_BIGINT ||
+         src.type == COLUMN_TYPE_FLOAT || src.type == COLUMN_TYPE_NUMERIC ||
+         src.type == COLUMN_TYPE_BOOLEAN)) {
+        char buf[128];
+        switch (src.type) {
+        case COLUMN_TYPE_SMALLINT: snprintf(buf, sizeof(buf), "%d", (int)src.value.as_smallint); break;
+        case COLUMN_TYPE_INT:      snprintf(buf, sizeof(buf), "%d", src.value.as_int); break;
+        case COLUMN_TYPE_BIGINT:   snprintf(buf, sizeof(buf), "%lld", src.value.as_bigint); break;
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:  snprintf(buf, sizeof(buf), "%g", src.value.as_float); break;
+        case COLUMN_TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s", src.value.as_bool ? "true" : "false"); break;
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+            buf[0] = '\0'; break;
+        }
+        cell_release_rb(&src, rb);
+        struct cell r = {0};
+        r.type = target;
+        r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+        return r;
+    }
+
+    /* text → numeric */
+    if ((target == COLUMN_TYPE_SMALLINT || target == COLUMN_TYPE_INT || target == COLUMN_TYPE_BIGINT ||
+         target == COLUMN_TYPE_FLOAT || target == COLUMN_TYPE_NUMERIC) &&
+        column_type_is_text(src.type) && src.value.as_text) {
+        const char *s = src.value.as_text;
+        struct cell r = {0};
+        r.type = target;
+        switch (target) {
+        case COLUMN_TYPE_SMALLINT: r.value.as_smallint = (int16_t)atoi(s); break;
+        case COLUMN_TYPE_INT:      r.value.as_int = atoi(s); break;
+        case COLUMN_TYPE_BIGINT:   r.value.as_bigint = atoll(s); break;
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:  r.value.as_float = atof(s); break;
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+            break;
+        }
+        cell_release_rb(&src, rb);
+        return r;
+    }
+
+    /* text → boolean */
+    if (target == COLUMN_TYPE_BOOLEAN && column_type_is_text(src.type) && src.value.as_text) {
+        const char *s = src.value.as_text;
+        int bval = (strcasecmp(s, "true") == 0 || strcasecmp(s, "t") == 0 ||
+                    strcasecmp(s, "yes") == 0 || strcasecmp(s, "1") == 0);
+        cell_release_rb(&src, rb);
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_BOOLEAN;
+        r.value.as_bool = bval;
+        return r;
+    }
+
+    /* boolean → int */
+    if (target == COLUMN_TYPE_INT && src.type == COLUMN_TYPE_BOOLEAN) {
+        int v = src.value.as_bool ? 1 : 0;
+        return cell_make_int(v);
+    }
+
+    /* text → text-like (DATE, TIMESTAMP, etc.) — just change the type tag */
+    if (column_type_is_text(target) && column_type_is_text(src.type)) {
+        src.type = target;
+        return src;
+    }
+
+    /* fallback: convert to text first, then to target */
+    char *txt = cell_to_text_rb(&src, rb);
+    cell_release_rb(&src, rb);
+    struct cell r = {0};
+    r.type = target;
+    switch (target) {
+    case COLUMN_TYPE_SMALLINT:
+        r.value.as_smallint = txt ? (int16_t)atoi(txt) : 0;
+        if (!rb && txt) free(txt);
+        break;
+    case COLUMN_TYPE_INT:
+        r.value.as_int = txt ? atoi(txt) : 0;
+        if (!rb && txt) free(txt);
+        break;
+    case COLUMN_TYPE_BIGINT:
+        r.value.as_bigint = txt ? atoll(txt) : 0;
+        if (!rb && txt) free(txt);
+        break;
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:
+        r.value.as_float = txt ? atof(txt) : 0.0;
+        if (!rb && txt) free(txt);
+        break;
+    case COLUMN_TYPE_BOOLEAN:
+        r.value.as_bool = (txt && (strcasecmp(txt, "true") == 0 || strcmp(txt, "1") == 0)) ? 1 : 0;
+        if (!rb && txt) free(txt);
+        break;
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:
+    default:
+        r.value.as_text = txt;
+        break;
+    }
+    return r;
 }
 
 struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
@@ -1632,1169 +3001,44 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
     case EXPR_UNARY_OP: {
         struct cell operand = eval_expr(e->unary.operand, arena, t, row, db, rb);
         if (cell_is_null(&operand)) return operand;
-        if (e->unary.op == OP_NEG) {
-            if (operand.type == COLUMN_TYPE_SMALLINT) {
-                operand.value.as_smallint = -operand.value.as_smallint;
-            } else if (operand.type == COLUMN_TYPE_INT) {
-                operand.value.as_int = -operand.value.as_int;
-            } else if (operand.type == COLUMN_TYPE_FLOAT) {
-                operand.value.as_float = -operand.value.as_float;
-            } else if (operand.type == COLUMN_TYPE_BIGINT) {
-                operand.value.as_bigint = -operand.value.as_bigint;
+        switch (e->unary.op) {
+        case OP_NEG:
+            switch (operand.type) {
+            case COLUMN_TYPE_SMALLINT: operand.value.as_smallint = -operand.value.as_smallint; break;
+            case COLUMN_TYPE_INT:      operand.value.as_int = -operand.value.as_int; break;
+            case COLUMN_TYPE_FLOAT:    operand.value.as_float = -operand.value.as_float; break;
+            case COLUMN_TYPE_BIGINT:   operand.value.as_bigint = -operand.value.as_bigint; break;
+            case COLUMN_TYPE_NUMERIC:  operand.value.as_float = -operand.value.as_float; break;
+            case COLUMN_TYPE_BOOLEAN:
+            case COLUMN_TYPE_TEXT:
+            case COLUMN_TYPE_ENUM:
+            case COLUMN_TYPE_DATE:
+            case COLUMN_TYPE_TIME:
+            case COLUMN_TYPE_TIMESTAMP:
+            case COLUMN_TYPE_TIMESTAMPTZ:
+            case COLUMN_TYPE_INTERVAL:
+            case COLUMN_TYPE_UUID:
+                break;
             }
+            break;
+        case OP_ADD:
+        case OP_SUB:
+        case OP_MUL:
+        case OP_DIV:
+        case OP_MOD:
+        case OP_CONCAT:
+            break; /* not unary ops */
         }
         return operand;
     }
 
-    case EXPR_BINARY_OP: {
-        struct cell lhs = eval_expr(e->binary.left, arena, t, row, db, rb);
-        struct cell rhs = eval_expr(e->binary.right, arena, t, row, db, rb);
+    case EXPR_BINARY_OP:
+        return eval_binary_op(e, arena, t, row, db, rb);
 
-        /* string concatenation */
-        if (e->binary.op == OP_CONCAT) {
-            /* SQL standard: NULL || anything = NULL */
-            if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
-                cell_release_rb(&lhs, rb);
-                cell_release_rb(&rhs, rb);
-                return cell_make_null();
-            }
-            char *ls = cell_to_text_rb(&lhs, rb);
-            char *rs = cell_to_text_rb(&rhs, rb);
-            size_t llen = ls ? strlen(ls) : 0;
-            size_t rlen = rs ? strlen(rs) : 0;
-            char *buf = rb ? (char *)bump_alloc(rb, llen + rlen + 1)
-                           : malloc(llen + rlen + 1);
-            if (ls) memcpy(buf, ls, llen);
-            if (rs) memcpy(buf + llen, rs, rlen);
-            buf[llen + rlen] = '\0';
-            if (!rb) { free(ls); free(rs); }
-            cell_release_rb(&lhs, rb);
-            cell_release_rb(&rhs, rb);
-            /* caller owns returned text — see JPL contract at cell_release() */
-            struct cell c = {0};
-            c.type = COLUMN_TYPE_TEXT;
-            c.value.as_text = buf;
-            return c;
-        }
+    case EXPR_FUNC_CALL:
+        return eval_func_call(e->func_call.func, e->func_call.args_count,
+                              e->func_call.args_start, arena, t, row, db, rb);
 
-        /* arithmetic: NULL propagation */
-        if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
-            cell_release_rb(&lhs, rb);
-            cell_release_rb(&rhs, rb);
-            struct cell c = {0};
-            c.type = COLUMN_TYPE_INT;
-            c.is_null = 1;
-            return c;
-        }
-
-        /* date/time arithmetic: date/timestamp +/- interval, timestamp - timestamp */
-        {
-            int lhs_is_dt = (lhs.type == COLUMN_TYPE_DATE || lhs.type == COLUMN_TYPE_TIMESTAMP ||
-                             lhs.type == COLUMN_TYPE_TIMESTAMPTZ);
-            int rhs_is_dt = (rhs.type == COLUMN_TYPE_DATE || rhs.type == COLUMN_TYPE_TIMESTAMP ||
-                             rhs.type == COLUMN_TYPE_TIMESTAMPTZ);
-            int lhs_is_interval = (lhs.type == COLUMN_TYPE_INTERVAL);
-            int rhs_is_interval = (rhs.type == COLUMN_TYPE_INTERVAL);
-
-            /* date/timestamp +/- interval */
-            if (lhs_is_dt && rhs_is_interval && (e->binary.op == OP_ADD || e->binary.op == OP_SUB)) {
-                const char *dt_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
-                const char *iv_str = (column_type_is_text(rhs.type) && rhs.value.as_text) ? rhs.value.as_text : "";
-                struct tm tm_val;
-                if (parse_datetime(dt_str, &tm_val)) {
-                    double secs = parse_interval_to_seconds(iv_str);
-                    time_t t_val = mktime(&tm_val);
-                    if (e->binary.op == OP_ADD) t_val += (time_t)secs;
-                    else t_val -= (time_t)secs;
-                    struct tm *result_tm = localtime(&t_val);
-                    char buf[32];
-                    if (lhs.type == COLUMN_TYPE_DATE)
-                        format_date(result_tm, buf, sizeof(buf));
-                    else
-                        format_timestamp(result_tm, buf, sizeof(buf));
-                    cell_release_rb(&lhs, rb);
-                    cell_release_rb(&rhs, rb);
-                    struct cell r = {0};
-                    r.type = lhs.type;
-                    r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                    return r;
-                }
-            }
-
-            /* interval + date/timestamp */
-            if (lhs_is_interval && rhs_is_dt && e->binary.op == OP_ADD) {
-                const char *iv_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
-                const char *dt_str = (column_type_is_text(rhs.type) && rhs.value.as_text) ? rhs.value.as_text : "";
-                struct tm tm_val;
-                if (parse_datetime(dt_str, &tm_val)) {
-                    double secs = parse_interval_to_seconds(iv_str);
-                    time_t t_val = mktime(&tm_val);
-                    t_val += (time_t)secs;
-                    struct tm *result_tm = localtime(&t_val);
-                    char buf[32];
-                    if (rhs.type == COLUMN_TYPE_DATE)
-                        format_date(result_tm, buf, sizeof(buf));
-                    else
-                        format_timestamp(result_tm, buf, sizeof(buf));
-                    cell_release_rb(&lhs, rb);
-                    cell_release_rb(&rhs, rb);
-                    struct cell r = {0};
-                    r.type = rhs.type;
-                    r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                    return r;
-                }
-            }
-
-            /* timestamp - timestamp = interval */
-            if (lhs_is_dt && rhs_is_dt && e->binary.op == OP_SUB) {
-                const char *sa = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
-                const char *sb = (column_type_is_text(rhs.type) && rhs.value.as_text) ? rhs.value.as_text : "";
-                struct tm tm_a, tm_b;
-                if (parse_datetime(sa, &tm_a) && parse_datetime(sb, &tm_b)) {
-                    time_t ta = mktime(&tm_a);
-                    time_t tb = mktime(&tm_b);
-                    double diff = difftime(ta, tb);
-                    char buf[128];
-                    format_interval(diff, buf, sizeof(buf));
-                    cell_release_rb(&lhs, rb);
-                    cell_release_rb(&rhs, rb);
-                    struct cell r = {0};
-                    r.type = COLUMN_TYPE_INTERVAL;
-                    r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                    return r;
-                }
-            }
-
-            /* date/timestamp + integer days */
-            if (lhs_is_dt && (rhs.type == COLUMN_TYPE_INT || rhs.type == COLUMN_TYPE_BIGINT) &&
-                e->binary.op == OP_ADD) {
-                const char *dt_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
-                struct tm tm_val;
-                if (parse_datetime(dt_str, &tm_val)) {
-                    int days = (rhs.type == COLUMN_TYPE_INT) ? rhs.value.as_int : (int)rhs.value.as_bigint;
-                    time_t t_val = mktime(&tm_val);
-                    t_val += (time_t)days * 86400;
-                    struct tm *result_tm = localtime(&t_val);
-                    char buf[32];
-                    if (lhs.type == COLUMN_TYPE_DATE)
-                        format_date(result_tm, buf, sizeof(buf));
-                    else
-                        format_timestamp(result_tm, buf, sizeof(buf));
-                    cell_release_rb(&lhs, rb);
-                    cell_release_rb(&rhs, rb);
-                    struct cell r = {0};
-                    r.type = lhs.type;
-                    r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                    return r;
-                }
-            }
-
-            /* date/timestamp - integer days */
-            if (lhs_is_dt && (rhs.type == COLUMN_TYPE_INT || rhs.type == COLUMN_TYPE_BIGINT) &&
-                e->binary.op == OP_SUB) {
-                const char *dt_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
-                struct tm tm_val;
-                if (parse_datetime(dt_str, &tm_val)) {
-                    int days = (rhs.type == COLUMN_TYPE_INT) ? rhs.value.as_int : (int)rhs.value.as_bigint;
-                    time_t t_val = mktime(&tm_val);
-                    t_val -= (time_t)days * 86400;
-                    struct tm *result_tm = localtime(&t_val);
-                    char buf[32];
-                    if (lhs.type == COLUMN_TYPE_DATE)
-                        format_date(result_tm, buf, sizeof(buf));
-                    else
-                        format_timestamp(result_tm, buf, sizeof(buf));
-                    cell_release_rb(&lhs, rb);
-                    cell_release_rb(&rhs, rb);
-                    struct cell r = {0};
-                    r.type = lhs.type;
-                    r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                    return r;
-                }
-            }
-        }
-
-        double lv = cell_to_double_val(&lhs);
-        double rv = cell_to_double_val(&rhs);
-        double result_v = 0.0;
-        switch (e->binary.op) {
-            case OP_ADD: result_v = lv + rv; break;
-            case OP_SUB: result_v = lv - rv; break;
-            case OP_MUL: result_v = lv * rv; break;
-            case OP_DIV: result_v = (rv != 0.0) ? lv / rv : 0.0; break;
-            case OP_MOD: result_v = (rv != 0.0) ? (double)((long long)lv % (long long)rv) : 0.0; break;
-            case OP_CONCAT: break; /* handled above */
-            case OP_NEG: break;    /* not a binary op */
-        }
-
-        int use_float = (lhs.type == COLUMN_TYPE_FLOAT || rhs.type == COLUMN_TYPE_FLOAT);
-        cell_release_rb(&lhs, rb);
-        cell_release_rb(&rhs, rb);
-
-        if (use_float || result_v != (double)(int)result_v)
-            return cell_make_float(result_v);
-        return cell_make_int((int)result_v);
-    }
-
-    case EXPR_FUNC_CALL: {
-        enum expr_func fn = e->func_call.func;
-        uint32_t nargs = e->func_call.args_count;
-        uint32_t args_start = e->func_call.args_start;
-
-        if (fn == FUNC_COALESCE) {
-            for (uint32_t i = 0; i < nargs; i++) {
-                struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
-                if (!cell_is_null(&c)) return c; /* ownership transfers to caller */
-                cell_release_rb(&c, rb);
-            }
-            return cell_make_null();
-        }
-
-        if (fn == FUNC_NULLIF) {
-            if (nargs < 2) return cell_make_null();
-            struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell b = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (!cell_is_null(&a) && !cell_is_null(&b) && cell_equal(&a, &b)) {
-                cell_release_rb(&a, rb);
-                cell_release_rb(&b, rb);
-                struct cell n = { .type = a.type, .is_null = 1 };
-                return n;
-            }
-            cell_release_rb(&b, rb);
-            return a; /* ownership transfers to caller */
-        }
-
-        if (fn == FUNC_GREATEST || fn == FUNC_LEAST) {
-            int is_greatest = (fn == FUNC_GREATEST);
-            if (nargs == 0) return cell_make_null();
-            struct cell best = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            int best_null = cell_is_null(&best);
-            for (uint32_t i = 1; i < nargs; i++) {
-                struct cell cur = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
-                int cur_null = cell_is_null(&cur);
-                if (best_null) {
-                    cell_release_rb(&best, rb);
-                    best = cur; best_null = cur_null;
-                    continue;
-                }
-                if (cur_null) {
-                    cell_release_rb(&cur, rb);
-                    continue;
-                }
-                int cmp = cell_compare(&cur, &best);
-                if ((is_greatest && cmp > 0) || (!is_greatest && cmp < 0)) {
-                    cell_release_rb(&best, rb);
-                    best = cur;
-                } else {
-                    cell_release_rb(&cur, rb);
-                }
-            }
-            return best;
-        }
-
-        if (fn == FUNC_UPPER || fn == FUNC_LOWER) {
-            if (nargs == 0) return cell_make_null();
-            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&arg)) return arg;
-            if (column_type_is_text(arg.type) && arg.value.as_text) {
-                int is_upper = (fn == FUNC_UPPER);
-                for (char *p = arg.value.as_text; *p; p++)
-                    *p = is_upper ? toupper((unsigned char)*p) : tolower((unsigned char)*p);
-            }
-            return arg;
-        }
-
-        if (fn == FUNC_LENGTH) {
-            if (nargs == 0) return cell_make_null();
-            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&arg)) {
-                struct cell r = {0}; r.type = COLUMN_TYPE_INT; r.is_null = 1;
-                return r;
-            }
-            if (column_type_is_text(arg.type) && arg.value.as_text) {
-                int len = (int)strlen(arg.value.as_text);
-                cell_release_rb(&arg, rb);
-                return cell_make_int(len);
-            }
-            return cell_make_int(0);
-        }
-
-        if (fn == FUNC_TRIM) {
-            if (nargs == 0) return cell_make_null();
-            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&arg)) return arg;
-            if (column_type_is_text(arg.type) && arg.value.as_text) {
-                char *s = arg.value.as_text;
-                while (*s == ' ' || *s == '\t') s++;
-                char *end = s + strlen(s);
-                while (end > s && (end[-1] == ' ' || end[-1] == '\t')) end--;
-                size_t tlen = (size_t)(end - s);
-                char *trimmed = rb ? (char *)bump_alloc(rb, tlen + 1)
-                                   : malloc(tlen + 1);
-                memcpy(trimmed, s, tlen);
-                trimmed[tlen] = '\0';
-                if (!rb) free(arg.value.as_text);
-                arg.value.as_text = trimmed;
-            }
-            return arg; /* ownership transfers to caller */
-        }
-
-        if (fn == FUNC_NEXTVAL || fn == FUNC_CURRVAL) {
-            if (nargs == 0 || !db) return cell_make_null();
-            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&arg)) return cell_make_null();
-            const char *seq_name = NULL;
-            if (column_type_is_text(arg.type) && arg.value.as_text)
-                seq_name = arg.value.as_text;
-            if (!seq_name) { cell_release_rb(&arg, rb); return cell_make_null(); }
-            /* find sequence in database */
-            struct sequence *seq = NULL;
-            for (size_t si = 0; si < db->sequences.count; si++) {
-                if (strcmp(db->sequences.items[si].name, seq_name) == 0) {
-                    seq = &db->sequences.items[si];
-                    break;
-                }
-            }
-            cell_release_rb(&arg, rb);
-            if (!seq) {
-                arena_set_error(arena, "42P01", "sequence '%s' not found", seq_name);
-                return cell_make_null();
-            }
-            if (fn == FUNC_NEXTVAL) {
-                long long val;
-                if (!seq->has_been_called) {
-                    val = seq->current_value;
-                    seq->has_been_called = 1;
-                } else {
-                    seq->current_value += seq->increment;
-                    val = seq->current_value;
-                }
-                struct cell r = {0};
-                r.type = COLUMN_TYPE_BIGINT;
-                r.value.as_bigint = val;
-                return r;
-            } else {
-                /* currval */
-                if (!seq->has_been_called) {
-                    arena_set_error(arena, "55000", "currval: sequence '%s' not yet called", seq_name);
-                    return cell_make_null();
-                }
-                struct cell r = {0};
-                r.type = COLUMN_TYPE_BIGINT;
-                r.value.as_bigint = seq->current_value;
-                return r;
-            }
-        }
-
-        if (fn == FUNC_GEN_RANDOM_UUID) {
-            /* generate a v4 UUID: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx */
-            static int uuid_seeded = 0;
-            if (!uuid_seeded) { srand((unsigned)time(NULL)); uuid_seeded = 1; }
-            char buf[37];
-            const char *hex = "0123456789abcdef";
-            for (int i = 0; i < 36; i++) {
-                if (i == 8 || i == 13 || i == 18 || i == 23) buf[i] = '-';
-                else if (i == 14) buf[i] = '4'; /* version 4 */
-                else if (i == 19) buf[i] = hex[8 + (rand() & 3)]; /* variant 10xx */
-                else buf[i] = hex[rand() & 15];
-            }
-            buf[36] = '\0';
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_UUID;
-            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-            return r;
-        }
-
-        /* ---- date/time functions ---- */
-
-        if (fn == FUNC_NOW || fn == FUNC_CURRENT_TIMESTAMP || fn == FUNC_CURRENT_DATE) {
-            time_t now = time(NULL);
-            struct tm *lt = localtime(&now);
-            char buf[32];
-            if (fn == FUNC_CURRENT_DATE) {
-                format_date(lt, buf, sizeof(buf));
-                struct cell r = {0};
-                r.type = COLUMN_TYPE_DATE;
-                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                return r;
-            } else {
-                format_timestamp(lt, buf, sizeof(buf));
-                struct cell r = {0};
-                r.type = COLUMN_TYPE_TIMESTAMP;
-                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                return r;
-            }
-        }
-
-        if (fn == FUNC_EXTRACT || fn == FUNC_DATE_PART) {
-            if (nargs < 2) return cell_make_null();
-            struct cell field_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell src_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&src_c)) {
-                cell_release_rb(&field_c, rb);
-                cell_release_rb(&src_c, rb);
-                struct cell r = {0}; r.type = COLUMN_TYPE_FLOAT; r.is_null = 1;
-                return r;
-            }
-            const char *field = (column_type_is_text(field_c.type) && field_c.value.as_text)
-                                ? field_c.value.as_text : "";
-            const char *src = (column_type_is_text(src_c.type) && src_c.value.as_text)
-                              ? src_c.value.as_text : "";
-            struct tm tm_val;
-            double result_v = 0.0;
-            if (src_c.type == COLUMN_TYPE_INTERVAL) {
-                /* EXTRACT from interval */
-                double secs = parse_interval_to_seconds(src);
-                if (strcasecmp(field, "epoch") == 0) result_v = secs;
-                else if (strcasecmp(field, "hour") == 0) result_v = (int)(secs / 3600) % 24;
-                else if (strcasecmp(field, "minute") == 0) result_v = (int)(secs / 60) % 60;
-                else if (strcasecmp(field, "second") == 0) result_v = (int)secs % 60;
-                else if (strcasecmp(field, "day") == 0) result_v = (int)(secs / 86400);
-            } else if (parse_datetime(src, &tm_val)) {
-                if (strcasecmp(field, "year") == 0) result_v = tm_val.tm_year + 1900;
-                else if (strcasecmp(field, "month") == 0) result_v = tm_val.tm_mon + 1;
-                else if (strcasecmp(field, "day") == 0) result_v = tm_val.tm_mday;
-                else if (strcasecmp(field, "hour") == 0) result_v = tm_val.tm_hour;
-                else if (strcasecmp(field, "minute") == 0) result_v = tm_val.tm_min;
-                else if (strcasecmp(field, "second") == 0) result_v = tm_val.tm_sec;
-                else if (strcasecmp(field, "dow") == 0) {
-                    mktime(&tm_val);
-                    result_v = tm_val.tm_wday;
-                } else if (strcasecmp(field, "doy") == 0) {
-                    mktime(&tm_val);
-                    result_v = tm_val.tm_yday + 1;
-                } else if (strcasecmp(field, "epoch") == 0) {
-                    result_v = (double)mktime(&tm_val);
-                } else if (strcasecmp(field, "quarter") == 0) {
-                    result_v = (tm_val.tm_mon / 3) + 1;
-                } else if (strcasecmp(field, "week") == 0) {
-                    mktime(&tm_val);
-                    result_v = (tm_val.tm_yday / 7) + 1;
-                }
-            }
-            cell_release_rb(&field_c, rb);
-            cell_release_rb(&src_c, rb);
-            /* EXTRACT returns float in PostgreSQL */
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_FLOAT;
-            r.value.as_float = result_v;
-            return r;
-        }
-
-        if (fn == FUNC_DATE_TRUNC) {
-            if (nargs < 2) return cell_make_null();
-            struct cell field_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell src_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&src_c)) {
-                cell_release_rb(&field_c, rb);
-                cell_release_rb(&src_c, rb);
-                return src_c;
-            }
-            const char *field = (column_type_is_text(field_c.type) && field_c.value.as_text)
-                                ? field_c.value.as_text : "";
-            const char *src = (column_type_is_text(src_c.type) && src_c.value.as_text)
-                              ? src_c.value.as_text : "";
-            struct tm tm_val;
-            if (parse_datetime(src, &tm_val)) {
-                if (strcasecmp(field, "year") == 0) {
-                    tm_val.tm_mon = 0; tm_val.tm_mday = 1;
-                    tm_val.tm_hour = 0; tm_val.tm_min = 0; tm_val.tm_sec = 0;
-                } else if (strcasecmp(field, "month") == 0) {
-                    tm_val.tm_mday = 1;
-                    tm_val.tm_hour = 0; tm_val.tm_min = 0; tm_val.tm_sec = 0;
-                } else if (strcasecmp(field, "day") == 0) {
-                    tm_val.tm_hour = 0; tm_val.tm_min = 0; tm_val.tm_sec = 0;
-                } else if (strcasecmp(field, "hour") == 0) {
-                    tm_val.tm_min = 0; tm_val.tm_sec = 0;
-                } else if (strcasecmp(field, "minute") == 0) {
-                    tm_val.tm_sec = 0;
-                }
-                /* second: no truncation needed */
-                char buf[32];
-                format_timestamp(&tm_val, buf, sizeof(buf));
-                cell_release_rb(&field_c, rb);
-                cell_release_rb(&src_c, rb);
-                struct cell r = {0};
-                r.type = COLUMN_TYPE_TIMESTAMP;
-                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                return r;
-            }
-            cell_release_rb(&field_c, rb);
-            cell_release_rb(&src_c, rb);
-            return cell_make_null();
-        }
-
-        if (fn == FUNC_AGE) {
-            if (nargs < 1) return cell_make_null();
-            struct cell a_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell b_c;
-            if (nargs >= 2) {
-                b_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            } else {
-                /* AGE(timestamp) = AGE(CURRENT_DATE, timestamp) */
-                time_t now = time(NULL);
-                struct tm *lt = localtime(&now);
-                char buf[32];
-                format_timestamp(lt, buf, sizeof(buf));
-                b_c = a_c;
-                a_c = (struct cell){0};
-                a_c.type = COLUMN_TYPE_TIMESTAMP;
-                a_c.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-            }
-            if (cell_is_null(&a_c) || cell_is_null(&b_c)) {
-                cell_release_rb(&a_c, rb);
-                cell_release_rb(&b_c, rb);
-                struct cell r = {0}; r.type = COLUMN_TYPE_INTERVAL; r.is_null = 1;
-                return r;
-            }
-            struct tm tm_a, tm_b;
-            const char *sa = (column_type_is_text(a_c.type) && a_c.value.as_text) ? a_c.value.as_text : "";
-            const char *sb = (column_type_is_text(b_c.type) && b_c.value.as_text) ? b_c.value.as_text : "";
-            if (parse_datetime(sa, &tm_a) && parse_datetime(sb, &tm_b)) {
-                time_t ta = mktime(&tm_a);
-                time_t tb = mktime(&tm_b);
-                double diff = difftime(ta, tb);
-                char buf[128];
-                format_interval(diff, buf, sizeof(buf));
-                cell_release_rb(&a_c, rb);
-                cell_release_rb(&b_c, rb);
-                struct cell r = {0};
-                r.type = COLUMN_TYPE_INTERVAL;
-                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                return r;
-            }
-            cell_release_rb(&a_c, rb);
-            cell_release_rb(&b_c, rb);
-            return cell_make_null();
-        }
-
-        if (fn == FUNC_TO_CHAR) {
-            if (nargs < 2) return cell_make_null();
-            struct cell src_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell fmt_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&src_c)) {
-                cell_release_rb(&fmt_c, rb);
-                return src_c;
-            }
-            const char *src = (column_type_is_text(src_c.type) && src_c.value.as_text)
-                              ? src_c.value.as_text : "";
-            const char *fmt = (column_type_is_text(fmt_c.type) && fmt_c.value.as_text)
-                              ? fmt_c.value.as_text : "";
-            struct tm tm_val;
-            if (parse_datetime(src, &tm_val)) {
-                /* simple PG format conversion: YYYY, MM, DD, HH24, MI, SS */
-                char buf[256] = {0};
-                char *out = buf;
-                const char *fp = fmt;
-                while (*fp && (size_t)(out - buf) < sizeof(buf) - 10) {
-                    if (strncasecmp(fp, "YYYY", 4) == 0) {
-                        out += sprintf(out, "%04d", tm_val.tm_year + 1900);
-                        fp += 4;
-                    } else if (strncasecmp(fp, "MM", 2) == 0) {
-                        out += sprintf(out, "%02d", tm_val.tm_mon + 1);
-                        fp += 2;
-                    } else if (strncasecmp(fp, "DD", 2) == 0) {
-                        out += sprintf(out, "%02d", tm_val.tm_mday);
-                        fp += 2;
-                    } else if (strncasecmp(fp, "HH24", 4) == 0) {
-                        out += sprintf(out, "%02d", tm_val.tm_hour);
-                        fp += 4;
-                    } else if (strncasecmp(fp, "HH", 2) == 0) {
-                        out += sprintf(out, "%02d", tm_val.tm_hour);
-                        fp += 2;
-                    } else if (strncasecmp(fp, "MI", 2) == 0) {
-                        out += sprintf(out, "%02d", tm_val.tm_min);
-                        fp += 2;
-                    } else if (strncasecmp(fp, "SS", 2) == 0) {
-                        out += sprintf(out, "%02d", tm_val.tm_sec);
-                        fp += 2;
-                    } else {
-                        *out++ = *fp++;
-                    }
-                }
-                *out = '\0';
-                cell_release_rb(&src_c, rb);
-                cell_release_rb(&fmt_c, rb);
-                struct cell r = {0};
-                r.type = COLUMN_TYPE_TEXT;
-                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                return r;
-            }
-            cell_release_rb(&src_c, rb);
-            cell_release_rb(&fmt_c, rb);
-            return cell_make_null();
-        }
-
-        if (fn == FUNC_SUBSTRING) {
-            if (nargs < 2) return cell_make_null();
-            struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell from_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&str)) {
-                cell_release_rb(&from_c, rb);
-                return str;
-            }
-            int from = (int)cell_to_double_val(&from_c);
-            if (from < 1) from = 1;
-            from--; /* convert to 0-based */
-            cell_release_rb(&from_c, rb);
-
-            if (column_type_is_text(str.type) && str.value.as_text) {
-                int slen = (int)strlen(str.value.as_text);
-                int len = slen - from;
-                if (nargs >= 3) {
-                    struct cell len_c = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
-                    len = (int)cell_to_double_val(&len_c);
-                    cell_release_rb(&len_c, rb);
-                }
-                if (from >= slen || len <= 0) {
-                    if (!rb) free(str.value.as_text);
-                    str.value.as_text = rb ? bump_strdup(rb, "") : strdup("");
-                    return str;
-                }
-                if (from + len > slen) len = slen - from;
-                char *sub = rb ? (char *)bump_alloc(rb, (size_t)len + 1)
-                               : malloc((size_t)len + 1);
-                memcpy(sub, str.value.as_text + from, (size_t)len);
-                sub[len] = '\0';
-                if (!rb) free(str.value.as_text);
-                str.value.as_text = sub;
-            }
-            return str;
-        }
-
-        /* ---- math functions ---- */
-
-        if (fn == FUNC_ABS) {
-            if (nargs == 0) return cell_make_null();
-            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&arg)) return arg;
-            if (arg.type == COLUMN_TYPE_INT) {
-                if (arg.value.as_int < 0) arg.value.as_int = -arg.value.as_int;
-                return arg;
-            }
-            if (arg.type == COLUMN_TYPE_BIGINT) {
-                if (arg.value.as_bigint < 0) arg.value.as_bigint = -arg.value.as_bigint;
-                return arg;
-            }
-            double v = cell_to_double_val(&arg);
-            return cell_make_float(v < 0 ? -v : v);
-        }
-
-        if (fn == FUNC_CEIL) {
-            if (nargs == 0) return cell_make_null();
-            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_FLOAT; return arg; }
-            double v = cell_to_double_val(&arg);
-            return cell_make_float(ceil(v));
-        }
-
-        if (fn == FUNC_FLOOR) {
-            if (nargs == 0) return cell_make_null();
-            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_FLOAT; return arg; }
-            double v = cell_to_double_val(&arg);
-            return cell_make_float(floor(v));
-        }
-
-        if (fn == FUNC_ROUND) {
-            if (nargs == 0) return cell_make_null();
-            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_FLOAT; return arg; }
-            double v = cell_to_double_val(&arg);
-            int places = 0;
-            if (nargs >= 2) {
-                struct cell p = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-                places = (int)cell_to_double_val(&p);
-                cell_release_rb(&p, rb);
-            }
-            if (places == 0) {
-                return cell_make_float(round(v));
-            } else {
-                double factor = pow(10.0, (double)places);
-                return cell_make_float(round(v * factor) / factor);
-            }
-        }
-
-        if (fn == FUNC_POWER) {
-            if (nargs < 2) return cell_make_null();
-            struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell b = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&a) || cell_is_null(&b)) {
-                cell_release_rb(&a, rb); cell_release_rb(&b, rb);
-                struct cell r = {0}; r.type = COLUMN_TYPE_FLOAT; r.is_null = 1; return r;
-            }
-            double result_v = pow(cell_to_double_val(&a), cell_to_double_val(&b));
-            cell_release_rb(&a, rb); cell_release_rb(&b, rb);
-            return cell_make_float(result_v);
-        }
-
-        if (fn == FUNC_SQRT) {
-            if (nargs == 0) return cell_make_null();
-            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_FLOAT; return arg; }
-            double v = cell_to_double_val(&arg);
-            return cell_make_float(sqrt(v));
-        }
-
-        if (fn == FUNC_MOD) {
-            if (nargs < 2) return cell_make_null();
-            struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell b = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&a) || cell_is_null(&b)) {
-                cell_release_rb(&a, rb); cell_release_rb(&b, rb);
-                return cell_make_null();
-            }
-            if (a.type == COLUMN_TYPE_INT && b.type == COLUMN_TYPE_INT) {
-                int bv = b.value.as_int;
-                if (bv == 0) { return cell_make_null(); }
-                return cell_make_int(a.value.as_int % bv);
-            }
-            double av = cell_to_double_val(&a);
-            double bv = cell_to_double_val(&b);
-            if (bv == 0.0) return cell_make_null();
-            return cell_make_float(fmod(av, bv));
-        }
-
-        if (fn == FUNC_SIGN) {
-            if (nargs == 0) return cell_make_null();
-            struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_INT; return arg; }
-            double v = cell_to_double_val(&arg);
-            return cell_make_int(v > 0 ? 1 : (v < 0 ? -1 : 0));
-        }
-
-        if (fn == FUNC_RANDOM) {
-            static int rand_seeded = 0;
-            if (!rand_seeded) { srand((unsigned)time(NULL)); rand_seeded = 1; }
-            return cell_make_float((double)rand() / ((double)RAND_MAX + 1.0));
-        }
-
-        /* ---- string functions ---- */
-
-        if (fn == FUNC_REPLACE) {
-            if (nargs < 3) return cell_make_null();
-            struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell from_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            struct cell to_c = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
-            if (cell_is_null(&str)) {
-                cell_release_rb(&from_c, rb); cell_release_rb(&to_c, rb);
-                return str;
-            }
-            const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
-            const char *from = (column_type_is_text(from_c.type) && from_c.value.as_text) ? from_c.value.as_text : "";
-            const char *to = (column_type_is_text(to_c.type) && to_c.value.as_text) ? to_c.value.as_text : "";
-            size_t from_len = strlen(from);
-            size_t to_len = strlen(to);
-            if (from_len == 0) {
-                cell_release_rb(&from_c, rb); cell_release_rb(&to_c, rb);
-                return str;
-            }
-            /* count occurrences to size output */
-            size_t count = 0;
-            const char *p = s;
-            while ((p = strstr(p, from)) != NULL) { count++; p += from_len; }
-            size_t slen = strlen(s);
-            size_t out_len = slen + count * (to_len - from_len);
-            char *out = rb ? (char *)bump_alloc(rb, out_len + 1) : malloc(out_len + 1);
-            char *wp = out;
-            p = s;
-            while (*p) {
-                if (strncmp(p, from, from_len) == 0) {
-                    memcpy(wp, to, to_len); wp += to_len; p += from_len;
-                } else {
-                    *wp++ = *p++;
-                }
-            }
-            *wp = '\0';
-            if (!rb) free(str.value.as_text);
-            str.value.as_text = out;
-            if (!column_type_is_text(str.type)) str.type = COLUMN_TYPE_TEXT;
-            cell_release_rb(&from_c, rb); cell_release_rb(&to_c, rb);
-            return str;
-        }
-
-        if (fn == FUNC_LPAD || fn == FUNC_RPAD) {
-            if (nargs < 2) return cell_make_null();
-            struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell len_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&str)) { cell_release_rb(&len_c, rb); return str; }
-            int target_len = (int)cell_to_double_val(&len_c);
-            cell_release_rb(&len_c, rb);
-            const char *fill = " ";
-            struct cell fill_c = {0};
-            if (nargs >= 3) {
-                fill_c = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
-                if (column_type_is_text(fill_c.type) && fill_c.value.as_text)
-                    fill = fill_c.value.as_text;
-            }
-            const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
-            int slen = (int)strlen(s);
-            size_t fill_len = strlen(fill);
-            if (target_len <= 0 || fill_len == 0) {
-                if (!rb) free(str.value.as_text);
-                str.value.as_text = rb ? bump_strdup(rb, "") : strdup("");
-                cell_release_rb(&fill_c, rb);
-                return str;
-            }
-            if (slen >= target_len) {
-                /* truncate to target_len */
-                char *out = rb ? (char *)bump_alloc(rb, (size_t)target_len + 1)
-                               : malloc((size_t)target_len + 1);
-                memcpy(out, s, (size_t)target_len);
-                out[target_len] = '\0';
-                if (!rb) free(str.value.as_text);
-                str.value.as_text = out;
-                cell_release_rb(&fill_c, rb);
-                return str;
-            }
-            int pad_needed = target_len - slen;
-            char *out = rb ? (char *)bump_alloc(rb, (size_t)target_len + 1)
-                           : malloc((size_t)target_len + 1);
-            if (fn == FUNC_LPAD) {
-                for (int i = 0; i < pad_needed; i++)
-                    out[i] = fill[i % fill_len];
-                memcpy(out + pad_needed, s, (size_t)slen);
-            } else {
-                memcpy(out, s, (size_t)slen);
-                for (int i = 0; i < pad_needed; i++)
-                    out[slen + i] = fill[i % fill_len];
-            }
-            out[target_len] = '\0';
-            if (!rb) free(str.value.as_text);
-            str.value.as_text = out;
-            cell_release_rb(&fill_c, rb);
-            return str;
-        }
-
-        if (fn == FUNC_CONCAT) {
-            /* CONCAT(a, b, ...) — NULLs treated as empty string */
-            char buf[4096];
-            size_t wp = 0;
-            for (uint32_t i = 0; i < nargs; i++) {
-                struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
-                if (!cell_is_null(&c)) {
-                    char *txt = cell_to_text_rb(&c, rb);
-                    if (txt) {
-                        size_t tlen = strlen(txt);
-                        if (wp + tlen < sizeof(buf)) {
-                            memcpy(buf + wp, txt, tlen);
-                            wp += tlen;
-                        }
-                        if (!rb) free(txt);
-                    }
-                }
-                cell_release_rb(&c, rb);
-            }
-            buf[wp] = '\0';
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_TEXT;
-            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-            return r;
-        }
-
-        if (fn == FUNC_CONCAT_WS) {
-            /* CONCAT_WS(sep, a, b, ...) — skip NULLs */
-            if (nargs < 1) return cell_make_null();
-            struct cell sep_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&sep_c)) return sep_c;
-            const char *sep = (column_type_is_text(sep_c.type) && sep_c.value.as_text) ? sep_c.value.as_text : "";
-            size_t sep_len = strlen(sep);
-            char buf[4096];
-            size_t wp = 0;
-            int first = 1;
-            for (uint32_t i = 1; i < nargs; i++) {
-                struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
-                if (!cell_is_null(&c)) {
-                    char *txt = cell_to_text_rb(&c, rb);
-                    if (txt) {
-                        if (!first && wp + sep_len < sizeof(buf)) {
-                            memcpy(buf + wp, sep, sep_len);
-                            wp += sep_len;
-                        }
-                        size_t tlen = strlen(txt);
-                        if (wp + tlen < sizeof(buf)) {
-                            memcpy(buf + wp, txt, tlen);
-                            wp += tlen;
-                        }
-                        first = 0;
-                        if (!rb) free(txt);
-                    }
-                }
-                cell_release_rb(&c, rb);
-            }
-            buf[wp] = '\0';
-            cell_release_rb(&sep_c, rb);
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_TEXT;
-            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-            return r;
-        }
-
-        if (fn == FUNC_POSITION) {
-            /* POSITION(sub IN str) — returns 1-based index, 0 if not found */
-            if (nargs < 2) return cell_make_int(0);
-            struct cell sub_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell str_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&sub_c) || cell_is_null(&str_c)) {
-                cell_release_rb(&sub_c, rb); cell_release_rb(&str_c, rb);
-                struct cell r = {0}; r.type = COLUMN_TYPE_INT; r.is_null = 1; return r;
-            }
-            const char *sub = (column_type_is_text(sub_c.type) && sub_c.value.as_text) ? sub_c.value.as_text : "";
-            const char *s = (column_type_is_text(str_c.type) && str_c.value.as_text) ? str_c.value.as_text : "";
-            const char *found = strstr(s, sub);
-            int pos = found ? (int)(found - s) + 1 : 0;
-            cell_release_rb(&sub_c, rb); cell_release_rb(&str_c, rb);
-            return cell_make_int(pos);
-        }
-
-        if (fn == FUNC_SPLIT_PART) {
-            if (nargs < 3) return cell_make_null();
-            struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell delim_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            struct cell part_c = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
-            if (cell_is_null(&str)) {
-                cell_release_rb(&delim_c, rb); cell_release_rb(&part_c, rb);
-                return str;
-            }
-            const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
-            const char *delim = (column_type_is_text(delim_c.type) && delim_c.value.as_text) ? delim_c.value.as_text : "";
-            int part = (int)cell_to_double_val(&part_c);
-            cell_release_rb(&delim_c, rb); cell_release_rb(&part_c, rb);
-            size_t dlen = strlen(delim);
-            if (dlen == 0 || part < 1) {
-                if (!rb) free(str.value.as_text);
-                str.value.as_text = rb ? bump_strdup(rb, "") : strdup("");
-                return str;
-            }
-            const char *start = s;
-            int cur = 1;
-            while (cur < part) {
-                const char *f = strstr(start, delim);
-                if (!f) { start = s + strlen(s); break; }
-                start = f + dlen;
-                cur++;
-            }
-            const char *end = strstr(start, delim);
-            if (!end) end = s + strlen(s);
-            size_t rlen = (size_t)(end - start);
-            char *out = rb ? (char *)bump_alloc(rb, rlen + 1) : malloc(rlen + 1);
-            memcpy(out, start, rlen);
-            out[rlen] = '\0';
-            if (!rb) free(str.value.as_text);
-            str.value.as_text = out;
-            return str;
-        }
-
-        if (fn == FUNC_LEFT) {
-            if (nargs < 2) return cell_make_null();
-            struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell n_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&str)) { cell_release_rb(&n_c, rb); return str; }
-            int n = (int)cell_to_double_val(&n_c);
-            cell_release_rb(&n_c, rb);
-            const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
-            int slen = (int)strlen(s);
-            if (n < 0) n = slen + n;
-            if (n < 0) n = 0;
-            if (n > slen) n = slen;
-            char *out = rb ? (char *)bump_alloc(rb, (size_t)n + 1) : malloc((size_t)n + 1);
-            memcpy(out, s, (size_t)n);
-            out[n] = '\0';
-            if (!rb) free(str.value.as_text);
-            str.value.as_text = out;
-            return str;
-        }
-
-        if (fn == FUNC_RIGHT) {
-            if (nargs < 2) return cell_make_null();
-            struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell n_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&str)) { cell_release_rb(&n_c, rb); return str; }
-            int n = (int)cell_to_double_val(&n_c);
-            cell_release_rb(&n_c, rb);
-            const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
-            int slen = (int)strlen(s);
-            if (n < 0) n = slen + n;
-            if (n < 0) n = 0;
-            if (n > slen) n = slen;
-            int start = slen - n;
-            char *out = rb ? (char *)bump_alloc(rb, (size_t)n + 1) : malloc((size_t)n + 1);
-            memcpy(out, s + start, (size_t)n);
-            out[n] = '\0';
-            if (!rb) free(str.value.as_text);
-            str.value.as_text = out;
-            return str;
-        }
-
-        if (fn == FUNC_REPEAT) {
-            if (nargs < 2) return cell_make_null();
-            struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            struct cell n_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
-            if (cell_is_null(&str)) { cell_release_rb(&n_c, rb); return str; }
-            int n = (int)cell_to_double_val(&n_c);
-            cell_release_rb(&n_c, rb);
-            if (n <= 0) {
-                if (!rb) free(str.value.as_text);
-                str.value.as_text = rb ? bump_strdup(rb, "") : strdup("");
-                return str;
-            }
-            const char *s = (column_type_is_text(str.type) && str.value.as_text) ? str.value.as_text : "";
-            size_t slen = strlen(s);
-            size_t out_len = slen * (size_t)n;
-            char *out = rb ? (char *)bump_alloc(rb, out_len + 1) : malloc(out_len + 1);
-            for (int i = 0; i < n; i++)
-                memcpy(out + i * slen, s, slen);
-            out[out_len] = '\0';
-            if (!rb) free(str.value.as_text);
-            str.value.as_text = out;
-            return str;
-        }
-
-        if (fn == FUNC_REVERSE) {
-            if (nargs == 0) return cell_make_null();
-            struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&str)) return str;
-            if (column_type_is_text(str.type) && str.value.as_text) {
-                size_t slen = strlen(str.value.as_text);
-                char *out = rb ? (char *)bump_alloc(rb, slen + 1) : malloc(slen + 1);
-                for (size_t i = 0; i < slen; i++)
-                    out[i] = str.value.as_text[slen - 1 - i];
-                out[slen] = '\0';
-                if (!rb) free(str.value.as_text);
-                str.value.as_text = out;
-            }
-            return str;
-        }
-
-        if (fn == FUNC_INITCAP) {
-            if (nargs == 0) return cell_make_null();
-            struct cell str = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            if (cell_is_null(&str)) return str;
-            if (column_type_is_text(str.type) && str.value.as_text) {
-                int at_start = 1;
-                for (char *p = str.value.as_text; *p; p++) {
-                    if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
-                        *p == '-' || *p == '_') {
-                        at_start = 1;
-                    } else if (at_start) {
-                        *p = toupper((unsigned char)*p);
-                        at_start = 0;
-                    } else {
-                        *p = tolower((unsigned char)*p);
-                    }
-                }
-            }
-            return str;
-        }
-
-        /* ---- pg_catalog stub functions ---- */
-
-        if (fn == FUNC_PG_GET_USERBYID) {
-            /* pg_get_userbyid(oid) -> role name; return db name as owner */
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_TEXT;
-            r.value.as_text = strdup(db ? db->name : "mskql");
-            return r;
-        }
-
-        if (fn == FUNC_PG_TABLE_IS_VISIBLE) {
-            /* pg_table_is_visible(oid) -> true for all public tables */
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_BOOLEAN;
-            r.value.as_bool = 1;
-            return r;
-        }
-
-        if (fn == FUNC_FORMAT_TYPE) {
-            /* format_type(type_oid, typemod) -> type name string */
-            if (nargs < 1) return cell_make_null();
-            struct cell oid_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-            int type_oid = 0;
-            if (oid_c.type == COLUMN_TYPE_INT) type_oid = oid_c.value.as_int;
-            else if (oid_c.type == COLUMN_TYPE_BIGINT) type_oid = (int)oid_c.value.as_bigint;
-            else if (column_type_is_text(oid_c.type) && oid_c.value.as_text) {
-                type_oid = atoi(oid_c.value.as_text);
-                cell_release(&oid_c);
-            }
-            const char *name = "unknown";
-            switch (type_oid) {
-                case 16:   name = "boolean"; break;
-                case 20:   name = "bigint"; break;
-                case 21:   name = "smallint"; break;
-                case 23:   name = "integer"; break;
-                case 25:   name = "text"; break;
-                case 701:  name = "double precision"; break;
-                case 1043: name = "character varying"; break;
-                case 1082: name = "date"; break;
-                case 1083: name = "time without time zone"; break;
-                case 1114: name = "timestamp without time zone"; break;
-                case 1184: name = "timestamp with time zone"; break;
-                case 1186: name = "interval"; break;
-                case 1700: name = "numeric"; break;
-                case 2950: name = "uuid"; break;
-            }
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_TEXT;
-            r.value.as_text = strdup(name);
-            return r;
-        }
-
-        if (fn == FUNC_PG_GET_EXPR || fn == FUNC_OBJ_DESCRIPTION ||
-            fn == FUNC_COL_DESCRIPTION || fn == FUNC_SHOBJ_DESCRIPTION) {
-            return cell_make_null();
-        }
-
-        if (fn == FUNC_PG_ENCODING_TO_CHAR) {
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_TEXT;
-            r.value.as_text = strdup("UTF8");
-            return r;
-        }
-
-        if (fn == FUNC_HAS_TABLE_PRIVILEGE || fn == FUNC_HAS_DATABASE_PRIVILEGE) {
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_BOOLEAN;
-            r.value.as_bool = 1;
-            return r;
-        }
-
-        if (fn == FUNC_PG_GET_CONSTRAINTDEF || fn == FUNC_PG_GET_INDEXDEF) {
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_TEXT;
-            r.value.as_text = strdup("");
-            return r;
-        }
-
-        if (fn == FUNC_ARRAY_TO_STRING) {
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_TEXT;
-            r.value.as_text = strdup("");
-            return r;
-        }
-
-        if (fn == FUNC_CURRENT_SCHEMA) {
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_TEXT;
-            r.value.as_text = strdup("public");
-            return r;
-        }
-
-        if (fn == FUNC_CURRENT_SCHEMAS) {
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_TEXT;
-            r.value.as_text = strdup("{pg_catalog,public}");
-            return r;
-        }
-
-        if (fn == FUNC_PG_IS_IN_RECOVERY) {
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_BOOLEAN;
-            r.value.as_bool = 0;
-            return r;
-        }
-
-        return cell_make_null();
-    }
 
     case EXPR_CASE_WHEN: {
         for (uint32_t i = 0; i < e->case_when.branches_count; i++) {
@@ -2841,134 +3085,8 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         return cell_make_null();
     }
 
-    case EXPR_CAST: {
-        struct cell src = eval_expr(e->cast.operand, arena, t, row, db, rb);
-        if (cell_is_null(&src)) {
-            src.type = e->cast.target;
-            return src;
-        }
-        enum column_type target = e->cast.target;
-
-        /* already the right type? */
-        if (src.type == target) return src;
-
-        /* numeric → numeric conversions */
-        if ((target == COLUMN_TYPE_SMALLINT || target == COLUMN_TYPE_INT || target == COLUMN_TYPE_BIGINT ||
-             target == COLUMN_TYPE_FLOAT || target == COLUMN_TYPE_NUMERIC) &&
-            (src.type == COLUMN_TYPE_SMALLINT || src.type == COLUMN_TYPE_INT || src.type == COLUMN_TYPE_BIGINT ||
-             src.type == COLUMN_TYPE_FLOAT || src.type == COLUMN_TYPE_NUMERIC)) {
-            double v = cell_to_double_val(&src);
-            cell_release_rb(&src, rb);
-            struct cell r = {0};
-            r.type = target;
-            if (target == COLUMN_TYPE_SMALLINT) {
-                r.value.as_smallint = (int16_t)v;
-            } else if (target == COLUMN_TYPE_INT) {
-                r.value.as_int = (int)v;
-            } else if (target == COLUMN_TYPE_BIGINT) {
-                r.value.as_bigint = (long long)v;
-            } else if (target == COLUMN_TYPE_FLOAT) {
-                r.value.as_float = v;
-            } else { /* NUMERIC */
-                r.value.as_float = v;
-            }
-            return r;
-        }
-
-        /* numeric → text */
-        if (column_type_is_text(target) &&
-            (src.type == COLUMN_TYPE_SMALLINT || src.type == COLUMN_TYPE_INT || src.type == COLUMN_TYPE_BIGINT ||
-             src.type == COLUMN_TYPE_FLOAT || src.type == COLUMN_TYPE_NUMERIC ||
-             src.type == COLUMN_TYPE_BOOLEAN)) {
-            char buf[128];
-            if (src.type == COLUMN_TYPE_SMALLINT)
-                snprintf(buf, sizeof(buf), "%d", (int)src.value.as_smallint);
-            else if (src.type == COLUMN_TYPE_INT)
-                snprintf(buf, sizeof(buf), "%d", src.value.as_int);
-            else if (src.type == COLUMN_TYPE_BIGINT)
-                snprintf(buf, sizeof(buf), "%lld", src.value.as_bigint);
-            else if (src.type == COLUMN_TYPE_FLOAT || src.type == COLUMN_TYPE_NUMERIC)
-                snprintf(buf, sizeof(buf), "%g", src.value.as_float);
-            else /* BOOLEAN */
-                snprintf(buf, sizeof(buf), "%s", src.value.as_bool ? "true" : "false");
-            cell_release_rb(&src, rb);
-            struct cell r = {0};
-            r.type = target;
-            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-            return r;
-        }
-
-        /* text → numeric */
-        if ((target == COLUMN_TYPE_SMALLINT || target == COLUMN_TYPE_INT || target == COLUMN_TYPE_BIGINT ||
-             target == COLUMN_TYPE_FLOAT || target == COLUMN_TYPE_NUMERIC) &&
-            column_type_is_text(src.type) && src.value.as_text) {
-            const char *s = src.value.as_text;
-            struct cell r = {0};
-            r.type = target;
-            if (target == COLUMN_TYPE_SMALLINT) {
-                r.value.as_smallint = (int16_t)atoi(s);
-            } else if (target == COLUMN_TYPE_INT) {
-                r.value.as_int = atoi(s);
-            } else if (target == COLUMN_TYPE_BIGINT) {
-                r.value.as_bigint = atoll(s);
-            } else { /* FLOAT or NUMERIC */
-                r.value.as_float = atof(s);
-            }
-            cell_release_rb(&src, rb);
-            return r;
-        }
-
-        /* text → boolean */
-        if (target == COLUMN_TYPE_BOOLEAN && column_type_is_text(src.type) && src.value.as_text) {
-            const char *s = src.value.as_text;
-            int bval = (strcasecmp(s, "true") == 0 || strcasecmp(s, "t") == 0 ||
-                        strcasecmp(s, "yes") == 0 || strcasecmp(s, "1") == 0);
-            cell_release_rb(&src, rb);
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_BOOLEAN;
-            r.value.as_bool = bval;
-            return r;
-        }
-
-        /* boolean → int */
-        if (target == COLUMN_TYPE_INT && src.type == COLUMN_TYPE_BOOLEAN) {
-            int v = src.value.as_bool ? 1 : 0;
-            return cell_make_int(v);
-        }
-
-        /* text → text-like (DATE, TIMESTAMP, etc.) — just change the type tag */
-        if (column_type_is_text(target) && column_type_is_text(src.type)) {
-            src.type = target;
-            return src;
-        }
-
-        /* fallback: convert to text first, then to target */
-        char *txt = cell_to_text_rb(&src, rb);
-        cell_release_rb(&src, rb);
-        struct cell r = {0};
-        r.type = target;
-        if (column_type_is_text(target)) {
-            r.value.as_text = txt;
-        } else if (target == COLUMN_TYPE_SMALLINT) {
-            r.value.as_smallint = txt ? (int16_t)atoi(txt) : 0;
-            if (!rb && txt) free(txt);
-        } else if (target == COLUMN_TYPE_INT) {
-            r.value.as_int = txt ? atoi(txt) : 0;
-            if (!rb && txt) free(txt);
-        } else if (target == COLUMN_TYPE_BIGINT) {
-            r.value.as_bigint = txt ? atoll(txt) : 0;
-            if (!rb && txt) free(txt);
-        } else if (target == COLUMN_TYPE_FLOAT || target == COLUMN_TYPE_NUMERIC) {
-            r.value.as_float = txt ? atof(txt) : 0.0;
-            if (!rb && txt) free(txt);
-        } else if (target == COLUMN_TYPE_BOOLEAN) {
-            r.value.as_bool = (txt && (strcasecmp(txt, "true") == 0 || strcmp(txt, "1") == 0)) ? 1 : 0;
-            if (!rb && txt) free(txt);
-        } else {
-            r.value.as_text = txt; /* DATE, TIMESTAMP, etc. */
-        }
-        return r;
-    }
+    case EXPR_CAST:
+        return eval_cast(e, arena, t, row, db, rb);
 
     case EXPR_IS_NULL: {
         struct cell val = eval_expr(e->is_null.operand_is, arena, t, row, db, rb);
@@ -3267,6 +3385,11 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
         row_count++;
         for (uint32_t a = 0; a < naggs; a++) {
             struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+            /* FILTER (WHERE ...) — skip this row for this aggregate if filter doesn't match */
+            if (ae->filter_cond != IDX_NONE) {
+                if (!eval_condition(ae->filter_cond, arena, &t->rows.items[i], t, NULL))
+                    continue;
+            }
             struct cell cv;
             struct cell *c;
             if (agg_col[a] == -2) {
@@ -3276,7 +3399,9 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
             } else if (agg_col[a] >= 0) {
                 c = &t->rows.items[i].cells.items[agg_col[a]];
             } else {
-                continue; /* COUNT(*) — no column value needed */
+                /* COUNT(*) with FILTER — count this row */
+                nonnull_count[a]++;
+                continue;
             }
             /* skip NULL values (SQL standard) */
             if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
@@ -3355,7 +3480,11 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                     c.value.as_int = distinct_count;
                 } else {
                     /* COUNT(*) counts all rows; COUNT(col/expr) counts non-NULL */
-                    c.value.as_int = (agg_col[a] == -1) ? (int)row_count : (int)nonnull_count[a];
+                    /* When FILTER is present, COUNT(*) uses nonnull_count (filtered) */
+                    if (agg_col[a] == -1 && ae->filter_cond == IDX_NONE)
+                        c.value.as_int = (int)row_count;
+                    else
+                        c.value.as_int = (int)nonnull_count[a];
                 }
                 break;
             case AGG_SUM:
@@ -4179,9 +4308,12 @@ static int grp_find_result_col(struct table *t, int *grp_cols, size_t ngrp,
             }
         }
     }
-    /* check aggregate names */
+    /* check aggregate aliases and names */
     for (size_t a = 0; a < agg_n; a++) {
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+        /* check alias first (e.g. SUM(val) AS total → ORDER BY total) */
+        if (ae->alias.len > 0 && sv_eq_ignorecase(ae->alias, name))
+            return (int)(agg_offset + a);
         const char *agg_name = "?";
         switch (ae->func) {
             case AGG_SUM:        agg_name = "sum";        break;

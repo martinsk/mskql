@@ -7,9 +7,9 @@ INSERT INTO deals (rep_id, customer, amount, stage, closed) VALUES (1, 'Acme Cor
 -- input:
 SELECT r.name AS rep, r.region, SUM(CASE WHEN d.stage = 'won' THEN 1 ELSE 0 END) AS won, SUM(d.amount) AS pipeline, SUM(CASE WHEN d.stage = 'won' THEN d.amount ELSE 0 END) AS revenue FROM deals d JOIN reps r ON d.rep_id = r.id GROUP BY r.name, r.region ORDER BY revenue DESC;
 -- expected output:
-Eve|Central|1|65000|50000
-Alice|West|2|95000|75000
-Bob|East|1|95000|55000
-Carol|West|1|95000|60000
 Dave|East|2|95000|95000
+Alice|West|2|95000|75000
+Carol|West|1|95000|60000
+Bob|East|1|95000|55000
+Eve|Central|1|65000|50000
 -- expected status: 0

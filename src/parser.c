@@ -104,7 +104,7 @@ static int is_keyword(sv word)
         "LEFT", "RIGHT", "REPEAT", "REVERSE", "INITCAP",
         "SHOW", "RESET", "DISCARD", "DEALLOCATE",
         "OPERATOR", "COLLATE",
-        "NULLS", "FIRST", "LAST",
+        "NULLS", "FIRST", "LAST", "FILTER",
         NULL
     };
     for (int i = 0; keywords[i]; i++) {
@@ -2615,6 +2615,7 @@ static int parse_single_agg(struct lexer *l, struct query_arena *a, sv func_name
 {
     agg->func = agg_from_keyword(func_name);
     agg->expr_idx = IDX_NONE;
+    agg->filter_cond = IDX_NONE;
     struct token tok = lexer_next(l); /* ( */
     if (tok.type != TOK_LPAREN) {
         arena_set_error(a, "42601", "expected '(' after aggregate function");
@@ -2669,6 +2670,31 @@ static int parse_single_agg(struct lexer *l, struct query_arena *a, sv func_name
     if (tok.type != TOK_RPAREN) {
         arena_set_error(a, "42601", "expected ')' after aggregate expression");
         return -1;
+    }
+    /* optional FILTER (WHERE ...) */
+    tok = lexer_peek(l);
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "FILTER")) {
+        lexer_next(l); /* consume FILTER */
+        tok = lexer_next(l); /* consume ( */
+        if (tok.type != TOK_LPAREN) {
+            arena_set_error(a, "42601", "expected '(' after FILTER");
+            return -1;
+        }
+        tok = lexer_next(l); /* consume WHERE */
+        if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "WHERE")) {
+            arena_set_error(a, "42601", "expected WHERE after FILTER (");
+            return -1;
+        }
+        agg->filter_cond = parse_or_cond(l, a);
+        if (agg->filter_cond == IDX_NONE) {
+            arena_set_error(a, "42601", "invalid FILTER condition");
+            return -1;
+        }
+        tok = lexer_next(l); /* consume ) */
+        if (tok.type != TOK_RPAREN) {
+            arena_set_error(a, "42601", "expected ')' after FILTER condition");
+            return -1;
+        }
     }
     return 0;
 }
@@ -2894,9 +2920,42 @@ static int parse_join_list(struct lexer *l, struct query_arena *a, struct query_
         ji.join_on_cond = IDX_NONE;
         ji.lateral_subquery_sql = IDX_NONE;
 
-        /* check for LATERAL (SELECT ...) */
+        /* check for LATERAL (SELECT ...) or plain (SELECT ...) subquery */
         struct token tok = lexer_next(l);
-        if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "LATERAL")) {
+        if (tok.type == TOK_LPAREN) {
+            /* JOIN (SELECT ...) AS alias — inline subquery */
+            const char *sq_start = l->input + l->pos;
+            int depth = 1;
+            struct token st;
+            while (depth > 0) {
+                st = lexer_next(l);
+                if (st.type == TOK_LPAREN) depth++;
+                else if (st.type == TOK_RPAREN) depth--;
+                else if (st.type == TOK_EOF) {
+                    arena_set_error(a, "42601", "unterminated JOIN subquery");
+                    return -1;
+                }
+            }
+            const char *sq_end = st.value.data;
+            while (sq_end > sq_start && (sq_end[-1] == ' ' || sq_end[-1] == '\n')) sq_end--;
+            size_t sq_len = (size_t)(sq_end - sq_start);
+            ji.lateral_subquery_sql = arena_store_string(a, sq_start, sq_len);
+            /* require AS alias */
+            peek = lexer_peek(l);
+            if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "AS")) {
+                lexer_next(l);
+                tok = lexer_next(l);
+                ji.join_alias = tok.value;
+                ji.join_table = tok.value;
+            } else if (peek.type == TOK_IDENTIFIER) {
+                tok = lexer_next(l);
+                ji.join_alias = tok.value;
+                ji.join_table = tok.value;
+            } else {
+                arena_set_error(a, "42601", "expected alias after JOIN subquery");
+                return -1;
+            }
+        } else if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "LATERAL")) {
             ji.is_lateral = 1;
             tok = lexer_next(l); /* should be ( */
             if (tok.type != TOK_LPAREN) {
@@ -4212,6 +4271,8 @@ static int parse_create_table(struct lexer *l, struct query *out)
     out->query_type = QUERY_TYPE_CREATE;
     struct query_create_table *crt = &out->create_table;
 
+    crt->as_select_sql = IDX_NONE;
+
     /* table name */
     struct token tok = lexer_next(l);
     if (tok.type == TOK_IDENTIFIER || tok.type == TOK_STRING) {
@@ -4219,6 +4280,24 @@ static int parse_create_table(struct lexer *l, struct query *out)
     } else {
         arena_set_error(&out->arena, "42601", "expected table name");
         return -1;
+    }
+
+    /* CREATE TABLE name AS SELECT ... */
+    tok = lexer_peek(l);
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "AS")) {
+        lexer_next(l); /* consume AS */
+        /* capture everything after AS as the SELECT SQL */
+        struct token sel = lexer_peek(l);
+        if (sel.type != TOK_EOF) {
+            const char *sql_start = sel.value.data;
+            size_t sql_len = strlen(sql_start);
+            while (sql_len > 0 && (sql_start[sql_len-1] == ';' || sql_start[sql_len-1] == ' '
+                                    || sql_start[sql_len-1] == '\n'))
+                sql_len--;
+            crt->as_select_sql = arena_store_string(&out->arena, sql_start, sql_len);
+        }
+        while (lexer_peek(l).type != TOK_EOF) lexer_next(l);
+        return 0;
     }
 
     /* ( col_name TYPE, ... ) */
@@ -4647,6 +4726,7 @@ static int parse_delete(struct lexer *l, struct query *out)
     out->query_type = QUERY_TYPE_DELETE;
     struct query_delete *d = &out->del;
     d->where.where_cond = IDX_NONE;
+    d->using_table = sv_from(NULL, 0);
 
     /* FROM */
     struct token tok = lexer_next(l);
@@ -4664,8 +4744,17 @@ static int parse_delete(struct lexer *l, struct query *out)
         return -1;
     }
 
-    /* optional WHERE */
+    /* optional USING */
     struct token peek = lexer_peek(l);
+    if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "USING")) {
+        lexer_next(l); /* consume USING */
+        tok = lexer_next(l);
+        if (tok.type == TOK_IDENTIFIER || tok.type == TOK_STRING)
+            d->using_table = tok.value;
+    }
+
+    /* optional WHERE */
+    peek = lexer_peek(l);
     if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "WHERE")) {
         lexer_next(l);
         if (parse_where_clause(l, &out->arena, &d->where) != 0) return -1;
