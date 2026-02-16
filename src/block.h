@@ -49,6 +49,38 @@ struct block_hash_table {
 
 /* ---- inline helpers ---- */
 
+/* Element size for a column type's data storage. */
+static inline size_t col_type_elem_size(enum column_type ct)
+{
+    switch (ct) {
+    case COLUMN_TYPE_SMALLINT:                          return sizeof(int16_t);
+    case COLUMN_TYPE_BIGINT:                            return sizeof(int64_t);
+    case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:   return sizeof(double);
+    case COLUMN_TYPE_TEXT:  case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:  case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID:   return sizeof(char *);
+    case COLUMN_TYPE_INT:   case COLUMN_TYPE_BOOLEAN:   return sizeof(int32_t);
+    }
+    return sizeof(int32_t);
+}
+
+/* Pointer to the data element at index i in a col_block (cast to void*). */
+static inline void *cb_data_ptr(const struct col_block *cb, uint32_t i)
+{
+    switch (cb->type) {
+    case COLUMN_TYPE_SMALLINT:                          return (void *)&cb->data.i16[i];
+    case COLUMN_TYPE_BIGINT:                            return (void *)&cb->data.i64[i];
+    case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:   return (void *)&cb->data.f64[i];
+    case COLUMN_TYPE_TEXT:  case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:  case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID:   return (void *)&cb->data.str[i];
+    case COLUMN_TYPE_INT:   case COLUMN_TYPE_BOOLEAN:   return (void *)&cb->data.i32[i];
+    }
+    return (void *)&cb->data.i32[i];
+}
+
 /* Reset a row_block for reuse (zero counts, keep allocated memory). */
 static inline void row_block_reset(struct row_block *rb)
 {

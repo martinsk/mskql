@@ -9,80 +9,10 @@
 
 /* ---- helpers ---- */
 
-static uint32_t col_type_to_oid(enum column_type t)
-{
-    switch (t) {
-        case COLUMN_TYPE_SMALLINT:   return 21;
-        case COLUMN_TYPE_INT:        return 23;
-        case COLUMN_TYPE_FLOAT:      return 701;
-        case COLUMN_TYPE_TEXT:       return 25;
-        case COLUMN_TYPE_ENUM:       return 25;
-        case COLUMN_TYPE_BOOLEAN:    return 16;
-        case COLUMN_TYPE_BIGINT:     return 20;
-        case COLUMN_TYPE_NUMERIC:    return 1700;
-        case COLUMN_TYPE_DATE:       return 1082;
-        case COLUMN_TYPE_TIME:       return 1083;
-        case COLUMN_TYPE_TIMESTAMP:  return 1114;
-        case COLUMN_TYPE_TIMESTAMPTZ:return 1184;
-        case COLUMN_TYPE_INTERVAL:   return 1186;
-        case COLUMN_TYPE_UUID:       return 2950;
-    }
-    return 25;
-}
-
-static int16_t col_type_to_len(enum column_type t)
-{
-    if (t == COLUMN_TYPE_SMALLINT) return 2;
-    if (t == COLUMN_TYPE_INT)      return 4;
-    if (t == COLUMN_TYPE_FLOAT)    return 8;
-    if (t == COLUMN_TYPE_BOOLEAN)  return 1;
-    if (t == COLUMN_TYPE_BIGINT)   return 8;
-    return -1;
-}
-
-/* Map column_type to PostgreSQL type name */
-static const char *col_type_pg_name(enum column_type t)
-{
-    switch (t) {
-        case COLUMN_TYPE_SMALLINT:   return "smallint";
-        case COLUMN_TYPE_INT:        return "integer";
-        case COLUMN_TYPE_BIGINT:     return "bigint";
-        case COLUMN_TYPE_FLOAT:      return "double precision";
-        case COLUMN_TYPE_NUMERIC:    return "numeric";
-        case COLUMN_TYPE_TEXT:       return "text";
-        case COLUMN_TYPE_ENUM:       return "USER-DEFINED";
-        case COLUMN_TYPE_BOOLEAN:    return "boolean";
-        case COLUMN_TYPE_DATE:       return "date";
-        case COLUMN_TYPE_TIME:       return "time without time zone";
-        case COLUMN_TYPE_TIMESTAMP:  return "timestamp without time zone";
-        case COLUMN_TYPE_TIMESTAMPTZ:return "timestamp with time zone";
-        case COLUMN_TYPE_INTERVAL:   return "interval";
-        case COLUMN_TYPE_UUID:       return "uuid";
-    }
-    return "text";
-}
-
-/* Map column_type to pg_type typname */
-static const char *col_type_to_typname(enum column_type t)
-{
-    switch (t) {
-        case COLUMN_TYPE_SMALLINT:   return "int2";
-        case COLUMN_TYPE_INT:        return "int4";
-        case COLUMN_TYPE_FLOAT:      return "float8";
-        case COLUMN_TYPE_TEXT:       return "text";
-        case COLUMN_TYPE_ENUM:       return "text";
-        case COLUMN_TYPE_BOOLEAN:    return "bool";
-        case COLUMN_TYPE_BIGINT:     return "int8";
-        case COLUMN_TYPE_NUMERIC:    return "numeric";
-        case COLUMN_TYPE_DATE:       return "date";
-        case COLUMN_TYPE_TIME:       return "time";
-        case COLUMN_TYPE_TIMESTAMP:  return "timestamp";
-        case COLUMN_TYPE_TIMESTAMPTZ:return "timestamptz";
-        case COLUMN_TYPE_INTERVAL:   return "interval";
-        case COLUMN_TYPE_UUID:       return "uuid";
-    }
-    return "text";
-}
+static uint32_t col_type_to_oid(enum column_type t) { return pg_type_lookup(t)->oid; }
+static int16_t col_type_to_len(enum column_type t)  { return pg_type_lookup(t)->typlen; }
+static const char *col_type_pg_name(enum column_type t) { return pg_type_lookup(t)->pg_name; }
+static const char *col_type_to_typname(enum column_type t) { return pg_type_lookup(t)->typname; }
 
 /* Add a text column to a table */
 static void add_text_col(struct table *t, const char *name)

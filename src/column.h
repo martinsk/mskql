@@ -1,6 +1,7 @@
 #ifndef COLUMN_H
 #define COLUMN_H
 
+#include <stdint.h>
 #include "dynamic_array.h"
 
 enum column_type {
@@ -27,6 +28,37 @@ static inline int column_type_is_text(enum column_type t)
            t == COLUMN_TYPE_DATE || t == COLUMN_TYPE_TIME ||
            t == COLUMN_TYPE_TIMESTAMP || t == COLUMN_TYPE_TIMESTAMPTZ ||
            t == COLUMN_TYPE_INTERVAL || t == COLUMN_TYPE_UUID;
+}
+
+/* Unified PostgreSQL type metadata table — single source of truth for
+ * OID, typname, display name, and storage length across catalog.c and pgwire.c. */
+struct pg_type_info {
+    uint32_t    oid;
+    const char *typname;    /* pg_type.typname (e.g. "int4") */
+    const char *pg_name;    /* information_schema display name (e.g. "integer") */
+    int16_t     typlen;     /* pg_type.typlen (-1 = variable) */
+};
+
+static const struct pg_type_info pg_type_table[] = {
+    /* [COLUMN_TYPE_SMALLINT]    */ { 21,   "int2",        "smallint",                    2 },
+    /* [COLUMN_TYPE_INT]         */ { 23,   "int4",        "integer",                     4 },
+    /* [COLUMN_TYPE_FLOAT]       */ { 701,  "float8",      "double precision",            8 },
+    /* [COLUMN_TYPE_TEXT]        */ { 25,   "text",        "text",                       -1 },
+    /* [COLUMN_TYPE_ENUM]        */ { 25,   "text",        "USER-DEFINED",               -1 },
+    /* [COLUMN_TYPE_BOOLEAN]     */ { 16,   "bool",        "boolean",                     1 },
+    /* [COLUMN_TYPE_BIGINT]      */ { 20,   "int8",        "bigint",                      8 },
+    /* [COLUMN_TYPE_NUMERIC]     */ { 1700, "numeric",     "numeric",                    -1 },
+    /* [COLUMN_TYPE_DATE]        */ { 1082, "date",        "date",                       -1 },
+    /* [COLUMN_TYPE_TIME]        */ { 1083, "time",        "time without time zone",     -1 },
+    /* [COLUMN_TYPE_TIMESTAMP]   */ { 1114, "timestamp",   "timestamp without time zone",-1 },
+    /* [COLUMN_TYPE_TIMESTAMPTZ] */ { 1184, "timestamptz", "timestamp with time zone",   -1 },
+    /* [COLUMN_TYPE_INTERVAL]    */ { 1186, "interval",    "interval",                   -1 },
+    /* [COLUMN_TYPE_UUID]        */ { 2950, "uuid",        "uuid",                       -1 },
+};
+
+static inline const struct pg_type_info *pg_type_lookup(enum column_type t)
+{
+    return &pg_type_table[(int)t];
 }
 
 struct enum_type {

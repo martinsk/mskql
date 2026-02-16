@@ -1,12 +1,13 @@
 #ifndef QUERY_H
 #define QUERY_H
 
-#include <stdint.h>
-#include <time.h>
 #include "row.h"
 #include "table.h"
 #include "stringview.h"
 #include "arena.h"
+
+#include <stdint.h>
+#include <time.h>
 
 struct database;
 

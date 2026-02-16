@@ -194,13 +194,23 @@ struct hash_join_state {
     uint32_t          right_emit_cursor; /* cursor for emitting unmatched inner rows */
 };
 
+/* Open-addressing hash set for COUNT(DISTINCT) */
+struct distinct_set {
+    uint64_t *slots;   /* bump-allocated hash slots (0 = empty) */
+    uint32_t  cap;     /* must be power of 2 */
+    uint32_t  count;   /* number of distinct values inserted */
+};
+
 struct simple_agg_state {
     double   *sums;        /* bump: [agg_count] */
     double   *mins;
     double   *maxs;
+    const char **text_mins; /* bump: [agg_count] for TEXT MIN/MAX */
+    const char **text_maxs;
     size_t   *nonnull;     /* non-null count per agg */
     size_t    total_rows;
     int      *minmax_init;
+    struct distinct_set *distinct_sets; /* bump: [agg_count], only used for DISTINCT aggs */
     int       input_done;
     int       emit_done;
     struct row tmp_row;
@@ -213,9 +223,12 @@ struct hash_agg_state {
     double   *sums;        /* bump-allocated: [agg_count * ngroups] */
     double   *mins;
     double   *maxs;
+    const char **text_mins; /* bump: [agg_count * ngroups] for TEXT MIN/MAX */
+    const char **text_maxs;
     size_t   *nonnull;     /* non-null count per agg per group */
     size_t   *grp_counts;  /* row count per group */
     int      *minmax_init;
+    struct distinct_set *distinct_sets; /* bump: [agg_count * group_cap], only for DISTINCT aggs */
     /* group key values stored in col_blocks */
     struct col_block *group_keys;
     uint32_t  ngroups;
