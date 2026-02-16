@@ -4507,12 +4507,16 @@ static uint32_t build_semi_join(struct table *t, struct query_select *s,
                 enum column_type fct = semi_inner_t->columns.items[fc].type;
                 if (fct == COLUMN_TYPE_INT || fct == COLUMN_TYPE_BIGINT ||
                     fct == COLUMN_TYPE_FLOAT || fct == COLUMN_TYPE_NUMERIC ||
-                    fct == COLUMN_TYPE_BOOLEAN) {
+                    fct == COLUMN_TYPE_BOOLEAN || column_type_is_text(fct)) {
                     semi_inner_filter_col = fc;
                     semi_inner_filter_op = (int)icond->op;
                     semi_inner_filter_val = icond->value;
+                    /* Copy text into plan arena — sub-query arena is freed after build */
+                    if (column_type_is_text(fct) && semi_inner_filter_val.value.as_text)
+                        semi_inner_filter_val.value.as_text =
+                            bump_strdup(&arena->scratch, semi_inner_filter_val.value.as_text);
                 } else {
-                    query_free(out_sq); return IDX_NONE; /* text WHERE — can't handle */
+                    query_free(out_sq); return IDX_NONE;
                 }
             } else {
                 query_free(out_sq); return IDX_NONE;
@@ -4677,62 +4681,104 @@ static uint32_t build_single_table(struct table *t, struct query_select *s,
     int have_source = 0;
     uint32_t current = IDX_NONE;
 
+    /* Extra filter condition index — set when COND_AND is decomposed into
+     * a semi-join (IN-subquery) + a simple comparison filter. */
+    uint32_t extra_filter_cond = IDX_NONE;
+
     if (s->where.has_where) {
         if (s->where.where_cond == IDX_NONE)
             return IDX_NONE;
         struct condition *cond = &COND(arena, s->where.where_cond);
-        if (cond->type != COND_COMPARE)
-            return IDX_NONE;
 
-        /* ---- IN-subquery → hash semi-join ---- */
-        if ((cond->op == CMP_IN || cond->op == CMP_NOT_IN) &&
-            cond->subquery_sql != IDX_NONE && db &&
-            cond->op == CMP_IN /* NOT IN is more complex — skip for now */) {
-
-            /* Check for mixed cell types in outer table first */
-            if (table_has_mixed_types(t))
-                return IDX_NONE;
-
-            struct query semi_sq = {0};
-            uint32_t semi_plan = build_semi_join(t, s, arena, db, &semi_sq);
-            if (semi_plan == IDX_NONE)
-                return IDX_NONE;
-
-            current = semi_plan;
-            query_free(&semi_sq);
-            have_source = 1;
-        } else {
-            /* ---- Standard simple comparison filter ---- */
-            if (cond->lhs_expr != IDX_NONE || cond->rhs_column.len != 0)
-                return IDX_NONE;
-            if (cond->scalar_subquery_sql != IDX_NONE) return IDX_NONE;
-            if (cond->subquery_sql != IDX_NONE) return IDX_NONE;
-            if (cond->in_values_count > 0) return IDX_NONE;
-            if (cond->array_values_count > 0) return IDX_NONE;
-            if (cond->is_any || cond->is_all) return IDX_NONE;
-            filter_col = table_find_column_sv(t, cond->column);
-            if (filter_col < 0) return IDX_NONE;
-            enum column_type ct = t->columns.items[filter_col].type;
-            if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BOOLEAN &&
-                ct != COLUMN_TYPE_FLOAT && ct != COLUMN_TYPE_NUMERIC &&
-                ct != COLUMN_TYPE_BIGINT && !column_type_is_text(ct))
-                return IDX_NONE;
-            if (cond->op > CMP_GE) return IDX_NONE;
-            /* For text columns, accept text comparison values */
-            if (column_type_is_text(ct)) {
-                if (!cond->value.is_null && !column_type_is_text(cond->value.type))
-                    return IDX_NONE;
-            } else {
-                /* Reject cross-type comparisons (e.g. INT col vs FLOAT value from subquery) */
-                if (!cond->value.is_null && cond->value.type != ct &&
-                    !(ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT) &&
-                    !(ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT))
-                    return IDX_NONE;
-                /* If INT column but FLOAT value, reject — fast path can't handle */
-                if (ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)
-                    return IDX_NONE;
+        /* ---- COND_AND: try to decompose into IN-subquery + simple filter ---- */
+        if (cond->type == COND_AND && cond->left != IDX_NONE && cond->right != IDX_NONE && db) {
+            struct condition *lc = &COND(arena, cond->left);
+            struct condition *rc = &COND(arena, cond->right);
+            /* Identify which child is the IN-subquery and which is the simple filter */
+            uint32_t in_cond_idx = IDX_NONE, other_cond_idx = IDX_NONE;
+            if (lc->type == COND_COMPARE && lc->op == CMP_IN && lc->subquery_sql != IDX_NONE) {
+                in_cond_idx = cond->left;
+                other_cond_idx = cond->right;
+            } else if (rc->type == COND_COMPARE && rc->op == CMP_IN && rc->subquery_sql != IDX_NONE) {
+                in_cond_idx = cond->right;
+                other_cond_idx = cond->left;
             }
-            filter_ok = 1;
+            if (in_cond_idx != IDX_NONE && other_cond_idx != IDX_NONE) {
+                /* Temporarily rewrite where_cond to point at just the IN child
+                 * so build_semi_join sees a simple COND_COMPARE */
+                uint32_t saved_where = s->where.where_cond;
+                s->where.where_cond = in_cond_idx;
+
+                if (!table_has_mixed_types(t)) {
+                    struct query semi_sq = {0};
+                    uint32_t semi_plan = build_semi_join(t, s, arena, db, &semi_sq);
+                    if (semi_plan != IDX_NONE) {
+                        current = semi_plan;
+                        query_free(&semi_sq);
+                        have_source = 1;
+                        extra_filter_cond = other_cond_idx;
+                    }
+                }
+
+                s->where.where_cond = saved_where;
+                /* If semi-join failed, fall through to bail out below */
+            }
+        }
+
+        if (!have_source) {
+            if (cond->type != COND_COMPARE)
+                return IDX_NONE;
+
+            /* ---- IN-subquery → hash semi-join ---- */
+            if ((cond->op == CMP_IN || cond->op == CMP_NOT_IN) &&
+                cond->subquery_sql != IDX_NONE && db &&
+                cond->op == CMP_IN /* NOT IN is more complex — skip for now */) {
+
+                /* Check for mixed cell types in outer table first */
+                if (table_has_mixed_types(t))
+                    return IDX_NONE;
+
+                struct query semi_sq = {0};
+                uint32_t semi_plan = build_semi_join(t, s, arena, db, &semi_sq);
+                if (semi_plan == IDX_NONE)
+                    return IDX_NONE;
+
+                current = semi_plan;
+                query_free(&semi_sq);
+                have_source = 1;
+            } else {
+                /* ---- Standard simple comparison filter ---- */
+                if (cond->lhs_expr != IDX_NONE || cond->rhs_column.len != 0)
+                    return IDX_NONE;
+                if (cond->scalar_subquery_sql != IDX_NONE) return IDX_NONE;
+                if (cond->subquery_sql != IDX_NONE) return IDX_NONE;
+                if (cond->in_values_count > 0) return IDX_NONE;
+                if (cond->array_values_count > 0) return IDX_NONE;
+                if (cond->is_any || cond->is_all) return IDX_NONE;
+                filter_col = table_find_column_sv(t, cond->column);
+                if (filter_col < 0) return IDX_NONE;
+                enum column_type ct = t->columns.items[filter_col].type;
+                if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BOOLEAN &&
+                    ct != COLUMN_TYPE_FLOAT && ct != COLUMN_TYPE_NUMERIC &&
+                    ct != COLUMN_TYPE_BIGINT && !column_type_is_text(ct))
+                    return IDX_NONE;
+                if (cond->op > CMP_GE) return IDX_NONE;
+                /* For text columns, accept text comparison values */
+                if (column_type_is_text(ct)) {
+                    if (!cond->value.is_null && !column_type_is_text(cond->value.type))
+                        return IDX_NONE;
+                } else {
+                    /* Reject cross-type comparisons (e.g. INT col vs FLOAT value from subquery) */
+                    if (!cond->value.is_null && cond->value.type != ct &&
+                        !(ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT) &&
+                        !(ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT))
+                        return IDX_NONE;
+                    /* If INT column but FLOAT value, reject — fast path can't handle */
+                    if (ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)
+                        return IDX_NONE;
+                }
+                filter_ok = 1;
+            }
         }
     }
 
@@ -4782,6 +4828,10 @@ static uint32_t build_single_table(struct table *t, struct query_select *s,
             }
         }
     }
+
+    /* Append extra filter from COND_AND decomposition (e.g. AND amount > 100) */
+    if (extra_filter_cond != IDX_NONE)
+        current = try_append_simple_filter(current, t, arena, arena, extra_filter_cond);
 
     /* Add SORT node if ORDER BY was validated */
     if (sort_nord > 0)
