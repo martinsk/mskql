@@ -290,22 +290,22 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 
 <table>
     <thead>
-        <tr><th>What it does</th><th>Type</th><th>Ratio</th><th></th><th></th></tr>
+        <tr><th>Workload</th><th>Type</th><th>Ratio</th><th></th><th></th></tr>
     </thead>
     <tbody>
-        <tr><td>SUM(price&nbsp;&times;&nbsp;qty) by category, 5K&nbsp;rows</td><td>batch</td><td class="bench-faster">0.10&times;</td><td>mskql 10&times; faster</td>
+        <tr><td><strong>Expression aggregate</strong> <span class="bench-detail">(SUM(price&times;qty), 5K rows)</span></td><td>batch</td><td class="bench-faster">0.10&times;</td><td>mskql 10&times; faster</td>
             <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:10%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
-        <tr><td>GROUP BY + SUM on 5K&nbsp;rows</td><td>batch</td><td class="bench-faster">0.12&times;</td><td>mskql 8&times; faster</td>
+        <tr><td><strong>Group + sum</strong> <span class="bench-detail">(5K rows)</span></td><td>batch</td><td class="bench-faster">0.12&times;</td><td>mskql 8&times; faster</td>
             <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:12%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
-        <tr><td>UPDATE 1K of 5K&nbsp;rows</td><td>batch</td><td class="bench-faster">0.20&times;</td><td>mskql 5&times; faster</td>
+        <tr><td><strong>Bulk update</strong> <span class="bench-detail">(1K of 5K rows)</span></td><td>batch</td><td class="bench-faster">0.20&times;</td><td>mskql 5&times; faster</td>
             <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:20%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
-        <tr><td>CTE &rarr; join &rarr; agg &rarr; sort, 50K&nbsp;rows</td><td>throughput</td><td class="bench-faster">152&times; QPS</td><td>74,069 vs 485 QPS</td>
+        <tr><td><strong>CTE star-schema</strong> <span class="bench-detail">(join &rarr; agg &rarr; sort, 50K rows)</span></td><td>throughput</td><td class="bench-faster">152&times; QPS</td><td>74,069 vs 485 QPS</td>
             <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:1%"></span></div></td></tr>
-        <tr><td>3-table join + GROUP BY, 50K&nbsp;rows</td><td>throughput</td><td class="bench-faster">64&times; QPS</td><td>23,560 vs 370 QPS</td>
+        <tr><td><strong>Three-table join + group</strong> <span class="bench-detail">(50K rows)</span></td><td>throughput</td><td class="bench-faster">64&times; QPS</td><td>23,560 vs 370 QPS</td>
             <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:2%"></span></div></td></tr>
-        <tr><td>GROUP BY + SUM, 5K&nbsp;rows</td><td>throughput</td><td class="bench-faster">6.0&times; QPS</td><td>60,541 vs 10,042 QPS</td>
+        <tr><td><strong>Group + sum</strong> <span class="bench-detail">(5K rows, throughput)</span></td><td>throughput</td><td class="bench-faster">6.0&times; QPS</td><td>60,541 vs 10,042 QPS</td>
             <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:17%"></span></div></td></tr>
-        <tr><td>80% reads / 20% writes</td><td>throughput</td><td class="bench-slower">0.78&times; QPS</td><td>PG&rsquo;s MVCC wins on writes</td>
+        <tr><td><strong>Mixed read/write</strong> <span class="bench-detail">(80/20)</span></td><td>throughput</td><td class="bench-slower">0.78&times; QPS</td><td>PG&rsquo;s MVCC wins on writes</td>
             <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:78%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
     </tbody>
 </table>

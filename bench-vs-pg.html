@@ -145,7 +145,7 @@
     </colgroup>
     <thead>
         <tr>
-            <th>What it does</th>
+            <th>Workload</th>
             <th class="num" style="text-align:right">mskql&ensp;(ms)</th>
             <th class="num" style="text-align:right">pg&ensp;(ms)</th>
             <th class="num" style="text-align:right">Ratio</th>
@@ -155,42 +155,42 @@
     <tbody>
         <tr class="group-label"><td colspan="5">reads &amp; scans</td></tr>
         <tr>
-            <td><strong>SELECT * on 5K rows</strong> &times;200</td>
+            <td><strong>Full table scan</strong> <span class="bench-detail">(5K rows &times;200)</span></td>
             <td class="num">301</td>
             <td class="num">444</td>
             <td class="num"><span class="faster">0.68&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:68%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>WHERE filter on 5K rows</strong> &times;500</td>
+            <td><strong>Filtered scan</strong> <span class="bench-detail">(5K rows &times;500)</span></td>
             <td class="num">366</td>
             <td class="num">623</td>
             <td class="num"><span class="faster">0.59&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:59%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>Indexed point lookup</strong> &times;2K</td>
+            <td><strong>Indexed point lookup</strong> <span class="bench-detail">(&times;2K)</span></td>
             <td class="num">105</td>
             <td class="num">108</td>
             <td class="num"><span class="faster">0.98&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:98%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>ORDER BY on 5K rows</strong> &times;200</td>
+            <td><strong>Sort</strong> <span class="bench-detail">(5K rows &times;200)</span></td>
             <td class="num">204</td>
             <td class="num">365</td>
             <td class="num"><span class="faster">0.56&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:56%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>Multi-column sort on 5K rows</strong> &times;200</td>
+            <td><strong>Multi-column sort</strong> <span class="bench-detail">(5K rows &times;200)</span></td>
             <td class="num">281</td>
             <td class="num">517</td>
             <td class="num"><span class="faster">0.54&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:54%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>DISTINCT on 100 categories</strong> &times;500</td>
+            <td><strong>Distinct</strong> <span class="bench-detail">(100 categories &times;500)</span></td>
             <td class="num">37</td>
             <td class="num">266</td>
             <td class="num"><span class="faster">0.14&times;</span></td>
@@ -198,28 +198,28 @@
         </tr>
         <tr class="group-label"><td colspan="5">writes</td></tr>
         <tr>
-            <td><strong>10K single-row INSERTs</strong></td>
+            <td><strong>Single-row inserts</strong> <span class="bench-detail">(10K)</span></td>
             <td class="num">314</td>
             <td class="num">856</td>
             <td class="num"><span class="faster">0.37&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:37%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>UPDATE 1K of 5K rows</strong> &times;200</td>
+            <td><strong>Bulk update</strong> <span class="bench-detail">(1K of 5K rows &times;200)</span></td>
             <td class="num">49</td>
             <td class="num">242</td>
             <td class="num"><span class="faster">0.20&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:20%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>Insert 2K + delete half</strong> &times;50</td>
+            <td><strong>Insert + delete</strong> <span class="bench-detail">(2K rows, delete half &times;50)</span></td>
             <td class="num">2,909</td>
             <td class="num">8,029</td>
             <td class="num"><span class="faster">0.36&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:36%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>100 txns, 50 inserts each</strong></td>
+            <td><strong>Transactional inserts</strong> <span class="bench-detail">(100 txns, 50 each)</span></td>
             <td class="num">175</td>
             <td class="num">188</td>
             <td class="num"><span class="faster">0.93&times;</span></td>
@@ -227,35 +227,35 @@
         </tr>
         <tr class="group-label"><td colspan="5">aggregation &amp; analytics</td></tr>
         <tr>
-            <td><strong>GROUP BY + SUM on 5K rows</strong> &times;500</td>
+            <td><strong>Group + sum</strong> <span class="bench-detail">(5K rows &times;500)</span></td>
             <td class="num">33</td>
             <td class="num">282</td>
             <td class="num"><span class="faster">0.12&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:12%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>SUM(price&times;qty) by category</strong> &times;500</td>
+            <td><strong>Expression aggregate</strong> <span class="bench-detail">(SUM(price&times;qty), 5K rows &times;500)</span></td>
             <td class="num">33</td>
             <td class="num">322</td>
             <td class="num"><span class="faster">0.10&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:10%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>7-col agg (COUNT,AVG,SUM,MIN,MAX) 50K rows</strong> &times;20</td>
+            <td><strong>Wide aggregate</strong> <span class="bench-detail">(7 columns, 50K rows &times;20)</span></td>
             <td class="num">23</td>
             <td class="num">163</td>
             <td class="num"><span class="faster">0.14&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:14%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>ROW_NUMBER() OVER on 5K rows</strong> &times;20</td>
+            <td><strong>Window function</strong> <span class="bench-detail">(ROW_NUMBER, 5K rows &times;20)</span></td>
             <td class="num">52</td>
             <td class="num">92</td>
             <td class="num"><span class="faster">0.57&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:57%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>RANK() OVER on 50K rows</strong> &times;5</td>
+            <td><strong>Window function</strong> <span class="bench-detail">(RANK, 50K rows &times;5)</span></td>
             <td class="num">128</td>
             <td class="num">231</td>
             <td class="num"><span class="faster">0.55&times;</span></td>
@@ -263,56 +263,56 @@
         </tr>
         <tr class="group-label"><td colspan="5">joins, subqueries &amp; complex queries</td></tr>
         <tr>
-            <td><strong>500 users JOIN 2K orders</strong> &times;50</td>
+            <td><strong>Two-table join</strong> <span class="bench-detail">(500 + 2K rows &times;50)</span></td>
             <td class="num">28</td>
             <td class="num">62</td>
             <td class="num"><span class="faster">0.45&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:45%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>3-table join + GROUP BY, 50K rows</strong> &times;5</td>
+            <td><strong>Three-table join + group</strong> <span class="bench-detail">(50K rows &times;5)</span></td>
             <td class="num">35</td>
             <td class="num">106</td>
             <td class="num"><span class="faster">0.33&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:33%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>WHERE id IN (SELECT&hellip;)</strong> &times;50</td>
+            <td><strong>Subquery filter</strong> <span class="bench-detail">(IN subquery &times;50)</span></td>
             <td class="num">43</td>
             <td class="num">99</td>
             <td class="num"><span class="faster">0.44&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:44%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>IN subquery + WHERE + sort + limit, 50K</strong> &times;20</td>
+            <td><strong>Subquery pipeline</strong> <span class="bench-detail">(filter + sort + limit, 50K &times;20)</span></td>
             <td class="num">27</td>
             <td class="num">138</td>
             <td class="num"><span class="faster">0.20&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:20%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>CTE filter chain on 5K rows</strong> &times;200</td>
+            <td><strong>CTE filter chain</strong> <span class="bench-detail">(5K rows &times;200)</span></td>
             <td class="num">52</td>
             <td class="num">118</td>
             <td class="num"><span class="faster">0.44&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:44%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>CTE &rarr; agg &rarr; sort &rarr; limit, 50K</strong> &times;20</td>
+            <td><strong>CTE pipeline</strong> <span class="bench-detail">(agg &rarr; sort &rarr; limit, 50K &times;20)</span></td>
             <td class="num">59</td>
             <td class="num">79</td>
             <td class="num"><span class="faster">0.75&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:75%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>CTE &rarr; join &rarr; agg &rarr; sort, 50K</strong> &times;5</td>
+            <td><strong>CTE star-schema</strong> <span class="bench-detail">(join &rarr; agg &rarr; sort, 50K &times;5)</span></td>
             <td class="num">31</td>
             <td class="num">77</td>
             <td class="num"><span class="faster">0.40&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:40%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>UNION of two 2K-row tables</strong> &times;50</td>
+            <td><strong>Union</strong> <span class="bench-detail">(two 2K-row tables &times;50)</span></td>
             <td class="num">55</td>
             <td class="num">101</td>
             <td class="num"><span class="faster">0.54&times;</span></td>
@@ -320,14 +320,14 @@
         </tr>
         <tr class="group-label"><td colspan="5">functions &amp; generation</td></tr>
         <tr>
-            <td><strong>generate_series(1, 10000)</strong> &times;200</td>
+            <td><strong>Generate series</strong> <span class="bench-detail">(10K rows &times;200)</span></td>
             <td class="num">215</td>
             <td class="num">674</td>
             <td class="num"><span class="faster">0.32&times;</span></td>
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:32%"></span><span class="bar bar-pg" style="width:100%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>UPPER, LENGTH, ABS, ROUND on 5K rows</strong> &times;200</td>
+            <td><strong>Scalar functions</strong> <span class="bench-detail">(4 functions, 5K rows &times;200)</span></td>
             <td class="num">384</td>
             <td class="num">963</td>
             <td class="num"><span class="faster">0.40&times;</span></td>
@@ -335,7 +335,7 @@
         </tr>
         <tr class="group-label"><td colspan="5">large dataset (50K rows)</td></tr>
         <tr>
-            <td><strong>ORDER BY on 50K rows</strong> &times;10</td>
+            <td><strong>Large sort</strong> <span class="bench-detail">(50K rows &times;10)</span></td>
             <td class="num">313</td>
             <td class="num">359</td>
             <td class="num"><span class="faster">0.87&times;</span></td>
@@ -372,7 +372,7 @@
     </colgroup>
     <thead>
         <tr>
-            <th>What it does</th>
+            <th>Workload</th>
             <th class="num" style="text-align:right">mskql QPS</th>
             <th class="num" style="text-align:right">pg QPS</th>
             <th class="num" style="text-align:right">Ratio</th>
@@ -384,7 +384,7 @@
     <tbody>
         <tr class="group-label"><td colspan="7">simple reads &amp; writes</td></tr>
         <tr>
-            <td><strong>Indexed single-row lookup</strong></td>
+            <td><strong>Indexed point lookup</strong></td>
             <td class="num">78,600</td>
             <td class="num">23,461</td>
             <td class="num"><span class="tp-higher">3.35&times;</span></td>
@@ -393,7 +393,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:30%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>SELECT * on 5K rows</strong></td>
+            <td><strong>Full table scan</strong> <span class="bench-detail">(5K rows)</span></td>
             <td class="num">121</td>
             <td class="num">120</td>
             <td class="num"><span class="tp-higher">1.00&times;</span></td>
@@ -402,7 +402,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:99%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>WHERE filter on 5K rows</strong></td>
+            <td><strong>Filtered scan</strong> <span class="bench-detail">(5K rows)</span></td>
             <td class="num">245</td>
             <td class="num">241</td>
             <td class="num"><span class="tp-higher">1.02&times;</span></td>
@@ -411,7 +411,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:98%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>Single-row INSERT</strong></td>
+            <td><strong>Single-row insert</strong></td>
             <td class="num">63,253</td>
             <td class="num">39,189</td>
             <td class="num"><span class="tp-higher">1.61&times;</span></td>
@@ -420,7 +420,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:62%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>80% reads / 20% writes</strong></td>
+            <td><strong>Mixed read/write</strong> <span class="bench-detail">(80/20)</span></td>
             <td class="num">45,252</td>
             <td class="num">58,001</td>
             <td class="num"><span class="tp-lower">0.78&times;</span></td>
@@ -430,7 +430,7 @@
         </tr>
         <tr class="group-label"><td colspan="7">aggregation &amp; analytics</td></tr>
         <tr>
-            <td><strong>GROUP BY + SUM, 5K rows</strong></td>
+            <td><strong>Group + sum</strong> <span class="bench-detail">(5K rows)</span></td>
             <td class="num">60,541</td>
             <td class="num">10,042</td>
             <td class="num"><span class="tp-higher">6.03&times;</span></td>
@@ -439,7 +439,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:17%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>7-col agg on 50K rows</strong></td>
+            <td><strong>Wide aggregate</strong> <span class="bench-detail">(50K rows)</span></td>
             <td class="num">5,386</td>
             <td class="num">786</td>
             <td class="num"><span class="tp-higher">6.85&times;</span></td>
@@ -448,7 +448,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:15%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>RANK() OVER on 50K rows</strong></td>
+            <td><strong>Window function</strong> <span class="bench-detail">(RANK, 50K rows)</span></td>
             <td class="num">14</td>
             <td class="num">12</td>
             <td class="num"><span class="tp-higher">1.22&times;</span></td>
@@ -458,7 +458,7 @@
         </tr>
         <tr class="group-label"><td colspan="7">complex queries (50K-row dataset)</td></tr>
         <tr>
-            <td><strong>500 users JOIN 2K orders</strong></td>
+            <td><strong>Two-table join</strong> <span class="bench-detail">(500 + 2K rows)</span></td>
             <td class="num">562</td>
             <td class="num">302</td>
             <td class="num"><span class="tp-higher">1.86&times;</span></td>
@@ -467,7 +467,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:54%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>3-table join + GROUP BY</strong></td>
+            <td><strong>Three-table join + group</strong></td>
             <td class="num">23,560</td>
             <td class="num">370</td>
             <td class="num"><span class="tp-higher">63.6&times;</span></td>
@@ -476,7 +476,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:2%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>CTE &rarr; agg &rarr; sort &rarr; limit</strong></td>
+            <td><strong>CTE pipeline</strong> <span class="bench-detail">(agg &rarr; sort &rarr; limit)</span></td>
             <td class="num">5,606</td>
             <td class="num">1,920</td>
             <td class="num"><span class="tp-higher">2.92&times;</span></td>
@@ -485,7 +485,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:34%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>IN subquery + filter + sort + limit</strong></td>
+            <td><strong>Subquery pipeline</strong> <span class="bench-detail">(filter + sort + limit)</span></td>
             <td class="num">1,170</td>
             <td class="num">898</td>
             <td class="num"><span class="tp-higher">1.30&times;</span></td>
@@ -494,7 +494,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:77%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>ORDER BY on 50K rows</strong></td>
+            <td><strong>Large sort</strong> <span class="bench-detail">(50K rows)</span></td>
             <td class="num">30</td>
             <td class="num">12</td>
             <td class="num"><span class="tp-higher">2.54&times;</span></td>
@@ -503,7 +503,7 @@
             <td class="bar-cell"><div class="bar-wrap"><span class="bar bar-mskql" style="width:100%"></span><span class="bar bar-pg" style="width:39%"></span></div></td>
         </tr>
         <tr>
-            <td><strong>CTE &rarr; join &rarr; agg &rarr; sort</strong></td>
+            <td><strong>CTE star-schema</strong> <span class="bench-detail">(join &rarr; agg &rarr; sort)</span></td>
             <td class="num">74,069</td>
             <td class="num">485</td>
             <td class="num"><span class="tp-higher">152.5&times;</span></td>
