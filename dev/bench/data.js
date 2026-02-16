@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1771280929085,
+  "lastUpdate": 1771281113432,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -7207,6 +7207,192 @@ window.BENCHMARK_DATA = {
             "value": 83.617,
             "unit": "ms",
             "extra": "iters=5  min=16.386  p50=16.478  p95=17.552  p99=17.763  max=17.816"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "040391d509349c7085cd44e12b6d9f49edc91e41",
+          "message": "rename test_bug_*.sql test files to test_regression_*.sql: rename 33 test files from test_bug_ prefix to test_regression_ prefix to better reflect their purpose as regression tests rather than active bug reports",
+          "timestamp": "2026-02-16T14:30:53-08:00",
+          "tree_id": "74e52354d93f864e866f14ccd068a507f910da54",
+          "url": "https://github.com/martinsk/mskql/commit/040391d509349c7085cd44e12b6d9f49edc91e41"
+        },
+        "date": 1771281112914,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 17.849,
+            "unit": "ms",
+            "extra": "iters=10000  min=0.002  p50=0.002  p95=0.003  p99=0.004  max=0.067"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 202.701,
+            "unit": "ms",
+            "extra": "iters=200  min=0.979  p50=0.990  p95=1.096  p99=1.473  max=1.492"
+          },
+          {
+            "name": "select_where",
+            "value": 130.86,
+            "unit": "ms",
+            "extra": "iters=500  min=0.245  p50=0.254  p95=0.280  p99=0.413  max=0.522"
+          },
+          {
+            "name": "aggregate",
+            "value": 248.845,
+            "unit": "ms",
+            "extra": "iters=500  min=0.481  p50=0.493  p95=0.531  p99=0.591  max=0.789"
+          },
+          {
+            "name": "order_by",
+            "value": 247.546,
+            "unit": "ms",
+            "extra": "iters=200  min=1.219  p50=1.234  p95=1.268  p99=1.292  max=1.310"
+          },
+          {
+            "name": "join",
+            "value": 35.608,
+            "unit": "ms",
+            "extra": "iters=50  min=0.701  p50=0.711  p95=0.729  p99=0.735  max=0.737"
+          },
+          {
+            "name": "update",
+            "value": 30.635,
+            "unit": "ms",
+            "extra": "iters=200  min=0.150  p50=0.151  p95=0.161  p99=0.164  max=0.168"
+          },
+          {
+            "name": "delete",
+            "value": 142.033,
+            "unit": "ms",
+            "extra": "iters=50  min=2.815  p50=2.835  p95=2.892  p99=2.935  max=2.956"
+          },
+          {
+            "name": "parser",
+            "value": 387.789,
+            "unit": "ms",
+            "extra": "iters=50000  min=0.001  p50=0.005  p95=0.021  p99=0.021  max=0.051"
+          },
+          {
+            "name": "index_lookup",
+            "value": 7.338,
+            "unit": "ms",
+            "extra": "iters=2000  min=0.003  p50=0.004  p95=0.004  p99=0.004  max=0.013"
+          },
+          {
+            "name": "transaction",
+            "value": 22.674,
+            "unit": "ms",
+            "extra": "iters=100  min=0.115  p50=0.225  p95=0.327  p99=0.340  max=0.341"
+          },
+          {
+            "name": "window_functions",
+            "value": 37.509,
+            "unit": "ms",
+            "extra": "iters=20  min=1.860  p50=1.873  p95=1.901  p99=1.911  max=1.913"
+          },
+          {
+            "name": "distinct",
+            "value": 69.747,
+            "unit": "ms",
+            "extra": "iters=500  min=0.134  p50=0.137  p95=0.149  p99=0.164  max=0.197"
+          },
+          {
+            "name": "subquery",
+            "value": 239.253,
+            "unit": "ms",
+            "extra": "iters=50  min=4.710  p50=4.737  p95=5.002  p99=5.145  max=5.163"
+          },
+          {
+            "name": "cte",
+            "value": 137.898,
+            "unit": "ms",
+            "extra": "iters=200  min=0.672  p50=0.686  p95=0.709  p99=0.760  max=0.791"
+          },
+          {
+            "name": "generate_series",
+            "value": 145.845,
+            "unit": "ms",
+            "extra": "iters=200  min=0.706  p50=0.723  p95=0.752  p99=0.926  max=1.013"
+          },
+          {
+            "name": "scalar_functions",
+            "value": 352.365,
+            "unit": "ms",
+            "extra": "iters=200  min=1.739  p50=1.756  p95=1.787  p99=1.860  max=1.987"
+          },
+          {
+            "name": "expression_agg",
+            "value": 470.298,
+            "unit": "ms",
+            "extra": "iters=500  min=0.919  p50=0.938  p95=0.960  p99=1.016  max=1.076"
+          },
+          {
+            "name": "multi_sort",
+            "value": 160.613,
+            "unit": "ms",
+            "extra": "iters=200  min=0.785  p50=0.799  p95=0.822  p99=0.895  max=0.966"
+          },
+          {
+            "name": "set_ops",
+            "value": 1356.221,
+            "unit": "ms",
+            "extra": "iters=50  min=26.831  p50=27.124  p95=27.273  p99=27.405  max=27.431"
+          },
+          {
+            "name": "multi_join",
+            "value": 697.818,
+            "unit": "ms",
+            "extra": "iters=5  min=128.091  p50=140.633  p95=149.040  p99=149.474  max=149.583"
+          },
+          {
+            "name": "analytical_cte",
+            "value": 874.824,
+            "unit": "ms",
+            "extra": "iters=20  min=43.322  p50=43.676  p95=44.242  p99=44.448  max=44.500"
+          },
+          {
+            "name": "wide_agg",
+            "value": 1037.832,
+            "unit": "ms",
+            "extra": "iters=20  min=51.377  p50=51.682  p95=52.516  p99=54.688  max=55.231"
+          },
+          {
+            "name": "large_sort",
+            "value": 120.036,
+            "unit": "ms",
+            "extra": "iters=10  min=11.456  p50=11.966  p95=12.763  p99=12.861  max=12.885"
+          },
+          {
+            "name": "subquery_complex",
+            "value": 325.841,
+            "unit": "ms",
+            "extra": "iters=20  min=15.981  p50=16.198  p95=17.111  p99=17.444  max=17.527"
+          },
+          {
+            "name": "window_rank",
+            "value": 185.252,
+            "unit": "ms",
+            "extra": "iters=5  min=33.564  p50=37.202  p95=39.313  p99=39.608  max=39.681"
+          },
+          {
+            "name": "mixed_analytical",
+            "value": 85.131,
+            "unit": "ms",
+            "extra": "iters=5  min=16.722  p50=16.782  p95=17.767  p99=17.944  max=17.988"
           }
         ]
       }
