@@ -1060,7 +1060,7 @@ static int send_row_desc_plan(int fd, struct table *t, struct table **join_table
 /* ---- Result cache: replay cached wire bytes for identical SELECT queries ---- */
 
 #define RCACHE_SLOTS 8192
-#define RCACHE_MAX_BYTES (512 * 1024) /* max cached wire data per entry */
+#define RCACHE_MAX_BYTES (4 * 1024 * 1024) /* max cached wire data per entry */
 
 struct rcache_entry {
     uint32_t sql_hash;

@@ -3384,28 +3384,74 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
     uint16_t child_ncols = _bsort_ctx.ncols;
     row_block_reset(out);
-    uint16_t out_count = 0;
 
-    /* Emit sorted rows directly from flat arrays — no block remap needed */
-    for (uint16_t c = 0; c < child_ncols; c++)
-        out->cols[c].type = _bsort_ctx.flat_col_types[c];
+    uint32_t remain = st->sorted_count - st->emit_cursor;
+    uint16_t out_count = (remain < BLOCK_CAPACITY) ? (uint16_t)remain : BLOCK_CAPACITY;
+    const uint32_t *idx = st->sorted_indices + st->emit_cursor;
 
-    while (st->emit_cursor < st->sorted_count && out_count < BLOCK_CAPACITY) {
-        uint32_t fi = st->sorted_indices[st->emit_cursor++];
+    /* Column-oriented gather emit — switch on type once per column,
+     * tight typed loop for the block. */
+    for (uint16_t c = 0; c < child_ncols; c++) {
+        struct col_block *ocb = &out->cols[c];
+        enum column_type ct = _bsort_ctx.flat_col_types[c];
+        const uint8_t *src_nulls = _bsort_ctx.flat_col_nulls[c];
+        const void *src_data = _bsort_ctx.flat_col_data[c];
+        ocb->type = ct;
+        ocb->count = out_count;
 
-        for (uint16_t c = 0; c < child_ncols; c++) {
-            out->cols[c].nulls[out_count] = _bsort_ctx.flat_col_nulls[c][fi];
-            enum column_type ct = _bsort_ctx.flat_col_types[c];
-            size_t esz = col_type_elem_size(ct);
-            memcpy(cb_data_ptr(&out->cols[c], (uint32_t)out_count),
-                   (const uint8_t *)_bsort_ctx.flat_col_data[c] + fi * esz, esz);
+        for (uint16_t r = 0; r < out_count; r++)
+            ocb->nulls[r] = src_nulls[idx[r]];
+
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT: {
+            const int16_t *s = (const int16_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i16[r] = s[idx[r]];
+            break;
         }
-        out_count++;
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_DATE: {
+            const int32_t *s = (const int32_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i32[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_BIGINT:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            const int64_t *s = (const int64_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i64[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC: {
+            const double *s = (const double *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.f64[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_UUID: {
+            char *const *s = (char *const *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.str[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_INTERVAL: {
+            const struct interval *s = (const struct interval *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.iv[r] = s[idx[r]];
+            break;
+        }
+        }
     }
 
+    st->emit_cursor += out_count;
     out->count = out_count;
-    for (uint16_t c = 0; c < child_ncols; c++)
-        out->cols[c].count = out_count;
 
     return 0;
 }
@@ -4016,61 +4062,107 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     /* Emit phase: output blocks with passthrough + window columns */
     if (st->emit_cursor >= st->total_rows) return -1;
 
-    uint16_t out_ncols = pn->window.out_ncols;
     uint16_t n_pass = pn->window.n_pass;
     uint16_t nw = pn->window.n_win;
     row_block_reset(out);
-    uint16_t out_count = 0;
 
-    /* Set output column types */
-    for (uint16_t c = 0; c < n_pass; c++)
-        out->cols[c].type = st->flat_types[pn->window.pass_cols[c]];
-    for (uint16_t w = 0; w < nw; w++)
-        out->cols[n_pass + w].type = st->win_is_str[w] ? COLUMN_TYPE_TEXT
-                                   : st->win_is_dbl[w] ? COLUMN_TYPE_FLOAT
-                                   : COLUMN_TYPE_INT;
+    uint32_t remain = st->total_rows - st->emit_cursor;
+    uint16_t out_count = (remain < BLOCK_CAPACITY) ? (uint16_t)remain : BLOCK_CAPACITY;
+    const uint32_t *idx = st->sorted + st->emit_cursor;
 
-    while (st->emit_cursor < st->total_rows && out_count < BLOCK_CAPACITY) {
-        uint32_t fi = st->sorted[st->emit_cursor++];
+    /* Column-oriented gather emit for passthrough columns */
+    for (uint16_t c = 0; c < n_pass; c++) {
+        int sci = pn->window.pass_cols[c];
+        struct col_block *ocb = &out->cols[c];
+        enum column_type ct = st->flat_types[sci];
+        const uint8_t *src_nulls = st->flat_nulls[sci];
+        const void *src_data = st->flat_data[sci];
+        ocb->type = ct;
+        ocb->count = out_count;
 
-        /* Passthrough columns */
-        for (uint16_t c = 0; c < n_pass; c++) {
-            int sci = pn->window.pass_cols[c];
-            out->cols[c].nulls[out_count] = st->flat_nulls[sci][fi];
-            enum column_type ct = st->flat_types[sci];
-            size_t esz = col_type_elem_size(ct);
-            memcpy(cb_data_ptr(&out->cols[c], out_count),
-                   (const uint8_t *)st->flat_data[sci] + fi * esz, esz);
+        for (uint16_t r = 0; r < out_count; r++)
+            ocb->nulls[r] = src_nulls[idx[r]];
+
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT: {
+            const int16_t *s = (const int16_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i16[r] = s[idx[r]];
+            break;
         }
-
-        /* Window result columns — indexed by original row index (fi) */
-        for (uint16_t w = 0; w < nw; w++) {
-            uint16_t oc = n_pass + w;
-            if (st->win_null[fi * nw + w]) {
-                out->cols[oc].nulls[out_count] = 1;
-                if (st->win_is_str[w])
-                    out->cols[oc].data.str[out_count] = NULL;
-                else if (st->win_is_dbl[w])
-                    out->cols[oc].data.f64[out_count] = 0.0;
-                else
-                    out->cols[oc].data.i32[out_count] = 0;
-            } else if (st->win_is_str[w]) {
-                out->cols[oc].nulls[out_count] = 0;
-                out->cols[oc].data.str[out_count] = st->win_str[fi * nw + w];
-            } else if (st->win_is_dbl[w]) {
-                out->cols[oc].nulls[out_count] = 0;
-                out->cols[oc].data.f64[out_count] = st->win_f64[fi * nw + w];
-            } else {
-                out->cols[oc].nulls[out_count] = 0;
-                out->cols[oc].data.i32[out_count] = st->win_i32[fi * nw + w];
-            }
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_DATE: {
+            const int32_t *s = (const int32_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i32[r] = s[idx[r]];
+            break;
         }
-        out_count++;
+        case COLUMN_TYPE_BIGINT:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            const int64_t *s = (const int64_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i64[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC: {
+            const double *s = (const double *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.f64[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_UUID: {
+            char *const *s = (char *const *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.str[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_INTERVAL: {
+            const struct interval *s = (const struct interval *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.iv[r] = s[idx[r]];
+            break;
+        }
+        }
     }
 
+    /* Window result columns — indexed by original row index */
+    for (uint16_t w = 0; w < nw; w++) {
+        uint16_t oc = n_pass + w;
+        struct col_block *ocb = &out->cols[oc];
+        ocb->type = st->win_is_str[w] ? COLUMN_TYPE_TEXT
+                  : st->win_is_dbl[w] ? COLUMN_TYPE_FLOAT
+                  : COLUMN_TYPE_INT;
+        ocb->count = out_count;
+
+        if (st->win_is_str[w]) {
+            for (uint16_t r = 0; r < out_count; r++) {
+                uint32_t fi = idx[r];
+                ocb->nulls[r] = st->win_null[fi * nw + w];
+                ocb->data.str[r] = st->win_str[fi * nw + w];
+            }
+        } else if (st->win_is_dbl[w]) {
+            for (uint16_t r = 0; r < out_count; r++) {
+                uint32_t fi = idx[r];
+                ocb->nulls[r] = st->win_null[fi * nw + w];
+                ocb->data.f64[r] = st->win_f64[fi * nw + w];
+            }
+        } else {
+            for (uint16_t r = 0; r < out_count; r++) {
+                uint32_t fi = idx[r];
+                ocb->nulls[r] = st->win_null[fi * nw + w];
+                ocb->data.i32[r] = st->win_i32[fi * nw + w];
+            }
+        }
+    }
+
+    st->emit_cursor += out_count;
     out->count = out_count;
-    for (uint16_t c = 0; c < out_ncols; c++)
-        out->cols[c].count = out_count;
 
     return 0;
 }
