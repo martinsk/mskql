@@ -43,24 +43,29 @@ int cell_compare(const struct cell *a, const struct cell *b)
     if (a_null && b_null) return 0;
     if (a_null) return 1;  /* NULL sorts last */
     if (b_null) return -1;
-    /* promote SMALLINT/INT <-> FLOAT for numeric comparison */
-    int a_is_int = (a->type == COLUMN_TYPE_INT || a->type == COLUMN_TYPE_SMALLINT);
-    int b_is_int = (b->type == COLUMN_TYPE_INT || b->type == COLUMN_TYPE_SMALLINT);
+    /* promote SMALLINT/INT/BIGINT <-> FLOAT for numeric comparison */
+    int a_is_int = (a->type == COLUMN_TYPE_INT || a->type == COLUMN_TYPE_SMALLINT || a->type == COLUMN_TYPE_BIGINT);
+    int b_is_int = (b->type == COLUMN_TYPE_INT || b->type == COLUMN_TYPE_SMALLINT || b->type == COLUMN_TYPE_BIGINT);
     if ((a_is_int && b->type == COLUMN_TYPE_FLOAT) ||
         (a->type == COLUMN_TYPE_FLOAT && b_is_int)) {
         double da = (a->type == COLUMN_TYPE_FLOAT) ? a->value.as_float :
+                    (a->type == COLUMN_TYPE_BIGINT) ? (double)a->value.as_bigint :
                     (a->type == COLUMN_TYPE_SMALLINT) ? (double)a->value.as_smallint : (double)a->value.as_int;
         double db = (b->type == COLUMN_TYPE_FLOAT) ? b->value.as_float :
+                    (b->type == COLUMN_TYPE_BIGINT) ? (double)b->value.as_bigint :
                     (b->type == COLUMN_TYPE_SMALLINT) ? (double)b->value.as_smallint : (double)b->value.as_int;
         if (da < db) return -1;
         if (da > db) return  1;
         return 0;
     }
-    /* promote SMALLINT <-> INT */
-    if ((a->type == COLUMN_TYPE_SMALLINT && b->type == COLUMN_TYPE_INT) ||
-        (a->type == COLUMN_TYPE_INT && b->type == COLUMN_TYPE_SMALLINT)) {
-        int va = (a->type == COLUMN_TYPE_SMALLINT) ? (int)a->value.as_smallint : a->value.as_int;
-        int vb = (b->type == COLUMN_TYPE_SMALLINT) ? (int)b->value.as_smallint : b->value.as_int;
+    /* promote SMALLINT/INT <-> BIGINT */
+    if (a_is_int && b_is_int && a->type != b->type) {
+        long long va = (a->type == COLUMN_TYPE_BIGINT) ? (long long)a->value.as_bigint :
+                       (a->type == COLUMN_TYPE_SMALLINT) ? (long long)a->value.as_smallint :
+                       (long long)a->value.as_int;
+        long long vb = (b->type == COLUMN_TYPE_BIGINT) ? (long long)b->value.as_bigint :
+                       (b->type == COLUMN_TYPE_SMALLINT) ? (long long)b->value.as_smallint :
+                       (long long)b->value.as_int;
         if (va < vb) return -1;
         if (va > vb) return  1;
         return 0;

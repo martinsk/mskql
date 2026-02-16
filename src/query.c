@@ -3570,6 +3570,82 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                 break;
             case AGG_SUM:
             case AGG_AVG:
+                if (ae->has_distinct && (agg_col[a] >= 0 || agg_col[a] == -2)) {
+                    /* SUM/AVG(DISTINCT col): re-scan rows, accumulate only unique values */
+                    double dsum = 0.0; size_t dcount = 0;
+                    struct cell *seen_d = nonnull_count[a] > 0
+                        ? bump_calloc(&arena->scratch, nonnull_count[a], sizeof(struct cell)) : NULL;
+                    int nseen_d = 0;
+                    for (size_t i = 0; i < t->rows.count; i++) {
+                        if (s->where.has_where) {
+                            if (s->where.where_cond != IDX_NONE) {
+                                if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
+                                    continue;
+                            } else if (where_col >= 0) {
+                                if (!cell_equal(&t->rows.items[i].cells.items[where_col], &s->where.where_value))
+                                    continue;
+                            }
+                        }
+                        if (ae->filter_cond != IDX_NONE) {
+                            if (!eval_condition(ae->filter_cond, arena, &t->rows.items[i], t, NULL))
+                                continue;
+                        }
+                        struct cell ev;
+                        struct cell *cv;
+                        if (agg_col[a] == -2) {
+                            ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL);
+                            cv = &ev;
+                        } else {
+                            cv = &t->rows.items[i].cells.items[agg_col[a]];
+                        }
+                        if (cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text))
+                            continue;
+                        int dup = 0;
+                        for (int d = 0; d < nseen_d; d++) {
+                            if (cell_compare(cv, &seen_d[d]) == 0) { dup = 1; break; }
+                        }
+                        if (dup) continue;
+                        if (seen_d) seen_d[nseen_d++] = *cv;
+                        switch (cv->type) {
+                            case COLUMN_TYPE_SMALLINT: dsum += (double)cv->value.as_smallint; break;
+                            case COLUMN_TYPE_INT:      dsum += (double)cv->value.as_int; break;
+                            case COLUMN_TYPE_BIGINT:   dsum += (double)cv->value.as_bigint; break;
+                            case COLUMN_TYPE_FLOAT:
+                            case COLUMN_TYPE_NUMERIC:  dsum += cv->value.as_float; break;
+                            case COLUMN_TYPE_BOOLEAN:
+                            case COLUMN_TYPE_TEXT:
+                            case COLUMN_TYPE_ENUM:
+                            case COLUMN_TYPE_UUID:
+                            case COLUMN_TYPE_DATE:
+                            case COLUMN_TYPE_TIME:
+                            case COLUMN_TYPE_TIMESTAMP:
+                            case COLUMN_TYPE_TIMESTAMPTZ:
+                            case COLUMN_TYPE_INTERVAL:  break;
+                        }
+                        dcount++;
+                    }
+                    if (dcount == 0) {
+                        c.type = col_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_BIGINT;
+                        c.is_null = 1;
+                    } else if (ae->func == AGG_AVG) {
+                        c.type = COLUMN_TYPE_FLOAT;
+                        c.value.as_float = dsum / (double)dcount;
+                    } else if (col_is_float) {
+                        c.type = COLUMN_TYPE_FLOAT;
+                        c.value.as_float = dsum;
+                    } else if (dsum == (double)(int)dsum && dsum >= -2147483648.0 && dsum <= 2147483647.0) {
+                        c.type = COLUMN_TYPE_INT;
+                        c.value.as_int = (int)dsum;
+                    } else {
+                        c.type = COLUMN_TYPE_BIGINT;
+                        c.value.as_bigint = (long long)dsum;
+                    }
+                } else {
+                    c = agg_build_result_cell(ae, a, sums, nonnull_count, minmax_init,
+                                              min_cells, max_cells, col_is_float,
+                                              col_is_bigint, col_is_text, rb);
+                }
+                break;
             case AGG_MIN:
             case AGG_MAX:
                 c = agg_build_result_cell(ae, a, sums, nonnull_count, minmax_init,
@@ -3670,6 +3746,45 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
         }
         da_push(&dst.cells, c);
     }
+    /* HAVING filter (without GROUP BY): evaluate condition against result row */
+    if (s->has_having && s->having_cond != IDX_NONE) {
+        struct table having_t = {0};
+        da_init(&having_t.columns);
+        da_init(&having_t.rows);
+        da_init(&having_t.indexes);
+        for (uint32_t a = 0; a < naggs; a++) {
+            struct agg_expr *ae_h = &arena->aggregates.items[s->aggregates_start + a];
+            char agg_name[256];
+            const char *fn = "?";
+            switch (ae_h->func) {
+                case AGG_COUNT: fn = "count"; break;
+                case AGG_SUM:   fn = "sum"; break;
+                case AGG_AVG:   fn = "avg"; break;
+                case AGG_MIN:   fn = "min"; break;
+                case AGG_MAX:   fn = "max"; break;
+                case AGG_STRING_AGG: fn = "string_agg"; break;
+                case AGG_ARRAY_AGG:  fn = "array_agg"; break;
+                case AGG_NONE: fn = "none"; break;
+            }
+            if (sv_eq_cstr(ae_h->column, "*"))
+                snprintf(agg_name, sizeof(agg_name), "%s", fn);
+            else
+                snprintf(agg_name, sizeof(agg_name), "%s", fn);
+            struct column col_h = { .name = strdup(agg_name),
+                                    .type = dst.cells.items[a].type,
+                                    .enum_type_name = NULL };
+            da_push(&having_t.columns, col_h);
+        }
+        int passes = eval_condition(s->having_cond, arena, &dst, &having_t, NULL);
+        for (size_t i = 0; i < having_t.columns.count; i++)
+            column_free(&having_t.columns.items[i]);
+        da_free(&having_t.columns);
+        if (!passes) {
+            da_free(&dst.cells);
+            return 0;
+        }
+    }
+
     rows_push(result, dst);
 
     return 0;
@@ -3920,10 +4035,11 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
     part_starts[nparts] = nmatch; /* sentinel */
 
     /* pre-compute per-partition aggregate totals for SUM/COUNT/AVG without frames */
-    /* We store results indexed by sorted position, then emit in sorted order */
-    int *win_int_vals = (int *)bump_calloc(&arena->scratch, nmatch * nexprs, sizeof(int));
-    double *win_dbl_vals = (double *)bump_calloc(&arena->scratch, nmatch * nexprs, sizeof(double));
-    int *win_is_null = (int *)bump_calloc(&arena->scratch, nmatch * nexprs, sizeof(int));
+    /* We store results indexed by ORIGINAL ROW INDEX (sorted_idx[i]) so that
+     * re-sorting for different partition columns doesn't invalidate earlier results */
+    int *win_int_vals = (int *)bump_calloc(&arena->scratch, nrows * nexprs, sizeof(int));
+    double *win_dbl_vals = (double *)bump_calloc(&arena->scratch, nrows * nexprs, sizeof(double));
+    int *win_is_null = (int *)bump_calloc(&arena->scratch, nrows * nexprs, sizeof(int));
     int *win_is_dbl = (int *)bump_calloc(&arena->scratch, nexprs, sizeof(int));
 
     /* process each window expression across all partitions */
@@ -3931,15 +4047,57 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
         struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
         if (se->kind == SEL_COLUMN) continue;
 
-        for (size_t p = 0; p < nparts; p++) {
-            size_t ps = part_starts[p];
-            size_t pe = part_starts[p + 1];
+        /* Per-expression partition boundaries: if this expression's partition
+         * column differs from the global one, re-sort and rebuild boundaries */
+        size_t *expr_part_starts = part_starts;
+        size_t expr_nparts = nparts;
+        if (part_idx[e] >= 0 && part_idx[e] != global_part) {
+            /* Re-sort sorted_idx by this expression's partition + order columns */
+            int e_sort_cols[2];
+            int e_sort_descs[2];
+            size_t e_sort_ncols = 0;
+            e_sort_cols[e_sort_ncols] = part_idx[e];
+            e_sort_descs[e_sort_ncols] = 0;
+            e_sort_ncols++;
+            if (ord_idx[e] >= 0) {
+                e_sort_cols[e_sort_ncols] = ord_idx[e];
+                e_sort_descs[e_sort_ncols] = se->win.order_desc;
+                e_sort_ncols++;
+            }
+            _sort_ctx.table = t;
+            _sort_ctx.cols = e_sort_cols;
+            _sort_ctx.descs = e_sort_descs;
+            _sort_ctx.ncols = e_sort_ncols;
+            qsort(sorted_idx, nmatch, sizeof(size_t), cmp_indices_multi);
+
+            expr_part_starts = (size_t *)bump_alloc(&arena->scratch,
+                                     (nmatch + 1) * sizeof(size_t));
+            expr_nparts = 0;
+            expr_part_starts[expr_nparts++] = 0;
+            for (size_t i = 1; i < nmatch; i++) {
+                struct cell *ca = &t->rows.items[sorted_idx[i - 1]].cells.items[part_idx[e]];
+                struct cell *cb_c = &t->rows.items[sorted_idx[i]].cells.items[part_idx[e]];
+                if (!cell_equal_nullsafe(ca, cb_c))
+                    expr_part_starts[expr_nparts++] = i;
+            }
+            expr_part_starts[expr_nparts] = nmatch;
+        } else if (part_idx[e] < 0 && global_part >= 0) {
+            /* No partition for this expr — treat entire result as one partition */
+            expr_part_starts = (size_t *)bump_alloc(&arena->scratch, 2 * sizeof(size_t));
+            expr_part_starts[0] = 0;
+            expr_part_starts[1] = nmatch;
+            expr_nparts = 1;
+        }
+
+        for (size_t p = 0; p < expr_nparts; p++) {
+            size_t ps = expr_part_starts[p];
+            size_t pe = expr_part_starts[p + 1];
             size_t psize = pe - ps;
 
             switch (se->win.func) {
                 case WIN_ROW_NUMBER:
                     for (size_t i = ps; i < pe; i++)
-                        win_int_vals[i * nexprs + e] = (int)(i - ps + 1);
+                        win_int_vals[sorted_idx[i] * nexprs + e] = (int)(i - ps + 1);
                     break;
 
                 case WIN_RANK: {
@@ -3951,7 +4109,7 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                                 &t->rows.items[sorted_idx[i - 1]].cells.items[ord_idx[e]]);
                             if (cmp != 0) rank = (int)(i - ps + 1);
                         }
-                        win_int_vals[i * nexprs + e] = rank;
+                        win_int_vals[sorted_idx[i] * nexprs + e] = rank;
                     }
                     break;
                 }
@@ -3965,7 +4123,7 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                                 &t->rows.items[sorted_idx[i - 1]].cells.items[ord_idx[e]]);
                             if (cmp != 0) rank++;
                         }
-                        win_int_vals[i * nexprs + e] = rank;
+                        win_int_vals[sorted_idx[i] * nexprs + e] = rank;
                     }
                     break;
                 }
@@ -3975,7 +4133,7 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                     for (size_t i = ps; i < pe; i++) {
                         size_t pos = i - ps; /* 0-based */
                         int bucket = (int)((pos * (size_t)nbuckets) / psize) + 1;
-                        win_int_vals[i * nexprs + e] = bucket;
+                        win_int_vals[sorted_idx[i] * nexprs + e] = bucket;
                     }
                     break;
                 }
@@ -3984,7 +4142,7 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                     win_is_dbl[e] = 1;
                     if (psize <= 1) {
                         for (size_t i = ps; i < pe; i++)
-                            win_dbl_vals[i * nexprs + e] = 0.0;
+                            win_dbl_vals[sorted_idx[i] * nexprs + e] = 0.0;
                     } else {
                         int rank = 1;
                         for (size_t i = ps; i < pe; i++) {
@@ -3994,7 +4152,7 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                                     &t->rows.items[sorted_idx[i - 1]].cells.items[ord_idx[e]]);
                                 if (cmp != 0) rank = (int)(i - ps + 1);
                             }
-                            win_dbl_vals[i * nexprs + e] = (double)(rank - 1) / (double)(psize - 1);
+                            win_dbl_vals[sorted_idx[i] * nexprs + e] = (double)(rank - 1) / (double)(psize - 1);
                         }
                     }
                     break;
@@ -4015,12 +4173,12 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                                 j++;
                             double cd = (double)(j - ps) / (double)psize;
                             for (size_t k = i; k < j; k++)
-                                win_dbl_vals[k * nexprs + e] = cd;
+                                win_dbl_vals[sorted_idx[k] * nexprs + e] = cd;
                             i = j;
                         }
                     } else {
                         for (size_t i = ps; i < pe; i++)
-                            win_dbl_vals[i * nexprs + e] = 1.0;
+                            win_dbl_vals[sorted_idx[i] * nexprs + e] = 1.0;
                     }
                     break;
                 }
@@ -4041,13 +4199,13 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                         if (in_range && arg_idx[e] >= 0) {
                             struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
                             if (ac->is_null || (column_type_is_text(ac->type) && !ac->value.as_text)) {
-                                win_is_null[i * nexprs + e] = 1;
+                                win_is_null[sorted_idx[i] * nexprs + e] = 1;
                             } else {
-                                win_dbl_vals[i * nexprs + e] = cell_to_double(ac);
+                                win_dbl_vals[sorted_idx[i] * nexprs + e] = cell_to_double(ac);
                                 win_is_dbl[e] = 1;
                             }
                         } else {
-                            win_is_null[i * nexprs + e] = 1;
+                            win_is_null[sorted_idx[i] * nexprs + e] = 1;
                         }
                     }
                     break;
@@ -4060,13 +4218,13 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                         if (arg_idx[e] >= 0) {
                             struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
                             if (ac->is_null || (column_type_is_text(ac->type) && !ac->value.as_text)) {
-                                win_is_null[i * nexprs + e] = 1;
+                                win_is_null[sorted_idx[i] * nexprs + e] = 1;
                             } else {
-                                win_dbl_vals[i * nexprs + e] = cell_to_double(ac);
+                                win_dbl_vals[sorted_idx[i] * nexprs + e] = cell_to_double(ac);
                                 win_is_dbl[e] = 1;
                             }
                         } else {
-                            win_is_null[i * nexprs + e] = 1;
+                            win_is_null[sorted_idx[i] * nexprs + e] = 1;
                         }
                     }
                     break;
@@ -4079,13 +4237,13 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                             size_t target = ps + (size_t)(nth - 1);
                             struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
                             if (ac->is_null || (column_type_is_text(ac->type) && !ac->value.as_text)) {
-                                win_is_null[i * nexprs + e] = 1;
+                                win_is_null[sorted_idx[i] * nexprs + e] = 1;
                             } else {
-                                win_dbl_vals[i * nexprs + e] = cell_to_double(ac);
+                                win_dbl_vals[sorted_idx[i] * nexprs + e] = cell_to_double(ac);
                                 win_is_dbl[e] = 1;
                             }
                         } else {
-                            win_is_null[i * nexprs + e] = 1;
+                            win_is_null[sorted_idx[i] * nexprs + e] = 1;
                         }
                     }
                     break;
@@ -4109,22 +4267,23 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                             }
                         }
                         for (size_t i = ps; i < pe; i++) {
+                            size_t oi = sorted_idx[i];
                             if (se->win.func == WIN_SUM) {
                                 if (arg_idx[e] >= 0 &&
                                     t->columns.items[arg_idx[e]].type == COLUMN_TYPE_FLOAT) {
                                     win_is_dbl[e] = 1;
-                                    win_dbl_vals[i * nexprs + e] = part_sum;
+                                    win_dbl_vals[oi * nexprs + e] = part_sum;
                                 } else {
-                                    win_int_vals[i * nexprs + e] = (int)part_sum;
+                                    win_int_vals[oi * nexprs + e] = (int)part_sum;
                                 }
                             } else if (se->win.func == WIN_COUNT) {
-                                win_int_vals[i * nexprs + e] = (arg_idx[e] >= 0) ? part_nn : part_count;
+                                win_int_vals[oi * nexprs + e] = (arg_idx[e] >= 0) ? part_nn : part_count;
                             } else { /* WIN_AVG */
                                 win_is_dbl[e] = 1;
                                 if (part_nn > 0) {
-                                    win_dbl_vals[i * nexprs + e] = part_sum / (double)part_nn;
+                                    win_dbl_vals[oi * nexprs + e] = part_sum / (double)part_nn;
                                 } else {
-                                    win_is_null[i * nexprs + e] = 1;
+                                    win_is_null[oi * nexprs + e] = 1;
                                 }
                             }
                         }
@@ -4143,22 +4302,23 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                                 }
                             }
                             running_count++;
+                            size_t oi = sorted_idx[i];
                             if (se->win.func == WIN_SUM) {
                                 if (arg_idx[e] >= 0 &&
                                     t->columns.items[arg_idx[e]].type == COLUMN_TYPE_FLOAT) {
                                     win_is_dbl[e] = 1;
-                                    win_dbl_vals[i * nexprs + e] = running_sum;
+                                    win_dbl_vals[oi * nexprs + e] = running_sum;
                                 } else {
-                                    win_int_vals[i * nexprs + e] = (int)running_sum;
+                                    win_int_vals[oi * nexprs + e] = (int)running_sum;
                                 }
                             } else if (se->win.func == WIN_COUNT) {
-                                win_int_vals[i * nexprs + e] = (arg_idx[e] >= 0) ? running_nn : running_count;
+                                win_int_vals[oi * nexprs + e] = (arg_idx[e] >= 0) ? running_nn : running_count;
                             } else { /* WIN_AVG */
                                 win_is_dbl[e] = 1;
                                 if (running_nn > 0) {
-                                    win_dbl_vals[i * nexprs + e] = running_sum / (double)running_nn;
+                                    win_dbl_vals[oi * nexprs + e] = running_sum / (double)running_nn;
                                 } else {
-                                    win_is_null[i * nexprs + e] = 1;
+                                    win_is_null[oi * nexprs + e] = 1;
                                 }
                             }
                         }
@@ -4196,22 +4356,23 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                                     }
                                 }
                             }
+                            size_t oi = sorted_idx[i];
                             if (se->win.func == WIN_SUM) {
                                 if (arg_idx[e] >= 0 &&
                                     t->columns.items[arg_idx[e]].type == COLUMN_TYPE_FLOAT) {
                                     win_is_dbl[e] = 1;
-                                    win_dbl_vals[i * nexprs + e] = frame_sum;
+                                    win_dbl_vals[oi * nexprs + e] = frame_sum;
                                 } else {
-                                    win_int_vals[i * nexprs + e] = (int)frame_sum;
+                                    win_int_vals[oi * nexprs + e] = (int)frame_sum;
                                 }
                             } else if (se->win.func == WIN_COUNT) {
-                                win_int_vals[i * nexprs + e] = (arg_idx[e] >= 0) ? frame_nn : frame_count;
+                                win_int_vals[oi * nexprs + e] = (arg_idx[e] >= 0) ? frame_nn : frame_count;
                             } else { /* WIN_AVG */
                                 win_is_dbl[e] = 1;
                                 if (frame_nn > 0) {
-                                    win_dbl_vals[i * nexprs + e] = frame_sum / (double)frame_nn;
+                                    win_dbl_vals[oi * nexprs + e] = frame_sum / (double)frame_nn;
                                 } else {
-                                    win_is_null[i * nexprs + e] = 1;
+                                    win_is_null[oi * nexprs + e] = 1;
                                 }
                             }
                         }
@@ -4220,6 +4381,30 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                 }
             }
         }
+    }
+
+    /* Re-sort sorted_idx back to the original global sort order for emit.
+     * This is needed because per-expression partition handling may have
+     * re-sorted sorted_idx for a different partition column. */
+    if (global_part >= 0 || global_ord >= 0) {
+        int e_sort_cols[2];
+        int e_sort_descs[2];
+        size_t e_sort_ncols = 0;
+        if (global_part >= 0) {
+            e_sort_cols[e_sort_ncols] = global_part;
+            e_sort_descs[e_sort_ncols] = 0;
+            e_sort_ncols++;
+        }
+        if (global_ord >= 0) {
+            e_sort_cols[e_sort_ncols] = global_ord;
+            e_sort_descs[e_sort_ncols] = 0; /* use original desc from first window expr */
+            e_sort_ncols++;
+        }
+        _sort_ctx.table = t;
+        _sort_ctx.cols = e_sort_cols;
+        _sort_ctx.descs = e_sort_descs;
+        _sort_ctx.ncols = e_sort_ncols;
+        qsort(sorted_idx, nmatch, sizeof(size_t), cmp_indices_multi);
     }
 
     /* emit result rows in sorted order */
@@ -4236,19 +4421,19 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
             if (se->kind == SEL_COLUMN) {
                 if (rb) cell_copy_bump(&c, &src->cells.items[col_idx[e]], rb);
                 else    cell_copy(&c, &src->cells.items[col_idx[e]]);
-            } else if (win_is_null[ri * nexprs + e]) {
+            } else if (win_is_null[row_i * nexprs + e]) {
                 c.type = (win_is_dbl[e]) ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
                 c.is_null = 1;
             } else if (win_is_dbl[e]) {
                 c.type = COLUMN_TYPE_FLOAT;
-                c.value.as_float = win_dbl_vals[ri * nexprs + e];
+                c.value.as_float = win_dbl_vals[row_i * nexprs + e];
             } else {
                 c.type = COLUMN_TYPE_INT;
-                c.value.as_int = win_int_vals[ri * nexprs + e];
+                c.value.as_int = win_int_vals[row_i * nexprs + e];
             }
 
             /* LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE: copy actual cell for text types */
-            if (se->kind == SEL_WINDOW && !win_is_null[ri * nexprs + e] &&
+            if (se->kind == SEL_WINDOW && !win_is_null[row_i * nexprs + e] &&
                 (se->win.func == WIN_LAG || se->win.func == WIN_LEAD ||
                  se->win.func == WIN_FIRST_VALUE || se->win.func == WIN_LAST_VALUE ||
                  se->win.func == WIN_NTH_VALUE) && arg_idx[e] >= 0) {
@@ -4427,7 +4612,7 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                 sv gbcol = ASV(arena, s->group_by_start + (uint32_t)k);
                 grp_cols[k] = table_find_column_sv(t, gbcol);
                 if (grp_cols[k] < 0) {
-                    /* try matching by SELECT alias */
+                    /* try matching by SELECT alias (parsed_columns path) */
                     for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
                         struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
                         if (sc->alias.len > 0 && sv_eq_ignorecase(sc->alias, gbcol) && sc->expr_idx != IDX_NONE) {
@@ -4436,6 +4621,48 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                                 grp_cols[k] = table_find_column_sv(t, e->column_ref.column);
                                 if (grp_cols[k] >= 0) break;
                             }
+                        }
+                    }
+                    /* fallback: scan raw s->columns text for "colname AS alias" */
+                    if (grp_cols[k] < 0 && s->columns.len > 0) {
+                        const char *p = s->columns.data;
+                        const char *end = s->columns.data + s->columns.len;
+                        while (p < end) {
+                            /* find start of this column item (skip leading whitespace) */
+                            while (p < end && (*p == ' ' || *p == '\t')) p++;
+                            const char *col_start = p;
+                            /* scan to comma or end, tracking " AS " position */
+                            const char *as_pos = NULL;
+                            int depth = 0;
+                            while (p < end && (depth > 0 || *p != ',')) {
+                                if (*p == '(') depth++;
+                                else if (*p == ')') depth--;
+                                else if (depth == 0 && p + 3 <= end &&
+                                         p > col_start &&
+                                         (p[-1] == ' ' || p[-1] == ')') &&
+                                         (p[0] == 'A' || p[0] == 'a') &&
+                                         (p[1] == 'S' || p[1] == 's') &&
+                                         (p[2] == ' ' || p[2] == ',')) {
+                                    as_pos = p;
+                                }
+                                p++;
+                            }
+                            if (as_pos) {
+                                const char *alias_start = as_pos + 3;
+                                while (alias_start < p && *alias_start == ' ') alias_start++;
+                                const char *alias_end = alias_start;
+                                while (alias_end < p && *alias_end != ' ' && *alias_end != ',') alias_end++;
+                                sv alias_sv = sv_from(alias_start, (size_t)(alias_end - alias_start));
+                                if (sv_eq_ignorecase(alias_sv, gbcol)) {
+                                    /* extract the column name before AS */
+                                    const char *cn_start = col_start;
+                                    const char *cn_end = as_pos;
+                                    while (cn_end > cn_start && cn_end[-1] == ' ') cn_end--;
+                                    sv cn = sv_from(cn_start, (size_t)(cn_end - cn_start));
+                                    grp_cols[k] = table_find_column_sv(t, cn);
+                                }
+                            }
+                            if (*p == ',') p++;
                         }
                     }
                     if (grp_cols[k] < 0) {
@@ -4896,16 +5123,31 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             }
             grp_t.rows.items = grp_row_arr;
             grp_t.rows.count = grp_row_count;
+            /* Save aggregate cells from original dst before rebuilding.
+             * Layout of dst: [grp0..grpN, agg0..aggN] (or reversed if agg_before_cols).
+             * Aggregate placeholders in parsed_columns (expr_idx==IDX_NONE) map
+             * sequentially to the aggregate cells. */
+            size_t agg_base = s->agg_before_cols ? 0 : ngrp;
+            struct cell *saved_agg = NULL;
+            if (agg_n > 0) {
+                saved_agg = (struct cell *)bump_alloc(&arena->scratch, agg_n * sizeof(struct cell));
+                for (size_t a = 0; a < agg_n; a++)
+                    saved_agg[a] = dst.cells.items[agg_base + a];
+            }
             /* Rebuild dst from parsed_columns */
             if (rb) da_free(&dst.cells);
             else    row_free(&dst);
             dst = (struct row){0};
             da_init(&dst.cells);
+            size_t agg_placeholder = 0;
             for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
                 struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
                 if (sc->expr_idx != IDX_NONE) {
                     struct cell c = eval_expr(sc->expr_idx, arena, &grp_t, &grp_t.rows.items[0], NULL, rb);
                     da_push(&dst.cells, c);
+                } else if (saved_agg && agg_placeholder < agg_n) {
+                    /* Aggregate placeholder — restore saved aggregate value */
+                    da_push(&dst.cells, saved_agg[agg_placeholder++]);
                 } else {
                     struct cell nc = { .type = COLUMN_TYPE_TEXT, .is_null = 1 };
                     da_push(&dst.cells, nc);

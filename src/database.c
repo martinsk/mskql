@@ -2758,6 +2758,32 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                 }
                             }
                             if (conflict) {
+                                /* Build merged table descriptor: [existing cols] + [excluded.col1, ...] */
+                                struct table merged_t = {0};
+                                da_init(&merged_t.columns);
+                                da_init(&merged_t.rows);
+                                da_init(&merged_t.indexes);
+                                size_t ncols = t->columns.count;
+                                for (size_t mc = 0; mc < ncols; mc++)
+                                    da_push(&merged_t.columns, t->columns.items[mc]);
+                                char *excl_names[64];
+                                for (size_t mc = 0; mc < ncols && mc < 64; mc++) {
+                                    struct column ecol = t->columns.items[mc];
+                                    size_t nlen = strlen(t->columns.items[mc].name);
+                                    excl_names[mc] = bump_alloc(&q->arena.scratch, 9 + nlen + 1);
+                                    memcpy(excl_names[mc], "excluded.", 9);
+                                    memcpy(excl_names[mc] + 9, t->columns.items[mc].name, nlen + 1);
+                                    ecol.name = excl_names[mc];
+                                    da_push(&merged_t.columns, ecol);
+                                }
+                                /* Build merged row: [existing cells] + [new row cells] */
+                                struct row merged_row = {0};
+                                da_init(&merged_row.cells);
+                                for (size_t mc = 0; mc < t->rows.items[conflict_row].cells.count; mc++)
+                                    da_push(&merged_row.cells, t->rows.items[conflict_row].cells.items[mc]);
+                                for (size_t mc = 0; mc < ir_items[ri].cells.count; mc++)
+                                    da_push(&merged_row.cells, ir_items[ri].cells.items[mc]);
+
                                 /* apply SET clauses to the existing row */
                                 for (uint32_t sc = 0; sc < ins->conflict_set_count; sc++) {
                                     struct set_clause *scp = &q->arena.set_clauses.items[ins->conflict_set_start + sc];
@@ -2778,7 +2804,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                                 val.is_null = 1;
                                             }
                                         } else {
-                                            val = eval_expr(scp->expr_idx, &q->arena, t, &t->rows.items[conflict_row], db, NULL);
+                                            val = eval_expr(scp->expr_idx, &q->arena, &merged_t, &merged_row, db, NULL);
                                         }
                                     } else
                                         cell_copy(&val, &scp->value);
@@ -2786,7 +2812,11 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                     if (column_type_is_text(dst->type) && dst->value.as_text)
                                         free(dst->value.as_text);
                                     *dst = val;
+                                    /* keep merged_row in sync for subsequent SET clauses */
+                                    merged_row.cells.items[ci] = val;
                                 }
+                                da_free(&merged_t.columns);
+                                da_free(&merged_row.cells);
                                 /* remove this insert row — it was handled as update.
                                  * Cell text is bump-allocated, so only free the DA
                                  * backing array (not per-cell text). */

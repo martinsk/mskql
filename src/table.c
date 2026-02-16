@@ -128,6 +128,11 @@ int table_find_column_sv(struct table *t, sv name)
         if (sv_eq_cstr(name, t->columns.items[i].name))
             return (int)i;
     }
+    /* case-insensitive exact match (SQL identifiers are case-insensitive) */
+    for (size_t i = 0; i < t->columns.count; i++) {
+        if (sv_eq_ignorecase_cstr(name, t->columns.items[i].name))
+            return (int)i;
+    }
     /* strip "table." prefix and retry */
     sv col = name;
     for (size_t k = 0; k < name.len; k++) {

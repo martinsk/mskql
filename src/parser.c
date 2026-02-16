@@ -2664,7 +2664,50 @@ static void parse_order_limit(struct lexer *l, struct query_arena *a, struct que
             /* try parsing as expression to handle ORDER BY a + b */
             uint32_t ei = parse_expr(l, a);
             if (ei == IDX_NONE) return;
-            if (EXPR(a, ei).type == EXPR_COLUMN_REF) {
+            if (EXPR(a, ei).type == EXPR_LITERAL &&
+                (EXPR(a, ei).literal.type == COLUMN_TYPE_INT ||
+                 EXPR(a, ei).literal.type == COLUMN_TYPE_BIGINT) &&
+                !EXPR(a, ei).literal.is_null) {
+                /* positional ORDER BY: ORDER BY 1, 2 */
+                long long pos = (EXPR(a, ei).literal.type == COLUMN_TYPE_BIGINT)
+                    ? (long long)EXPR(a, ei).literal.value.as_bigint
+                    : (long long)EXPR(a, ei).literal.value.as_int;
+                int resolved = 0;
+                if (pos >= 1 && s->parsed_columns_count > 0 &&
+                    (uint32_t)pos <= s->parsed_columns_count) {
+                    struct select_column *sc = &a->select_cols.items[s->parsed_columns_start + (uint32_t)(pos - 1)];
+                    if (sc->expr_idx != IDX_NONE) {
+                        struct expr *e = &EXPR(a, sc->expr_idx);
+                        if (e->type == EXPR_COLUMN_REF && e->column_ref.table.len == 0) {
+                            item.column = e->column_ref.column;
+                            resolved = 1;
+                        } else {
+                            item.expr_idx = sc->expr_idx;
+                            item.column = sv_from(NULL, 0);
+                            resolved = 1;
+                        }
+                    } else if (sc->alias.len > 0) {
+                        item.column = sc->alias;
+                        resolved = 1;
+                    }
+                }
+                if (!resolved) {
+                    /* fallback: resolve from legacy s->columns text */
+                    sv cols = s->columns;
+                    long long cur = 1;
+                    sv col = cols;
+                    while (cur < pos && col.len > 0) {
+                        size_t comma = 0;
+                        while (comma < col.len && col.data[comma] != ',') comma++;
+                        if (comma < col.len) { col.data += comma + 1; col.len -= comma + 1; cur++; }
+                        else break;
+                    }
+                    while (col.len > 0 && col.data[0] == ' ') { col.data++; col.len--; }
+                    size_t end = 0;
+                    while (end < col.len && col.data[end] != ',' && col.data[end] != ' ') end++;
+                    if (end > 0) { item.column = sv_from(col.data, end); resolved = 1; }
+                }
+            } else if (EXPR(a, ei).type == EXPR_COLUMN_REF) {
                 /* simple column reference — store as column name for backward compat */
                 if (EXPR(a, ei).column_ref.table.len > 0) {
                     /* reconstruct "table.column" from the two parts */
@@ -3477,12 +3520,16 @@ static int parse_select(struct lexer *l, struct query *out, struct query_arena *
         if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "AS")) {
             size_t saved_as = l->pos;
             lexer_next(l); /* consume AS */
-            lexer_next(l); /* consume alias */
+            struct token alias_tok = lexer_next(l); /* consume alias */
             peek = lexer_peek(l);
             if (peek.type != TOK_COMMA) {
                 /* no comma after alias — restore and fall through */
                 l->pos = saved_as;
                 peek = lexer_peek(l);
+            } else {
+                /* extend first_col to include "AS alias" so s->columns captures it */
+                first_col = sv_from(first_col.data,
+                    (size_t)(alias_tok.value.data + alias_tok.value.len - first_col.data));
             }
         }
         if (peek.type == TOK_COMMA) {

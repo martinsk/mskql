@@ -1262,8 +1262,10 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 break;
             }
             case COLUMN_TYPE_BIGINT: {
-                int64_t lo = pn->filter.cmp_val.value.as_bigint;
-                int64_t hi = pn->filter.between_high.value.as_bigint;
+                int64_t lo = (pn->filter.cmp_val.type == COLUMN_TYPE_INT || pn->filter.cmp_val.type == COLUMN_TYPE_BOOLEAN)
+                    ? (int64_t)pn->filter.cmp_val.value.as_int : pn->filter.cmp_val.value.as_bigint;
+                int64_t hi = (pn->filter.between_high.type == COLUMN_TYPE_INT || pn->filter.between_high.type == COLUMN_TYPE_BOOLEAN)
+                    ? (int64_t)pn->filter.between_high.value.as_int : pn->filter.between_high.value.as_bigint;
                 const int64_t *vals = cb->data.i64;
                 FILTER_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
                 break;
@@ -1344,7 +1346,12 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (nulls[r]) continue;
                     int64_t v = vals[r];
                     for (uint32_t j = 0; j < nv; j++) {
-                        if (!inv[j].is_null && inv[j].value.as_bigint == v) {
+                        int64_t jv = (inv[j].type == COLUMN_TYPE_INT || inv[j].type == COLUMN_TYPE_BOOLEAN)
+                            ? (int64_t)inv[j].value.as_int
+                            : (inv[j].type == COLUMN_TYPE_SMALLINT)
+                            ? (int64_t)inv[j].value.as_smallint
+                            : inv[j].value.as_bigint;
+                        if (!inv[j].is_null && jv == v) {
                             sel[sel_count++] = r; break;
                         }
                     }
@@ -1496,7 +1503,12 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 goto done;
             }
             case COLUMN_TYPE_BIGINT: {
-                int64_t cmp_val = pn->filter.cmp_val.value.as_bigint;
+                int64_t cmp_val = (pn->filter.cmp_val.type == COLUMN_TYPE_INT ||
+                                   pn->filter.cmp_val.type == COLUMN_TYPE_BOOLEAN)
+                    ? (int64_t)pn->filter.cmp_val.value.as_int
+                    : (pn->filter.cmp_val.type == COLUMN_TYPE_SMALLINT)
+                    ? (int64_t)pn->filter.cmp_val.value.as_smallint
+                    : pn->filter.cmp_val.value.as_bigint;
                 const int64_t *vals = cb->data.i64;
                 const uint8_t *nulls = cb->nulls;
                 switch (op) {
@@ -2229,6 +2241,8 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 for (uint16_t c = 0; c < st->build_ncols; c++) {
                     out->cols[outer_ncols + c].type = st->build_cols[c].type;
                     out->cols[outer_ncols + c].nulls[out_count] = 1;
+                    memset(cb_data_ptr(&out->cols[outer_ncols + c], (uint32_t)out_count), 0,
+                           col_type_elem_size(st->build_cols[c].type));
                 }
                 out_count++;
             }
@@ -2270,6 +2284,8 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             for (uint16_t c = 0; c < st->build_ncols; c++) {
                 out->cols[outer_ncols + c].type = st->build_cols[c].type;
                 out->cols[outer_ncols + c].nulls[out_count] = 1;
+                memset(cb_data_ptr(&out->cols[outer_ncols + c], (uint32_t)out_count), 0,
+                       col_type_elem_size(st->build_cols[c].type));
             }
             out_count++;
         }
@@ -2536,9 +2552,41 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 st->grp_counts[group_idx]++;
                 for (uint32_t a = 0; a < agg_n; a++) {
                     int ac = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
-                    if (ac == -1) continue; /* COUNT(*) — only grp_counts matters */
 
                     size_t idx = a * st->group_cap + group_idx;
+
+                    /* FILTER (WHERE ...): evaluate per-aggregate filter condition */
+                    struct agg_expr *ae_filt = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
+                    if (ae_filt->filter_cond != IDX_NONE) {
+                        if (!st->tmp_row_inited) {
+                            st->tmp_row.cells.count = child_ncols;
+                            st->tmp_row.cells.items = (struct cell *)bump_alloc(
+                                &ctx->arena->scratch, child_ncols * sizeof(struct cell));
+                            st->tmp_row_inited = 1;
+                        }
+                        for (uint16_t c = 0; c < child_ncols; c++) {
+                            struct col_block *cb = &input.cols[c];
+                            struct cell *cell = &st->tmp_row.cells.items[c];
+                            cell->type = cb->type;
+                            if (cb->nulls[ri]) {
+                                cell->is_null = 1;
+                                memset(&cell->value, 0, sizeof(cell->value));
+                            } else {
+                                cell->is_null = 0;
+                                cb_to_cell_at(cb, ri, cell);
+                            }
+                        }
+                        if (!eval_condition(ae_filt->filter_cond, ctx->arena,
+                                            &st->tmp_row, pn->hash_agg.table, NULL))
+                            continue;
+                    }
+
+                    if (ac == -1) {
+                        /* COUNT(*): if FILTER is present, track filtered count in nonnull */
+                        if (ae_filt->filter_cond != IDX_NONE)
+                            st->nonnull[idx]++;
+                        continue;
+                    }
 
                     if (ac == -2) {
                         /* Expression-based aggregate: reconstruct temp row, eval expr */
@@ -2686,10 +2734,12 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 case AGG_COUNT:
                     dst->type = COLUMN_TYPE_INT;
                     dst->nulls[out_count] = 0;
-                    dst->data.i32[out_count] = (pn->hash_agg.agg_col_indices &&
-                                                pn->hash_agg.agg_col_indices[a] == -1)
-                        ? (int32_t)st->grp_counts[g]
-                        : (int32_t)st->nonnull[idx];
+                    if (pn->hash_agg.agg_col_indices &&
+                        pn->hash_agg.agg_col_indices[a] == -1 &&
+                        ae->filter_cond == IDX_NONE)
+                        dst->data.i32[out_count] = (int32_t)st->grp_counts[g];
+                    else
+                        dst->data.i32[out_count] = (int32_t)st->nonnull[idx];
                     break;
                 case AGG_SUM: {
                     /* Determine source column type for correct output type */
@@ -2700,23 +2750,24 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
                             src_is_float = 1;
                     }
-                    if (st->nonnull[idx] == 0) {
-                        dst->type = src_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_BIGINT;
-                        dst->nulls[out_count] = 1;
-                    } else if (src_is_float) {
+                    /* Use consistent type across all groups: BIGINT for int sums,
+                     * FLOAT for float sums. Mixing INT/BIGINT across groups in the
+                     * same col_block causes misreads. */
+                    if (src_is_float) {
                         dst->type = COLUMN_TYPE_FLOAT;
-                        dst->nulls[out_count] = 0;
-                        dst->data.f64[out_count] = st->sums[idx];
-                    } else {
-                        double sv = st->sums[idx];
-                        if (sv == (double)(int32_t)sv && sv >= -2147483648.0 && sv <= 2147483647.0) {
-                            dst->type = COLUMN_TYPE_INT;
-                            dst->nulls[out_count] = 0;
-                            dst->data.i32[out_count] = (int32_t)sv;
+                        if (st->nonnull[idx] == 0) {
+                            dst->nulls[out_count] = 1;
                         } else {
-                            dst->type = COLUMN_TYPE_BIGINT;
                             dst->nulls[out_count] = 0;
-                            dst->data.i64[out_count] = (int64_t)sv;
+                            dst->data.f64[out_count] = st->sums[idx];
+                        }
+                    } else {
+                        dst->type = COLUMN_TYPE_BIGINT;
+                        if (st->nonnull[idx] == 0) {
+                            dst->nulls[out_count] = 1;
+                        } else {
+                            dst->nulls[out_count] = 0;
+                            dst->data.i64[out_count] = (int64_t)st->sums[idx];
                         }
                     }
                     break;
@@ -2843,7 +2894,39 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
                 for (uint32_t a = 0; a < agg_n; a++) {
                     int ac = pn->simple_agg.agg_col_indices[a];
-                    if (ac == -1) continue; /* COUNT(*) */
+
+                    /* FILTER (WHERE ...): evaluate per-aggregate filter condition */
+                    struct agg_expr *ae_filt = &ctx->arena->aggregates.items[pn->simple_agg.agg_start + a];
+                    if (ae_filt->filter_cond != IDX_NONE) {
+                        if (!st->tmp_row_inited) {
+                            st->tmp_row.cells.count = child_ncols;
+                            st->tmp_row.cells.items = (struct cell *)bump_alloc(
+                                &ctx->arena->scratch, child_ncols * sizeof(struct cell));
+                            st->tmp_row_inited = 1;
+                        }
+                        for (uint16_t c = 0; c < child_ncols; c++) {
+                            struct col_block *cb = &input.cols[c];
+                            struct cell *cell = &st->tmp_row.cells.items[c];
+                            cell->type = cb->type;
+                            if (cb->nulls[ri]) {
+                                cell->is_null = 1;
+                                memset(&cell->value, 0, sizeof(cell->value));
+                            } else {
+                                cell->is_null = 0;
+                                cb_to_cell_at(cb, ri, cell);
+                            }
+                        }
+                        if (!eval_condition(ae_filt->filter_cond, ctx->arena,
+                                            &st->tmp_row, pn->simple_agg.table, NULL))
+                            continue;
+                    }
+
+                    if (ac == -1) {
+                        /* COUNT(*): if FILTER is present, track filtered count in nonnull */
+                        if (ae_filt->filter_cond != IDX_NONE)
+                            st->nonnull[a]++;
+                        continue;
+                    }
 
                     if (ac == -2) {
                         /* Expression-based aggregate */
@@ -2978,9 +3061,11 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case AGG_COUNT:
                 dst->type = COLUMN_TYPE_INT;
                 dst->nulls[0] = 0;
-                dst->data.i32[0] = (pn->simple_agg.agg_col_indices[a] == -1)
-                    ? (int32_t)st->total_rows
-                    : (int32_t)st->nonnull[a];
+                if (pn->simple_agg.agg_col_indices[a] == -1 &&
+                    ae->filter_cond == IDX_NONE)
+                    dst->data.i32[0] = (int32_t)st->total_rows;
+                else
+                    dst->data.i32[0] = (int32_t)st->nonnull[a];
                 break;
             case AGG_SUM: {
                 int src_col = pn->simple_agg.agg_col_indices[a];
@@ -3597,15 +3682,56 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             int oc = pn->window.win_ord_col[w];
             int ac = pn->window.win_arg_col[w];
 
-            for (uint32_t p = 0; p < st->nparts; p++) {
-                uint32_t ps = st->part_starts[p];
-                uint32_t pe = st->part_starts[p + 1];
+            /* Per-expression partition boundaries: if this expression's partition
+             * column differs from the global sort partition, re-sort st->sorted
+             * by this expression's partition column and rebuild boundaries. */
+            uint32_t *w_part_starts = st->part_starts;
+            uint32_t w_nparts = st->nparts;
+            int wpc = pn->window.win_part_col[w];
+            if (wpc >= 0 && wpc != spc) {
+                /* Re-sort by this expression's partition column */
+                _wsort_ctx.has_part = 1;
+                _wsort_ctx.part_data = st->flat_data[wpc];
+                _wsort_ctx.part_nulls = st->flat_nulls[wpc];
+                _wsort_ctx.part_type = st->flat_types[wpc];
+                _wsort_ctx.has_ord = (oc >= 0);
+                if (oc >= 0) {
+                    _wsort_ctx.ord_data = st->flat_data[oc];
+                    _wsort_ctx.ord_nulls = st->flat_nulls[oc];
+                    _wsort_ctx.ord_type = st->flat_types[oc];
+                    _wsort_ctx.ord_desc = pn->window.sort_ord_desc;
+                }
+                qsort(st->sorted, total, sizeof(uint32_t), window_sort_cmp);
+
+                w_part_starts = (uint32_t *)bump_alloc(&ctx->arena->scratch, (total + 1) * sizeof(uint32_t));
+                w_nparts = 0;
+                w_part_starts[w_nparts++] = 0;
+                for (uint32_t i = 1; i < total; i++) {
+                    uint32_t a = st->sorted[i - 1], b = st->sorted[i];
+                    int an = st->flat_nulls[wpc][a], bn = st->flat_nulls[wpc][b];
+                    if (an != bn) { w_part_starts[w_nparts++] = i; continue; }
+                    if (an) continue;
+                    if (flat_col_ord_cmp(st->flat_data[wpc], st->flat_types[wpc], st->flat_nulls[wpc], a, b) != 0)
+                        w_part_starts[w_nparts++] = i;
+                }
+                w_part_starts[w_nparts] = total;
+            } else if (wpc < 0 && spc >= 0) {
+                /* No partition for this expr but global has one — use single partition */
+                w_part_starts = (uint32_t *)bump_alloc(&ctx->arena->scratch, 2 * sizeof(uint32_t));
+                w_part_starts[0] = 0;
+                w_part_starts[1] = total;
+                w_nparts = 1;
+            }
+
+            for (uint32_t p = 0; p < w_nparts; p++) {
+                uint32_t ps = w_part_starts[p];
+                uint32_t pe = w_part_starts[p + 1];
                 uint32_t psize = pe - ps;
 
                 switch (wf) {
                 case WIN_ROW_NUMBER:
                     for (uint32_t i = ps; i < pe; i++)
-                        st->win_i32[i * nw + w] = (int32_t)(i - ps + 1);
+                        st->win_i32[st->sorted[i] * nw + w] = (int32_t)(i - ps + 1);
                     break;
                 case WIN_RANK: {
                     int32_t rank = 1;
@@ -3614,7 +3740,7 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             flat_col_ord_cmp(st->flat_data[oc], st->flat_types[oc], st->flat_nulls[oc],
                                              st->sorted[i], st->sorted[i-1]) != 0)
                             rank = (int32_t)(i - ps + 1);
-                        st->win_i32[i * nw + w] = rank;
+                        st->win_i32[st->sorted[i] * nw + w] = rank;
                     }
                     break;
                 }
@@ -3625,20 +3751,20 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             flat_col_ord_cmp(st->flat_data[oc], st->flat_types[oc], st->flat_nulls[oc],
                                              st->sorted[i], st->sorted[i-1]) != 0)
                             rank++;
-                        st->win_i32[i * nw + w] = rank;
+                        st->win_i32[st->sorted[i] * nw + w] = rank;
                     }
                     break;
                 }
                 case WIN_NTILE: {
                     int nb = pn->window.win_offset[w] > 0 ? pn->window.win_offset[w] : 1;
                     for (uint32_t i = ps; i < pe; i++)
-                        st->win_i32[i * nw + w] = (int32_t)(((i - ps) * (uint32_t)nb) / psize) + 1;
+                        st->win_i32[st->sorted[i] * nw + w] = (int32_t)(((i - ps) * (uint32_t)nb) / psize) + 1;
                     break;
                 }
                 case WIN_PERCENT_RANK: {
                     st->win_is_dbl[w] = 1;
                     if (psize <= 1) {
-                        for (uint32_t i = ps; i < pe; i++) st->win_f64[i * nw + w] = 0.0;
+                        for (uint32_t i = ps; i < pe; i++) st->win_f64[st->sorted[i] * nw + w] = 0.0;
                     } else {
                         int32_t rank = 1;
                         for (uint32_t i = ps; i < pe; i++) {
@@ -3646,7 +3772,7 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 flat_col_ord_cmp(st->flat_data[oc], st->flat_types[oc], st->flat_nulls[oc],
                                                  st->sorted[i], st->sorted[i-1]) != 0)
                                 rank = (int32_t)(i - ps + 1);
-                            st->win_f64[i * nw + w] = (double)(rank - 1) / (double)(psize - 1);
+                            st->win_f64[st->sorted[i] * nw + w] = (double)(rank - 1) / (double)(psize - 1);
                         }
                     }
                     break;
@@ -3661,11 +3787,11 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                     st->flat_nulls[oc], st->sorted[j], st->sorted[i]) == 0)
                                 j++;
                             double cd = (double)(j - ps) / (double)psize;
-                            for (uint32_t k = i; k < j; k++) st->win_f64[k * nw + w] = cd;
+                            for (uint32_t k = i; k < j; k++) st->win_f64[st->sorted[k] * nw + w] = cd;
                             i = j;
                         }
                     } else {
-                        for (uint32_t i = ps; i < pe; i++) st->win_f64[i * nw + w] = 1.0;
+                        for (uint32_t i = ps; i < pe; i++) st->win_f64[st->sorted[i] * nw + w] = 1.0;
                     }
                     break;
                 }
@@ -3683,19 +3809,20 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             target = i + (uint32_t)offset;
                             if (target < pe) in_range = 1;
                         }
+                        uint32_t oi = st->sorted[i];
                         if (in_range && ac >= 0) {
                             uint32_t si = st->sorted[target];
                             if (st->flat_nulls[ac][si]) {
-                                st->win_null[i * nw + w] = 1;
+                                st->win_null[oi * nw + w] = 1;
                             } else if (is_text) {
-                                st->win_str[i * nw + w] = ((char **)st->flat_data[ac])[si];
+                                st->win_str[oi * nw + w] = ((char **)st->flat_data[ac])[si];
                                 st->win_is_str[w] = 1;
                             } else {
-                                st->win_f64[i * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                st->win_f64[oi * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
                                 st->win_is_dbl[w] = 1;
                             }
                         } else {
-                            st->win_null[i * nw + w] = 1;
+                            st->win_null[oi * nw + w] = 1;
                         }
                     }
                     break;
@@ -3705,19 +3832,20 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     int is_text_fv = (ac >= 0) && column_type_is_text(st->flat_types[ac]);
                     for (uint32_t i = ps; i < pe; i++) {
                         uint32_t target = (wf == WIN_FIRST_VALUE) ? ps : (pe - 1);
+                        uint32_t oi = st->sorted[i];
                         if (ac >= 0) {
                             uint32_t si = st->sorted[target];
                             if (st->flat_nulls[ac][si]) {
-                                st->win_null[i * nw + w] = 1;
+                                st->win_null[oi * nw + w] = 1;
                             } else if (is_text_fv) {
-                                st->win_str[i * nw + w] = ((char **)st->flat_data[ac])[si];
+                                st->win_str[oi * nw + w] = ((char **)st->flat_data[ac])[si];
                                 st->win_is_str[w] = 1;
                             } else {
-                                st->win_f64[i * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                st->win_f64[oi * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
                                 st->win_is_dbl[w] = 1;
                             }
                         } else {
-                            st->win_null[i * nw + w] = 1;
+                            st->win_null[oi * nw + w] = 1;
                         }
                     }
                     break;
@@ -3726,19 +3854,20 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     int nth = pn->window.win_offset[w];
                     int is_text_nv = (ac >= 0) && column_type_is_text(st->flat_types[ac]);
                     for (uint32_t i = ps; i < pe; i++) {
+                        uint32_t oi = st->sorted[i];
                         if (nth >= 1 && (uint32_t)nth <= psize && ac >= 0) {
                             uint32_t si = st->sorted[ps + (uint32_t)(nth - 1)];
                             if (st->flat_nulls[ac][si]) {
-                                st->win_null[i * nw + w] = 1;
+                                st->win_null[oi * nw + w] = 1;
                             } else if (is_text_nv) {
-                                st->win_str[i * nw + w] = ((char **)st->flat_data[ac])[si];
+                                st->win_str[oi * nw + w] = ((char **)st->flat_data[ac])[si];
                                 st->win_is_str[w] = 1;
                             } else {
-                                st->win_f64[i * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                st->win_f64[oi * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
                                 st->win_is_dbl[w] = 1;
                             }
                         } else {
-                            st->win_null[i * nw + w] = 1;
+                            st->win_null[oi * nw + w] = 1;
                         }
                     }
                     break;
@@ -3760,19 +3889,20 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             }
                         }
                         for (uint32_t i = ps; i < pe; i++) {
+                            uint32_t oi = st->sorted[i];
                             if (wf == WIN_SUM) {
                                 if (ac >= 0 && (st->flat_types[ac] == COLUMN_TYPE_FLOAT || st->flat_types[ac] == COLUMN_TYPE_NUMERIC)) {
                                     st->win_is_dbl[w] = 1;
-                                    st->win_f64[i * nw + w] = part_sum;
+                                    st->win_f64[oi * nw + w] = part_sum;
                                 } else {
-                                    st->win_i32[i * nw + w] = (int32_t)part_sum;
+                                    st->win_i32[oi * nw + w] = (int32_t)part_sum;
                                 }
                             } else if (wf == WIN_COUNT) {
-                                st->win_i32[i * nw + w] = (ac >= 0) ? part_nn : (int32_t)psize;
+                                st->win_i32[oi * nw + w] = (ac >= 0) ? part_nn : (int32_t)psize;
                             } else {
                                 st->win_is_dbl[w] = 1;
-                                if (part_nn > 0) st->win_f64[i * nw + w] = part_sum / (double)part_nn;
-                                else st->win_null[i * nw + w] = 1;
+                                if (part_nn > 0) st->win_f64[oi * nw + w] = part_sum / (double)part_nn;
+                                else st->win_null[oi * nw + w] = 1;
                             }
                         }
                     } else if (!pn->window.win_has_frame[w] && oc >= 0) {
@@ -3787,19 +3917,20 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 running_nn++;
                             }
                             running_count++;
+                            uint32_t oi = st->sorted[i];
                             if (wf == WIN_SUM) {
                                 if (ac >= 0 && (st->flat_types[ac] == COLUMN_TYPE_FLOAT || st->flat_types[ac] == COLUMN_TYPE_NUMERIC)) {
                                     st->win_is_dbl[w] = 1;
-                                    st->win_f64[i * nw + w] = running_sum;
+                                    st->win_f64[oi * nw + w] = running_sum;
                                 } else {
-                                    st->win_i32[i * nw + w] = (int32_t)running_sum;
+                                    st->win_i32[oi * nw + w] = (int32_t)running_sum;
                                 }
                             } else if (wf == WIN_COUNT) {
-                                st->win_i32[i * nw + w] = (ac >= 0) ? running_nn : running_count;
+                                st->win_i32[oi * nw + w] = (ac >= 0) ? running_nn : running_count;
                             } else {
                                 st->win_is_dbl[w] = 1;
-                                if (running_nn > 0) st->win_f64[i * nw + w] = running_sum / (double)running_nn;
-                                else st->win_null[i * nw + w] = 1;
+                                if (running_nn > 0) st->win_f64[oi * nw + w] = running_sum / (double)running_nn;
+                                else st->win_null[oi * nw + w] = 1;
                             }
                         }
                     } else {
@@ -3831,16 +3962,17 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                     frame_nn++;
                                 }
                             }
+                            uint32_t oi = st->sorted[i];
                             if (wf == WIN_SUM) {
                                 if (ac >= 0 && (st->flat_types[ac] == COLUMN_TYPE_FLOAT || st->flat_types[ac] == COLUMN_TYPE_NUMERIC)) {
-                                    st->win_is_dbl[w] = 1; st->win_f64[i * nw + w] = frame_sum;
-                                } else st->win_i32[i * nw + w] = (int32_t)frame_sum;
+                                    st->win_is_dbl[w] = 1; st->win_f64[oi * nw + w] = frame_sum;
+                                } else st->win_i32[oi * nw + w] = (int32_t)frame_sum;
                             } else if (wf == WIN_COUNT) {
-                                st->win_i32[i * nw + w] = (ac >= 0) ? frame_nn : frame_count;
+                                st->win_i32[oi * nw + w] = (ac >= 0) ? frame_nn : frame_count;
                             } else {
                                 st->win_is_dbl[w] = 1;
-                                if (frame_nn > 0) st->win_f64[i * nw + w] = frame_sum / (double)frame_nn;
-                                else st->win_null[i * nw + w] = 1;
+                                if (frame_nn > 0) st->win_f64[oi * nw + w] = frame_sum / (double)frame_nn;
+                                else st->win_null[oi * nw + w] = 1;
                             }
                         }
                     }
@@ -3849,6 +3981,25 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 } /* switch */
             } /* partitions */
         } /* window exprs */
+
+        /* Re-sort sorted[] back to the original global sort order for emit.
+         * Per-expression partition handling may have re-sorted it. */
+        if (spc >= 0 || soc >= 0) {
+            _wsort_ctx.has_part = (spc >= 0);
+            if (spc >= 0) {
+                _wsort_ctx.part_data = st->flat_data[spc];
+                _wsort_ctx.part_nulls = st->flat_nulls[spc];
+                _wsort_ctx.part_type = st->flat_types[spc];
+            }
+            _wsort_ctx.has_ord = (soc >= 0);
+            if (soc >= 0) {
+                _wsort_ctx.ord_data = st->flat_data[soc];
+                _wsort_ctx.ord_nulls = st->flat_nulls[soc];
+                _wsort_ctx.ord_type = st->flat_types[soc];
+                _wsort_ctx.ord_desc = pn->window.sort_ord_desc;
+            }
+            qsort(st->sorted, total, sizeof(uint32_t), window_sort_cmp);
+        }
 
         st->input_done = 1;
         st->emit_cursor = 0;
@@ -3884,11 +4035,10 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                    (const uint8_t *)st->flat_data[sci] + fi * esz, esz);
         }
 
-        /* Window result columns */
-        uint32_t si = st->emit_cursor - 1; /* sorted position */
+        /* Window result columns — indexed by original row index (fi) */
         for (uint16_t w = 0; w < nw; w++) {
             uint16_t oc = n_pass + w;
-            if (st->win_null[si * nw + w]) {
+            if (st->win_null[fi * nw + w]) {
                 out->cols[oc].nulls[out_count] = 1;
                 if (st->win_is_str[w])
                     out->cols[oc].data.str[out_count] = NULL;
@@ -3898,13 +4048,13 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     out->cols[oc].data.i32[out_count] = 0;
             } else if (st->win_is_str[w]) {
                 out->cols[oc].nulls[out_count] = 0;
-                out->cols[oc].data.str[out_count] = st->win_str[si * nw + w];
+                out->cols[oc].data.str[out_count] = st->win_str[fi * nw + w];
             } else if (st->win_is_dbl[w]) {
                 out->cols[oc].nulls[out_count] = 0;
-                out->cols[oc].data.f64[out_count] = st->win_f64[si * nw + w];
+                out->cols[oc].data.f64[out_count] = st->win_f64[fi * nw + w];
             } else {
                 out->cols[oc].nulls[out_count] = 0;
-                out->cols[oc].data.i32[out_count] = st->win_i32[si * nw + w];
+                out->cols[oc].data.i32[out_count] = st->win_i32[fi * nw + w];
             }
         }
         out_count++;
@@ -5762,7 +5912,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     if (s->has_recursive_cte)   return PLAN_RES_NOTIMPL;
     if (s->has_distinct_on)     return PLAN_RES_NOTIMPL;
     if (s->insert_rows_count > 0) return PLAN_RES_NOTIMPL;
-    if (s->has_having && !s->has_group_by) return PLAN_RES_NOTIMPL; /* HAVING without GROUP BY */
+    /* HAVING without GROUP BY is handled in build_simple_agg */
     if (s->group_by_rollup || s->group_by_cube) return PLAN_RES_NOTIMPL;
 
     struct table *t1 = t;
@@ -6484,7 +6634,6 @@ static struct plan_result build_simple_agg(struct table *t, struct query_select 
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
         if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
             return PLAN_RES_NOTIMPL;
-        if (ae->has_distinct && ae->func != AGG_COUNT) return PLAN_RES_NOTIMPL;
         if (ae->expr_idx != IDX_NONE) {
             agg_col_idxs[a] = -2;
         } else if (sv_eq_cstr(ae->column, "*")) {
@@ -6494,12 +6643,6 @@ static struct plan_result build_simple_agg(struct table *t, struct query_select 
             if (ci < 0) return PLAN_RES_ERR;
             agg_col_idxs[a] = ci;
         }
-    }
-
-    /* Bail out for aggregate FILTER clauses */
-    for (uint32_t a = 0; a < s->aggregates_count; a++) {
-        struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
-        if (ae->filter_cond != IDX_NONE) return PLAN_RES_NOTIMPL;
     }
 
     /* Build: SEQ_SCAN → (FILTER) → SIMPLE_AGG */
@@ -6520,8 +6663,15 @@ static struct plan_result build_simple_agg(struct table *t, struct query_select 
     PLAN_NODE(arena, agg_idx).simple_agg.agg_count = s->aggregates_count;
     PLAN_NODE(arena, agg_idx).simple_agg.agg_col_indices = agg_col_idxs;
     PLAN_NODE(arena, agg_idx).simple_agg.table = t;
+    current = agg_idx;
 
-    return PLAN_RES_OK(agg_idx);
+    /* HAVING filter (without GROUP BY) */
+    if (s->has_having && s->having_cond != IDX_NONE) {
+        current = try_append_having_filter(current, s, arena);
+        if (current == IDX_NONE) return PLAN_RES_NOTIMPL;
+    }
+
+    return PLAN_RES_OK(current);
 }
 
 /* ---- Plan builder: aggregate path ---- */
@@ -6672,7 +6822,6 @@ static enum plan_status validate_agg_columns(struct table *t, struct query_selec
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
         if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
             return PLAN_NOTIMPL;
-        if (ae->has_distinct && ae->func != AGG_COUNT) return PLAN_NOTIMPL;
         if (ae->expr_idx != IDX_NONE) {
             agg_col_idxs[a] = -2; /* expression-based aggregate */
         } else if (sv_eq_cstr(ae->column, "*")) {
@@ -6688,7 +6837,65 @@ static enum plan_status validate_agg_columns(struct table *t, struct query_selec
         for (uint32_t g = 0; g < s->group_by_count; g++) {
             sv gcol = arena->svs.items[s->group_by_start + g];
             grp[g] = table_find_column_sv(t, gcol);
-            if (grp[g] < 0) return PLAN_ERROR;
+            /* try matching by SELECT alias (parsed_columns path) */
+            if (grp[g] < 0 && s->parsed_columns_count > 0) {
+                for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                    struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
+                    if (sc->alias.len > 0 && sv_eq_ignorecase(sc->alias, gcol) && sc->expr_idx != IDX_NONE) {
+                        struct expr *e = &EXPR(arena, sc->expr_idx);
+                        if (e->type == EXPR_COLUMN_REF) {
+                            grp[g] = table_find_column_sv(t, e->column_ref.column);
+                            if (grp[g] >= 0) break;
+                        }
+                    }
+                }
+            }
+            /* fallback: scan raw s->columns text for "colname AS alias" */
+            if (grp[g] < 0 && s->columns.len > 0) {
+                const char *p = s->columns.data;
+                const char *end = s->columns.data + s->columns.len;
+                while (p < end) {
+                    while (p < end && (*p == ' ' || *p == '\t')) p++;
+                    const char *col_start = p;
+                    const char *as_pos = NULL;
+                    int depth = 0;
+                    while (p < end && (depth > 0 || *p != ',')) {
+                        if (*p == '(') depth++;
+                        else if (*p == ')') depth--;
+                        else if (depth == 0 && p + 3 <= end &&
+                                 p > col_start &&
+                                 (p[-1] == ' ' || p[-1] == ')') &&
+                                 (p[0] == 'A' || p[0] == 'a') &&
+                                 (p[1] == 'S' || p[1] == 's') &&
+                                 (p[2] == ' ' || p[2] == ',')) {
+                            as_pos = p;
+                        }
+                        p++;
+                    }
+                    if (as_pos) {
+                        const char *alias_start = as_pos + 3;
+                        while (alias_start < p && *alias_start == ' ') alias_start++;
+                        const char *alias_end = alias_start;
+                        while (alias_end < p && *alias_end != ' ' && *alias_end != ',') alias_end++;
+                        sv alias_sv = sv_from(alias_start, (size_t)(alias_end - alias_start));
+                        if (sv_eq_ignorecase(alias_sv, gcol)) {
+                            const char *cn_start = col_start;
+                            const char *cn_end = as_pos;
+                            while (cn_end > cn_start && cn_end[-1] == ' ') cn_end--;
+                            sv cn = sv_from(cn_start, (size_t)(cn_end - cn_start));
+                            grp[g] = table_find_column_sv(t, cn);
+                        }
+                    }
+                    if (p < end && *p == ',') p++;
+                }
+            }
+            /* check for expression-based GROUP BY key */
+            if (grp[g] < 0 && s->group_by_exprs_start + g < (uint32_t)arena->arg_indices.count) {
+                uint32_t expr_idx = arena->arg_indices.items[s->group_by_exprs_start + g];
+                if (expr_idx != IDX_NONE)
+                    return PLAN_NOTIMPL; /* expression GROUP BY — fall to legacy */
+            }
+            if (grp[g] < 0) return PLAN_NOTIMPL;
         }
         *out_grp_col_idxs = grp;
     }
