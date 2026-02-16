@@ -233,9 +233,9 @@
 
 <p>
     mskql distills the core ideas of a database engine&mdash;wire protocol, parser,
-    query executor, storage&mdash;into ~24,000 lines of C with zero external
+    query executor, storage&mdash;into ~29,000 lines of C with zero external
     dependencies. One <code>.c</code> file per subsystem. Three AI agents built it
-    in iterative rounds: no human wrote any C code or SQL test. 960+ test cases,
+    in iterative rounds: no human wrote any C code or SQL test. 1,030+ test cases,
     every one memory-checked. Connect with <code>psql</code> on port&nbsp;5433
     or <a href="#try-it">try it in the browser</a> via WebAssembly.
 </p>
@@ -278,7 +278,9 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 <h2 id="performance">Performance vs PostgreSQL</h2>
 
 <p>
-    Batch latency (single client) and concurrent throughput (4 threads, 5s).
+    Across 26 batch workloads and 14 concurrent workloads (8 threads),
+    mskql is faster than PostgreSQL in every batch test and 12&nbsp;of&nbsp;14
+    throughput tests. Highlights:
 </p>
 
 <div class="bench-legend">
@@ -288,28 +290,28 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 
 <table>
     <thead>
-        <tr><th>Workload</th><th>Type</th><th>Ratio</th><th></th><th></th></tr>
+        <tr><th>What it does</th><th>Type</th><th>Ratio</th><th></th><th></th></tr>
     </thead>
     <tbody>
-        <tr><td>aggregate</td><td>batch</td><td class="bench-faster">0.12&times;</td><td>mskql 8&times; faster</td>
+        <tr><td>SUM(price&nbsp;&times;&nbsp;qty) by category, 5K&nbsp;rows</td><td>batch</td><td class="bench-faster">0.10&times;</td><td>mskql 10&times; faster</td>
+            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:10%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
+        <tr><td>GROUP BY + SUM on 5K&nbsp;rows</td><td>batch</td><td class="bench-faster">0.12&times;</td><td>mskql 8&times; faster</td>
             <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:12%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
-        <tr><td>distinct</td><td>batch</td><td class="bench-faster">0.15&times;</td><td>mskql 7&times; faster</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:15%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
-        <tr><td>insert_bulk</td><td>batch</td><td class="bench-faster">0.33&times;</td><td>mskql 3&times; faster</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:33%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
-        <tr><td>order_by</td><td>batch</td><td class="bench-faster">0.49&times;</td><td>mskql 2&times; faster</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:49%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
-        <tr><td>aggregate</td><td>throughput</td><td class="bench-faster">9.21&times; QPS</td><td>52,670 vs 5,720 QPS</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:11%"></span></div></td></tr>
-        <tr><td>insert</td><td>throughput</td><td class="bench-faster">2.06&times; QPS</td><td>56,658 vs 27,520 QPS</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:49%"></span></div></td></tr>
-        <tr><td>full_scan</td><td>throughput</td><td class="bench-slower">0.91&times; QPS</td><td>network-bound</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:91%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
+        <tr><td>UPDATE 1K of 5K&nbsp;rows</td><td>batch</td><td class="bench-faster">0.20&times;</td><td>mskql 5&times; faster</td>
+            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:20%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
+        <tr><td>CTE &rarr; join &rarr; agg &rarr; sort, 50K&nbsp;rows</td><td>throughput</td><td class="bench-faster">152&times; QPS</td><td>74,069 vs 485 QPS</td>
+            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:1%"></span></div></td></tr>
+        <tr><td>3-table join + GROUP BY, 50K&nbsp;rows</td><td>throughput</td><td class="bench-faster">64&times; QPS</td><td>23,560 vs 370 QPS</td>
+            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:2%"></span></div></td></tr>
+        <tr><td>GROUP BY + SUM, 5K&nbsp;rows</td><td>throughput</td><td class="bench-faster">6.0&times; QPS</td><td>60,541 vs 10,042 QPS</td>
+            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:17%"></span></div></td></tr>
+        <tr><td>80% reads / 20% writes</td><td>throughput</td><td class="bench-slower">0.78&times; QPS</td><td>PG&rsquo;s MVCC wins on writes</td>
+            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:78%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
     </tbody>
 </table>
 
 <p>
-    &#8594;&ensp;<a href="bench-vs-pg.html"><strong>Full benchmark comparison</strong></a>
+    &#8594;&ensp;<a href="bench-vs-pg.html"><strong>All 26 batch + 14 throughput results</strong></a>
     &ensp;&middot;&ensp;
     <a href="dev/bench/index.html"><strong>Historical charts</strong></a>
 </p>
@@ -321,7 +323,7 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 <p style="margin-bottom:0.8rem;">
     Three agents in iterative rounds. <strong>Challenger</strong> writes adversarial
     SQL tests. <strong>Reviewer</strong> flags code-quality issues.
-    <strong>Writer</strong> fixes until all 960+ tests pass.
+    <strong>Writer</strong> fixes until all 1,030+ tests pass.
     No human wrote any C code or SQL test cases.
 </p>
 <p style="margin-bottom:0;">
@@ -351,7 +353,7 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
   <path d="M244,40 L214,40" stroke="#a00" stroke-width="1.2" fill="none" marker-end="url(#ah)"/>
   <path d="M288,52 C288,72 170,78 52,72 C30,71 18,66 18,52"
         stroke="#ccc" stroke-width="1" fill="none" stroke-dasharray="3,2"/>
-  <text x="170" y="90" text-anchor="middle" font-size="8.5" fill="#555" font-style="italic">iterate until all 960+ tests pass</text>
+  <text x="170" y="90" text-anchor="middle" font-size="8.5" fill="#555" font-style="italic">iterate until all 1,030+ tests pass</text>
 </svg>
 </div>
 </div>
@@ -425,7 +427,7 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
     </div>
     <div class="cta-card">
         <h3>Read the source</h3>
-        <p>~24,000 lines of C11. Every subsystem in a single file.</p>
+        <p>~29,000 lines of C11. Every subsystem in a single file.</p>
         <a href="https://github.com/martinsk/mskql" class="cta-link">GitHub &rarr;</a>
     </div>
 </div>
@@ -446,11 +448,11 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
     DML, joins, aggregation, window functions, CTEs, subqueries, 30+ built-in functions.
     &ensp;<a href="grammar.html">Grammar</a>
     <br>
-    <a href="testing.html"><strong>Testing</strong></a>&ensp;&mdash;&ensp;960+ test cases,
+    <a href="testing.html"><strong>Testing</strong></a>&ensp;&mdash;&ensp;1,030+ test cases,
     every one under a memory-safety checker. Parallel execution across all cores.
     <br>
     <a href="bench-vs-pg.html"><strong>Benchmarks</strong></a>&ensp;&mdash;&ensp;mskql
-    vs PostgreSQL on 19 batch workloads and 7 throughput workloads.
+    vs PostgreSQL on 26 batch workloads and 14 throughput workloads.
     &ensp;<a href="dev/bench/index.html">Historical charts</a>
 </p>
 

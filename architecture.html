@@ -19,7 +19,7 @@
 <hr class="title-rule">
 
 <p>
-    <strong>~24K lines of C. Zero dependencies. Four stages: wire protocol, parser,
+    <strong>~29K lines of C. Zero dependencies. Four stages: wire protocol, parser,
     executor, storage.</strong> Every query flows through the same pipeline.
     The block-oriented plan executor processes 1,024-row column blocks for
     cache-friendly, vectorized execution.
@@ -118,8 +118,9 @@
 
 <p>
     <strong>Fast.</strong> The block-oriented executor with columnar scan caching
-    beats PostgreSQL on 16 of 19 batch benchmarks. Aggregate queries run 8&times;
-    faster. Direct columnar-to-wire serialization avoids row materialization entirely.
+    is faster than PostgreSQL on all 26 batch benchmarks. Aggregate queries run
+    up to 10&times; faster. Direct columnar-to-wire serialization avoids row
+    materialization entirely.
 </p>
 <p>
     <strong>Simple.</strong> Zero external dependencies. One <code>.c</code> file per
