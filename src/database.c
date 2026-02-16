@@ -1570,48 +1570,53 @@ void remove_temp_table(struct database *db, struct table *t)
     }
 }
 
+static int db_exec_begin(struct database *db, struct query *q)
+{
+    struct txn_state *txn = db->active_txn;
+    if (!txn) { arena_set_error(&q->arena, "25000", "no connection context for transaction"); return -1; }
+    struct db_snapshot *snap = snapshot_create(db);
+    snap->parent = txn->snapshot;
+    txn->snapshot = snap;
+    txn->in_transaction = 1;
+    return 0;
+}
+
+static int db_exec_commit(struct database *db, struct query *q)
+{
+    struct txn_state *txn = db->active_txn;
+    if (!txn || !txn->in_transaction) {
+        arena_set_error(&q->arena, "25P01", "WARNING: no transaction in progress");
+        return 0;
+    }
+    struct db_snapshot *snap = txn->snapshot;
+    txn->snapshot = snap->parent;
+    snap->parent = NULL;
+    snapshot_free(snap);
+    if (!txn->snapshot)
+        txn->in_transaction = 0;
+    return 0;
+}
+
+static int db_exec_rollback(struct database *db, struct query *q)
+{
+    struct txn_state *txn = db->active_txn;
+    if (!txn || !txn->in_transaction) {
+        arena_set_error(&q->arena, "25P01", "WARNING: no transaction in progress");
+        return 0;
+    }
+    struct db_snapshot *snap = txn->snapshot;
+    txn->snapshot = snap->parent;
+    snap->parent = NULL;
+    snapshot_restore(db, snap);
+    snapshot_free(snap);
+    if (!txn->snapshot)
+        txn->in_transaction = 0;
+    return 0;
+}
+
 int db_exec(struct database *db, struct query *q, struct rows *result, struct bump_alloc *rb)
 {
-    /* handle transaction statements first (uses per-connection txn_state) */
     struct txn_state *txn = db->active_txn; /* may be NULL (wasm / internal) */
-    if (q->query_type == QUERY_TYPE_BEGIN) {
-        if (!txn) { arena_set_error(&q->arena, "25000", "no connection context for transaction"); return -1; }
-        /* Support nested BEGIN: create a new snapshot with parent pointer */
-        struct db_snapshot *snap = snapshot_create(db);
-        snap->parent = txn->snapshot; /* NULL if outermost */
-        txn->snapshot = snap;
-        txn->in_transaction = 1;
-        return 0;
-    }
-    if (q->query_type == QUERY_TYPE_COMMIT) {
-        if (!txn || !txn->in_transaction) {
-            arena_set_error(&q->arena, "25P01", "WARNING: no transaction in progress");
-            return 0;
-        }
-        /* Pop the innermost snapshot (discard it, changes are kept) */
-        struct db_snapshot *snap = txn->snapshot;
-        txn->snapshot = snap->parent;
-        snap->parent = NULL;
-        snapshot_free(snap);
-        if (!txn->snapshot)
-            txn->in_transaction = 0;
-        return 0;
-    }
-    if (q->query_type == QUERY_TYPE_ROLLBACK) {
-        if (!txn || !txn->in_transaction) {
-            arena_set_error(&q->arena, "25P01", "WARNING: no transaction in progress");
-            return 0;
-        }
-        /* Restore only the innermost snapshot, then pop it */
-        struct db_snapshot *snap = txn->snapshot;
-        txn->snapshot = snap->parent;
-        snap->parent = NULL;
-        snapshot_restore(db, snap);
-        snapshot_free(snap);
-        if (!txn->snapshot)
-            txn->in_transaction = 0;
-        return 0;
-    }
 
     switch (q->query_type) {
         case QUERY_TYPE_CREATE: {
@@ -3172,10 +3177,9 @@ skip_conflict_nothing:
             }
             return -1;
         }
-        case QUERY_TYPE_BEGIN:
-        case QUERY_TYPE_COMMIT:
-        case QUERY_TYPE_ROLLBACK:
-            return 0; /* handled above */
+        case QUERY_TYPE_BEGIN:    return db_exec_begin(db, q);
+        case QUERY_TYPE_COMMIT:   return db_exec_commit(db, q);
+        case QUERY_TYPE_ROLLBACK: return db_exec_rollback(db, q);
         case QUERY_TYPE_COPY:
             return 0; /* handled in pgwire */
         case QUERY_TYPE_SET:

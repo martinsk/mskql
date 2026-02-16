@@ -188,6 +188,10 @@ struct hash_join_state {
     /* probe state */
     int               build_done;
     size_t            probe_cursor;  /* for nested-loop fallback */
+    /* outer join state */
+    uint8_t          *matched;       /* bitmap: matched[i]=1 if inner row i was matched (RIGHT/FULL) */
+    int               outer_done;    /* 1 when probe phase is complete */
+    uint32_t          right_emit_cursor; /* cursor for emitting unmatched inner rows */
 };
 
 struct simple_agg_state {

@@ -1,0 +1,13 @@
+-- plan: FULL OUTER JOIN with unmatched rows on both sides
+-- setup:
+CREATE TABLE t1 (id INT, name TEXT);
+CREATE TABLE t2 (fk INT, val INT);
+INSERT INTO t1 VALUES (1, 'alice'), (2, 'bob');
+INSERT INTO t2 VALUES (1, 100), (3, 300);
+-- input:
+SELECT t1.name, t2.val FROM t1 FULL JOIN t2 ON t1.id = t2.fk ORDER BY t2.val;
+-- expected output:
+alice|100
+|300
+bob|
+-- expected status: 0

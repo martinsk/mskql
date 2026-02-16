@@ -40,6 +40,16 @@ Other directories: `tests/cases/` (SQL test files), `bench/` (micro-benchmarks).
 
 **Types**: `struct` with tagged unions for polymorphism (`plan_node`, `expr`, `cell`). Enums for type tags (`enum plan_op`, `enum expr_type`, `enum column_type`).
 
+### Dispatch rules
+
+Tagged unions exist so the compiler can enforce exhaustive handling via `-Wswitch-enum`.
+
+- **Always `switch` on enum types**, never if/else-if chains. A switch lets the compiler warn when a new variant is added and a handler is missing.
+- **No `default:` on finite enums** — list every variant explicitly, even if the body is just `break`. A `default:` silences the compiler warning and hides missing cases.
+- **No fallback return after an exhaustive switch** — a trailing `return -1` after a switch that already covers every variant defeats the compiler warning. Use `__builtin_unreachable()` if the compiler insists on a return.
+- **Short cases**: if a case body exceeds ~3 lines, extract it into a named `static` function. The switch should read like a dispatch table: `case PLAN_X: return handle_x(pn->x);` — the switch "picks" the relevant part of the union and sends only that to the handler, like SML pattern matching.
+- **Exception**: grouping types that share identical handling (e.g. all text-like `column_type` variants) is fine — list them all explicitly as fall-through cases, just don't add `default:`.
+
 **Strings**: `sv` (string view) for non-owning references; `char *` (strdup'd) for owned strings. Use `SV_FMT` / `SV_ARG()` for printf formatting.
 
 **Collections**: `DYNAMIC_ARRAY(T)` macro for growable arrays; `da_push` / `da_free` / `da_reset`.
@@ -78,7 +88,19 @@ Other directories: `tests/cases/` (SQL test files), `bench/` (micro-benchmarks).
 
 **New scalar function**: Add `FUNC_*` enum → keyword registration in `parser.c` → evaluation case in `eval_expr()`.
 
-**Bail-out pattern**: When the plan executor can't handle a query shape, return `IDX_NONE` from `plan_build_select`. The legacy path handles it. Never crash on unsupported queries.
+**Bail-out pattern**: When the plan executor can't handle a query shape, return `IDX_NONE` from `plan_build_select`. The legacy path handles it. Never crash on unsupported queries. See *Fail-fast* and *Validation-then-build* below.
+
+### Fail-fast
+
+Reject unsupported or invalid inputs at the top of a function with early returns. After the guard block, the remaining code operates in a "normalized world" where all inputs are known-valid — no defensive checks needed downstream.
+
+- Prefer immediate `return` over accumulating error state in a variable (e.g. `fail_reason`) when early exit is possible.
+- Keep nesting depth ≤ 3 in function bodies; extract helpers or use early returns to flatten.
+- Exemplary: `build_join` (11 bail-outs at the top, then clean logic) and `build_single_table` (13 bail-outs).
+
+### Validation-then-build
+
+Plan builders validate all inputs (columns exist, types match, features supported) before allocating any plan nodes. This prevents orphaned arena allocations on error paths.
 
 ## Testing
 

@@ -594,14 +594,31 @@ static int send_row_description(int fd, struct database *db, struct query *q,
     }
 
     /* try to get column metadata from the table */
-    if (q->query_type == QUERY_TYPE_SELECT && q->select.table.len > 0) {
-        t = db_find_table_sv(db, q->select.table);
-    } else if (q->query_type == QUERY_TYPE_DELETE && q->del.table.len > 0) {
-        t = db_find_table_sv(db, q->del.table);
-    } else if (q->query_type == QUERY_TYPE_UPDATE && q->update.table.len > 0) {
-        t = db_find_table_sv(db, q->update.table);
-    } else if (q->query_type == QUERY_TYPE_INSERT && q->insert.table.len > 0) {
-        t = db_find_table_sv(db, q->insert.table);
+    switch (q->query_type) {
+    case QUERY_TYPE_SELECT:   if (q->select.table.len > 0) t = db_find_table_sv(db, q->select.table); break;
+    case QUERY_TYPE_DELETE:   if (q->del.table.len > 0)    t = db_find_table_sv(db, q->del.table);    break;
+    case QUERY_TYPE_UPDATE:   if (q->update.table.len > 0) t = db_find_table_sv(db, q->update.table); break;
+    case QUERY_TYPE_INSERT:   if (q->insert.table.len > 0) t = db_find_table_sv(db, q->insert.table); break;
+    case QUERY_TYPE_CREATE:
+    case QUERY_TYPE_DROP:
+    case QUERY_TYPE_CREATE_INDEX:
+    case QUERY_TYPE_DROP_INDEX:
+    case QUERY_TYPE_CREATE_TYPE:
+    case QUERY_TYPE_DROP_TYPE:
+    case QUERY_TYPE_ALTER:
+    case QUERY_TYPE_BEGIN:
+    case QUERY_TYPE_COMMIT:
+    case QUERY_TYPE_ROLLBACK:
+    case QUERY_TYPE_CREATE_SEQUENCE:
+    case QUERY_TYPE_DROP_SEQUENCE:
+    case QUERY_TYPE_CREATE_VIEW:
+    case QUERY_TYPE_DROP_VIEW:
+    case QUERY_TYPE_TRUNCATE:
+    case QUERY_TYPE_EXPLAIN:
+    case QUERY_TYPE_COPY:
+    case QUERY_TYPE_SET:
+    case QUERY_TYPE_SHOW:
+        break;
     }
 
     msgbuf_push_u16(&m, (uint16_t)ncols);

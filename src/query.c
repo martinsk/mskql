@@ -3258,7 +3258,7 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
     }
 
     }
-    return cell_make_null();
+    __builtin_unreachable();
 }
 
 /* JPL ownership: emit_row receives cells with owned text from eval_expr,

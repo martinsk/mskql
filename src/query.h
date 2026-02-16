@@ -633,10 +633,34 @@ struct query_show {
 /* Returns 1 if the query type is read-only (no database mutation). */
 static inline int query_is_read_only(enum query_type qt)
 {
-    return qt == QUERY_TYPE_SELECT
-        || qt == QUERY_TYPE_SHOW
-        || qt == QUERY_TYPE_SET
-        || qt == QUERY_TYPE_EXPLAIN;
+    switch (qt) {
+    case QUERY_TYPE_SELECT:
+    case QUERY_TYPE_SHOW:
+    case QUERY_TYPE_SET:
+    case QUERY_TYPE_EXPLAIN:
+        return 1;
+    case QUERY_TYPE_CREATE:
+    case QUERY_TYPE_DROP:
+    case QUERY_TYPE_INSERT:
+    case QUERY_TYPE_DELETE:
+    case QUERY_TYPE_UPDATE:
+    case QUERY_TYPE_CREATE_INDEX:
+    case QUERY_TYPE_DROP_INDEX:
+    case QUERY_TYPE_CREATE_TYPE:
+    case QUERY_TYPE_DROP_TYPE:
+    case QUERY_TYPE_ALTER:
+    case QUERY_TYPE_BEGIN:
+    case QUERY_TYPE_COMMIT:
+    case QUERY_TYPE_ROLLBACK:
+    case QUERY_TYPE_CREATE_SEQUENCE:
+    case QUERY_TYPE_DROP_SEQUENCE:
+    case QUERY_TYPE_CREATE_VIEW:
+    case QUERY_TYPE_DROP_VIEW:
+    case QUERY_TYPE_TRUNCATE:
+    case QUERY_TYPE_COPY:
+        return 0;
+    }
+    __builtin_unreachable();
 }
 
 struct query {

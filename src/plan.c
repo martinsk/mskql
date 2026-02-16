@@ -60,8 +60,7 @@ static void scan_cache_build(struct table *t)
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_INTERVAL:
-        case COLUMN_TYPE_UUID:
-        default:                   elem_sz = sizeof(char *); break;
+        case COLUMN_TYPE_UUID:     elem_sz = sizeof(char *); break;
         }
 
         sc->col_data[c] = calloc(nrows ? nrows : 1, elem_sz);
@@ -148,8 +147,7 @@ static void scan_cache_build(struct table *t)
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_INTERVAL:
-        case COLUMN_TYPE_UUID:
-        default: {
+        case COLUMN_TYPE_UUID: {
             /* text types */
             char **dst = (char **)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
@@ -199,7 +197,6 @@ void scan_cache_update_row(struct table *t, size_t row_idx)
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
-        default:
             ((char **)sc->col_data[c])[row_idx] = cell->value.as_text; break;
         }
     }
@@ -252,7 +249,6 @@ static uint16_t scan_cache_read(struct scan_cache *sc, size_t *cursor,
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
-        default:
             memcpy(cb->data.str, (char **)sc->col_data[tc] + start, nrows * sizeof(char *)); break;
         }
     }
@@ -281,8 +277,7 @@ static inline void cb_copy_value(struct col_block *dst, uint32_t dst_i,
     case COLUMN_TYPE_INTERVAL:
     case COLUMN_TYPE_UUID:     dst->data.str[dst_i] = src->data.str[src_i]; break;
     case COLUMN_TYPE_INT:
-    case COLUMN_TYPE_BOOLEAN:
-    default:                   dst->data.i32[dst_i] = src->data.i32[src_i]; break;
+    case COLUMN_TYPE_BOOLEAN:  dst->data.i32[dst_i] = src->data.i32[src_i]; break;
     }
 }
 
@@ -305,8 +300,7 @@ static inline void cb_bulk_copy(struct col_block *dst,
     case COLUMN_TYPE_INTERVAL:
     case COLUMN_TYPE_UUID:     memcpy(dst->data.str, src->data.str, count * sizeof(char *)); break;
     case COLUMN_TYPE_INT:
-    case COLUMN_TYPE_BOOLEAN:
-    default:                   memcpy(dst->data.i32, src->data.i32, count * sizeof(int32_t)); break;
+    case COLUMN_TYPE_BOOLEAN:  memcpy(dst->data.i32, src->data.i32, count * sizeof(int32_t)); break;
     }
 }
 
@@ -319,8 +313,7 @@ static inline double cb_to_double(const struct col_block *cb, uint16_t i)
     case COLUMN_TYPE_BIGINT:   return (double)cb->data.i64[i];
     case COLUMN_TYPE_SMALLINT: return (double)cb->data.i16[i];
     case COLUMN_TYPE_INT:
-    case COLUMN_TYPE_BOOLEAN:
-    default:                   return (double)cb->data.i32[i];
+    case COLUMN_TYPE_BOOLEAN:  return (double)cb->data.i32[i];
     case COLUMN_TYPE_TEXT:
     case COLUMN_TYPE_ENUM:
     case COLUMN_TYPE_DATE:
@@ -364,7 +357,7 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
         /* not yet implemented — fall through to child */
         return plan_node_ncols(arena, pn->left);
     }
-    return plan_node_ncols(arena, pn->left);
+    __builtin_unreachable();
 }
 
 /* ---- Hash table init (needs bump_alloc from arena.h) ---- */
@@ -498,9 +491,8 @@ uint16_t scan_table_block(struct table *t, size_t *cursor,
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_INTERVAL:
-        case COLUMN_TYPE_UUID:
-        default: {
-            /* Generic path for all other types */
+        case COLUMN_TYPE_UUID: {
+            /* Generic path for text-like types */
             for (uint16_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[start + r].cells.items[tc];
                 if (cell->is_null || cell->type != cb->type
@@ -1570,8 +1562,7 @@ static void flat_col_set_from_cb(struct flat_col *fc, uint32_t dst_i,
     case COLUMN_TYPE_INTERVAL:
     case COLUMN_TYPE_UUID:     ((char **)fc->data)[dst_i] = src->data.str[src_i]; break;
     case COLUMN_TYPE_INT:
-    case COLUMN_TYPE_BOOLEAN:
-    default:                   ((int32_t *)fc->data)[dst_i] = src->data.i32[src_i]; break;
+    case COLUMN_TYPE_BOOLEAN:  ((int32_t *)fc->data)[dst_i] = src->data.i32[src_i]; break;
     }
 }
 
@@ -1615,8 +1606,7 @@ static int flat_col_eq(const struct flat_col *a, uint32_t ai,
         return strcmp(sa, sb) == 0;
     }
     case COLUMN_TYPE_INT:
-    case COLUMN_TYPE_BOOLEAN:
-    default: return ((int32_t *)a->data)[ai] == b->data.i32[bi];
+    case COLUMN_TYPE_BOOLEAN:  return ((int32_t *)a->data)[ai] == b->data.i32[bi];
     }
 }
 
@@ -1638,8 +1628,7 @@ static void flat_col_copy_to_out(const struct flat_col *fc, uint32_t src_i,
     case COLUMN_TYPE_INTERVAL:
     case COLUMN_TYPE_UUID:     dst->data.str[dst_i] = ((char **)fc->data)[src_i]; break;
     case COLUMN_TYPE_INT:
-    case COLUMN_TYPE_BOOLEAN:
-    default:                   dst->data.i32[dst_i] = ((int32_t *)fc->data)[src_i]; break;
+    case COLUMN_TYPE_BOOLEAN:  dst->data.i32[dst_i] = ((int32_t *)fc->data)[src_i]; break;
     }
 }
 
@@ -1743,9 +1732,7 @@ static void hash_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
     }
 
     /* Determine inner column count */
-    uint16_t inner_ncols = 0;
-    if (inner->op == PLAN_SEQ_SCAN) inner_ncols = inner->seq_scan.ncols;
-    else inner_ncols = 16; /* fallback estimate */
+    uint16_t inner_ncols = plan_node_ncols(ctx->arena, pn->right);
 
     /* Collect all rows from inner side into flat columns */
     uint32_t cap = 1024;
@@ -1823,17 +1810,55 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     if (!st->build_done)
         hash_join_build(ctx, node_idx);
 
-    /* Determine outer (left child) column count */
-    struct plan_node *outer = &PLAN_NODE(ctx->arena, pn->left);
-    uint16_t outer_ncols = 0;
-    if (outer->op == PLAN_SEQ_SCAN) outer_ncols = outer->seq_scan.ncols;
-    else outer_ncols = (uint16_t)(out->ncols - st->build_ncols);
+    int join_type = pn->hash_join.join_type; /* 0=INNER,1=LEFT,2=RIGHT,3=FULL */
 
+    /* Allocate matched bitmap for RIGHT/FULL on first call */
+    if ((join_type == 2 || join_type == 3) && !st->matched && st->build_count > 0) {
+        st->matched = (uint8_t *)bump_calloc(&ctx->arena->scratch,
+                                              st->build_count, sizeof(uint8_t));
+    }
+
+    /* Determine outer (left child) column count */
+    uint16_t outer_ncols = plan_node_ncols(ctx->arena, pn->left);
+
+    /* ---- Phase 2: emit unmatched inner rows (RIGHT/FULL) ---- */
+    if (st->outer_done) {
+        if (join_type != 2 && join_type != 3) return -1;
+        row_block_reset(out);
+        uint16_t out_count = 0;
+        while (st->right_emit_cursor < st->build_count && out_count < BLOCK_CAPACITY) {
+            uint32_t bi = st->right_emit_cursor++;
+            if (st->matched && st->matched[bi]) continue;
+            /* Emit NULL outer cols + inner cols */
+            for (uint16_t c = 0; c < outer_ncols; c++) {
+                out->cols[c].nulls[out_count] = 1;
+            }
+            for (uint16_t c = 0; c < st->build_ncols; c++) {
+                out->cols[outer_ncols + c].type = st->build_cols[c].type;
+                flat_col_copy_to_out(&st->build_cols[c], bi,
+                                     &out->cols[outer_ncols + c], out_count);
+            }
+            out_count++;
+        }
+        if (out_count == 0) return -1;
+        out->count = out_count;
+        for (uint16_t c = 0; c < out->ncols; c++)
+            out->cols[c].count = out_count;
+        return 0;
+    }
+
+    /* ---- Phase 1: probe outer rows against hash table ---- */
     struct row_block outer_block;
     row_block_alloc(&outer_block, outer_ncols, &ctx->arena->scratch);
 
     int rc = plan_next_block(ctx, pn->left, &outer_block);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        /* Outer exhausted — transition to phase 2 for RIGHT/FULL */
+        st->outer_done = 1;
+        if (join_type == 2 || join_type == 3)
+            return hash_join_next(ctx, node_idx, out); /* re-enter for phase 2 */
+        return -1;
+    }
 
     /* Probe: for each outer row, look up in hash table */
     int outer_key = pn->hash_join.outer_key_col;
@@ -1847,11 +1872,28 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
     for (uint16_t i = 0; i < active && out_count < BLOCK_CAPACITY; i++) {
         uint16_t oi = row_block_row_idx(&outer_block, i);
-        if (outer_key_cb->nulls[oi]) continue;
+
+        /* NULL key: no match possible */
+        if (outer_key_cb->nulls[oi]) {
+            /* LEFT/FULL: emit outer row with NULL inner columns */
+            if (join_type == 1 || join_type == 3) {
+                for (uint16_t c = 0; c < outer_ncols; c++) {
+                    out->cols[c].type = outer_block.cols[c].type;
+                    cb_copy_value(&out->cols[c], out_count, &outer_block.cols[c], oi);
+                }
+                for (uint16_t c = 0; c < st->build_ncols; c++) {
+                    out->cols[outer_ncols + c].type = st->build_cols[c].type;
+                    out->cols[outer_ncols + c].nulls[out_count] = 1;
+                }
+                out_count++;
+            }
+            continue;
+        }
 
         uint32_t h = block_hash_cell(outer_key_cb, oi);
         uint32_t bucket = h & (st->ht.nbuckets - 1);
         uint32_t entry = st->ht.buckets[bucket];
+        int found = 0;
 
         while (entry != IDX_NONE && entry != 0xFFFFFFFF && out_count < BLOCK_CAPACITY) {
             if (st->ht.hashes[entry] == h &&
@@ -1867,12 +1909,31 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                          &out->cols[outer_ncols + c], out_count);
                 }
                 out_count++;
+                found = 1;
+                /* Mark inner row as matched for RIGHT/FULL */
+                if (st->matched) st->matched[entry] = 1;
             }
             entry = st->ht.nexts[entry];
         }
+
+        /* LEFT/FULL: emit outer row with NULL inner columns when no match */
+        if (!found && (join_type == 1 || join_type == 3) && out_count < BLOCK_CAPACITY) {
+            for (uint16_t c = 0; c < outer_ncols; c++) {
+                out->cols[c].type = outer_block.cols[c].type;
+                cb_copy_value(&out->cols[c], out_count, &outer_block.cols[c], oi);
+            }
+            for (uint16_t c = 0; c < st->build_ncols; c++) {
+                out->cols[outer_ncols + c].type = st->build_cols[c].type;
+                out->cols[outer_ncols + c].nulls[out_count] = 1;
+            }
+            out_count++;
+        }
     }
 
-    if (out_count == 0) return -1;
+    if (out_count == 0) {
+        /* No output from this probe block — try next block or phase 2 */
+        return hash_join_next(ctx, node_idx, out);
+    }
 
     out->count = out_count;
     for (uint16_t c = 0; c < out->ncols; c++)
@@ -4161,7 +4222,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
         /* not yet implemented */
         return -1;
     }
-    return -1;
+    __builtin_unreachable();
 }
 
 /* ---- Full plan execution to rows ---- */
@@ -4219,7 +4280,157 @@ static int cell_value_to_str(const struct cell *c, char *buf, int buflen)
             return snprintf(buf, buflen, "'%s'", c->value.as_text);
         return snprintf(buf, buflen, "?");
     }
-    return snprintf(buf, buflen, "?");
+    __builtin_unreachable();
+}
+
+static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
+                              char *buf, int buflen, int depth);
+
+static const char *cmp_op_str(enum cmp_op op)
+{
+    switch (op) {
+    case CMP_EQ:             return "=";
+    case CMP_NE:             return "!=";
+    case CMP_LT:             return "<";
+    case CMP_GT:             return ">";
+    case CMP_LE:             return "<=";
+    case CMP_GE:             return ">=";
+    case CMP_IS_NULL:        return "IS NULL";
+    case CMP_IS_NOT_NULL:    return "IS NOT NULL";
+    case CMP_IN:             return "IN";
+    case CMP_NOT_IN:         return "NOT IN";
+    case CMP_BETWEEN:        return "BETWEEN";
+    case CMP_LIKE:           return "LIKE";
+    case CMP_ILIKE:          return "ILIKE";
+    case CMP_IS_DISTINCT:    return "IS DISTINCT FROM";
+    case CMP_IS_NOT_DISTINCT: return "IS NOT DISTINCT FROM";
+    case CMP_EXISTS:         return "EXISTS";
+    case CMP_NOT_EXISTS:     return "NOT EXISTS";
+    case CMP_REGEX_MATCH:    return "~";
+    case CMP_REGEX_NOT_MATCH: return "!~";
+    }
+    __builtin_unreachable();
+}
+
+static int explain_index_scan(struct query_arena *arena, struct plan_node *pn,
+                               char *buf, int buflen)
+{
+    const char *tname = pn->index_scan.table ? pn->index_scan.table->name : "?";
+    if (pn->index_scan.cond_idx != IDX_NONE) {
+        struct condition *cond = &arena->conditions.items[pn->index_scan.cond_idx];
+        char vbuf[64] = "";
+        cell_value_to_str(&cond->value, vbuf, sizeof(vbuf));
+        return snprintf(buf, buflen, "Index Scan on %s (" SV_FMT " %s %s)\n",
+                        tname, (int)cond->column.len, cond->column.data,
+                        cmp_op_str(cond->op), vbuf);
+    }
+    return snprintf(buf, buflen, "Index Scan on %s\n", tname);
+}
+
+static int explain_filter(struct query_arena *arena, struct plan_node *pn,
+                           char *buf, int buflen, int depth)
+{
+    int written = 0, n;
+    if (pn->filter.cond_idx != IDX_NONE) {
+        struct condition *cond = &arena->conditions.items[pn->filter.cond_idx];
+        char vbuf[64] = "";
+        cell_value_to_str(&cond->value, vbuf, sizeof(vbuf));
+        n = snprintf(buf, buflen, "Filter: (" SV_FMT " %s %s)\n",
+                     (int)cond->column.len, cond->column.data,
+                     cmp_op_str(cond->op), vbuf);
+    } else {
+        n = snprintf(buf, buflen, "Filter\n");
+    }
+    if (n > 0) written += n;
+    n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+    if (n > 0) written += n;
+    return written;
+}
+
+static int explain_sort(struct query_arena *arena, struct plan_node *pn,
+                         char *buf, int buflen, int depth)
+{
+    int written = 0, n;
+    n = snprintf(buf, buflen, "Sort");
+    if (n > 0) written += n;
+    if (pn->sort.nsort_cols > 0 && pn->left != IDX_NONE) {
+        /* walk child chain to find SEQ_SCAN for column names */
+        struct plan_node *child = &PLAN_NODE(arena, pn->left);
+        struct table *st = NULL;
+        if (child->op == PLAN_SEQ_SCAN) st = child->seq_scan.table;
+        else if (child->op == PLAN_FILTER && child->left != IDX_NONE) {
+            struct plan_node *gc = &PLAN_NODE(arena, child->left);
+            if (gc->op == PLAN_SEQ_SCAN) st = gc->seq_scan.table;
+        }
+        if (st) {
+            n = snprintf(buf + written, buflen - written, " (");
+            if (n > 0) written += n;
+            for (uint16_t k = 0; k < pn->sort.nsort_cols; k++) {
+                int ci = pn->sort.sort_cols[k];
+                if (ci >= 0 && (size_t)ci < st->columns.count) {
+                    if (k > 0) { n = snprintf(buf + written, buflen - written, ", "); if (n > 0) written += n; }
+                    n = snprintf(buf + written, buflen - written, "%s", st->columns.items[ci].name);
+                    if (n > 0) written += n;
+                    if (pn->sort.sort_descs[k]) {
+                        n = snprintf(buf + written, buflen - written, " DESC");
+                        if (n > 0) written += n;
+                    }
+                }
+            }
+            n = snprintf(buf + written, buflen - written, ")");
+            if (n > 0) written += n;
+        }
+    }
+    n = snprintf(buf + written, buflen - written, "\n");
+    if (n > 0) written += n;
+    n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+    if (n > 0) written += n;
+    return written;
+}
+
+static int explain_limit(struct plan_node *pn, char *buf, int buflen)
+{
+    if (pn->limit.has_limit && pn->limit.has_offset)
+        return snprintf(buf, buflen, "Limit (%zu, offset %zu)\n",
+                        pn->limit.limit, pn->limit.offset);
+    if (pn->limit.has_limit)
+        return snprintf(buf, buflen, "Limit (%zu)\n", pn->limit.limit);
+    return snprintf(buf, buflen, "Limit\n");
+}
+
+static int explain_set_op(struct plan_node *pn, char *buf, int buflen)
+{
+    const char *opname = "SetOp";
+    if (pn->set_op.set_op == 0) opname = pn->set_op.set_all ? "Append (UNION ALL)" : "HashSetOp Union";
+    else if (pn->set_op.set_op == 1) opname = "HashSetOp Intersect";
+    else if (pn->set_op.set_op == 2) opname = "HashSetOp Except";
+    return snprintf(buf, buflen, "%s\n", opname);
+}
+
+/* Emit label + recurse into left child (common pattern for unary nodes). */
+static int explain_unary(struct query_arena *arena, struct plan_node *pn,
+                          const char *label, char *buf, int buflen, int depth)
+{
+    int written = 0, n;
+    n = snprintf(buf, buflen, "%s\n", label);
+    if (n > 0) written += n;
+    n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+    if (n > 0) written += n;
+    return written;
+}
+
+/* Emit label + recurse into left and right children (common pattern for binary nodes). */
+static int explain_binary(struct query_arena *arena, struct plan_node *pn,
+                           const char *label, char *buf, int buflen, int depth)
+{
+    int written = 0, n;
+    n = snprintf(buf, buflen, "%s\n", label);
+    if (n > 0) written += n;
+    n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+    if (n > 0) written += n;
+    n = plan_explain_node(arena, pn->right, buf + written, buflen - written, depth + 1);
+    if (n > 0) written += n;
+    return written;
 }
 
 static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
@@ -4240,159 +4451,62 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
                      pn->seq_scan.table ? pn->seq_scan.table->name : "?");
         if (n > 0) written += n;
         break;
-    case PLAN_INDEX_SCAN: {
-        /* Try to show the filter condition */
-        const char *tname = pn->index_scan.table ? pn->index_scan.table->name : "?";
-        if (pn->index_scan.cond_idx != IDX_NONE) {
-            struct condition *cond = &arena->conditions.items[pn->index_scan.cond_idx];
-            const char *op_str = cond->op == CMP_EQ ? "=" : cond->op == CMP_NE ? "!=" :
-                cond->op == CMP_LT ? "<" : cond->op == CMP_GT ? ">" :
-                cond->op == CMP_LE ? "<=" : cond->op == CMP_GE ? ">=" : "?";
-            char vbuf[64] = "";
-            cell_value_to_str(&cond->value, vbuf, sizeof(vbuf));
-            n = snprintf(buf + written, buflen - written,
-                         "Index Scan on %s (" SV_FMT " %s %s)\n",
-                         tname, (int)cond->column.len, cond->column.data, op_str, vbuf);
-        } else {
-            n = snprintf(buf + written, buflen - written, "Index Scan on %s\n", tname);
-        }
+    case PLAN_INDEX_SCAN:
+        n = explain_index_scan(arena, pn, buf + written, buflen - written);
         if (n > 0) written += n;
         break;
-    }
-    case PLAN_FILTER: {
-        /* Show filter condition */
-        if (pn->filter.cond_idx != IDX_NONE) {
-            struct condition *cond = &arena->conditions.items[pn->filter.cond_idx];
-            const char *op_str = cond->op == CMP_EQ ? "=" : cond->op == CMP_NE ? "!=" :
-                cond->op == CMP_LT ? "<" : cond->op == CMP_GT ? ">" :
-                cond->op == CMP_LE ? "<=" : cond->op == CMP_GE ? ">=" : "?";
-            char vbuf[64] = "";
-            cell_value_to_str(&cond->value, vbuf, sizeof(vbuf));
-            n = snprintf(buf + written, buflen - written,
-                         "Filter: (" SV_FMT " %s %s)\n",
-                         (int)cond->column.len, cond->column.data, op_str, vbuf);
-        } else {
-            n = snprintf(buf + written, buflen - written, "Filter\n");
-        }
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+    case PLAN_FILTER:
+        n = explain_filter(arena, pn, buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
-    }
     case PLAN_PROJECT:
-        n = snprintf(buf + written, buflen - written, "Project\n");
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        n = explain_unary(arena, pn, "Project", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
     case PLAN_EXPR_PROJECT:
-        n = snprintf(buf + written, buflen - written, "Project (expressions)\n");
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        n = explain_unary(arena, pn, "Project (expressions)", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
-    case PLAN_SORT: {
-        n = snprintf(buf + written, buflen - written, "Sort");
-        if (n > 0) written += n;
-        /* show sort columns */
-        if (pn->sort.nsort_cols > 0 && pn->left != IDX_NONE) {
-            /* try to get table from child seq_scan */
-            struct plan_node *child = &PLAN_NODE(arena, pn->left);
-            struct table *st = NULL;
-            if (child->op == PLAN_SEQ_SCAN) st = child->seq_scan.table;
-            else if (child->op == PLAN_FILTER && child->left != IDX_NONE) {
-                struct plan_node *gc = &PLAN_NODE(arena, child->left);
-                if (gc->op == PLAN_SEQ_SCAN) st = gc->seq_scan.table;
-            }
-            if (st) {
-                n = snprintf(buf + written, buflen - written, " (");
-                if (n > 0) written += n;
-                for (uint16_t k = 0; k < pn->sort.nsort_cols; k++) {
-                    int ci = pn->sort.sort_cols[k];
-                    if (ci >= 0 && (size_t)ci < st->columns.count) {
-                        if (k > 0) { n = snprintf(buf + written, buflen - written, ", "); if (n > 0) written += n; }
-                        n = snprintf(buf + written, buflen - written, "%s", st->columns.items[ci].name);
-                        if (n > 0) written += n;
-                        if (pn->sort.sort_descs[k]) {
-                            n = snprintf(buf + written, buflen - written, " DESC");
-                            if (n > 0) written += n;
-                        }
-                    }
-                }
-                n = snprintf(buf + written, buflen - written, ")");
-                if (n > 0) written += n;
-            }
-        }
-        n = snprintf(buf + written, buflen - written, "\n");
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+    case PLAN_SORT:
+        n = explain_sort(arena, pn, buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
-    }
     case PLAN_HASH_JOIN:
-        n = snprintf(buf + written, buflen - written, "Hash Join\n");
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->right, buf + written, buflen - written, depth + 1);
+        n = explain_binary(arena, pn, "Hash Join", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
     case PLAN_HASH_SEMI_JOIN:
-        n = snprintf(buf + written, buflen - written, "Hash Semi Join\n");
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->right, buf + written, buflen - written, depth + 1);
+        n = explain_binary(arena, pn, "Hash Semi Join", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
-    case PLAN_LIMIT: {
-        if (pn->limit.has_limit && pn->limit.has_offset)
-            n = snprintf(buf + written, buflen - written, "Limit (%zu, offset %zu)\n",
-                         pn->limit.limit, pn->limit.offset);
-        else if (pn->limit.has_limit)
-            n = snprintf(buf + written, buflen - written, "Limit (%zu)\n", pn->limit.limit);
-        else
-            n = snprintf(buf + written, buflen - written, "Limit\n");
+    case PLAN_LIMIT:
+        n = explain_limit(pn, buf + written, buflen - written);
         if (n > 0) written += n;
         n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
         if (n > 0) written += n;
         break;
-    }
     case PLAN_DISTINCT:
-        n = snprintf(buf + written, buflen - written, "HashAggregate (DISTINCT)\n");
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        n = explain_unary(arena, pn, "HashAggregate (DISTINCT)", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
     case PLAN_HASH_AGG:
-        n = snprintf(buf + written, buflen - written, "HashAggregate\n");
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        n = explain_unary(arena, pn, "HashAggregate", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
     case PLAN_SIMPLE_AGG:
-        n = snprintf(buf + written, buflen - written, "Aggregate\n");
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        n = explain_unary(arena, pn, "Aggregate", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
-    case PLAN_SET_OP: {
-        const char *opname = "SetOp";
-        if (pn->set_op.set_op == 0) opname = pn->set_op.set_all ? "Append (UNION ALL)" : "HashSetOp Union";
-        else if (pn->set_op.set_op == 1) opname = "HashSetOp Intersect";
-        else if (pn->set_op.set_op == 2) opname = "HashSetOp Except";
-        n = snprintf(buf + written, buflen - written, "%s\n", opname);
+    case PLAN_SET_OP:
+        n = explain_set_op(pn, buf + written, buflen - written);
         if (n > 0) written += n;
         n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
         if (n > 0) written += n;
         n = plan_explain_node(arena, pn->right, buf + written, buflen - written, depth + 1);
         if (n > 0) written += n;
         break;
-    }
     case PLAN_WINDOW:
-        n = snprintf(buf + written, buflen - written, "WindowAgg\n");
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
+        n = explain_unary(arena, pn, "WindowAgg", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
     case PLAN_GENERATE_SERIES:
@@ -4400,11 +4514,7 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
         if (n > 0) written += n;
         break;
     case PLAN_NESTED_LOOP:
-        n = snprintf(buf + written, buflen - written, "Nested Loop\n");
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->left, buf + written, buflen - written, depth + 1);
-        if (n > 0) written += n;
-        n = plan_explain_node(arena, pn->right, buf + written, buflen - written, depth + 1);
+        n = explain_binary(arena, pn, "Nested Loop", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
     }
@@ -5060,7 +5170,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
 
     for (uint32_t j = 0; j < s->joins_count && ntables < MAX_JOIN_TABLES; j++) {
         struct join_info *ji = &arena->joins.items[s->joins_start + j];
-        if (ji->join_type != 0) return PLAN_RES_NOTIMPL; /* not INNER */
+        if (ji->join_type == 4) return PLAN_RES_NOTIMPL; /* CROSS join */
         if (ji->is_lateral)     return PLAN_RES_NOTIMPL;
         if (ji->is_natural)     return PLAN_RES_NOTIMPL;
         if (ji->has_using)      return PLAN_RES_NOTIMPL;
@@ -5157,28 +5267,48 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     int  join_sort_nf[32];
     uint16_t join_sort_nord = 0;
 
+    int need_expr_project_join = 0;
+    uint32_t *expr_proj_indices_join = NULL;
+
     if (!has_agg) {
         if (select_all_join) {
             /* No projection */
         } else if (s->parsed_columns_count > 0) {
             proj_ncols_join = (uint16_t)s->parsed_columns_count;
             proj_map_join = (int *)bump_alloc(&arena->scratch, proj_ncols_join * sizeof(int));
+            int all_column_refs = 1;
             for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
                 struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
-                if (sc->expr_idx == IDX_NONE) return PLAN_RES_NOTIMPL;
+                if (sc->expr_idx == IDX_NONE) { all_column_refs = 0; break; }
                 struct expr *e = &EXPR(arena, sc->expr_idx);
-                if (e->type != EXPR_COLUMN_REF) return PLAN_RES_NOTIMPL;
+                if (e->type != EXPR_COLUMN_REF) { all_column_refs = 0; break; }
                 int ci = find_col_in_tables_q(e->column_ref.table, e->column_ref.column, tables, offsets, aliases, ntables);
-                if (ci < 0) return PLAN_RES_ERR;
+                if (ci < 0) { all_column_refs = 0; break; }
                 proj_map_join[i] = ci;
             }
-            need_project_join = 1;
+            if (all_column_refs) {
+                need_project_join = 1;
+            } else {
+                /* Fall back to expression projection */
+                expr_proj_indices_join = (uint32_t *)bump_alloc(&arena->scratch,
+                    proj_ncols_join * sizeof(uint32_t));
+                int expr_ok = 1;
+                for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+                    struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
+                    if (sc->expr_idx == IDX_NONE) { expr_ok = 0; break; }
+                    struct expr *e = &EXPR(arena, sc->expr_idx);
+                    if (e->type == EXPR_SUBQUERY) { expr_ok = 0; break; }
+                    expr_proj_indices_join[i] = sc->expr_idx;
+                }
+                if (!expr_ok) return PLAN_RES_NOTIMPL;
+                need_expr_project_join = 1;
+            }
         } else {
             return PLAN_RES_NOTIMPL;
         }
 
-        /* ORDER BY for multi-table joins (>2) — bail to legacy for now */
-        if (s->has_order_by && ntables > 2) return PLAN_RES_NOTIMPL;
+        /* Multi-table joins (>2 tables) have deeper key resolution issues — bail for now */
+        if (ntables > 2) return PLAN_RES_NOTIMPL;
 
         /* Pre-validate ORDER BY columns in merged column space */
         if (s->has_order_by && s->order_by_count > 0) {
@@ -5220,6 +5350,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     uint32_t current = build_seq_scan(tables[0], arena);
 
     for (uint32_t j = 0; j < s->joins_count; j++) {
+        struct join_info *ji = &arena->joins.items[s->joins_start + j];
         uint32_t right_scan = build_seq_scan(tables[j + 1], arena);
 
         uint32_t join_idx = plan_alloc_node(arena, PLAN_HASH_JOIN);
@@ -5227,7 +5358,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
         PLAN_NODE(arena, join_idx).right = right_scan;
         PLAN_NODE(arena, join_idx).hash_join.outer_key_col = outer_keys[j];
         PLAN_NODE(arena, join_idx).hash_join.inner_key_col = inner_keys[j];
-        PLAN_NODE(arena, join_idx).hash_join.join_type = 0; /* INNER */
+        PLAN_NODE(arena, join_idx).hash_join.join_type = ji->join_type;
         current = join_idx;
     }
 
@@ -5330,6 +5461,15 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
             current = append_sort_node(current, arena, join_sort_cols, join_sort_descs, join_sort_nf, join_sort_nord);
         if (need_project_join)
             current = append_project_node(current, arena, proj_ncols_join, proj_map_join);
+        if (need_expr_project_join) {
+            struct table *merged = build_merged_table_desc(tables, ntables, aliases, cum_cols, arena);
+            uint32_t eproj_idx = plan_alloc_node(arena, PLAN_EXPR_PROJECT);
+            PLAN_NODE(arena, eproj_idx).left = current;
+            PLAN_NODE(arena, eproj_idx).expr_project.ncols = proj_ncols_join;
+            PLAN_NODE(arena, eproj_idx).expr_project.expr_indices = expr_proj_indices_join;
+            PLAN_NODE(arena, eproj_idx).expr_project.table = merged;
+            current = eproj_idx;
+        }
     }
 
     if (s->has_distinct) {
@@ -5887,46 +6027,51 @@ static uint32_t try_append_having_filter(uint32_t current,
     return IDX_NONE;
 }
 
-/* Try to build a plan for a GROUP BY + aggregates query. */
-static struct plan_result build_aggregate(struct table *t, struct query_select *s,
-                                          struct query_arena *arena)
+/* Validate aggregate columns, returning PLAN_OK on success or an error status.
+ * On success, agg_col_idxs and grp_col_idxs are populated. */
+static enum plan_status validate_agg_columns(struct table *t, struct query_select *s,
+                                              struct query_arena *arena,
+                                              int *agg_col_idxs, int **out_grp_col_idxs)
 {
-    /* Validate: all aggregates must be simple SUM/COUNT/AVG/MIN/MAX on column refs */
-    enum plan_status fail_reason = PLAN_OK;
-    int *agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
     for (uint32_t a = 0; a < s->aggregates_count; a++) {
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
         if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
-            { fail_reason = PLAN_NOTIMPL; break; }
-        if (ae->has_distinct) { fail_reason = PLAN_NOTIMPL; break; }
+            return PLAN_NOTIMPL;
+        if (ae->has_distinct) return PLAN_NOTIMPL;
         if (ae->expr_idx != IDX_NONE) {
             agg_col_idxs[a] = -2; /* expression-based aggregate */
         } else if (sv_eq_cstr(ae->column, "*")) {
             agg_col_idxs[a] = -1; /* COUNT(*) */
         } else {
             int ci = table_find_column_sv(t, ae->column);
-            if (ci < 0) { fail_reason = PLAN_ERROR; break; }
-            /* MIN/MAX on TEXT columns can't use double-based accumulation */
+            if (ci < 0) return PLAN_ERROR;
             if ((ae->func == AGG_MIN || ae->func == AGG_MAX) &&
                 column_type_is_text(t->columns.items[ci].type))
-                { fail_reason = PLAN_NOTIMPL; break; }
+                return PLAN_NOTIMPL;
             agg_col_idxs[a] = ci;
         }
     }
-
-    /* Validate: GROUP BY columns are resolvable */
-    int *grp_col_idxs = NULL;
-    if (fail_reason == PLAN_OK && s->group_by_count > 0) {
-        grp_col_idxs = (int *)bump_alloc(&arena->scratch, s->group_by_count * sizeof(int));
+    if (s->group_by_count > 0) {
+        int *grp = (int *)bump_alloc(&arena->scratch, s->group_by_count * sizeof(int));
         for (uint32_t g = 0; g < s->group_by_count; g++) {
             sv gcol = arena->svs.items[s->group_by_start + g];
-            grp_col_idxs[g] = table_find_column_sv(t, gcol);
-            if (grp_col_idxs[g] < 0) { fail_reason = PLAN_ERROR; break; }
+            grp[g] = table_find_column_sv(t, gcol);
+            if (grp[g] < 0) return PLAN_ERROR;
         }
+        *out_grp_col_idxs = grp;
     }
+    return PLAN_OK;
+}
 
-    if (fail_reason != PLAN_OK)
-        return (struct plan_result){ .node = IDX_NONE, .status = fail_reason };
+/* Try to build a plan for a GROUP BY + aggregates query. */
+static struct plan_result build_aggregate(struct table *t, struct query_select *s,
+                                          struct query_arena *arena)
+{
+    int *agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
+    int *grp_col_idxs = NULL;
+    enum plan_status vs = validate_agg_columns(t, s, arena, agg_col_idxs, &grp_col_idxs);
+    if (vs != PLAN_OK)
+        return (struct plan_result){ .node = IDX_NONE, .status = vs };
 
     /* Build: SEQ_SCAN → (FILTER) → HASH_AGG */
     uint32_t scan_idx = build_seq_scan(t, arena);
