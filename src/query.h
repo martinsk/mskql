@@ -159,6 +159,8 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                    struct row *row, struct table *t,
                    struct database *db);
 
+int like_match(const char *pattern, const char *text, int case_insensitive);
+
 /* ---------------------------------------------------------------------------
  * Expression AST — tagged union for all SQL expressions.
  * All child references are uint32_t indices into the query arena pools.

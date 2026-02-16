@@ -27,6 +27,23 @@ enum plan_op {
     PLAN_EXPR_PROJECT,   /* expression evaluation: UPPER(x), ABS(y), etc. */
 };
 
+/* ---- Plan builder result ---- */
+
+enum plan_status {
+    PLAN_OK,       /* plan built successfully */
+    PLAN_NOTIMPL,  /* feature not yet implemented — fall back to legacy */
+    PLAN_ERROR     /* real error (bad column, type mismatch, etc.) */
+};
+
+struct plan_result {
+    uint32_t         node;   /* valid only when status == PLAN_OK */
+    enum plan_status status;
+};
+
+#define PLAN_RES_OK(n)   ((struct plan_result){ .node = (n), .status = PLAN_OK })
+#define PLAN_RES_NOTIMPL ((struct plan_result){ .node = IDX_NONE, .status = PLAN_NOTIMPL })
+#define PLAN_RES_ERR     ((struct plan_result){ .node = IDX_NONE, .status = PLAN_ERROR })
+
 /* Plan node: arena-allocated in query_arena.plan_nodes DA.
  * Children referenced by uint32_t index (IDX_NONE = no child). */
 struct plan_node {
@@ -53,6 +70,11 @@ struct plan_node {
             int      col_idx;        /* column index for simple comparisons (-1 = complex) */
             int      cmp_op;         /* CMP_EQ, CMP_GT, etc. for simple path */
             struct cell cmp_val;     /* comparison value for simple path */
+            /* Extended filter fields */
+            struct cell between_high;  /* high bound for CMP_BETWEEN */
+            struct cell *in_values;    /* bump-allocated array for CMP_IN literal list */
+            uint32_t    in_count;      /* number of values in in_values */
+            const char *like_pattern;  /* bump-allocated pattern for CMP_LIKE/CMP_ILIKE */
         } filter;
         struct {
             uint16_t ncols;          /* number of output columns */
@@ -85,6 +107,8 @@ struct plan_node {
         struct {
             uint32_t agg_start;
             uint32_t agg_count;
+            int      *agg_col_indices; /* pre-resolved: -1=COUNT(*), -2=expr */
+            struct table *table;       /* for eval_expr on expression aggs */
         } simple_agg;
         struct {
             size_t offset;
@@ -166,6 +190,19 @@ struct hash_join_state {
     size_t            probe_cursor;  /* for nested-loop fallback */
 };
 
+struct simple_agg_state {
+    double   *sums;        /* bump: [agg_count] */
+    double   *mins;
+    double   *maxs;
+    size_t   *nonnull;     /* non-null count per agg */
+    size_t    total_rows;
+    int      *minmax_init;
+    int       input_done;
+    int       emit_done;
+    struct row tmp_row;
+    int       tmp_row_inited;
+};
+
 struct hash_agg_state {
     struct block_hash_table ht;
     /* per-group accumulators stored in parallel arrays */
@@ -216,6 +253,8 @@ struct window_state {
     double   *win_f64;          /* bump: [n_win * total_rows] */
     uint8_t  *win_null;         /* bump: [n_win * total_rows] */
     int      *win_is_dbl;       /* bump: [n_win] — 1 if result is double */
+    char    **win_str;          /* bump: [n_win * total_rows] — text results */
+    int      *win_is_str;       /* bump: [n_win] — 1 if result is text */
 };
 
 struct hash_semi_join_state {
@@ -268,10 +307,11 @@ struct plan_exec_ctx {
 uint32_t plan_alloc_node(struct query_arena *arena, enum plan_op op);
 
 /* Try to build a block-oriented plan for a SELECT query.
- * Returns the root plan node index, or IDX_NONE if the query
- * cannot be handled by the planner (falls back to legacy path). */
-uint32_t plan_build_select(struct table *t, struct query_select *s,
-                           struct query_arena *arena, struct database *db);
+ * Returns a plan_result: PLAN_OK with a valid node index on success,
+ * PLAN_NOTIMPL for unimplemented features (fall back to legacy),
+ * or PLAN_ERROR for real errors (bad column, type mismatch, etc.). */
+struct plan_result plan_build_select(struct table *t, struct query_select *s,
+                                     struct query_arena *arena, struct database *db);
 
 /* Initialize execution context for a plan tree. */
 void plan_exec_init(struct plan_exec_ctx *ctx, struct query_arena *arena,

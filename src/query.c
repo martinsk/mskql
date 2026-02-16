@@ -154,7 +154,7 @@ static int cell_is_null(const struct cell *c);
 /* SQL LIKE pattern matching: % = any sequence, _ = any single char.
  * Iterative algorithm: tracks a single backtrack point for the last '%'
  * seen, giving O(n*m) worst case instead of exponential. */
-static int like_match(const char *pattern, const char *text, int case_insensitive)
+int like_match(const char *pattern, const char *text, int case_insensitive)
 {
     const char *star_p = NULL; /* pattern position after last '%' */
     const char *star_t = NULL; /* text position at last '%' match */
@@ -5351,11 +5351,11 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
     /* try block-oriented plan executor for simple queries
      * (skip if has_set_op — db_exec handles set operations separately) */
     if (!s->has_set_op) {
-        uint32_t plan_root = plan_build_select(t, s, arena, db);
-        if (plan_root != IDX_NONE) {
+        struct plan_result pr = plan_build_select(t, s, arena, db);
+        if (pr.status == PLAN_OK) {
             struct plan_exec_ctx ctx;
-            plan_exec_init(&ctx, arena, db, plan_root);
-            return plan_exec_to_rows(&ctx, plan_root, result, rb);
+            plan_exec_init(&ctx, arena, db, pr.node);
+            return plan_exec_to_rows(&ctx, pr.node, result, rb);
         }
     }
 

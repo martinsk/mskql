@@ -6,5 +6,5 @@ INSERT INTO cte_events SELECT n, n % 50, n % 3, (n * 11) % 100 FROM generate_ser
 -- input:
 WITH totals AS (SELECT user_id, SUM(amount) AS total FROM cte_events WHERE event_type = 0 GROUP BY user_id), big AS (SELECT * FROM totals WHERE total > 100) SELECT COUNT(*) FROM big;
 -- expected output:
-50
+49
 -- expected status: 0

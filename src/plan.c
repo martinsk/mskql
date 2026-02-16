@@ -358,8 +358,9 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
     case PLAN_FILTER:
     case PLAN_LIMIT:
         return plan_node_ncols(arena, pn->left);
-    case PLAN_NESTED_LOOP:
     case PLAN_SIMPLE_AGG:
+        return pn->simple_agg.agg_count;
+    case PLAN_NESTED_LOOP:
         /* not yet implemented — fall through to child */
         return plan_node_ncols(arena, pn->left);
     }
@@ -746,6 +747,231 @@ static int index_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* Evaluate a single COND_COMPARE leaf against columnar data.
+ * Returns number of matching rows written to sel. */
+static uint16_t filter_eval_leaf(struct col_block *cb, int op,
+                                  struct cell *cmp_val, struct cell *between_high,
+                                  struct cell *in_values, uint32_t in_count,
+                                  const char *like_pattern,
+                                  uint32_t *cand, uint16_t cand_count,
+                                  uint32_t *sel)
+{
+    uint16_t sel_count = 0;
+
+    #define FLEAF_LOOP(COND) \
+        for (uint16_t _c = 0; _c < cand_count; _c++) { \
+            uint16_t r = (uint16_t)cand[_c]; \
+            if (COND) sel[sel_count++] = r; \
+        }
+
+    /* IS NULL / IS NOT NULL */
+    if (op == CMP_IS_NULL) { const uint8_t *nulls = cb->nulls; FLEAF_LOOP(nulls[r]); return sel_count; }
+    if (op == CMP_IS_NOT_NULL) { const uint8_t *nulls = cb->nulls; FLEAF_LOOP(!nulls[r]); return sel_count; }
+
+    /* BETWEEN */
+    if (op == CMP_BETWEEN && cmp_val && between_high) {
+        const uint8_t *nulls = cb->nulls;
+        if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
+            int32_t lo = cmp_val->value.as_int, hi = between_high->value.as_int;
+            const int32_t *vals = cb->data.i32;
+            FLEAF_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+        } else if (cb->type == COLUMN_TYPE_BIGINT) {
+            int64_t lo = cmp_val->value.as_bigint, hi = between_high->value.as_bigint;
+            const int64_t *vals = cb->data.i64;
+            FLEAF_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+        } else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC) {
+            double lo = cmp_val->type == COLUMN_TYPE_FLOAT ? cmp_val->value.as_float : (double)cmp_val->value.as_int;
+            double hi = between_high->type == COLUMN_TYPE_FLOAT ? between_high->value.as_float : (double)between_high->value.as_int;
+            const double *vals = cb->data.f64;
+            FLEAF_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+        } else if (column_type_is_text(cb->type)) {
+            const char *lo = cmp_val->value.as_text ? cmp_val->value.as_text : "";
+            const char *hi = between_high->value.as_text ? between_high->value.as_text : "";
+            char * const *vals = cb->data.str;
+            FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], lo) >= 0 && strcmp(vals[r], hi) <= 0);
+        } else if (cb->type == COLUMN_TYPE_SMALLINT) {
+            int16_t lo = (int16_t)cmp_val->value.as_int, hi = (int16_t)between_high->value.as_int;
+            const int16_t *vals = cb->data.i16;
+            FLEAF_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+        }
+        return sel_count;
+    }
+
+    /* IN-list */
+    if (op == CMP_IN && in_values && in_count > 0) {
+        const uint8_t *nulls = cb->nulls;
+        if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
+            const int32_t *vals = cb->data.i32;
+            for (uint16_t _c = 0; _c < cand_count; _c++) {
+                uint16_t r = (uint16_t)cand[_c];
+                if (nulls[r]) continue;
+                for (uint32_t j = 0; j < in_count; j++)
+                    if (!in_values[j].is_null && in_values[j].value.as_int == vals[r]) { sel[sel_count++] = r; break; }
+            }
+        } else if (cb->type == COLUMN_TYPE_BIGINT) {
+            const int64_t *vals = cb->data.i64;
+            for (uint16_t _c = 0; _c < cand_count; _c++) {
+                uint16_t r = (uint16_t)cand[_c];
+                if (nulls[r]) continue;
+                for (uint32_t j = 0; j < in_count; j++)
+                    if (!in_values[j].is_null && in_values[j].value.as_bigint == vals[r]) { sel[sel_count++] = r; break; }
+            }
+        } else if (column_type_is_text(cb->type)) {
+            char * const *vals = cb->data.str;
+            for (uint16_t _c = 0; _c < cand_count; _c++) {
+                uint16_t r = (uint16_t)cand[_c];
+                if (nulls[r] || !vals[r]) continue;
+                for (uint32_t j = 0; j < in_count; j++)
+                    if (!in_values[j].is_null && in_values[j].value.as_text &&
+                        strcmp(vals[r], in_values[j].value.as_text) == 0) { sel[sel_count++] = r; break; }
+            }
+        }
+        return sel_count;
+    }
+
+    /* LIKE / ILIKE */
+    if ((op == CMP_LIKE || op == CMP_ILIKE) && column_type_is_text(cb->type)) {
+        const char *pat = like_pattern ? like_pattern : (cmp_val ? cmp_val->value.as_text : "");
+        if (!pat) pat = "";
+        char * const *vals = cb->data.str;
+        const uint8_t *nulls = cb->nulls;
+        int icase = (op == CMP_ILIKE);
+        FLEAF_LOOP(!nulls[r] && vals[r] && like_match(pat, vals[r], icase));
+        return sel_count;
+    }
+
+    /* Basic comparison (CMP_EQ..CMP_GE) */
+    if (cmp_val && op >= CMP_EQ && op <= CMP_GE) {
+        const uint8_t *nulls = cb->nulls;
+        if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
+            int32_t cv = cmp_val->value.as_int;
+            const int32_t *vals = cb->data.i32;
+            switch (op) {
+                case CMP_EQ: FLEAF_LOOP(!nulls[r] && vals[r] == cv); break;
+                case CMP_NE: FLEAF_LOOP(!nulls[r] && vals[r] != cv); break;
+                case CMP_LT: FLEAF_LOOP(!nulls[r] && vals[r] <  cv); break;
+                case CMP_GT: FLEAF_LOOP(!nulls[r] && vals[r] >  cv); break;
+                case CMP_LE: FLEAF_LOOP(!nulls[r] && vals[r] <= cv); break;
+                case CMP_GE: FLEAF_LOOP(!nulls[r] && vals[r] >= cv); break;
+                default: break;
+            }
+        } else if (cb->type == COLUMN_TYPE_BIGINT) {
+            int64_t cv = cmp_val->value.as_bigint;
+            const int64_t *vals = cb->data.i64;
+            switch (op) {
+                case CMP_EQ: FLEAF_LOOP(!nulls[r] && vals[r] == cv); break;
+                case CMP_NE: FLEAF_LOOP(!nulls[r] && vals[r] != cv); break;
+                case CMP_LT: FLEAF_LOOP(!nulls[r] && vals[r] <  cv); break;
+                case CMP_GT: FLEAF_LOOP(!nulls[r] && vals[r] >  cv); break;
+                case CMP_LE: FLEAF_LOOP(!nulls[r] && vals[r] <= cv); break;
+                case CMP_GE: FLEAF_LOOP(!nulls[r] && vals[r] >= cv); break;
+                default: break;
+            }
+        } else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC) {
+            double cv = cmp_val->type == COLUMN_TYPE_FLOAT ? cmp_val->value.as_float : (double)cmp_val->value.as_int;
+            const double *vals = cb->data.f64;
+            switch (op) {
+                case CMP_EQ: FLEAF_LOOP(!nulls[r] && vals[r] == cv); break;
+                case CMP_NE: FLEAF_LOOP(!nulls[r] && vals[r] != cv); break;
+                case CMP_LT: FLEAF_LOOP(!nulls[r] && vals[r] <  cv); break;
+                case CMP_GT: FLEAF_LOOP(!nulls[r] && vals[r] >  cv); break;
+                case CMP_LE: FLEAF_LOOP(!nulls[r] && vals[r] <= cv); break;
+                case CMP_GE: FLEAF_LOOP(!nulls[r] && vals[r] >= cv); break;
+                default: break;
+            }
+        } else if (column_type_is_text(cb->type)) {
+            const char *cv = cmp_val->value.as_text;
+            if (!cv) cv = "";
+            char * const *vals = cb->data.str;
+            switch (op) {
+                case CMP_EQ: FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cv) == 0); break;
+                case CMP_NE: FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cv) != 0); break;
+                case CMP_LT: FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cv) <  0); break;
+                case CMP_GT: FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cv) >  0); break;
+                case CMP_LE: FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cv) <= 0); break;
+                case CMP_GE: FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cv) >= 0); break;
+                default: break;
+            }
+        } else if (cb->type == COLUMN_TYPE_SMALLINT) {
+            int16_t cv = (int16_t)cmp_val->value.as_int;
+            const int16_t *vals = cb->data.i16;
+            switch (op) {
+                case CMP_EQ: FLEAF_LOOP(!nulls[r] && vals[r] == cv); break;
+                case CMP_NE: FLEAF_LOOP(!nulls[r] && vals[r] != cv); break;
+                case CMP_LT: FLEAF_LOOP(!nulls[r] && vals[r] <  cv); break;
+                case CMP_GT: FLEAF_LOOP(!nulls[r] && vals[r] >  cv); break;
+                case CMP_LE: FLEAF_LOOP(!nulls[r] && vals[r] <= cv); break;
+                case CMP_GE: FLEAF_LOOP(!nulls[r] && vals[r] >= cv); break;
+                default: break;
+            }
+        }
+    }
+
+    #undef FLEAF_LOOP
+    return sel_count;
+}
+
+/* Evaluate a condition tree against columnar data, producing a selection vector.
+ * Handles COND_AND (intersect), COND_OR (union), and leaf COND_COMPARE.
+ * t: table for column name resolution (maps condition column names to block indices).
+ * cand/cand_count: input candidate rows to evaluate.
+ * sel: output buffer (must hold cand_count entries).
+ * Returns number of matching rows written to sel. */
+static uint16_t filter_eval_cond_columnar(struct query_arena *arena,
+                                           struct table *t,
+                                           uint32_t cond_idx,
+                                           struct row_block *blk,
+                                           uint32_t *cand, uint16_t cand_count,
+                                           uint32_t *sel,
+                                           struct bump_alloc *scratch)
+{
+    if (cond_idx == IDX_NONE || cand_count == 0) return 0;
+    struct condition *cond = &COND(arena, cond_idx);
+
+    /* ---- COND_AND: intersect left and right ---- */
+    if (cond->type == COND_AND) {
+        uint32_t *tmp = (uint32_t *)bump_alloc(scratch, cand_count * sizeof(uint32_t));
+        uint16_t left_count = filter_eval_cond_columnar(arena, t, cond->left, blk,
+                                                         cand, cand_count, tmp, scratch);
+        return filter_eval_cond_columnar(arena, t, cond->right, blk,
+                                          tmp, left_count, sel, scratch);
+    }
+
+    /* ---- COND_OR: union left and right ---- */
+    if (cond->type == COND_OR) {
+        uint32_t *left_sel = (uint32_t *)bump_alloc(scratch, cand_count * sizeof(uint32_t));
+        uint32_t *right_sel = (uint32_t *)bump_alloc(scratch, cand_count * sizeof(uint32_t));
+        uint16_t left_count = filter_eval_cond_columnar(arena, t, cond->left, blk,
+                                                         cand, cand_count, left_sel, scratch);
+        uint16_t right_count = filter_eval_cond_columnar(arena, t, cond->right, blk,
+                                                          cand, cand_count, right_sel, scratch);
+        /* Merge-union (both are subsets of cand, in order) */
+        uint16_t out_count = 0;
+        uint16_t li = 0, ri = 0;
+        while (li < left_count && ri < right_count) {
+            if (left_sel[li] < right_sel[ri]) sel[out_count++] = left_sel[li++];
+            else if (left_sel[li] > right_sel[ri]) sel[out_count++] = right_sel[ri++];
+            else { sel[out_count++] = left_sel[li++]; ri++; }
+        }
+        while (li < left_count) sel[out_count++] = left_sel[li++];
+        while (ri < right_count) sel[out_count++] = right_sel[ri++];
+        return out_count;
+    }
+
+    /* ---- Leaf COND_COMPARE ---- */
+    if (cond->type != COND_COMPARE) return 0;
+    int fc = table_find_column_sv(t, cond->column);
+    if (fc < 0 || fc >= blk->ncols) return 0;
+
+    return filter_eval_leaf(&blk->cols[fc], (int)cond->op,
+                             &cond->value, &cond->between_high,
+                             cond->in_values_count > 0 ?
+                                 &arena->cells.items[cond->in_values_start] : NULL,
+                             cond->in_values_count,
+                             cond->value.value.as_text,
+                             cand, cand_count, sel);
+}
+
 static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                        struct row_block *out)
 {
@@ -755,71 +981,218 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     int rc = plan_next_block(ctx, pn->left, out);
     if (rc != 0) return rc;
 
-    /* Allocate selection vector */
+    /* If child already has a selection vector (stacked filters), we must
+     * only consider those rows.  Build a candidate array for uniform iteration. */
+    uint16_t cand_count;
+    uint32_t *cand;
+    if (out->sel) {
+        cand_count = out->sel_count;
+        cand = out->sel;
+    } else {
+        cand_count = out->count;
+        cand = (uint32_t *)bump_alloc(&ctx->arena->scratch,
+                                       cand_count * sizeof(uint32_t));
+        for (uint16_t i = 0; i < cand_count; i++) cand[i] = i;
+    }
+
+    /* Allocate output selection vector */
     uint32_t *sel = (uint32_t *)bump_alloc(&ctx->arena->scratch,
-                                           out->count * sizeof(uint32_t));
+                                           cand_count * sizeof(uint32_t));
     uint16_t sel_count = 0;
+
+    /* Columnar compound evaluation path (OR, nested AND/OR trees).
+     * col_idx == -1 signals that this filter uses filter_eval_cond_columnar. */
+    if (pn->filter.col_idx == -1 && pn->filter.cond_idx != IDX_NONE) {
+        /* Find the table from the child node chain for column resolution */
+        struct table *t = NULL;
+        uint32_t walk = pn->left;
+        while (walk != IDX_NONE) {
+            struct plan_node *wn = &PLAN_NODE(ctx->arena, walk);
+            if (wn->op == PLAN_SEQ_SCAN) { t = wn->seq_scan.table; break; }
+            if (wn->op == PLAN_FILTER || wn->op == PLAN_PROJECT ||
+                wn->op == PLAN_SORT || wn->op == PLAN_LIMIT ||
+                wn->op == PLAN_DISTINCT || wn->op == PLAN_EXPR_PROJECT)
+                walk = wn->left;
+            else break;
+        }
+        if (t) {
+            sel_count = filter_eval_cond_columnar(ctx->arena, t, pn->filter.cond_idx,
+                                                   out, cand, cand_count, sel,
+                                                   &ctx->arena->scratch);
+        }
+        goto done;
+    }
 
     /* Fast path: simple numeric comparison on a single column */
     if (pn->filter.col_idx >= 0 && pn->filter.col_idx < out->ncols) {
         struct col_block *cb = &out->cols[pn->filter.col_idx];
         int op = pn->filter.cmp_op;
 
+        /* Macro: iterate over candidate rows */
+        #define FILTER_LOOP(COND) \
+            for (uint16_t _c = 0; _c < cand_count; _c++) { \
+                uint16_t r = (uint16_t)cand[_c]; \
+                if (COND) sel[sel_count++] = r; \
+            }
+
+        /* ---- IS NULL / IS NOT NULL (type-independent, check first) ---- */
+        if (op == CMP_IS_NULL) {
+            const uint8_t *nulls = cb->nulls;
+            FILTER_LOOP(nulls[r]);
+            goto done;
+        }
+        if (op == CMP_IS_NOT_NULL) {
+            const uint8_t *nulls = cb->nulls;
+            FILTER_LOOP(!nulls[r]);
+            goto done;
+        }
+
+        /* ---- BETWEEN ---- */
+        if (op == CMP_BETWEEN) {
+            const uint8_t *nulls = cb->nulls;
+            if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
+                int32_t lo = pn->filter.cmp_val.value.as_int;
+                int32_t hi = pn->filter.between_high.value.as_int;
+                const int32_t *vals = cb->data.i32;
+                FILTER_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+            } else if (cb->type == COLUMN_TYPE_BIGINT) {
+                int64_t lo = pn->filter.cmp_val.value.as_bigint;
+                int64_t hi = pn->filter.between_high.value.as_bigint;
+                const int64_t *vals = cb->data.i64;
+                FILTER_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+            } else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC) {
+                double lo = pn->filter.cmp_val.type == COLUMN_TYPE_FLOAT
+                    ? pn->filter.cmp_val.value.as_float : (double)pn->filter.cmp_val.value.as_int;
+                double hi = pn->filter.between_high.type == COLUMN_TYPE_FLOAT
+                    ? pn->filter.between_high.value.as_float : (double)pn->filter.between_high.value.as_int;
+                const double *vals = cb->data.f64;
+                FILTER_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+            } else if (column_type_is_text(cb->type)) {
+                const char *lo = pn->filter.cmp_val.value.as_text ? pn->filter.cmp_val.value.as_text : "";
+                const char *hi = pn->filter.between_high.value.as_text ? pn->filter.between_high.value.as_text : "";
+                char * const *vals = cb->data.str;
+                FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], lo) >= 0 && strcmp(vals[r], hi) <= 0);
+            } else if (cb->type == COLUMN_TYPE_SMALLINT) {
+                int16_t lo = (int16_t)pn->filter.cmp_val.value.as_int;
+                int16_t hi = (int16_t)pn->filter.between_high.value.as_int;
+                const int16_t *vals = cb->data.i16;
+                FILTER_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+            }
+            goto done;
+        }
+
+        /* ---- IN-list (literal values) ---- */
+        if (op == CMP_IN && pn->filter.in_values && pn->filter.in_count > 0) {
+            const uint8_t *nulls = cb->nulls;
+            uint32_t nv = pn->filter.in_count;
+            struct cell *inv = pn->filter.in_values;
+            if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
+                const int32_t *vals = cb->data.i32;
+                for (uint16_t _c = 0; _c < cand_count; _c++) {
+                    uint16_t r = (uint16_t)cand[_c];
+                    if (nulls[r]) continue;
+                    int32_t v = vals[r];
+                    for (uint32_t j = 0; j < nv; j++) {
+                        if (!inv[j].is_null && inv[j].value.as_int == v) {
+                            sel[sel_count++] = r; break;
+                        }
+                    }
+                }
+            } else if (cb->type == COLUMN_TYPE_BIGINT) {
+                const int64_t *vals = cb->data.i64;
+                for (uint16_t _c = 0; _c < cand_count; _c++) {
+                    uint16_t r = (uint16_t)cand[_c];
+                    if (nulls[r]) continue;
+                    int64_t v = vals[r];
+                    for (uint32_t j = 0; j < nv; j++) {
+                        if (!inv[j].is_null && inv[j].value.as_bigint == v) {
+                            sel[sel_count++] = r; break;
+                        }
+                    }
+                }
+            } else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC) {
+                const double *vals = cb->data.f64;
+                for (uint16_t _c = 0; _c < cand_count; _c++) {
+                    uint16_t r = (uint16_t)cand[_c];
+                    if (nulls[r]) continue;
+                    double v = vals[r];
+                    for (uint32_t j = 0; j < nv; j++) {
+                        double jv = inv[j].type == COLUMN_TYPE_FLOAT ? inv[j].value.as_float
+                                  : inv[j].type == COLUMN_TYPE_NUMERIC ? inv[j].value.as_numeric
+                                  : (double)inv[j].value.as_int;
+                        if (!inv[j].is_null && v == jv) {
+                            sel[sel_count++] = r; break;
+                        }
+                    }
+                }
+            } else if (column_type_is_text(cb->type)) {
+                char * const *vals = cb->data.str;
+                for (uint16_t _c = 0; _c < cand_count; _c++) {
+                    uint16_t r = (uint16_t)cand[_c];
+                    if (nulls[r] || !vals[r]) continue;
+                    for (uint32_t j = 0; j < nv; j++) {
+                        if (!inv[j].is_null && inv[j].value.as_text &&
+                            strcmp(vals[r], inv[j].value.as_text) == 0) {
+                            sel[sel_count++] = r; break;
+                        }
+                    }
+                }
+            } else if (cb->type == COLUMN_TYPE_SMALLINT) {
+                const int16_t *vals = cb->data.i16;
+                for (uint16_t _c = 0; _c < cand_count; _c++) {
+                    uint16_t r = (uint16_t)cand[_c];
+                    if (nulls[r]) continue;
+                    int16_t v = vals[r];
+                    for (uint32_t j = 0; j < nv; j++) {
+                        if (!inv[j].is_null && (int16_t)inv[j].value.as_int == v) {
+                            sel[sel_count++] = r; break;
+                        }
+                    }
+                }
+            }
+            goto done;
+        }
+
+        /* ---- LIKE / ILIKE ---- */
+        if ((op == CMP_LIKE || op == CMP_ILIKE) && column_type_is_text(cb->type)) {
+            const char *pat = pn->filter.like_pattern;
+            if (!pat) pat = "";
+            char * const *vals = cb->data.str;
+            const uint8_t *nulls = cb->nulls;
+            int icase = (op == CMP_ILIKE);
+            FILTER_LOOP(!nulls[r] && vals[r] && like_match(pat, vals[r], icase));
+            goto done;
+        }
+
+        /* ---- Basic comparison (CMP_EQ..CMP_GE) per type ---- */
         if (cb->type == COLUMN_TYPE_SMALLINT) {
             int16_t cmp_val = (pn->filter.cmp_val.type == COLUMN_TYPE_SMALLINT)
                 ? pn->filter.cmp_val.value.as_smallint : (int16_t)pn->filter.cmp_val.value.as_int;
             const int16_t *vals = cb->data.i16;
             const uint8_t *nulls = cb->nulls;
-            uint16_t count = out->count;
 
             switch (op) {
-                case CMP_EQ: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] == cmp_val) sel[sel_count++] = r; break;
-                case CMP_NE: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] != cmp_val) sel[sel_count++] = r; break;
-                case CMP_LT: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] <  cmp_val) sel[sel_count++] = r; break;
-                case CMP_GT: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] >  cmp_val) sel[sel_count++] = r; break;
-                case CMP_LE: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] <= cmp_val) sel[sel_count++] = r; break;
-                case CMP_GE: for (uint16_t r = 0; r < count; r++) if (!nulls[r] && vals[r] >= cmp_val) sel[sel_count++] = r; break;
+                case CMP_EQ: FILTER_LOOP(!nulls[r] && vals[r] == cmp_val); break;
+                case CMP_NE: FILTER_LOOP(!nulls[r] && vals[r] != cmp_val); break;
+                case CMP_LT: FILTER_LOOP(!nulls[r] && vals[r] <  cmp_val); break;
+                case CMP_GT: FILTER_LOOP(!nulls[r] && vals[r] >  cmp_val); break;
+                case CMP_LE: FILTER_LOOP(!nulls[r] && vals[r] <= cmp_val); break;
+                case CMP_GE: FILTER_LOOP(!nulls[r] && vals[r] >= cmp_val); break;
                 default: break;
             }
         } else if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN) {
             int32_t cmp_val = pn->filter.cmp_val.value.as_int;
             const int32_t *vals = cb->data.i32;
             const uint8_t *nulls = cb->nulls;
-            uint16_t count = out->count;
 
             switch (op) {
-                case 0: /* CMP_EQ */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] == cmp_val)
-                            sel[sel_count++] = i;
-                    break;
-                case 1: /* CMP_NEQ */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] != cmp_val)
-                            sel[sel_count++] = i;
-                    break;
-                case 2: /* CMP_LT */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] < cmp_val)
-                            sel[sel_count++] = i;
-                    break;
-                case 3: /* CMP_GT */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] > cmp_val)
-                            sel[sel_count++] = i;
-                    break;
-                case 4: /* CMP_LTE */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] <= cmp_val)
-                            sel[sel_count++] = i;
-                    break;
-                case 5: /* CMP_GTE */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] >= cmp_val)
-                            sel[sel_count++] = i;
-                    break;
-                default:
-                    goto fallback;
+                case CMP_EQ: FILTER_LOOP(!nulls[r] && vals[r] == cmp_val); break;
+                case CMP_NE: FILTER_LOOP(!nulls[r] && vals[r] != cmp_val); break;
+                case CMP_LT: FILTER_LOOP(!nulls[r] && vals[r] <  cmp_val); break;
+                case CMP_GT: FILTER_LOOP(!nulls[r] && vals[r] >  cmp_val); break;
+                case CMP_LE: FILTER_LOOP(!nulls[r] && vals[r] <= cmp_val); break;
+                case CMP_GE: FILTER_LOOP(!nulls[r] && vals[r] >= cmp_val); break;
+                default: goto fallback;
             }
             goto done;
         }
@@ -830,41 +1203,15 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 : (double)pn->filter.cmp_val.value.as_int;
             const double *vals = cb->data.f64;
             const uint8_t *nulls = cb->nulls;
-            uint16_t count = out->count;
 
             switch (op) {
-                case 0: /* CMP_EQ */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] == cmp_val_f)
-                            sel[sel_count++] = i;
-                    break;
-                case 1: /* CMP_NEQ */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] != cmp_val_f)
-                            sel[sel_count++] = i;
-                    break;
-                case 2: /* CMP_LT */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] < cmp_val_f)
-                            sel[sel_count++] = i;
-                    break;
-                case 3: /* CMP_GT */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] > cmp_val_f)
-                            sel[sel_count++] = i;
-                    break;
-                case 4: /* CMP_LTE */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] <= cmp_val_f)
-                            sel[sel_count++] = i;
-                    break;
-                case 5: /* CMP_GTE */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] >= cmp_val_f)
-                            sel[sel_count++] = i;
-                    break;
-                default:
-                    goto fallback;
+                case CMP_EQ: FILTER_LOOP(!nulls[r] && vals[r] == cmp_val_f); break;
+                case CMP_NE: FILTER_LOOP(!nulls[r] && vals[r] != cmp_val_f); break;
+                case CMP_LT: FILTER_LOOP(!nulls[r] && vals[r] <  cmp_val_f); break;
+                case CMP_GT: FILTER_LOOP(!nulls[r] && vals[r] >  cmp_val_f); break;
+                case CMP_LE: FILTER_LOOP(!nulls[r] && vals[r] <= cmp_val_f); break;
+                case CMP_GE: FILTER_LOOP(!nulls[r] && vals[r] >= cmp_val_f); break;
+                default: goto fallback;
             }
             goto done;
         }
@@ -873,46 +1220,22 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             const char *cmp_str = pn->filter.cmp_val.value.as_text;
             char * const *vals = cb->data.str;
             const uint8_t *nulls = cb->nulls;
-            uint16_t count = out->count;
 
             if (!cmp_str) cmp_str = "";
 
             switch (op) {
-                case 0: /* CMP_EQ */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) == 0)
-                            sel[sel_count++] = i;
-                    break;
-                case 1: /* CMP_NEQ */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) != 0)
-                            sel[sel_count++] = i;
-                    break;
-                case 2: /* CMP_LT */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) < 0)
-                            sel[sel_count++] = i;
-                    break;
-                case 3: /* CMP_GT */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) > 0)
-                            sel[sel_count++] = i;
-                    break;
-                case 4: /* CMP_LTE */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) <= 0)
-                            sel[sel_count++] = i;
-                    break;
-                case 5: /* CMP_GTE */
-                    for (uint16_t i = 0; i < count; i++)
-                        if (!nulls[i] && vals[i] && strcmp(vals[i], cmp_str) >= 0)
-                            sel[sel_count++] = i;
-                    break;
-                default:
-                    goto fallback;
+                case CMP_EQ: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) == 0); break;
+                case CMP_NE: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) != 0); break;
+                case CMP_LT: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) <  0); break;
+                case CMP_GT: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) >  0); break;
+                case CMP_LE: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) <= 0); break;
+                case CMP_GE: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) >= 0); break;
+                default: goto fallback;
             }
             goto done;
         }
+
+        #undef FILTER_LOOP
     }
 
 fallback:
@@ -924,11 +1247,10 @@ fallback:
             t = parent->seq_scan.table;
 
         if (t) {
-            /* We need to find the original row for eval_condition.
-             * The scan state tells us which rows were scanned. */
             struct scan_state *sst = (struct scan_state *)ctx->node_states[pn->left];
             size_t base = sst ? (sst->cursor - out->count) : 0;
-            for (uint16_t i = 0; i < out->count; i++) {
+            for (uint16_t _c = 0; _c < cand_count; _c++) {
+                uint16_t i = (uint16_t)cand[_c];
                 size_t row_idx = base + i;
                 if (row_idx < t->rows.count &&
                     eval_condition(pn->filter.cond_idx, ctx->arena,
@@ -1928,6 +2250,211 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* ---- Simple Aggregate (no GROUP BY) ---- */
+
+static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                           struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct simple_agg_state *st = (struct simple_agg_state *)ctx->node_states[node_idx];
+    uint32_t agg_n = pn->simple_agg.agg_count;
+
+    if (!st) {
+        st = (struct simple_agg_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        ctx->node_states[node_idx] = st;
+        st->sums      = (double *)bump_calloc(&ctx->arena->scratch, agg_n, sizeof(double));
+        st->mins      = (double *)bump_calloc(&ctx->arena->scratch, agg_n, sizeof(double));
+        st->maxs      = (double *)bump_calloc(&ctx->arena->scratch, agg_n, sizeof(double));
+        st->nonnull   = (size_t *)bump_calloc(&ctx->arena->scratch, agg_n, sizeof(size_t));
+        st->minmax_init = (int *)bump_calloc(&ctx->arena->scratch, agg_n, sizeof(int));
+    }
+
+    /* Phase 1: consume all input blocks */
+    if (!st->input_done) {
+        uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
+        struct row_block input;
+        row_block_alloc(&input, child_ncols, &ctx->arena->scratch);
+
+        while (plan_next_block(ctx, pn->left, &input) == 0) {
+            uint16_t active = row_block_active_count(&input);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = row_block_row_idx(&input, r);
+                st->total_rows++;
+
+                for (uint32_t a = 0; a < agg_n; a++) {
+                    int ac = pn->simple_agg.agg_col_indices[a];
+                    if (ac == -1) continue; /* COUNT(*) */
+
+                    if (ac == -2) {
+                        /* Expression-based aggregate */
+                        struct agg_expr *ae = &ctx->arena->aggregates.items[pn->simple_agg.agg_start + a];
+                        if (!st->tmp_row_inited) {
+                            st->tmp_row.cells.count = child_ncols;
+                            st->tmp_row.cells.items = (struct cell *)bump_alloc(
+                                &ctx->arena->scratch, child_ncols * sizeof(struct cell));
+                            st->tmp_row_inited = 1;
+                        }
+                        for (uint16_t c = 0; c < child_ncols; c++) {
+                            struct col_block *cb = &input.cols[c];
+                            struct cell *cell = &st->tmp_row.cells.items[c];
+                            cell->type = cb->type;
+                            if (cb->nulls[ri]) {
+                                cell->is_null = 1;
+                                memset(&cell->value, 0, sizeof(cell->value));
+                            } else {
+                                cell->is_null = 0;
+                                if (cb->type == COLUMN_TYPE_SMALLINT)
+                                    cell->value.as_smallint = cb->data.i16[ri];
+                                else if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN)
+                                    cell->value.as_int = cb->data.i32[ri];
+                                else if (cb->type == COLUMN_TYPE_BIGINT)
+                                    cell->value.as_bigint = cb->data.i64[ri];
+                                else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC)
+                                    cell->value.as_float = cb->data.f64[ri];
+                                else
+                                    cell->value.as_text = cb->data.str[ri];
+                            }
+                        }
+                        struct cell cv = eval_expr(ae->expr_idx, ctx->arena,
+                                                   pn->simple_agg.table, &st->tmp_row,
+                                                   ctx->db, &ctx->arena->scratch);
+                        if (cv.is_null) continue;
+                        st->nonnull[a]++;
+                        double v = 0.0;
+                        switch (cv.type) {
+                            case COLUMN_TYPE_SMALLINT: v = (double)cv.value.as_smallint; break;
+                            case COLUMN_TYPE_INT:      v = (double)cv.value.as_int; break;
+                            case COLUMN_TYPE_BIGINT:   v = (double)cv.value.as_bigint; break;
+                            case COLUMN_TYPE_FLOAT:
+                            case COLUMN_TYPE_NUMERIC:  v = cv.value.as_float; break;
+                            case COLUMN_TYPE_BOOLEAN:  v = (double)cv.value.as_bool; break;
+                            case COLUMN_TYPE_TEXT:
+                            case COLUMN_TYPE_ENUM:
+                            case COLUMN_TYPE_DATE:
+                            case COLUMN_TYPE_TIME:
+                            case COLUMN_TYPE_TIMESTAMP:
+                            case COLUMN_TYPE_TIMESTAMPTZ:
+                            case COLUMN_TYPE_INTERVAL:
+                            case COLUMN_TYPE_UUID:     break;
+                        }
+                        st->sums[a] += v;
+                        if (!st->minmax_init[a] || v < st->mins[a]) st->mins[a] = v;
+                        if (!st->minmax_init[a] || v > st->maxs[a]) st->maxs[a] = v;
+                        st->minmax_init[a] = 1;
+                        continue;
+                    }
+
+                    struct col_block *acb = &input.cols[ac];
+                    if (acb->nulls[ri]) continue;
+                    st->nonnull[a]++;
+                    double v = cb_to_double(acb, ri);
+                    st->sums[a] += v;
+                    if (!st->minmax_init[a] || v < st->mins[a]) st->mins[a] = v;
+                    if (!st->minmax_init[a] || v > st->maxs[a]) st->maxs[a] = v;
+                    st->minmax_init[a] = 1;
+                }
+            }
+            row_block_reset(&input);
+        }
+        st->input_done = 1;
+    }
+
+    /* Phase 2: emit exactly one row */
+    if (st->emit_done) return -1;
+    st->emit_done = 1;
+
+    row_block_reset(out);
+    for (uint32_t a = 0; a < agg_n; a++) {
+        struct agg_expr *ae = &ctx->arena->aggregates.items[pn->simple_agg.agg_start + a];
+        struct col_block *dst = &out->cols[a];
+
+        switch (ae->func) {
+            case AGG_COUNT:
+                dst->type = COLUMN_TYPE_INT;
+                dst->nulls[0] = 0;
+                dst->data.i32[0] = (sv_eq_cstr(ae->column, "*"))
+                    ? (int32_t)st->total_rows
+                    : (int32_t)st->nonnull[a];
+                break;
+            case AGG_SUM: {
+                int src_col = pn->simple_agg.agg_col_indices[a];
+                int src_is_float = 0;
+                if (src_col >= 0 && pn->simple_agg.table) {
+                    enum column_type sct = pn->simple_agg.table->columns.items[src_col].type;
+                    if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
+                        src_is_float = 1;
+                }
+                if (st->nonnull[a] == 0) {
+                    dst->type = src_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_BIGINT;
+                    dst->nulls[0] = 1;
+                } else if (src_is_float) {
+                    dst->type = COLUMN_TYPE_FLOAT;
+                    dst->nulls[0] = 0;
+                    dst->data.f64[0] = st->sums[a];
+                } else {
+                    double sv = st->sums[a];
+                    if (sv == (double)(int32_t)sv && sv >= -2147483648.0 && sv <= 2147483647.0) {
+                        dst->type = COLUMN_TYPE_INT;
+                        dst->nulls[0] = 0;
+                        dst->data.i32[0] = (int32_t)sv;
+                    } else {
+                        dst->type = COLUMN_TYPE_BIGINT;
+                        dst->nulls[0] = 0;
+                        dst->data.i64[0] = (int64_t)sv;
+                    }
+                }
+                break;
+            }
+            case AGG_AVG:
+                dst->type = COLUMN_TYPE_FLOAT;
+                if (st->nonnull[a] == 0) {
+                    dst->nulls[0] = 1;
+                } else {
+                    dst->nulls[0] = 0;
+                    dst->data.f64[0] = st->sums[a] / (double)st->nonnull[a];
+                }
+                break;
+            case AGG_MIN:
+            case AGG_MAX: {
+                double mv = ae->func == AGG_MIN ? st->mins[a] : st->maxs[a];
+                int src_col_mm = pn->simple_agg.agg_col_indices[a];
+                enum column_type src_type_mm = COLUMN_TYPE_INT;
+                if (src_col_mm >= 0 && pn->simple_agg.table)
+                    src_type_mm = pn->simple_agg.table->columns.items[src_col_mm].type;
+                if (st->nonnull[a] == 0) {
+                    dst->type = src_type_mm;
+                    dst->nulls[0] = 1;
+                } else if (src_type_mm == COLUMN_TYPE_FLOAT || src_type_mm == COLUMN_TYPE_NUMERIC) {
+                    dst->type = COLUMN_TYPE_FLOAT;
+                    dst->nulls[0] = 0;
+                    dst->data.f64[0] = mv;
+                } else if (src_type_mm == COLUMN_TYPE_BIGINT) {
+                    dst->type = COLUMN_TYPE_BIGINT;
+                    dst->nulls[0] = 0;
+                    dst->data.i64[0] = (int64_t)mv;
+                } else {
+                    dst->type = COLUMN_TYPE_INT;
+                    dst->nulls[0] = 0;
+                    dst->data.i32[0] = (int32_t)mv;
+                }
+                break;
+            }
+            case AGG_STRING_AGG:
+            case AGG_ARRAY_AGG:
+                dst->type = COLUMN_TYPE_TEXT;
+                dst->nulls[0] = 1;
+                break;
+            case AGG_NONE:
+                break;
+        }
+    }
+
+    out->count = 1;
+    for (uint16_t c = 0; c < out->ncols; c++)
+        out->cols[c].count = 1;
+    return 0;
+}
+
 /* ---- Sort ---- */
 
 struct block_sort_ctx {
@@ -2444,6 +2971,8 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         st->win_f64 = (double *)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(double));
         st->win_null = (uint8_t *)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(uint8_t));
         st->win_is_dbl = (int *)bump_calloc(&ctx->arena->scratch, nw, sizeof(int));
+        st->win_str = (char **)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(char *));
+        st->win_is_str = (int *)bump_calloc(&ctx->arena->scratch, nw, sizeof(int));
 
         for (uint16_t w = 0; w < nw; w++) {
             int wf = pn->window.win_func[w];
@@ -2525,6 +3054,7 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 case WIN_LAG:
                 case WIN_LEAD: {
                     int offset = pn->window.win_offset[w];
+                    int is_text = column_type_is_text(st->flat_types[ac >= 0 ? ac : 0]);
                     for (uint32_t i = ps; i < pe; i++) {
                         uint32_t pos = i - ps;
                         uint32_t target = 0;
@@ -2539,6 +3069,9 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             uint32_t si = st->sorted[target];
                             if (st->flat_nulls[ac][si]) {
                                 st->win_null[i * nw + w] = 1;
+                            } else if (is_text) {
+                                st->win_str[i * nw + w] = ((char **)st->flat_data[ac])[si];
+                                st->win_is_str[w] = 1;
                             } else {
                                 st->win_f64[i * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
                                 st->win_is_dbl[w] = 1;
@@ -2551,12 +3084,16 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
                 case WIN_FIRST_VALUE:
                 case WIN_LAST_VALUE: {
+                    int is_text_fv = (ac >= 0) && column_type_is_text(st->flat_types[ac]);
                     for (uint32_t i = ps; i < pe; i++) {
                         uint32_t target = (wf == WIN_FIRST_VALUE) ? ps : (pe - 1);
                         if (ac >= 0) {
                             uint32_t si = st->sorted[target];
                             if (st->flat_nulls[ac][si]) {
                                 st->win_null[i * nw + w] = 1;
+                            } else if (is_text_fv) {
+                                st->win_str[i * nw + w] = ((char **)st->flat_data[ac])[si];
+                                st->win_is_str[w] = 1;
                             } else {
                                 st->win_f64[i * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
                                 st->win_is_dbl[w] = 1;
@@ -2569,11 +3106,15 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
                 case WIN_NTH_VALUE: {
                     int nth = pn->window.win_offset[w];
+                    int is_text_nv = (ac >= 0) && column_type_is_text(st->flat_types[ac]);
                     for (uint32_t i = ps; i < pe; i++) {
                         if (nth >= 1 && (uint32_t)nth <= psize && ac >= 0) {
                             uint32_t si = st->sorted[ps + (uint32_t)(nth - 1)];
                             if (st->flat_nulls[ac][si]) {
                                 st->win_null[i * nw + w] = 1;
+                            } else if (is_text_nv) {
+                                st->win_str[i * nw + w] = ((char **)st->flat_data[ac])[si];
+                                st->win_is_str[w] = 1;
                             } else {
                                 st->win_f64[i * nw + w] = flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
                                 st->win_is_dbl[w] = 1;
@@ -2708,7 +3249,9 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     for (uint16_t c = 0; c < n_pass; c++)
         out->cols[c].type = st->flat_types[pn->window.pass_cols[c]];
     for (uint16_t w = 0; w < nw; w++)
-        out->cols[n_pass + w].type = st->win_is_dbl[w] ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
+        out->cols[n_pass + w].type = st->win_is_str[w] ? COLUMN_TYPE_TEXT
+                                   : st->win_is_dbl[w] ? COLUMN_TYPE_FLOAT
+                                   : COLUMN_TYPE_INT;
 
     while (st->emit_cursor < st->total_rows && out_count < BLOCK_CAPACITY) {
         uint32_t fi = st->sorted[st->emit_cursor++];
@@ -2736,10 +3279,15 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             uint16_t oc = n_pass + w;
             if (st->win_null[si * nw + w]) {
                 out->cols[oc].nulls[out_count] = 1;
-                if (st->win_is_dbl[w])
+                if (st->win_is_str[w])
+                    out->cols[oc].data.str[out_count] = NULL;
+                else if (st->win_is_dbl[w])
                     out->cols[oc].data.f64[out_count] = 0.0;
                 else
                     out->cols[oc].data.i32[out_count] = 0;
+            } else if (st->win_is_str[w]) {
+                out->cols[oc].nulls[out_count] = 0;
+                out->cols[oc].data.str[out_count] = st->win_str[si * nw + w];
             } else if (st->win_is_dbl[w]) {
                 out->cols[oc].nulls[out_count] = 0;
                 out->cols[oc].data.f64[out_count] = st->win_f64[si * nw + w];
@@ -3608,8 +4156,8 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     case PLAN_DISTINCT:        return distinct_next(ctx, node_idx, out);
     case PLAN_GENERATE_SERIES: return gen_series_next(ctx, node_idx, out);
     case PLAN_EXPR_PROJECT:    return expr_project_next(ctx, node_idx, out);
+    case PLAN_SIMPLE_AGG:       return simple_agg_next(ctx, node_idx, out);
     case PLAN_NESTED_LOOP:
-    case PLAN_SIMPLE_AGG:
         /* not yet implemented */
         return -1;
     }
@@ -3947,11 +4495,316 @@ static uint32_t append_filter_node(uint32_t current, struct query_arena *arena,
     return filter_idx;
 }
 
+/* Forward declaration — defined later alongside other multi-table helpers */
+static int find_col_in_tables_a(sv col, struct table **tables, uint16_t *offsets,
+                                sv *aliases, int ntables);
+
+/* Column resolver: abstracts column lookup for single-table vs multi-table contexts.
+ * resolve(col, ctx) returns the column index (>=0) or -1 if not found.
+ * col_type(col_idx, ctx) returns the column type for a resolved index. */
+struct col_resolver {
+    int (*resolve)(sv col, void *ctx);
+    enum column_type (*col_type)(int col_idx, void *ctx);
+    void *ctx;
+};
+
+/* Single-table resolver context */
+struct single_table_ctx { struct table *tbl; };
+
+static int single_table_resolve(sv col, void *ctx) {
+    return table_find_column_sv(((struct single_table_ctx *)ctx)->tbl, col);
+}
+static enum column_type single_table_col_type(int col_idx, void *ctx) {
+    return ((struct single_table_ctx *)ctx)->tbl->columns.items[col_idx].type;
+}
+
+/* Multi-table (join) resolver context */
+struct multi_table_ctx {
+    struct table **tables;
+    uint16_t *offsets;
+    sv *aliases;
+    int ntables;
+};
+
+static int multi_table_resolve(sv col, void *ctx) {
+    struct multi_table_ctx *m = (struct multi_table_ctx *)ctx;
+    return find_col_in_tables_a(col, m->tables, m->offsets, m->aliases, m->ntables);
+}
+static enum column_type multi_table_col_type(int col_idx, void *ctx) {
+    struct multi_table_ctx *m = (struct multi_table_ctx *)ctx;
+    for (int ti = m->ntables - 1; ti >= 0; ti--) {
+        if (col_idx >= m->offsets[ti]) {
+            int local = col_idx - m->offsets[ti];
+            return m->tables[ti]->columns.items[local].type;
+        }
+    }
+    return COLUMN_TYPE_INT; /* fallback */
+}
+
+/* Try to validate and append an extended filter for a single COND_COMPARE.
+ * Handles IS NULL, IS NOT NULL, BETWEEN, IN-list, LIKE/ILIKE in addition to
+ * the basic comparison ops.  Returns current unchanged if not handleable. */
+static uint32_t try_append_extended_filter_r(uint32_t current, struct col_resolver *cr,
+                                              struct query_arena *plan_arena,
+                                              struct query_arena *cond_arena,
+                                              uint32_t cond_idx)
+{
+    if (cond_idx == IDX_NONE) return current;
+    struct condition *cond = &COND(cond_arena, cond_idx);
+    if (cond->type != COND_COMPARE) return current;
+    if (cond->lhs_expr != IDX_NONE) return current;
+    if (cond->rhs_column.len != 0) return current;
+    if (cond->scalar_subquery_sql != IDX_NONE) return current;
+    if (cond->subquery_sql != IDX_NONE) return current;
+    if (cond->is_any || cond->is_all) return current;
+    if (cond->array_values_count > 0) return current;
+
+    int fc = cr->resolve(cond->column, cr->ctx);
+    if (fc < 0) return current;
+    enum column_type ct = cr->col_type(fc, cr->ctx);
+
+    /* IS NULL / IS NOT NULL — works on any column type */
+    if (cond->op == CMP_IS_NULL || cond->op == CMP_IS_NOT_NULL) {
+        struct cell dummy = {0};
+        uint32_t fi = plan_alloc_node(plan_arena, PLAN_FILTER);
+        PLAN_NODE(plan_arena, fi).left = current;
+        PLAN_NODE(plan_arena, fi).filter.cond_idx = cond_idx;
+        PLAN_NODE(plan_arena, fi).filter.col_idx = fc;
+        PLAN_NODE(plan_arena, fi).filter.cmp_op = (int)cond->op;
+        PLAN_NODE(plan_arena, fi).filter.cmp_val = dummy;
+        return fi;
+    }
+
+    /* BETWEEN — col BETWEEN low AND high */
+    if (cond->op == CMP_BETWEEN) {
+        if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BOOLEAN &&
+            ct != COLUMN_TYPE_FLOAT && ct != COLUMN_TYPE_NUMERIC &&
+            ct != COLUMN_TYPE_BIGINT && ct != COLUMN_TYPE_SMALLINT &&
+            !column_type_is_text(ct))
+            return current;
+        uint32_t fi = plan_alloc_node(plan_arena, PLAN_FILTER);
+        PLAN_NODE(plan_arena, fi).left = current;
+        PLAN_NODE(plan_arena, fi).filter.cond_idx = cond_idx;
+        PLAN_NODE(plan_arena, fi).filter.col_idx = fc;
+        PLAN_NODE(plan_arena, fi).filter.cmp_op = CMP_BETWEEN;
+        PLAN_NODE(plan_arena, fi).filter.cmp_val = cond->value;
+        PLAN_NODE(plan_arena, fi).filter.between_high = cond->between_high;
+        return fi;
+    }
+
+    /* IN-list (literal values, not subquery) */
+    if (cond->op == CMP_IN && cond->in_values_count > 0 && cond->subquery_sql == IDX_NONE) {
+        if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BOOLEAN &&
+            ct != COLUMN_TYPE_FLOAT && ct != COLUMN_TYPE_NUMERIC &&
+            ct != COLUMN_TYPE_BIGINT && ct != COLUMN_TYPE_SMALLINT &&
+            !column_type_is_text(ct))
+            return current;
+        /* Copy IN values into plan arena scratch */
+        uint32_t nv = cond->in_values_count;
+        struct cell *vals = (struct cell *)bump_alloc(&plan_arena->scratch,
+                                                      nv * sizeof(struct cell));
+        for (uint32_t i = 0; i < nv; i++) {
+            vals[i] = cond_arena->cells.items[cond->in_values_start + i];
+            /* Copy text pointers into plan arena so they survive subquery arena free */
+            if (column_type_is_text(vals[i].type) && vals[i].value.as_text)
+                vals[i].value.as_text = bump_strdup(&plan_arena->scratch, vals[i].value.as_text);
+        }
+        uint32_t fi = plan_alloc_node(plan_arena, PLAN_FILTER);
+        PLAN_NODE(plan_arena, fi).left = current;
+        PLAN_NODE(plan_arena, fi).filter.cond_idx = cond_idx;
+        PLAN_NODE(plan_arena, fi).filter.col_idx = fc;
+        PLAN_NODE(plan_arena, fi).filter.cmp_op = CMP_IN;
+        PLAN_NODE(plan_arena, fi).filter.cmp_val = cond->value;
+        PLAN_NODE(plan_arena, fi).filter.in_values = vals;
+        PLAN_NODE(plan_arena, fi).filter.in_count = nv;
+        return fi;
+    }
+
+    /* LIKE / ILIKE */
+    if (cond->op == CMP_LIKE || cond->op == CMP_ILIKE) {
+        if (!column_type_is_text(ct)) return current;
+        const char *pat = cond->value.value.as_text;
+        if (!pat) return current;
+        uint32_t fi = plan_alloc_node(plan_arena, PLAN_FILTER);
+        PLAN_NODE(plan_arena, fi).left = current;
+        PLAN_NODE(plan_arena, fi).filter.cond_idx = cond_idx;
+        PLAN_NODE(plan_arena, fi).filter.col_idx = fc;
+        PLAN_NODE(plan_arena, fi).filter.cmp_op = (int)cond->op;
+        PLAN_NODE(plan_arena, fi).filter.cmp_val = cond->value;
+        PLAN_NODE(plan_arena, fi).filter.like_pattern = bump_strdup(&plan_arena->scratch, pat);
+        return fi;
+    }
+
+    /* Fall through to basic comparison handler */
+    return current;
+}
+
+/* Validate that a condition tree can be fully handled by the plan filter.
+ * Returns 1 if all leaves are handleable, 0 otherwise. */
+static int validate_compound_filter_r(struct col_resolver *cr, struct query_arena *cond_arena,
+                                       uint32_t cond_idx)
+{
+    if (cond_idx == IDX_NONE) return 0;
+    struct condition *cond = &COND(cond_arena, cond_idx);
+
+    if (cond->type == COND_AND || cond->type == COND_OR) {
+        if (cond->left == IDX_NONE || cond->right == IDX_NONE) return 0;
+        return validate_compound_filter_r(cr, cond_arena, cond->left) &&
+               validate_compound_filter_r(cr, cond_arena, cond->right);
+    }
+
+    if (cond->type != COND_COMPARE) return 0;
+    if (cond->lhs_expr != IDX_NONE) return 0;
+    if (cond->rhs_column.len != 0) return 0;
+    if (cond->scalar_subquery_sql != IDX_NONE) return 0;
+    if (cond->is_any || cond->is_all) return 0;
+    if (cond->array_values_count > 0) return 0;
+
+    int fc = cr->resolve(cond->column, cr->ctx);
+    if (fc < 0) return 0;
+    enum column_type ct = cr->col_type(fc, cr->ctx);
+
+    /* IS NULL / IS NOT NULL — any type */
+    if (cond->op == CMP_IS_NULL || cond->op == CMP_IS_NOT_NULL) return 1;
+
+    /* BETWEEN */
+    if (cond->op == CMP_BETWEEN) {
+        return (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN ||
+                ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC ||
+                ct == COLUMN_TYPE_BIGINT || ct == COLUMN_TYPE_SMALLINT ||
+                column_type_is_text(ct));
+    }
+
+    /* IN-list (literal, not subquery) */
+    if (cond->op == CMP_IN && cond->in_values_count > 0 && cond->subquery_sql == IDX_NONE) {
+        return (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN ||
+                ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC ||
+                ct == COLUMN_TYPE_BIGINT || ct == COLUMN_TYPE_SMALLINT ||
+                column_type_is_text(ct));
+    }
+
+    /* LIKE / ILIKE */
+    if (cond->op == CMP_LIKE || cond->op == CMP_ILIKE) {
+        return column_type_is_text(ct) && cond->value.value.as_text != NULL;
+    }
+
+    /* Basic comparison (CMP_EQ..CMP_GE) */
+    if (cond->op > CMP_GE) return 0;
+    if (cond->subquery_sql != IDX_NONE) return 0;
+    if (cond->in_values_count > 0) return 0;
+
+    if (column_type_is_text(ct)) {
+        if (!cond->value.is_null && !column_type_is_text(cond->value.type))
+            return 0;
+    } else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN ||
+               ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC ||
+               ct == COLUMN_TYPE_BIGINT || ct == COLUMN_TYPE_SMALLINT) {
+        if (!cond->value.is_null && cond->value.type != ct &&
+            !(ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT))
+            return 0;
+        if (ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)
+            return 0;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/* Append a single filter leaf (basic or extended) using resolver. */
+static uint32_t append_single_filter_leaf_r(uint32_t current, struct col_resolver *cr,
+                                             struct query_arena *plan_arena,
+                                             struct query_arena *cond_arena,
+                                             uint32_t cond_idx)
+{
+    struct condition *cond = &COND(cond_arena, cond_idx);
+
+    /* Try extended ops first (IS NULL, BETWEEN, IN-list, LIKE) */
+    uint32_t ext = try_append_extended_filter_r(current, cr, plan_arena, cond_arena, cond_idx);
+    if (ext != current) return ext;
+
+    /* Basic comparison (CMP_EQ..CMP_GE) */
+    int fc = cr->resolve(cond->column, cr->ctx);
+    return append_filter_node(current, plan_arena, cond_idx, fc,
+                              (int)cond->op, cond->value);
+}
+
+/* Recursively decompose a compound WHERE (COND_AND tree) into stacked
+ * PLAN_FILTER nodes using resolver.  Caller must validate first. */
+static uint32_t append_compound_filter_r(uint32_t current, struct col_resolver *cr,
+                                          struct query_arena *plan_arena,
+                                          struct query_arena *cond_arena,
+                                          uint32_t cond_idx)
+{
+    if (cond_idx == IDX_NONE) return current;
+    struct condition *cond = &COND(cond_arena, cond_idx);
+
+    if (cond->type == COND_AND) {
+        current = append_compound_filter_r(current, cr, plan_arena, cond_arena, cond->left);
+        current = append_compound_filter_r(current, cr, plan_arena, cond_arena, cond->right);
+        return current;
+    }
+
+    /* COND_OR: create a single filter node with col_idx=-1.
+     * filter_next will use filter_eval_cond_columnar for runtime evaluation. */
+    if (cond->type == COND_OR) {
+        struct cell dummy = {0};
+        uint32_t fi = plan_alloc_node(plan_arena, PLAN_FILTER);
+        PLAN_NODE(plan_arena, fi).left = current;
+        PLAN_NODE(plan_arena, fi).filter.cond_idx = cond_idx;
+        PLAN_NODE(plan_arena, fi).filter.col_idx = -1;
+        PLAN_NODE(plan_arena, fi).filter.cmp_op = 0;
+        PLAN_NODE(plan_arena, fi).filter.cmp_val = dummy;
+        return fi;
+    }
+
+    return append_single_filter_leaf_r(current, cr, plan_arena, cond_arena, cond_idx);
+}
+
+/* Try to validate and append a compound filter.  Returns current unchanged
+ * if the condition tree can't be fully handled. */
+static uint32_t try_append_compound_filter_r(uint32_t current, struct col_resolver *cr,
+                                              struct query_arena *plan_arena,
+                                              struct query_arena *cond_arena,
+                                              uint32_t cond_idx)
+{
+    if (cond_idx == IDX_NONE) return current;
+    if (!validate_compound_filter_r(cr, cond_arena, cond_idx))
+        return current;
+    return append_compound_filter_r(current, cr, plan_arena, cond_arena, cond_idx);
+}
+
+/* ---- Backward-compatible single-table wrappers ---- */
+
+static struct col_resolver make_single_table_resolver(struct single_table_ctx *stc, struct table *tbl) {
+    stc->tbl = tbl;
+    return (struct col_resolver){ single_table_resolve, single_table_col_type, stc };
+}
+
+static int validate_compound_filter(struct table *tbl, struct query_arena *cond_arena,
+                                     uint32_t cond_idx) {
+    struct single_table_ctx stc;
+    struct col_resolver cr = make_single_table_resolver(&stc, tbl);
+    return validate_compound_filter_r(&cr, cond_arena, cond_idx);
+}
+
+static uint32_t try_append_compound_filter(uint32_t current, struct table *tbl,
+                                            struct query_arena *plan_arena,
+                                            struct query_arena *cond_arena,
+                                            uint32_t cond_idx) {
+    struct single_table_ctx stc;
+    struct col_resolver cr = make_single_table_resolver(&stc, tbl);
+    return try_append_compound_filter_r(current, &cr, plan_arena, cond_arena, cond_idx);
+}
+
 /* Try to validate and append a simple comparison filter for a WHERE clause.
  * Handles COND_COMPARE with col op literal (numeric or text).
  * Returns current unchanged if the WHERE can't be handled as a plan filter.
  * plan_arena is used for node allocation; cond_arena for condition lookup
  * (they differ when the condition comes from a parsed sub-query). */
+static uint32_t try_append_having_filter(uint32_t current,
+                                          struct query_select *s,
+                                          struct query_arena *arena);
+
 static uint32_t try_append_simple_filter(uint32_t current, struct table *tbl,
                                           struct query_arena *plan_arena,
                                           struct query_arena *cond_arena,
@@ -4061,27 +4914,58 @@ static struct table *build_merged_table_desc(struct table **tables, int ntables,
     return mt;
 }
 
-/* Find a column name in the merged column space of multiple tables.
- * tables[0..ntables-1] are the tables, offsets[0..ntables-1] are the
- * cumulative column offsets.  Returns the merged column index, or -1. */
+/* Find a column in the merged column space.
+ * table_prefix: optional table alias/name qualifier (empty sv = unqualified).
+ * col: the bare column name.
+ * aliases: optional per-table aliases for prefix matching (NULL = none). */
+static int find_col_in_tables_q(sv table_prefix, sv col,
+                                struct table **tables, uint16_t *offsets,
+                                sv *aliases, int ntables)
+{
+    /* If there's a qualifier, match it against aliases or table names first */
+    if (table_prefix.len > 0) {
+        for (int ti = 0; ti < ntables; ti++) {
+            int match = 0;
+            if (aliases && aliases[ti].len > 0 && sv_eq_ignorecase(table_prefix, aliases[ti]))
+                match = 1;
+            else if (tables[ti]->name && sv_eq_ignorecase_cstr(table_prefix, tables[ti]->name))
+                match = 1;
+            if (match) {
+                int ci = table_find_column_sv(tables[ti], col);
+                if (ci >= 0) return offsets[ti] + ci;
+            }
+        }
+    }
+
+    /* No qualifier or qualifier didn't match — search all tables for bare name */
+    for (int ti = 0; ti < ntables; ti++) {
+        int ci = table_find_column_sv(tables[ti], col);
+        if (ci >= 0) return offsets[ti] + ci;
+    }
+    return -1;
+}
+
+/* Legacy wrapper: parses "table.col" from a single sv (e.g. ORDER BY, GROUP BY). */
+static int find_col_in_tables_a(sv col, struct table **tables, uint16_t *offsets,
+                                sv *aliases, int ntables)
+{
+    sv prefix = {0};
+    sv bare = col;
+    for (size_t p = 0; p < col.len; p++) {
+        if (col.data[p] == '.') {
+            prefix = sv_from(col.data, p);
+            bare = sv_from(col.data + p + 1, col.len - p - 1);
+            break;
+        }
+    }
+    return find_col_in_tables_q(prefix, bare, tables, offsets, aliases, ntables);
+}
+
+/* Convenience wrapper: no aliases, parses prefix from col. */
 static int find_col_in_tables(sv col, struct table **tables, uint16_t *offsets,
                               int ntables)
 {
-    /* Strip table alias prefix (e.g. "o.customer_id" → "customer_id") */
-    sv bare = col;
-    for (size_t p = 0; p < col.len; p++)
-        if (col.data[p] == '.') { bare = sv_from(col.data + p + 1, col.len - p - 1); break; }
-
-    for (int ti = 0; ti < ntables; ti++) {
-        int ci = table_find_column_sv(tables[ti], bare);
-        if (ci >= 0) return offsets[ti] + ci;
-        /* Also try with full qualified name against table name prefix */
-        if (bare.data != col.data) {
-            ci = table_find_column_sv(tables[ti], col);
-            if (ci >= 0) return offsets[ti] + ci;
-        }
-    }
-    return -1;
+    return find_col_in_tables_a(col, tables, offsets, NULL, ntables);
 }
 
 /* Extract equi-join key columns from a join_info.
@@ -4140,28 +5024,25 @@ static int extract_join_keys(struct join_info *ji, struct query_arena *arena,
 }
 
 /* Try to build a plan for a join query (single or multi-table).
- * Supports: INNER equi-joins, post-join GROUP BY + aggregates, ORDER BY.
- * Returns root plan node index, or IDX_NONE if the query is too complex. */
-static uint32_t build_join(struct table *t, struct query_select *s,
-                            struct query_arena *arena, struct database *db)
+ * Supports: INNER equi-joins, post-join GROUP BY + aggregates, ORDER BY. */
+static struct plan_result build_join(struct table *t, struct query_select *s,
+                                     struct query_arena *arena, struct database *db)
 {
     /* Bail out for unsupported features */
-    if (s->select_exprs_count > 0) return IDX_NONE; /* window functions */
-    if (s->has_set_op)          return IDX_NONE;
-    if (s->ctes_count > 0)     return IDX_NONE;
-    if (s->cte_sql != IDX_NONE) return IDX_NONE;
-    if (s->from_subquery_sql != IDX_NONE) return IDX_NONE;
-    if (s->has_recursive_cte)   return IDX_NONE;
-    if (s->has_distinct)        return IDX_NONE;
-    if (s->has_distinct_on)     return IDX_NONE;
-    if (s->where.has_where)     return IDX_NONE;
-    if (s->insert_rows_count > 0) return IDX_NONE;
-    if (s->has_having)          return IDX_NONE;
-    if (s->group_by_rollup || s->group_by_cube) return IDX_NONE;
+    if (s->select_exprs_count > 0) return PLAN_RES_NOTIMPL; /* window functions */
+    if (s->has_set_op)          return PLAN_RES_NOTIMPL;
+    if (s->ctes_count > 0)     return PLAN_RES_NOTIMPL;
+    if (s->cte_sql != IDX_NONE) return PLAN_RES_NOTIMPL;
+    if (s->from_subquery_sql != IDX_NONE) return PLAN_RES_NOTIMPL;
+    if (s->has_recursive_cte)   return PLAN_RES_NOTIMPL;
+    if (s->has_distinct_on)     return PLAN_RES_NOTIMPL;
+    if (s->insert_rows_count > 0) return PLAN_RES_NOTIMPL;
+    if (s->has_having && !s->has_group_by) return PLAN_RES_NOTIMPL; /* HAVING without GROUP BY */
+    if (s->group_by_rollup || s->group_by_cube) return PLAN_RES_NOTIMPL;
 
     struct table *t1 = t;
-    if (!t1) return IDX_NONE;
-    if (table_has_mixed_types(t1)) return IDX_NONE;
+    if (!t1) return PLAN_RES_ERR;
+    if (table_has_mixed_types(t1)) return PLAN_RES_NOTIMPL;
 
     /* Collect all tables, aliases, and validate all joins are INNER equi-joins */
     #define MAX_JOIN_TABLES 8
@@ -4179,15 +5060,15 @@ static uint32_t build_join(struct table *t, struct query_select *s,
 
     for (uint32_t j = 0; j < s->joins_count && ntables < MAX_JOIN_TABLES; j++) {
         struct join_info *ji = &arena->joins.items[s->joins_start + j];
-        if (ji->join_type != 0) return IDX_NONE; /* not INNER */
-        if (ji->is_lateral)     return IDX_NONE;
-        if (ji->is_natural)     return IDX_NONE;
-        if (ji->has_using)      return IDX_NONE;
+        if (ji->join_type != 0) return PLAN_RES_NOTIMPL; /* not INNER */
+        if (ji->is_lateral)     return PLAN_RES_NOTIMPL;
+        if (ji->is_natural)     return PLAN_RES_NOTIMPL;
+        if (ji->has_using)      return PLAN_RES_NOTIMPL;
 
         struct table *tn = db_find_table_sv(db, ji->join_table);
-        if (!tn) return IDX_NONE;
-        if (tn->view_sql) return IDX_NONE;
-        if (table_has_mixed_types(tn)) return IDX_NONE;
+        if (!tn) return PLAN_RES_ERR;
+        if (tn->view_sql) return PLAN_RES_NOTIMPL;
+        if (table_has_mixed_types(tn)) return PLAN_RES_NOTIMPL;
 
         tables[ntables] = tn;
         offsets[ntables] = cum_cols;
@@ -4203,7 +5084,19 @@ static uint32_t build_join(struct table *t, struct query_select *s,
         struct join_info *ji = &arena->joins.items[s->joins_start + j];
         if (extract_join_keys(ji, arena, tables, offsets, (int)(j + 1),
                               tables[j + 1], &outer_keys[j], &inner_keys[j]) != 0)
-            return IDX_NONE;
+            return PLAN_RES_ERR;
+        /* Bail out for cross-type join keys (e.g. INT vs FLOAT) */
+        enum column_type inner_kt = tables[j + 1]->columns.items[inner_keys[j]].type;
+        /* Find outer key's type in the cumulative column space */
+        enum column_type outer_kt = COLUMN_TYPE_INT;
+        for (int ti = (int)j; ti >= 0; ti--) {
+            if (outer_keys[j] >= offsets[ti]) {
+                int local = outer_keys[j] - offsets[ti];
+                outer_kt = tables[ti]->columns.items[local].type;
+                break;
+            }
+        }
+        if (outer_kt != inner_kt) return PLAN_RES_ERR;
     }
 
     /* --- Resolve post-join operations --- */
@@ -4220,15 +5113,15 @@ static uint32_t build_join(struct table *t, struct query_select *s,
         for (uint32_t a = 0; a < s->aggregates_count; a++) {
             struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
             if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
-                return IDX_NONE;
-            if (ae->has_distinct) return IDX_NONE;
+                return PLAN_RES_NOTIMPL;
+            if (ae->has_distinct) return PLAN_RES_NOTIMPL;
             if (ae->expr_idx != IDX_NONE) {
                 agg_col_idxs[a] = -2; /* expression-based aggregate */
             } else if (sv_eq_cstr(ae->column, "*")) {
                 agg_col_idxs[a] = -1; /* COUNT(*) */
             } else {
-                int ci = find_col_in_tables(ae->column, tables, offsets, ntables);
-                if (ci < 0) return IDX_NONE;
+                int ci = find_col_in_tables_a(ae->column, tables, offsets, aliases, ntables);
+                if (ci < 0) return PLAN_RES_ERR;
                 if ((ae->func == AGG_MIN || ae->func == AGG_MAX) &&
                     ci < cum_cols) {
                     /* Find the actual table and column to check type */
@@ -4236,7 +5129,7 @@ static uint32_t build_join(struct table *t, struct query_select *s,
                         if (ci >= offsets[ti]) {
                             int local = ci - offsets[ti];
                             if (column_type_is_text(tables[ti]->columns.items[local].type))
-                                return IDX_NONE;
+                                return PLAN_RES_NOTIMPL;
                             break;
                         }
                     }
@@ -4249,8 +5142,8 @@ static uint32_t build_join(struct table *t, struct query_select *s,
         grp_col_idxs = (int *)bump_alloc(&arena->scratch, s->group_by_count * sizeof(int));
         for (uint32_t g = 0; g < s->group_by_count; g++) {
             sv gcol = arena->svs.items[s->group_by_start + g];
-            grp_col_idxs[g] = find_col_in_tables(gcol, tables, offsets, ntables);
-            if (grp_col_idxs[g] < 0) return IDX_NONE;
+            grp_col_idxs[g] = find_col_in_tables_a(gcol, tables, offsets, aliases, ntables);
+            if (grp_col_idxs[g] < 0) return PLAN_RES_ERR;
         }
     }
 
@@ -4259,8 +5152,12 @@ static uint32_t build_join(struct table *t, struct query_select *s,
     int *proj_map_join = NULL;
     uint16_t proj_ncols_join = 0;
 
+    int  join_sort_cols[32];
+    int  join_sort_descs[32];
+    int  join_sort_nf[32];
+    uint16_t join_sort_nord = 0;
+
     if (!has_agg) {
-        if (s->has_order_by) return IDX_NONE; /* ORDER BY without agg not yet supported */
         if (select_all_join) {
             /* No projection */
         } else if (s->parsed_columns_count > 0) {
@@ -4268,17 +5165,53 @@ static uint32_t build_join(struct table *t, struct query_select *s,
             proj_map_join = (int *)bump_alloc(&arena->scratch, proj_ncols_join * sizeof(int));
             for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
                 struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
-                if (sc->expr_idx == IDX_NONE) return IDX_NONE;
+                if (sc->expr_idx == IDX_NONE) return PLAN_RES_NOTIMPL;
                 struct expr *e = &EXPR(arena, sc->expr_idx);
-                if (e->type != EXPR_COLUMN_REF) return IDX_NONE;
-                int ci = find_col_in_tables(e->column_ref.column, tables, offsets, ntables);
-                if (ci < 0) return IDX_NONE;
+                if (e->type != EXPR_COLUMN_REF) return PLAN_RES_NOTIMPL;
+                int ci = find_col_in_tables_q(e->column_ref.table, e->column_ref.column, tables, offsets, aliases, ntables);
+                if (ci < 0) return PLAN_RES_ERR;
                 proj_map_join[i] = ci;
             }
             need_project_join = 1;
         } else {
-            return IDX_NONE;
+            return PLAN_RES_NOTIMPL;
         }
+
+        /* ORDER BY for multi-table joins (>2) — bail to legacy for now */
+        if (s->has_order_by && ntables > 2) return PLAN_RES_NOTIMPL;
+
+        /* Pre-validate ORDER BY columns in merged column space */
+        if (s->has_order_by && s->order_by_count > 0) {
+            join_sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+            for (uint16_t k = 0; k < join_sort_nord; k++) {
+                struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
+                join_sort_descs[k] = obi->desc;
+                join_sort_nf[k] = obi->nulls_first;
+                join_sort_cols[k] = find_col_in_tables_a(obi->column, tables, offsets, aliases, ntables);
+                /* Try matching against SELECT aliases */
+                if (join_sort_cols[k] < 0 && need_project_join) {
+                    for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                        struct select_column *scp = &arena->select_cols.items[s->parsed_columns_start + pc];
+                        if (scp->alias.len > 0 && sv_eq_ignorecase(obi->column, scp->alias)) {
+                            join_sort_cols[k] = proj_map_join[pc];
+                            break;
+                        }
+                    }
+                }
+                if (join_sort_cols[k] < 0) return PLAN_RES_ERR;
+            }
+        }
+    }
+
+    /* Pre-validate WHERE clause for post-join filter using multi-table resolver */
+    struct multi_table_ctx mtc = { tables, offsets, aliases, ntables };
+    struct col_resolver join_cr = { multi_table_resolve, multi_table_col_type, &mtc };
+    int join_filter_ok = 0;
+    if (s->where.has_where && s->where.where_cond != IDX_NONE) {
+        if (validate_compound_filter_r(&join_cr, arena, s->where.where_cond))
+            join_filter_ok = 1;
+        else
+            return PLAN_RES_NOTIMPL;
     }
 
     /* --- All validation passed, build plan nodes --- */
@@ -4298,6 +5231,10 @@ static uint32_t build_join(struct table *t, struct query_select *s,
         current = join_idx;
     }
 
+    /* Append post-join WHERE filter(s) */
+    if (join_filter_ok)
+        current = append_compound_filter_r(current, &join_cr, arena, arena, s->where.where_cond);
+
     if (has_agg) {
         /* Append HASH_AGG node */
         uint32_t agg_idx = plan_alloc_node(arena, PLAN_HASH_AGG);
@@ -4312,6 +5249,12 @@ static uint32_t build_join(struct table *t, struct query_select *s,
         PLAN_NODE(arena, agg_idx).hash_agg.table =
             build_merged_table_desc(tables, ntables, aliases, cum_cols, arena);
         current = agg_idx;
+
+        /* Append HAVING filter if present */
+        if (s->has_having && s->having_cond != IDX_NONE) {
+            current = try_append_having_filter(current, s, arena);
+            if (current == IDX_NONE) return PLAN_RES_NOTIMPL;
+        }
 
         /* Append SORT if ORDER BY present */
         if (s->has_order_by && s->order_by_count > 0) {
@@ -4382,29 +5325,36 @@ static uint32_t build_join(struct table *t, struct query_select *s,
                 current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, NULL, sort_nord);
         }
     } else {
-        /* No aggregates — just projection */
+        /* No aggregates — sort on merged columns, then project */
+        if (join_sort_nord > 0)
+            current = append_sort_node(current, arena, join_sort_cols, join_sort_descs, join_sort_nf, join_sort_nord);
         if (need_project_join)
             current = append_project_node(current, arena, proj_ncols_join, proj_map_join);
     }
 
+    if (s->has_distinct) {
+        uint32_t dist_idx = plan_alloc_node(arena, PLAN_DISTINCT);
+        PLAN_NODE(arena, dist_idx).left = current;
+        current = dist_idx;
+    }
+
     current = build_limit(current, s, arena);
 
-    return current;
+    return PLAN_RES_OK(current);
     #undef MAX_JOIN_TABLES
 }
 
 /* ---- Plan builder: set operations path ---- */
 
-/* Try to build a plan for a UNION/INTERSECT/EXCEPT query.
- * Returns root plan node index, or IDX_NONE if the query is too complex. */
-static uint32_t build_set_op(struct table *t, struct query_select *s,
-                              struct query_arena *arena, struct database *db)
+/* Try to build a plan for a UNION/INTERSECT/EXCEPT query. */
+static struct plan_result build_set_op(struct table *t, struct query_select *s,
+                                       struct query_arena *arena, struct database *db)
 {
     /* Parse the RHS SQL */
     const char *rhs_sql = ASTRING(arena, s->set_rhs_sql);
     struct query rhs_q = {0};
-    if (query_parse(rhs_sql, &rhs_q) != 0) return IDX_NONE;
-    if (rhs_q.query_type != QUERY_TYPE_SELECT) { query_free(&rhs_q); return IDX_NONE; }
+    if (query_parse(rhs_sql, &rhs_q) != 0) return PLAN_RES_ERR;
+    if (rhs_q.query_type != QUERY_TYPE_SELECT) { query_free(&rhs_q); return PLAN_RES_ERR; }
 
     struct query_select *rs = &rhs_q.select;
     /* Only handle simple single-table RHS SELECTs */
@@ -4413,11 +5363,11 @@ static uint32_t build_set_op(struct table *t, struct query_select *s,
         rs->from_subquery_sql != IDX_NONE || rs->has_generate_series ||
         rs->select_exprs_count > 0) {
         query_free(&rhs_q);
-        return IDX_NONE;
+        return PLAN_RES_NOTIMPL;
     }
 
     struct table *t2 = db_find_table_sv(db, rs->table);
-    if (!t2 || t2->view_sql) { query_free(&rhs_q); return IDX_NONE; }
+    if (!t2 || t2->view_sql) { query_free(&rhs_q); return PLAN_RES_ERR; }
 
     /* Resolve LHS columns */
     int select_all_lhs = sv_eq_cstr(s->columns, "*");
@@ -4432,16 +5382,16 @@ static uint32_t build_set_op(struct table *t, struct query_select *s,
         lhs_col_map = (int *)bump_alloc(&arena->scratch, lhs_ncols * sizeof(int));
         for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
             struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
-            if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return IDX_NONE; }
+            if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return PLAN_RES_NOTIMPL; }
             struct expr *e = &EXPR(arena, sc->expr_idx);
-            if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return IDX_NONE; }
+            if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return PLAN_RES_NOTIMPL; }
             int ci = table_find_column_sv(t, e->column_ref.column);
-            if (ci < 0) { query_free(&rhs_q); return IDX_NONE; }
+            if (ci < 0) { query_free(&rhs_q); return PLAN_RES_ERR; }
             lhs_col_map[i] = ci;
         }
     } else {
         query_free(&rhs_q);
-        return IDX_NONE;
+        return PLAN_RES_NOTIMPL;
     }
 
     /* Resolve RHS columns */
@@ -4457,11 +5407,11 @@ static uint32_t build_set_op(struct table *t, struct query_select *s,
         rhs_col_map = (int *)bump_alloc(&arena->scratch, rhs_ncols * sizeof(int));
         for (uint32_t i = 0; i < rs->parsed_columns_count; i++) {
             struct select_column *sc = &rhs_q.arena.select_cols.items[rs->parsed_columns_start + i];
-            if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return IDX_NONE; }
+            if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return PLAN_RES_NOTIMPL; }
             struct expr *e = &EXPR(&rhs_q.arena, sc->expr_idx);
-            if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return IDX_NONE; }
+            if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return PLAN_RES_NOTIMPL; }
             int ci = table_find_column_sv(t2, e->column_ref.column);
-            if (ci < 0) { query_free(&rhs_q); return IDX_NONE; }
+            if (ci < 0) { query_free(&rhs_q); return PLAN_RES_ERR; }
             rhs_col_map[i] = ci;
         }
     } else {
@@ -4469,26 +5419,26 @@ static uint32_t build_set_op(struct table *t, struct query_select *s,
         if (rs->columns.len > 0 && !sv_eq_cstr(rs->columns, "*")) {
             /* Parse comma-separated column list from raw text */
             query_free(&rhs_q);
-            return IDX_NONE;
+            return PLAN_RES_NOTIMPL;
         }
         query_free(&rhs_q);
-        return IDX_NONE;
+        return PLAN_RES_NOTIMPL;
     }
 
     /* Column counts must match */
-    if (lhs_ncols != rhs_ncols) { query_free(&rhs_q); return IDX_NONE; }
+    if (lhs_ncols != rhs_ncols) { query_free(&rhs_q); return PLAN_RES_ERR; }
 
     /* Check column type compatibility between LHS and RHS */
     for (uint16_t i = 0; i < lhs_ncols; i++) {
         enum column_type lt = t->columns.items[lhs_col_map[i]].type;
         enum column_type rt = t2->columns.items[rhs_col_map[i]].type;
-        if (lt != rt) { query_free(&rhs_q); return IDX_NONE; }
+        if (lt != rt) { query_free(&rhs_q); return PLAN_RES_ERR; }
     }
 
     /* Check for mixed cell types in both tables */
     if (table_has_mixed_types(t) || table_has_mixed_types(t2)) {
         query_free(&rhs_q);
-        return IDX_NONE;
+        return PLAN_RES_NOTIMPL;
     }
 
     /* Build LHS plan: SEQ_SCAN (→ PROJECT if not SELECT *) */
@@ -4611,15 +5561,14 @@ static uint32_t build_set_op(struct table *t, struct query_select *s,
     current = build_limit(current, s, arena);
 
     query_free(&rhs_q);
-    return current;
+    return PLAN_RES_OK(current);
 }
 
 /* ---- Plan builder: window path ---- */
 
-/* Try to build a plan for a window function query.
- * Returns root plan node index, or IDX_NONE if the query is too complex. */
-static uint32_t build_window(struct table *t, struct query_select *s,
-                              struct query_arena *arena)
+/* Try to build a plan for a window function query. */
+static struct plan_result build_window(struct table *t, struct query_select *s,
+                                       struct query_arena *arena)
 {
     size_t nexprs = s->select_exprs_count;
     /* Count passthrough and window expressions, resolve column indices */
@@ -4629,7 +5578,7 @@ static uint32_t build_window(struct table *t, struct query_select *s,
         if (se->kind == SEL_COLUMN) n_pass++;
         else n_win++;
     }
-    if (n_win == 0) return IDX_NONE; /* shouldn't happen */
+    if (n_win == 0) return PLAN_RES_ERR; /* shouldn't happen */
 
     /* Validate all columns exist and resolve indices */
     int *pass_cols = (int *)bump_alloc(&arena->scratch, (n_pass ? n_pass : 1) * sizeof(int));
@@ -4651,31 +5600,26 @@ static uint32_t build_window(struct table *t, struct query_select *s,
         struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
         if (se->kind == SEL_COLUMN) {
             int ci = table_find_column_sv(t, se->column);
-            if (ci < 0) return IDX_NONE;
+            if (ci < 0) return PLAN_RES_ERR;
             pass_cols[pi++] = ci;
         } else {
             int pc = -1, oc = -1, ac = -1;
             if (se->win.has_partition) {
                 pc = table_find_column_sv(t, se->win.partition_col);
-                if (pc < 0) return IDX_NONE;
+                if (pc < 0) return PLAN_RES_ERR;
                 if (global_part < 0) global_part = pc;
             }
             if (se->win.has_order) {
                 oc = table_find_column_sv(t, se->win.order_col);
-                if (oc < 0) return IDX_NONE;
+                if (oc < 0) return PLAN_RES_ERR;
                 if (global_ord < 0) { global_ord = oc; global_ord_desc = se->win.order_desc; }
             }
             if (se->win.arg_column.len > 0 && !sv_eq_cstr(se->win.arg_column, "*")) {
                 ac = table_find_column_sv(t, se->win.arg_column);
-                if (ac < 0) return IDX_NONE;
+                if (ac < 0) return PLAN_RES_ERR;
             }
-            /* For LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE with text arg columns,
-             * bail out — plan executor uses double arrays, can't handle text */
-            if (ac >= 0 && column_type_is_text(t->columns.items[ac].type) &&
-                (se->win.func == WIN_LAG || se->win.func == WIN_LEAD ||
-                 se->win.func == WIN_FIRST_VALUE || se->win.func == WIN_LAST_VALUE ||
-                 se->win.func == WIN_NTH_VALUE))
-                return IDX_NONE;
+            /* LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE on text columns
+             * are handled via win_str arrays in the executor. */
             wpc[wi] = pc;
             woc[wi] = oc;
             wod[wi] = se->win.order_desc;
@@ -4693,7 +5637,7 @@ static uint32_t build_window(struct table *t, struct query_select *s,
 
     /* Bail out if table has mixed cell types */
     if (table_has_mixed_types(t))
-        return IDX_NONE;
+        return PLAN_RES_NOTIMPL;
 
     /* Build scan → (filter →) window (→ sort) plan */
     uint32_t current = build_seq_scan(t, arena);
@@ -4768,54 +5712,234 @@ static uint32_t build_window(struct table *t, struct query_select *s,
 
     current = build_limit(current, s, arena);
 
-    return current;
+    return PLAN_RES_OK(current);
 }
 
-/* ---- Plan builder: aggregate path ---- */
+/* ---- Plan builder: simple aggregate path (no GROUP BY) ---- */
 
-/* Try to build a plan for a GROUP BY + aggregates query.
- * Returns root plan node index, or IDX_NONE if the query is too complex. */
-static uint32_t build_aggregate(struct table *t, struct query_select *s,
-                                 struct query_arena *arena)
+/* Try to build a plan for an aggregate-only query (no GROUP BY). */
+static struct plan_result build_simple_agg(struct table *t, struct query_select *s,
+                                           struct query_arena *arena)
 {
-    /* Validate: all aggregates must be simple SUM/COUNT/AVG/MIN/MAX on column refs */
-    int agg_ok = 1;
+    if (!t) return PLAN_RES_ERR;
+    if (table_has_mixed_types(t)) return PLAN_RES_NOTIMPL;
+
+    /* Validate aggregates */
     int *agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
     for (uint32_t a = 0; a < s->aggregates_count; a++) {
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
         if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
-            { agg_ok = 0; break; }
-        if (ae->has_distinct) { agg_ok = 0; break; }
+            return PLAN_RES_NOTIMPL;
+        if (ae->has_distinct) return PLAN_RES_NOTIMPL;
+        if (ae->expr_idx != IDX_NONE) {
+            /* Expression-based COUNT needs careful NULL propagation — bail */
+            if (ae->func == AGG_COUNT) return PLAN_RES_NOTIMPL;
+            agg_col_idxs[a] = -2;
+        } else if (sv_eq_cstr(ae->column, "*")) {
+            agg_col_idxs[a] = -1;
+        } else {
+            int ci = table_find_column_sv(t, ae->column);
+            if (ci < 0) return PLAN_RES_ERR;
+            if ((ae->func == AGG_MIN || ae->func == AGG_MAX) &&
+                column_type_is_text(t->columns.items[ci].type))
+                return PLAN_RES_NOTIMPL;
+            agg_col_idxs[a] = ci;
+        }
+    }
+
+    /* Bail out for aggregate FILTER clauses */
+    for (uint32_t a = 0; a < s->aggregates_count; a++) {
+        struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+        if (ae->filter_cond != IDX_NONE) return PLAN_RES_NOTIMPL;
+    }
+
+    /* Build: SEQ_SCAN → (FILTER) → SIMPLE_AGG */
+    uint32_t current = build_seq_scan(t, arena);
+
+    if (s->where.has_where) {
+        uint32_t filtered = try_append_compound_filter(current, t, arena, arena, s->where.where_cond);
+        if (filtered == current) {
+            filtered = try_append_simple_filter(current, t, arena, arena, s->where.where_cond);
+            if (filtered == current) return PLAN_RES_NOTIMPL; /* WHERE too complex */
+        }
+        current = filtered;
+    }
+
+    uint32_t agg_idx = plan_alloc_node(arena, PLAN_SIMPLE_AGG);
+    PLAN_NODE(arena, agg_idx).left = current;
+    PLAN_NODE(arena, agg_idx).simple_agg.agg_start = s->aggregates_start;
+    PLAN_NODE(arena, agg_idx).simple_agg.agg_count = s->aggregates_count;
+    PLAN_NODE(arena, agg_idx).simple_agg.agg_col_indices = agg_col_idxs;
+    PLAN_NODE(arena, agg_idx).simple_agg.table = t;
+
+    return PLAN_RES_OK(agg_idx);
+}
+
+/* ---- Plan builder: aggregate path ---- */
+
+/* Append a HAVING filter after a HASH_AGG node.
+ * Resolves HAVING column names against the aggregate output layout
+ * (group cols + agg cols).  Returns updated current node on success,
+ * IDX_NONE if the HAVING condition can't be handled. */
+static uint32_t try_append_having_filter(uint32_t current,
+                                          struct query_select *s,
+                                          struct query_arena *arena)
+{
+    uint16_t ngrp = (uint16_t)s->group_by_count;
+    uint32_t agg_n = s->aggregates_count;
+    uint16_t agg_offset = s->agg_before_cols ? 0 : ngrp;
+    uint16_t grp_offset = s->agg_before_cols ? (uint16_t)agg_n : 0;
+
+    struct condition *hcond = &COND(arena, s->having_cond);
+    if (hcond->type != COND_COMPARE) return IDX_NONE;
+    if (hcond->lhs_expr != IDX_NONE) return IDX_NONE;
+    if (hcond->rhs_column.len != 0) return IDX_NONE;
+    if (hcond->scalar_subquery_sql != IDX_NONE) return IDX_NONE;
+    if (hcond->subquery_sql != IDX_NONE) return IDX_NONE;
+    if (hcond->is_any || hcond->is_all) return IDX_NONE;
+
+    int having_col = -1;
+
+    /* Match against GROUP BY column names */
+    for (uint32_t g = 0; g < s->group_by_count; g++) {
+        sv gcol = arena->svs.items[s->group_by_start + g];
+        if (sv_eq_ignorecase(hcond->column, gcol)) {
+            having_col = (int)(grp_offset + g);
+            break;
+        }
+        /* Strip table prefix and compare */
+        sv bare_h = hcond->column, bare_g = gcol;
+        for (size_t p = 0; p < hcond->column.len; p++)
+            if (hcond->column.data[p] == '.') { bare_h = sv_from(hcond->column.data + p + 1, hcond->column.len - p - 1); break; }
+        for (size_t p = 0; p < gcol.len; p++)
+            if (gcol.data[p] == '.') { bare_g = sv_from(gcol.data + p + 1, gcol.len - p - 1); break; }
+        if (sv_eq_ignorecase(bare_h, bare_g)) {
+            having_col = (int)(grp_offset + g);
+            break;
+        }
+    }
+
+    /* Match against aggregate aliases or function names */
+    if (having_col < 0) {
+        for (uint32_t a = 0; a < agg_n; a++) {
+            struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+            if (ae->alias.len > 0 && sv_eq_ignorecase(hcond->column, ae->alias)) {
+                having_col = (int)(agg_offset + a);
+                break;
+            }
+            const char *fname = NULL;
+            switch (ae->func) {
+                case AGG_SUM:        fname = "sum";   break;
+                case AGG_COUNT:      fname = "count"; break;
+                case AGG_AVG:        fname = "avg";   break;
+                case AGG_MIN:        fname = "min";   break;
+                case AGG_MAX:        fname = "max";   break;
+                case AGG_STRING_AGG: break;
+                case AGG_ARRAY_AGG:  break;
+                case AGG_NONE:       break;
+            }
+            if (fname && sv_eq_ignorecase(hcond->column, sv_from_cstr(fname))) {
+                having_col = (int)(agg_offset + a);
+                break;
+            }
+        }
+    }
+
+    if (having_col < 0) return IDX_NONE;
+
+    /* Support extended HAVING ops: IS NULL, BETWEEN, IN-list, basic comparisons */
+    if (hcond->op == CMP_IS_NULL || hcond->op == CMP_IS_NOT_NULL) {
+        struct cell dummy = {0};
+        return append_filter_node(current, arena, s->having_cond,
+                                   having_col, (int)hcond->op, dummy);
+    } else if (hcond->op == CMP_BETWEEN) {
+        uint32_t fi = plan_alloc_node(arena, PLAN_FILTER);
+        PLAN_NODE(arena, fi).left = current;
+        PLAN_NODE(arena, fi).filter.cond_idx = s->having_cond;
+        PLAN_NODE(arena, fi).filter.col_idx = having_col;
+        PLAN_NODE(arena, fi).filter.cmp_op = CMP_BETWEEN;
+        PLAN_NODE(arena, fi).filter.cmp_val = hcond->value;
+        PLAN_NODE(arena, fi).filter.between_high = hcond->between_high;
+        return fi;
+    } else if (hcond->op == CMP_IN && hcond->in_values_count > 0 &&
+               hcond->subquery_sql == IDX_NONE) {
+        uint32_t nv = hcond->in_values_count;
+        struct cell *vals = (struct cell *)bump_alloc(&arena->scratch,
+                                                      nv * sizeof(struct cell));
+        for (uint32_t i = 0; i < nv; i++) {
+            vals[i] = arena->cells.items[hcond->in_values_start + i];
+            if (column_type_is_text(vals[i].type) && vals[i].value.as_text)
+                vals[i].value.as_text = bump_strdup(&arena->scratch, vals[i].value.as_text);
+        }
+        uint32_t fi = plan_alloc_node(arena, PLAN_FILTER);
+        PLAN_NODE(arena, fi).left = current;
+        PLAN_NODE(arena, fi).filter.cond_idx = s->having_cond;
+        PLAN_NODE(arena, fi).filter.col_idx = having_col;
+        PLAN_NODE(arena, fi).filter.cmp_op = CMP_IN;
+        PLAN_NODE(arena, fi).filter.cmp_val = hcond->value;
+        PLAN_NODE(arena, fi).filter.in_values = vals;
+        PLAN_NODE(arena, fi).filter.in_count = nv;
+        return fi;
+    } else if (hcond->op <= CMP_GE) {
+        return append_filter_node(current, arena, s->having_cond,
+                                   having_col, (int)hcond->op, hcond->value);
+    }
+    return IDX_NONE;
+}
+
+/* Try to build a plan for a GROUP BY + aggregates query. */
+static struct plan_result build_aggregate(struct table *t, struct query_select *s,
+                                          struct query_arena *arena)
+{
+    /* Validate: all aggregates must be simple SUM/COUNT/AVG/MIN/MAX on column refs */
+    enum plan_status fail_reason = PLAN_OK;
+    int *agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
+    for (uint32_t a = 0; a < s->aggregates_count; a++) {
+        struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+        if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
+            { fail_reason = PLAN_NOTIMPL; break; }
+        if (ae->has_distinct) { fail_reason = PLAN_NOTIMPL; break; }
         if (ae->expr_idx != IDX_NONE) {
             agg_col_idxs[a] = -2; /* expression-based aggregate */
         } else if (sv_eq_cstr(ae->column, "*")) {
             agg_col_idxs[a] = -1; /* COUNT(*) */
         } else {
             int ci = table_find_column_sv(t, ae->column);
-            if (ci < 0) { agg_ok = 0; break; }
+            if (ci < 0) { fail_reason = PLAN_ERROR; break; }
             /* MIN/MAX on TEXT columns can't use double-based accumulation */
             if ((ae->func == AGG_MIN || ae->func == AGG_MAX) &&
                 column_type_is_text(t->columns.items[ci].type))
-                { agg_ok = 0; break; }
+                { fail_reason = PLAN_NOTIMPL; break; }
             agg_col_idxs[a] = ci;
         }
     }
 
     /* Validate: GROUP BY columns are resolvable */
     int *grp_col_idxs = NULL;
-    if (agg_ok && s->group_by_count > 0) {
+    if (fail_reason == PLAN_OK && s->group_by_count > 0) {
         grp_col_idxs = (int *)bump_alloc(&arena->scratch, s->group_by_count * sizeof(int));
         for (uint32_t g = 0; g < s->group_by_count; g++) {
             sv gcol = arena->svs.items[s->group_by_start + g];
             grp_col_idxs[g] = table_find_column_sv(t, gcol);
-            if (grp_col_idxs[g] < 0) { agg_ok = 0; break; }
+            if (grp_col_idxs[g] < 0) { fail_reason = PLAN_ERROR; break; }
         }
     }
 
-    if (!agg_ok) return IDX_NONE;
+    if (fail_reason != PLAN_OK)
+        return (struct plan_result){ .node = IDX_NONE, .status = fail_reason };
 
-    /* Build: SEQ_SCAN → HASH_AGG */
+    /* Build: SEQ_SCAN → (FILTER) → HASH_AGG */
     uint32_t scan_idx = build_seq_scan(t, arena);
+
+    /* Apply WHERE filter before aggregation */
+    if (s->where.has_where && s->where.where_cond != IDX_NONE) {
+        uint32_t filtered = try_append_compound_filter(scan_idx, t, arena, arena, s->where.where_cond);
+        if (filtered == scan_idx) {
+            filtered = try_append_simple_filter(scan_idx, t, arena, arena, s->where.where_cond);
+            if (filtered == scan_idx) return PLAN_RES_NOTIMPL;
+        }
+        scan_idx = filtered;
+    }
 
     uint32_t agg_idx = plan_alloc_node(arena, PLAN_HASH_AGG);
     PLAN_NODE(arena, agg_idx).left = scan_idx;
@@ -4828,6 +5952,12 @@ static uint32_t build_aggregate(struct table *t, struct query_select *s,
     PLAN_NODE(arena, agg_idx).hash_agg.table = t;
 
     uint32_t current = agg_idx;
+
+    /* Add HAVING filter if present */
+    if (s->has_having && s->having_cond != IDX_NONE) {
+        current = try_append_having_filter(current, s, arena);
+        if (current == IDX_NONE) return PLAN_RES_NOTIMPL;
+    }
 
     /* Add SORT node if ORDER BY is present */
     if (s->has_order_by && s->order_by_count > 0) {
@@ -4908,29 +6038,28 @@ static uint32_t build_aggregate(struct table *t, struct query_select *s,
 
     current = build_limit(current, s, arena);
 
-    return current;
+    return PLAN_RES_OK(current);
 }
 
 /* ---- Semi-join builder ---- */
 
 /* Try to build a hash semi-join plan for an IN-subquery WHERE clause.
- * Returns the HASH_SEMI_JOIN node index on success, IDX_NONE on failure.
  * On success, the caller must call query_free on *out_sq after use. */
-static uint32_t build_semi_join(struct table *t, struct query_select *s,
-                                struct query_arena *arena, struct database *db,
-                                struct query *out_sq)
+static struct plan_result build_semi_join(struct table *t, struct query_select *s,
+                                          struct query_arena *arena, struct database *db,
+                                          struct query *out_sq)
 {
     struct condition *cond = &COND(arena, s->where.where_cond);
 
     /* Find outer key column */
     int semi_outer_key = table_find_column_sv(t, cond->column);
-    if (semi_outer_key < 0) return IDX_NONE;
+    if (semi_outer_key < 0) return PLAN_RES_ERR;
 
     /* Parse the subquery */
     const char *sq_sql = ASTRING(arena, cond->subquery_sql);
-    if (query_parse(sq_sql, out_sq) != 0) return IDX_NONE;
+    if (query_parse(sq_sql, out_sq) != 0) return PLAN_RES_ERR;
     if (out_sq->query_type != QUERY_TYPE_SELECT) {
-        query_free(out_sq); return IDX_NONE;
+        query_free(out_sq); return PLAN_RES_ERR;
     }
 
     struct query_select *isq = &out_sq->select;
@@ -4938,13 +6067,13 @@ static uint32_t build_semi_join(struct table *t, struct query_select *s,
     if (isq->has_join || isq->has_group_by || isq->aggregates_count > 0 ||
         isq->has_set_op || isq->ctes_count > 0 || isq->has_distinct ||
         isq->from_subquery_sql != IDX_NONE || isq->has_generate_series) {
-        query_free(out_sq); return IDX_NONE;
+        query_free(out_sq); return PLAN_RES_NOTIMPL;
     }
 
     /* Find inner table */
     struct table *semi_inner_t = db_find_table_sv(db, isq->table);
-    if (!semi_inner_t) { query_free(out_sq); return IDX_NONE; }
-    if (semi_inner_t->view_sql) { query_free(out_sq); return IDX_NONE; }
+    if (!semi_inner_t) { query_free(out_sq); return PLAN_RES_ERR; }
+    if (semi_inner_t->view_sql) { query_free(out_sq); return PLAN_RES_NOTIMPL; }
 
     /* Resolve inner SELECT column — must be a single column ref */
     int semi_inner_key = -1;
@@ -4964,7 +6093,7 @@ static uint32_t build_semi_join(struct table *t, struct query_select *s,
             semi_inner_key = table_find_column_sv(semi_inner_t, isq->columns);
         }
     }
-    if (semi_inner_key < 0) { query_free(out_sq); return IDX_NONE; }
+    if (semi_inner_key < 0) { query_free(out_sq); return PLAN_RES_ERR; }
 
     /* Validate inner WHERE (optional simple numeric filter) */
     int semi_inner_filter_col = -1;
@@ -4990,19 +6119,19 @@ static uint32_t build_semi_join(struct table *t, struct query_select *s,
                         semi_inner_filter_val.value.as_text =
                             bump_strdup(&arena->scratch, semi_inner_filter_val.value.as_text);
                 } else {
-                    query_free(out_sq); return IDX_NONE;
+                    query_free(out_sq); return PLAN_RES_NOTIMPL;
                 }
             } else {
-                query_free(out_sq); return IDX_NONE;
+                query_free(out_sq); return PLAN_RES_NOTIMPL;
             }
         } else {
-            query_free(out_sq); return IDX_NONE; /* complex inner WHERE */
+            query_free(out_sq); return PLAN_RES_NOTIMPL; /* complex inner WHERE */
         }
     }
 
     /* Check for mixed cell types in inner table */
     if (table_has_mixed_types(semi_inner_t)) {
-        query_free(out_sq); return IDX_NONE;
+        query_free(out_sq); return PLAN_RES_NOTIMPL;
     }
 
     /* --- Build plan nodes --- */
@@ -5045,7 +6174,7 @@ static uint32_t build_semi_join(struct table *t, struct query_select *s,
     PLAN_NODE(arena, semi_idx).hash_semi_join.outer_key_col = semi_outer_key;
     PLAN_NODE(arena, semi_idx).hash_semi_join.inner_key_col = semi_inner_key;
 
-    return semi_idx;
+    return PLAN_RES_OK(semi_idx);
 }
 
 /* ---- Single-table plan builder ---- */
@@ -5053,24 +6182,23 @@ static uint32_t build_semi_join(struct table *t, struct query_select *s,
 /* Build a plan for a single-table SELECT (no joins, no window functions,
  * no set operations, no aggregates).  Handles simple WHERE filters,
  * IN-subquery semi-joins, index scans, ORDER BY, projection, DISTINCT,
- * and LIMIT/OFFSET.
- * Returns root plan node index, or IDX_NONE for legacy fallback. */
-static uint32_t build_single_table(struct table *t, struct query_select *s,
-                                   struct query_arena *arena, struct database *db)
+ * and LIMIT/OFFSET. */
+static struct plan_result build_single_table(struct table *t, struct query_select *s,
+                                             struct query_arena *arena, struct database *db)
 {
     /* Bail out for queries we don't handle yet */
-    if (s->has_join)            return IDX_NONE;
-    if (s->select_exprs_count > 0) return IDX_NONE; /* window functions — handled above */
-    if (s->has_group_by)        return IDX_NONE;
-    if (s->aggregates_count > 0) return IDX_NONE;
-    if (s->has_set_op)          return IDX_NONE;
-    if (s->ctes_count > 0)     return IDX_NONE;
-    if (s->cte_sql != IDX_NONE) return IDX_NONE;
-    if (s->from_subquery_sql != IDX_NONE) return IDX_NONE;
-    if (s->has_recursive_cte)   return IDX_NONE;
-    if (s->has_distinct_on)     return IDX_NONE;
-    if (!t)                     return IDX_NONE;
-    if (s->insert_rows_count > 0) return IDX_NONE; /* literal SELECT */
+    if (s->has_join)            return PLAN_RES_NOTIMPL;
+    if (s->select_exprs_count > 0) return PLAN_RES_NOTIMPL; /* window functions — handled above */
+    if (s->has_group_by)        return PLAN_RES_NOTIMPL;
+    if (s->aggregates_count > 0) return PLAN_RES_NOTIMPL;
+    if (s->has_set_op)          return PLAN_RES_NOTIMPL;
+    if (s->ctes_count > 0)     return PLAN_RES_NOTIMPL;
+    if (s->cte_sql != IDX_NONE) return PLAN_RES_NOTIMPL;
+    if (s->from_subquery_sql != IDX_NONE) return PLAN_RES_NOTIMPL;
+    if (s->has_recursive_cte)   return PLAN_RES_NOTIMPL;
+    if (s->has_distinct_on)     return PLAN_RES_NOTIMPL;
+    if (!t)                     return PLAN_RES_ERR;
+    if (s->insert_rows_count > 0) return PLAN_RES_NOTIMPL; /* literal SELECT */
 
     int select_all = sv_eq_cstr(s->columns, "*");
 
@@ -5111,17 +6239,17 @@ static uint32_t build_single_table(struct table *t, struct query_select *s,
                 if (e->type == EXPR_SUBQUERY) { expr_ok = 0; break; }
                 expr_proj_indices[i] = sc->expr_idx;
             }
-            if (!expr_ok) return IDX_NONE;
+            if (!expr_ok) return PLAN_RES_NOTIMPL;
             need_expr_project = 1;
         }
     } else {
         /* Legacy text-based column list — can't handle */
-        return IDX_NONE;
+        return PLAN_RES_NOTIMPL;
     }
 
-    /* Expression projection can't handle ORDER BY or DISTINCT yet — bail to legacy */
-    if (need_expr_project && s->has_order_by) return IDX_NONE;
-    if (need_expr_project && s->has_distinct) return IDX_NONE;
+    /* ORDER BY + expr_project: sort on raw columns before expression eval.
+     * DISTINCT + expr_project: EXPR_PROJECT runs before DISTINCT.
+     * Both are handled by the existing node construction order. */
 
     /* Pre-validate ORDER BY columns BEFORE allocating plan nodes */
     int  sort_cols_buf[32];
@@ -5145,23 +6273,24 @@ static uint32_t build_single_table(struct table *t, struct query_select *s,
                     }
                 }
             }
-            if (sort_cols_buf[k] < 0) return IDX_NONE;
+            if (sort_cols_buf[k] < 0) return PLAN_RES_ERR;
         }
     }
 
     /* Pre-validate WHERE clause BEFORE allocating plan nodes */
-    int filter_col = -1;
-    int filter_ok = 0;
     int have_source = 0;
     uint32_t current = IDX_NONE;
 
     /* Extra filter condition index — set when COND_AND is decomposed into
      * a semi-join (IN-subquery) + a simple comparison filter. */
     uint32_t extra_filter_cond = IDX_NONE;
+    /* Compound filter condition — set when WHERE is a COND_AND tree or
+     * an extended op (IS NULL, BETWEEN, IN-list, LIKE) that passed validation. */
+    uint32_t compound_filter_cond = IDX_NONE;
 
     if (s->where.has_where) {
         if (s->where.where_cond == IDX_NONE)
-            return IDX_NONE;
+            return PLAN_RES_ERR;
         struct condition *cond = &COND(arena, s->where.where_cond);
 
         /* ---- COND_AND: try to decompose into IN-subquery + simple filter ---- */
@@ -5185,9 +6314,9 @@ static uint32_t build_single_table(struct table *t, struct query_select *s,
 
                 if (!table_has_mixed_types(t)) {
                     struct query semi_sq = {0};
-                    uint32_t semi_plan = build_semi_join(t, s, arena, db, &semi_sq);
-                    if (semi_plan != IDX_NONE) {
-                        current = semi_plan;
+                    struct plan_result semi_pr = build_semi_join(t, s, arena, db, &semi_sq);
+                    if (semi_pr.status == PLAN_OK) {
+                        current = semi_pr.node;
                         query_free(&semi_sq);
                         have_source = 1;
                         extra_filter_cond = other_cond_idx;
@@ -5200,58 +6329,31 @@ static uint32_t build_single_table(struct table *t, struct query_select *s,
         }
 
         if (!have_source) {
-            if (cond->type != COND_COMPARE)
-                return IDX_NONE;
-
-            /* ---- IN-subquery → hash semi-join ---- */
-            if ((cond->op == CMP_IN || cond->op == CMP_NOT_IN) &&
-                cond->subquery_sql != IDX_NONE && db &&
-                cond->op == CMP_IN /* NOT IN is more complex — skip for now */) {
-
-                /* Check for mixed cell types in outer table first */
-                if (table_has_mixed_types(t))
-                    return IDX_NONE;
-
-                struct query semi_sq = {0};
-                uint32_t semi_plan = build_semi_join(t, s, arena, db, &semi_sq);
-                if (semi_plan == IDX_NONE)
-                    return IDX_NONE;
-
-                current = semi_plan;
-                query_free(&semi_sq);
-                have_source = 1;
-            } else {
-                /* ---- Standard simple comparison filter ---- */
-                if (cond->lhs_expr != IDX_NONE || cond->rhs_column.len != 0)
-                    return IDX_NONE;
-                if (cond->scalar_subquery_sql != IDX_NONE) return IDX_NONE;
-                if (cond->subquery_sql != IDX_NONE) return IDX_NONE;
-                if (cond->in_values_count > 0) return IDX_NONE;
-                if (cond->array_values_count > 0) return IDX_NONE;
-                if (cond->is_any || cond->is_all) return IDX_NONE;
-                filter_col = table_find_column_sv(t, cond->column);
-                if (filter_col < 0) return IDX_NONE;
-                enum column_type ct = t->columns.items[filter_col].type;
-                if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BOOLEAN &&
-                    ct != COLUMN_TYPE_FLOAT && ct != COLUMN_TYPE_NUMERIC &&
-                    ct != COLUMN_TYPE_BIGINT && !column_type_is_text(ct))
-                    return IDX_NONE;
-                if (cond->op > CMP_GE) return IDX_NONE;
-                /* For text columns, accept text comparison values */
-                if (column_type_is_text(ct)) {
-                    if (!cond->value.is_null && !column_type_is_text(cond->value.type))
-                        return IDX_NONE;
-                } else {
-                    /* Reject cross-type comparisons (e.g. INT col vs FLOAT value from subquery) */
-                    if (!cond->value.is_null && cond->value.type != ct &&
-                        !(ct == COLUMN_TYPE_FLOAT && cond->value.type == COLUMN_TYPE_INT) &&
-                        !(ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT))
-                        return IDX_NONE;
-                    /* If INT column but FLOAT value, reject — fast path can't handle */
-                    if (ct == COLUMN_TYPE_INT && cond->value.type == COLUMN_TYPE_FLOAT)
-                        return IDX_NONE;
+            /* ---- IN-subquery → hash semi-join (must be checked first) ---- */
+            if (cond->type == COND_COMPARE && cond->op == CMP_IN &&
+                cond->subquery_sql != IDX_NONE && db) {
+                if (!table_has_mixed_types(t)) {
+                    struct query semi_sq = {0};
+                    struct plan_result semi_pr = build_semi_join(t, s, arena, db, &semi_sq);
+                    if (semi_pr.status == PLAN_OK) {
+                        current = semi_pr.node;
+                        query_free(&semi_sq);
+                        have_source = 1;
+                    } else if (semi_pr.status == PLAN_ERROR) {
+                        return semi_pr;
+                    }
+                    /* NOTIMPL falls through to compound filter below */
                 }
-                filter_ok = 1;
+            }
+
+            /* ---- Unified compound filter: handles COND_AND trees, extended ops,
+             * and basic comparisons through a single validation path ---- */
+            if (!have_source) {
+                if (validate_compound_filter(t, arena, s->where.where_cond)) {
+                    compound_filter_cond = s->where.where_cond;
+                } else {
+                    return PLAN_RES_NOTIMPL;
+                }
             }
         }
     }
@@ -5260,32 +6362,37 @@ static uint32_t build_single_table(struct table *t, struct query_select *s,
     if (!have_source) {
         /* Bail out if outer table has mixed cell types (e.g. after ALTER COLUMN TYPE) */
         if (table_has_mixed_types(t))
-            return IDX_NONE;
+            return PLAN_RES_NOTIMPL;
 
         /* --- All validation passed, now allocate plan nodes --- */
 
-        /* Try index scan for equality WHERE on an indexed column */
+        /* Try index scan for simple equality WHERE on an indexed column */
         int used_index = 0;
-        if (filter_ok && filter_col >= 0) {
-            struct condition *cond = &COND(arena, s->where.where_cond);
-            if (cond->op == CMP_EQ) {
-                uint16_t scan_ncols = (uint16_t)t->columns.count;
-                int *col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
-                for (uint16_t i = 0; i < scan_ncols; i++)
-                    col_map[i] = (int)i;
-                for (size_t ix = 0; ix < t->indexes.count; ix++) {
-                    if (strcmp(t->indexes.items[ix].column_name,
-                               t->columns.items[filter_col].name) == 0) {
-                        uint32_t idx_node = plan_alloc_node(arena, PLAN_INDEX_SCAN);
-                        PLAN_NODE(arena, idx_node).index_scan.table = t;
-                        PLAN_NODE(arena, idx_node).index_scan.idx = &t->indexes.items[ix];
-                        PLAN_NODE(arena, idx_node).index_scan.cond_idx = s->where.where_cond;
-                        PLAN_NODE(arena, idx_node).index_scan.ncols = scan_ncols;
-                        PLAN_NODE(arena, idx_node).index_scan.col_map = col_map;
-                        PLAN_NODE(arena, idx_node).est_rows = 1.0;
-                        current = idx_node;
-                        used_index = 1;
-                        break;
+        if (compound_filter_cond != IDX_NONE) {
+            struct condition *cond = &COND(arena, compound_filter_cond);
+            if (cond->type == COND_COMPARE && cond->op == CMP_EQ &&
+                cond->subquery_sql == IDX_NONE) {
+                int fc = table_find_column_sv(t, cond->column);
+                if (fc >= 0) {
+                    uint16_t scan_ncols = (uint16_t)t->columns.count;
+                    int *col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
+                    for (uint16_t i = 0; i < scan_ncols; i++)
+                        col_map[i] = (int)i;
+                    for (size_t ix = 0; ix < t->indexes.count; ix++) {
+                        if (strcmp(t->indexes.items[ix].column_name,
+                                   t->columns.items[fc].name) == 0) {
+                            uint32_t idx_node = plan_alloc_node(arena, PLAN_INDEX_SCAN);
+                            PLAN_NODE(arena, idx_node).index_scan.table = t;
+                            PLAN_NODE(arena, idx_node).index_scan.idx = &t->indexes.items[ix];
+                            PLAN_NODE(arena, idx_node).index_scan.cond_idx = compound_filter_cond;
+                            PLAN_NODE(arena, idx_node).index_scan.ncols = scan_ncols;
+                            PLAN_NODE(arena, idx_node).index_scan.col_map = col_map;
+                            PLAN_NODE(arena, idx_node).est_rows = 1.0;
+                            current = idx_node;
+                            used_index = 1;
+                            compound_filter_cond = IDX_NONE; /* consumed by index scan */
+                            break;
+                        }
                     }
                 }
             }
@@ -5294,18 +6401,20 @@ static uint32_t build_single_table(struct table *t, struct query_select *s,
         if (!used_index) {
             current = build_seq_scan(t, arena);
 
-            /* Add filter node if WHERE clause was validated */
-            if (filter_ok) {
-                struct condition *cond = &COND(arena, s->where.where_cond);
-                current = append_filter_node(current, arena, s->where.where_cond,
-                                             filter_col, (int)cond->op, cond->value);
+            /* Add compound filter (COND_AND tree, extended op, or basic comparison) */
+            if (compound_filter_cond != IDX_NONE) {
+                current = try_append_compound_filter(current, t, arena, arena, compound_filter_cond);
             }
         }
     }
 
     /* Append extra filter from COND_AND decomposition (e.g. AND amount > 100) */
-    if (extra_filter_cond != IDX_NONE)
-        current = try_append_simple_filter(current, t, arena, arena, extra_filter_cond);
+    if (extra_filter_cond != IDX_NONE) {
+        uint32_t prev = current;
+        current = try_append_compound_filter(current, t, arena, arena, extra_filter_cond);
+        if (current == prev)
+            current = try_append_simple_filter(current, t, arena, arena, extra_filter_cond);
+    }
 
     /* Add SORT node if ORDER BY was validated */
     if (sort_nord > 0)
@@ -5334,16 +6443,17 @@ static uint32_t build_single_table(struct table *t, struct query_select *s,
 
     current = build_limit(current, s, arena);
 
-    return current;
+    return PLAN_RES_OK(current);
 }
 
 /* ---- Plan builder ---- */
 
-/* Try to build a block-oriented plan for a simple single-table SELECT.
- * Returns root plan node index, or IDX_NONE if the query is too complex
- * and should fall back to the legacy executor. */
-uint32_t plan_build_select(struct table *t, struct query_select *s,
-                           struct query_arena *arena, struct database *db)
+/* Try to build a block-oriented plan for a SELECT query.
+ * Returns a plan_result: PLAN_OK with a valid node index on success,
+ * PLAN_NOTIMPL for unimplemented features (fall back to legacy),
+ * or PLAN_ERROR for real errors (bad column, type mismatch, etc.). */
+struct plan_result plan_build_select(struct table *t, struct query_select *s,
+                                     struct query_arena *arena, struct database *db)
 {
     /* ---- Generate series fast path ---- */
     if (s->has_generate_series && s->gs_start_expr != IDX_NONE &&
@@ -5353,9 +6463,9 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
             s->has_set_op || s->ctes_count > 0 || s->has_distinct ||
             s->select_exprs_count > 0 || s->where.has_where ||
             s->has_order_by || s->parsed_columns_count > 0)
-            return IDX_NONE;
+            return PLAN_RES_NOTIMPL;
         if (!sv_eq_cstr(s->columns, "*"))
-            return IDX_NONE;
+            return PLAN_RES_NOTIMPL;
 
         struct cell c_start = eval_expr(s->gs_start_expr, arena, NULL, NULL, db, NULL);
         struct cell c_stop  = eval_expr(s->gs_stop_expr, arena, NULL, NULL, db, NULL);
@@ -5363,9 +6473,9 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         /* Bail out for timestamp/date series — keep on legacy path */
         if (c_start.type == COLUMN_TYPE_DATE || c_start.type == COLUMN_TYPE_TIMESTAMP ||
             c_start.type == COLUMN_TYPE_TIMESTAMPTZ)
-            return IDX_NONE;
+            return PLAN_RES_NOTIMPL;
         if (c_start.type == COLUMN_TYPE_INTERVAL || c_stop.type == COLUMN_TYPE_INTERVAL)
-            return IDX_NONE;
+            return PLAN_RES_NOTIMPL;
 
         long long gs_start = (c_start.type == COLUMN_TYPE_BIGINT) ? c_start.value.as_bigint
                            : (c_start.type == COLUMN_TYPE_FLOAT)  ? (long long)c_start.value.as_float
@@ -5377,7 +6487,7 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         if (s->gs_step_expr != IDX_NONE) {
             struct cell c_step = eval_expr(s->gs_step_expr, arena, NULL, NULL, db, NULL);
             if (c_step.type == COLUMN_TYPE_INTERVAL || column_type_is_text(c_step.type))
-                return IDX_NONE; /* timestamp step — bail to legacy */
+                return PLAN_RES_NOTIMPL; /* timestamp step — bail to legacy */
             gs_step = (c_step.type == COLUMN_TYPE_BIGINT) ? c_step.value.as_bigint
                     : (c_step.type == COLUMN_TYPE_FLOAT)  ? (long long)c_step.value.as_float
                     : c_step.value.as_int;
@@ -5398,14 +6508,12 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
 
         current = build_limit(current, s, arena);
 
-        return current;
+        return PLAN_RES_OK(current);
     }
 
     /* ---- Join fast path (single or multi-table) ---- */
     if (s->has_join && s->joins_count >= 1 && db) {
-        uint32_t join_plan = build_join(t, s, arena, db);
-        if (join_plan != IDX_NONE) return join_plan;
-        return IDX_NONE;
+        return build_join(t, s, arena, db);
     }
 
     /* ---- Window function fast path ---- */
@@ -5414,9 +6522,7 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         s->cte_sql == IDX_NONE && s->from_subquery_sql == IDX_NONE &&
         !s->has_recursive_cte && !s->has_distinct && !s->has_distinct_on &&
         t && s->insert_rows_count == 0) {
-        uint32_t win_plan = build_window(t, s, arena);
-        if (win_plan != IDX_NONE) return win_plan;
-        return IDX_NONE;
+        return build_window(t, s, arena);
     }
 
     /* ---- Set operations fast path (UNION / INTERSECT / EXCEPT) ---- */
@@ -5426,9 +6532,17 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         !s->has_recursive_cte && s->select_exprs_count == 0 &&
         !s->where.has_where &&
         t && db && s->insert_rows_count == 0) {
-        uint32_t set_plan = build_set_op(t, s, arena, db);
-        if (set_plan != IDX_NONE) return set_plan;
-        return IDX_NONE;
+        return build_set_op(t, s, arena, db);
+    }
+
+    /* ---- Simple aggregate (no GROUP BY) fast path ---- */
+    if (!s->has_group_by && s->aggregates_count > 0 && t && !s->has_join &&
+        !s->has_set_op && s->ctes_count == 0 && s->cte_sql == IDX_NONE &&
+        s->from_subquery_sql == IDX_NONE && !s->has_recursive_cte &&
+        s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
+        !s->has_distinct && !s->has_distinct_on) {
+        struct plan_result sa_pr = build_simple_agg(t, s, arena);
+        if (sa_pr.status == PLAN_OK) return sa_pr;
     }
 
     /* ---- Single-table GROUP BY + aggregates fast path ---- */
@@ -5437,10 +6551,9 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         s->from_subquery_sql == IDX_NONE && !s->has_recursive_cte &&
         s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
         !s->has_distinct && !s->has_distinct_on &&
-        !s->group_by_rollup && !s->group_by_cube &&
-        !s->has_having) {
-        uint32_t agg_plan = build_aggregate(t, s, arena);
-        if (agg_plan != IDX_NONE) return agg_plan;
+        !s->group_by_rollup && !s->group_by_cube) {
+        struct plan_result agg_pr = build_aggregate(t, s, arena);
+        if (agg_pr.status == PLAN_OK) return agg_pr;
     }
 
     /* ---- Single-table path ---- */

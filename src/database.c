@@ -1441,11 +1441,11 @@ struct table *materialize_subquery(struct database *db, const char *sql,
         if (ss->table.len > 0)
             src = db_find_table_sv(db, ss->table);
         if (src) {
-            uint32_t plan_root = plan_build_select(src, ss, &sq.arena, db);
-            if (plan_root != IDX_NONE) {
+            struct plan_result pr = plan_build_select(src, ss, &sq.arena, db);
+            if (pr.status == PLAN_OK) {
                 struct plan_exec_ctx ctx;
-                plan_exec_init(&ctx, &sq.arena, db, plan_root);
-                plan_exec_to_rows(&ctx, plan_root, &sq_rows, NULL);
+                plan_exec_init(&ctx, &sq.arena, db, pr.node);
+                plan_exec_to_rows(&ctx, pr.node, &sq_rows, NULL);
                 used_plan = 1;
             }
         }
@@ -1900,11 +1900,11 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
 
             if (inner_q.query_type == QUERY_TYPE_SELECT) {
                 struct table *t = db_find_table_sv(db, inner_q.select.table);
-                uint32_t root = IDX_NONE;
+                struct plan_result epr = { .node = IDX_NONE, .status = PLAN_NOTIMPL };
                 if (t)
-                    root = plan_build_select(t, &inner_q.select, &inner_q.arena, db);
-                if (root != IDX_NONE) {
-                    explain_len = plan_explain(&inner_q.arena, root, explain_buf, sizeof(explain_buf));
+                    epr = plan_build_select(t, &inner_q.select, &inner_q.arena, db);
+                if (epr.status == PLAN_OK) {
+                    explain_len = plan_explain(&inner_q.arena, epr.node, explain_buf, sizeof(explain_buf));
                 } else {
                     explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
                 }

@@ -955,6 +955,28 @@ static int send_row_desc_plan(int fd, struct table *t, struct table *t2,
                     }
                 }
             }
+        } else if (q->select.aggregates_count > 0 && (uint32_t)i < q->select.aggregates_count &&
+                   q->select.parsed_columns_count == 0 && q->select.select_exprs_count == 0) {
+            /* Simple aggregate (no GROUP BY): derive column name from aggregate */
+            struct agg_expr *ae = &q->arena.aggregates.items[q->select.aggregates_start + i];
+            if (ae->alias.len > 0) {
+                static __thread char agg_alias_buf[256];
+                size_t alen = ae->alias.len < 255 ? ae->alias.len : 255;
+                memcpy(agg_alias_buf, ae->alias.data, alen);
+                agg_alias_buf[alen] = '\0';
+                colname = agg_alias_buf;
+            } else {
+                switch (ae->func) {
+                    case AGG_SUM:        colname = "sum";        break;
+                    case AGG_COUNT:      colname = "count";      break;
+                    case AGG_AVG:        colname = "avg";        break;
+                    case AGG_MIN:        colname = "min";        break;
+                    case AGG_MAX:        colname = "max";        break;
+                    case AGG_STRING_AGG: colname = "string_agg"; break;
+                    case AGG_ARRAY_AGG:  colname = "array_agg";  break;
+                    case AGG_NONE:       break;
+                }
+            }
         } else if (t && (size_t)i < t->columns.count) {
             colname = t->columns.items[i].name;
         }
@@ -1110,8 +1132,8 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         t2 = db_find_table_sv(db, ji->join_table);
     }
 
-    uint32_t plan_root = plan_build_select(t, s, &q->arena, db);
-    if (plan_root == IDX_NONE) {
+    struct plan_result pr = plan_build_select(t, s, &q->arena, db);
+    if (pr.status != PLAN_OK) {
         /* Restore CTE fields so legacy path can handle */
         s->ctes_count = saved_ctes_count;
         s->ctes_start = saved_ctes_start;
@@ -1123,9 +1145,9 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     }
 
     struct plan_exec_ctx ctx;
-    plan_exec_init(&ctx, &q->arena, db, plan_root);
+    plan_exec_init(&ctx, &q->arena, db, pr.node);
 
-    uint16_t ncols = plan_node_ncols(&q->arena, plan_root);
+    uint16_t ncols = plan_node_ncols(&q->arena, pr.node);
     if (ncols == 0) {
         for (size_t ci = n_cte_temps; ci > 0; ci--)
             remove_temp_table(db, cte_temps[ci - 1]);
@@ -1136,7 +1158,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     struct row_block block;
     row_block_alloc(&block, ncols, &q->arena.scratch);
 
-    int rc = plan_next_block(&ctx, plan_root, &block);
+    int rc = plan_next_block(&ctx, pr.node, &block);
     if (rc != 0) {
         /* No rows — send empty RowDescription + zero data rows */
         enum column_type types[64];
@@ -1292,7 +1314,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
 
         /* Get next block */
         row_block_reset(&block);
-        if (plan_next_block(&ctx, plan_root, &block) != 0)
+        if (plan_next_block(&ctx, pr.node, &block) != 0)
             break;
     }
 
