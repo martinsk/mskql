@@ -753,7 +753,7 @@ const char *catalog_resolve_name(const char *schema, size_t schema_len,
                                   char *buf, size_t bufsz)
 {
     /* pg_catalog.X -> X (bare name, catalog tables are stored as "pg_X") */
-    if (schema_len == 10 && strncasecmp(schema, "pg_catalog", 10) == 0) {
+    if (schema_len == sizeof("pg_catalog") - 1 && strncasecmp(schema, "pg_catalog", sizeof("pg_catalog") - 1) == 0) {
         if (table_len < bufsz) {
             memcpy(buf, table, table_len);
             buf[table_len] = '\0';
@@ -761,17 +761,18 @@ const char *catalog_resolve_name(const char *schema, size_t schema_len,
         }
     }
     /* information_schema.X -> "information_schema_X" */
-    if (schema_len == 18 && strncasecmp(schema, "information_schema", 18) == 0) {
-        size_t needed = 19 + table_len + 1; /* "information_schema_" + table + NUL */
+    if (schema_len == sizeof("information_schema") - 1 && strncasecmp(schema, "information_schema", sizeof("information_schema") - 1) == 0) {
+        size_t prefix_len = sizeof("information_schema_") - 1;
+        size_t needed = prefix_len + table_len + 1; /* "information_schema_" + table + NUL */
         if (needed <= bufsz) {
-            memcpy(buf, "information_schema_", 19);
-            memcpy(buf + 19, table, table_len);
-            buf[19 + table_len] = '\0';
+            memcpy(buf, "information_schema_", prefix_len);
+            memcpy(buf + prefix_len, table, table_len);
+            buf[prefix_len + table_len] = '\0';
             return buf;
         }
     }
     /* public.X -> X */
-    if (schema_len == 6 && strncasecmp(schema, "public", 6) == 0) {
+    if (schema_len == sizeof("public") - 1 && strncasecmp(schema, "public", sizeof("public") - 1) == 0) {
         if (table_len < bufsz) {
             memcpy(buf, table, table_len);
             buf[table_len] = '\0';

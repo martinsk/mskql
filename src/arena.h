@@ -188,8 +188,8 @@ static inline void arena_set_error(struct query_arena *a,
 {
     if (a->errmsg[0] != '\0') return; /* first error wins */
     if (state) {
-        memcpy(a->sqlstate, state, 5);
-        a->sqlstate[5] = '\0';
+        memcpy(a->sqlstate, state, sizeof(a->sqlstate) - 1);
+        a->sqlstate[sizeof(a->sqlstate) - 1] = '\0';
     }
     va_list ap;
     va_start(ap, fmt);

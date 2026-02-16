@@ -242,7 +242,7 @@ static void build_merged_columns_ex(struct table *t1, const char *alias1,
 static uint32_t cell_hash(const struct cell *c)
 {
     if (c->is_null) return 0;
-    uint32_t h = 2166136261u;
+    uint32_t h = FNV_OFFSET;
     switch (c->type) {
         case COLUMN_TYPE_SMALLINT:
         case COLUMN_TYPE_INT:
@@ -268,7 +268,7 @@ static uint32_t cell_hash(const struct cell *c)
             case COLUMN_TYPE_UUID:     dv = 0.0; break;
             }
             uint8_t *p = (uint8_t *)&dv;
-            for (int i = 0; i < 8; i++) { h ^= p[i]; h *= 16777619u; }
+            for (int i = 0; i < (int)sizeof(double); i++) { h ^= p[i]; h *= FNV_PRIME; }
             break;
         }
         case COLUMN_TYPE_TEXT:
@@ -281,7 +281,7 @@ static uint32_t cell_hash(const struct cell *c)
         case COLUMN_TYPE_UUID:
             if (c->value.as_text) {
                 const char *s = c->value.as_text;
-                while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+                while (*s) { h ^= (uint8_t)*s++; h *= FNV_PRIME; }
             }
             break;
     }
@@ -1418,7 +1418,7 @@ struct table *materialize_subquery(struct database *db, const char *sql,
                                   const char *table_name)
 {
     /* Buffer for rewritten SQL (must outlive sq since parser stores pointers into it) */
-    char gs_rewritten[4096];
+    char *gs_rewritten = NULL;
     struct query sq = {0};
     if (query_parse(sql, &sq) != 0) {
         query_free(&sq);
@@ -1459,16 +1459,20 @@ struct table *materialize_subquery(struct database *db, const char *sql,
                 }
                 /* Build: SELECT * FROM generate_series(...) AS gs_tbl(col_alias) */
                 size_t gs_call_len = (size_t)(gs_end - gs);
+                size_t gs_buf_sz = gs_call_len + sizeof("SELECT * FROM  AS _gs()") + sizeof(col_alias);
+                gs_rewritten = malloc(gs_buf_sz);
+                if (!gs_rewritten) return NULL;
                 if (col_alias[0])
-                    snprintf(gs_rewritten, sizeof(gs_rewritten),
+                    snprintf(gs_rewritten, gs_buf_sz,
                              "SELECT * FROM %.*s AS _gs(%s)",
                              (int)gs_call_len, gs, col_alias);
                 else
-                    snprintf(gs_rewritten, sizeof(gs_rewritten),
+                    snprintf(gs_rewritten, gs_buf_sz,
                              "SELECT * FROM %.*s", (int)gs_call_len, gs);
                 memset(&sq, 0, sizeof(sq));
                 if (query_parse(gs_rewritten, &sq) != 0) {
                     query_free(&sq);
+                    free(gs_rewritten);
                     return NULL;
                 }
                 goto parse_ok;
@@ -1500,6 +1504,7 @@ struct table *materialize_subquery(struct database *db, const char *sql,
     if (!used_plan) {
         if (db_exec(db, &sq, &sq_rows, NULL) != 0) {
             query_free(&sq);
+            free(gs_rewritten);
             return NULL;
         }
     }
@@ -1597,6 +1602,7 @@ struct table *materialize_subquery(struct database *db, const char *sql,
         da_push(&ct.rows, sq_rows.data[i]);
     free(sq_rows.data);
     query_free(&sq);
+    free(gs_rewritten);
     da_push(&db->tables, ct);
     return &db->tables.items[db->tables.count - 1];
 }

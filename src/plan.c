@@ -7,6 +7,8 @@
 #include <string.h>
 #include <strings.h>
 
+#define MAX_SORT_KEYS 32
+
 /* ---- cell ↔ col_block conversion helpers ---- */
 
 /* Write a struct cell value into a col_block at index i.
@@ -3172,10 +3174,10 @@ struct block_sort_ctx {
     int              *sort_descs;
     int              *sort_nulls_first; /* per-key: -1=default, 0=NULLS LAST, 1=NULLS FIRST */
     uint16_t          nsort_cols;
-    /* Flat arrays for fast comparator (one per sort key) */
-    void             *flat_keys[32];   /* contiguous typed array per sort key */
-    uint8_t          *flat_nulls[32];  /* contiguous null bitmap per sort key */
-    enum column_type  key_types[32];
+    /* Flat arrays for fast comparator (one per sort key, bump-allocated) */
+    void            **flat_keys;       /* [nsort_cols] contiguous typed array per sort key */
+    uint8_t         **flat_nulls;      /* [nsort_cols] contiguous null bitmap per sort key */
+    enum column_type *key_types;       /* [nsort_cols] */
     /* Flat arrays for ALL columns — used by emit phase to avoid block remap */
     void            **flat_col_data;   /* [ncols] contiguous typed arrays */
     uint8_t         **flat_col_nulls;  /* [ncols] contiguous null bitmaps */
@@ -3353,7 +3355,13 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         }
 
         /* Point sort key flat arrays into the all-column flat arrays */
-        uint16_t nsk = pn->sort.nsort_cols < 32 ? pn->sort.nsort_cols : 32;
+        uint16_t nsk = pn->sort.nsort_cols;
+        _bsort_ctx.flat_keys = (void **)bump_alloc(&ctx->arena->scratch,
+                                                     nsk * sizeof(void *));
+        _bsort_ctx.flat_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch,
+                                                         nsk * sizeof(uint8_t *));
+        _bsort_ctx.key_types = (enum column_type *)bump_alloc(&ctx->arena->scratch,
+                                                               nsk * sizeof(enum column_type));
         for (uint16_t k = 0; k < nsk; k++) {
             int sci = pn->sort.sort_cols[k];
             _bsort_ctx.flat_keys[k] = _bsort_ctx.flat_col_data[sci];
@@ -5920,10 +5928,12 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     if (table_has_mixed_types(t1)) return PLAN_RES_NOTIMPL;
 
     /* Collect all tables, aliases, and validate all joins are INNER equi-joins */
-    #define MAX_JOIN_TABLES 8
-    struct table *tables[MAX_JOIN_TABLES];
-    uint16_t offsets[MAX_JOIN_TABLES]; /* cumulative column offset per table */
-    sv aliases[MAX_JOIN_TABLES];       /* table aliases for eval_expr resolution */
+    int max_tables = (int)s->joins_count + 1;
+    struct table **tables = (struct table **)bump_alloc(&arena->scratch,
+                                                         max_tables * sizeof(struct table *));
+    uint16_t *offsets = (uint16_t *)bump_alloc(&arena->scratch,
+                                                max_tables * sizeof(uint16_t));
+    sv *aliases = (sv *)bump_alloc(&arena->scratch, max_tables * sizeof(sv));
     int ntables = 0;
 
     tables[ntables] = t1;
@@ -5934,7 +5944,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     uint16_t cum_cols = (uint16_t)t1->columns.count;
 
     int has_non_inner = 0;
-    for (uint32_t j = 0; j < s->joins_count && ntables < MAX_JOIN_TABLES; j++) {
+    for (uint32_t j = 0; j < s->joins_count; j++) {
         struct join_info *ji = &arena->joins.items[s->joins_start + j];
         if (ji->join_type == 4) return PLAN_RES_NOTIMPL; /* CROSS join */
         if (ji->is_lateral)     return PLAN_RES_NOTIMPL;
@@ -5957,8 +5967,8 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     if (ntables > 2 && has_non_inner) return PLAN_RES_NOTIMPL;
 
     /* Extract join keys for each join */
-    int outer_keys[MAX_JOIN_TABLES];
-    int inner_keys[MAX_JOIN_TABLES];
+    int *outer_keys = (int *)bump_alloc(&arena->scratch, s->joins_count * sizeof(int));
+    int *inner_keys = (int *)bump_alloc(&arena->scratch, s->joins_count * sizeof(int));
     for (uint32_t j = 0; j < s->joins_count; j++) {
         struct join_info *ji = &arena->joins.items[s->joins_start + j];
         if (extract_join_keys(ji, arena, tables, offsets, aliases, (int)(j + 1),
@@ -6029,9 +6039,9 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     int *proj_map_join = NULL;
     uint16_t proj_ncols_join = 0;
 
-    int  join_sort_cols[32];
-    int  join_sort_descs[32];
-    int  join_sort_nf[32];
+    int  join_sort_cols[MAX_SORT_KEYS];
+    int  join_sort_descs[MAX_SORT_KEYS];
+    int  join_sort_nf[MAX_SORT_KEYS];
     uint16_t join_sort_nord = 0;
 
     int need_expr_project_join = 0;
@@ -6076,7 +6086,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
 
         /* Pre-validate ORDER BY columns in merged column space */
         if (s->has_order_by && s->order_by_count > 0) {
-            join_sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+            join_sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
             for (uint16_t k = 0; k < join_sort_nord; k++) {
                 struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
                 join_sort_descs[k] = obi->desc;
@@ -6158,9 +6168,9 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
             uint16_t agg_offset = s->agg_before_cols ? 0 : ngrp;
             uint16_t grp_offset = s->agg_before_cols ? (uint16_t)agg_n : 0;
 
-            int sort_cols_buf[32];
-            int sort_descs_buf[32];
-            uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+            int sort_cols_buf[MAX_SORT_KEYS];
+            int sort_descs_buf[MAX_SORT_KEYS];
+            uint16_t sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
             int sort_ok = 1;
 
             for (uint16_t k = 0; k < sort_nord; k++) {
@@ -6245,7 +6255,6 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     current = build_limit(current, s, arena);
 
     return PLAN_RES_OK(current);
-    #undef MAX_JOIN_TABLES
 }
 
 /* ---- Plan builder: set operations path ---- */
@@ -6381,12 +6390,12 @@ static struct plan_result build_set_op(struct table *t, struct query_select *s,
         if (strncasecmp(p, "BY", 2) == 0) p += 2;
         while (*p == ' ') p++;
 
-        int sort_cols_buf[32];
-        int sort_descs_buf[32];
+        int sort_cols_buf[MAX_SORT_KEYS];
+        int sort_descs_buf[MAX_SORT_KEYS];
         uint16_t sort_nord = 0;
         int sort_ok = 1;
 
-        while (*p && sort_nord < 32) {
+        while (*p && sort_nord < MAX_SORT_KEYS) {
             while (*p == ' ') p++;
             if (!*p) break;
 
@@ -6436,9 +6445,9 @@ static struct plan_result build_set_op(struct table *t, struct query_select *s,
 
     /* Also handle ORDER BY from the main query (s->has_order_by) */
     if (s->has_order_by && s->order_by_count > 0) {
-        uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
-        int sort_cols_buf2[32];
-        int sort_descs_buf2[32];
+        uint16_t sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
+        int sort_cols_buf2[MAX_SORT_KEYS];
+        int sort_descs_buf2[MAX_SORT_KEYS];
         int sort_ok = 1;
         for (uint16_t k = 0; k < sort_nord; k++) {
             struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
@@ -6578,9 +6587,9 @@ static struct plan_result build_window(struct table *t, struct query_select *s,
         /* The output layout is: passthrough columns first (indices 0..n_pass-1),
          * then window columns (indices n_pass..n_pass+n_win-1).
          * We need to map ORDER BY column names to these output indices. */
-        int sort_cols_buf[32];
-        int sort_descs_buf[32];
-        uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+        int sort_cols_buf[MAX_SORT_KEYS];
+        int sort_descs_buf[MAX_SORT_KEYS];
+        uint16_t sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
         int sort_ok = 1;
         for (uint16_t k = 0; k < sort_nord; k++) {
             struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
@@ -6950,9 +6959,9 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
         uint16_t agg_offset = s->agg_before_cols ? 0 : ngrp;
         uint16_t grp_offset = s->agg_before_cols ? (uint16_t)agg_n : 0;
 
-        int sort_cols_buf[32];
-        int sort_descs_buf[32];
-        uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+        int sort_cols_buf[MAX_SORT_KEYS];
+        int sort_descs_buf[MAX_SORT_KEYS];
+        uint16_t sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
         int sort_ok = 1;
 
         for (uint16_t k = 0; k < sort_nord; k++) {
@@ -7246,12 +7255,12 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
      * Both are handled by the existing node construction order. */
 
     /* Pre-validate ORDER BY columns BEFORE allocating plan nodes */
-    int  sort_cols_buf[32];
-    int  sort_descs_buf[32];
-    int  sort_nf_buf[32];
+    int  sort_cols_buf[MAX_SORT_KEYS];
+    int  sort_descs_buf[MAX_SORT_KEYS];
+    int  sort_nf_buf[MAX_SORT_KEYS];
     uint16_t sort_nord = 0;
     if (s->has_order_by && s->order_by_count > 0) {
-        sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+        sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
         for (uint16_t k = 0; k < sort_nord; k++) {
             struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
             sort_descs_buf[k] = obi->desc;

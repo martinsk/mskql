@@ -413,9 +413,9 @@ static char *substitute_params(const char *sql, const char **param_values,
             int idx = num - 1;
             if (!param_values[idx]) {
                 /* NULL parameter */
-                if (pos + 5 > est) { est = (pos + 5) * 2; char *tmp = realloc(out, est); if (!tmp) { free(out); return NULL; } out = tmp; }
-                memcpy(out + pos, "NULL", 4);
-                pos += 4;
+                if (pos + sizeof("NULL") > est) { est = (pos + sizeof("NULL")) * 2; char *tmp = realloc(out, est); if (!tmp) { free(out); return NULL; } out = tmp; }
+                memcpy(out + pos, "NULL", sizeof("NULL") - 1);
+                pos += sizeof("NULL") - 1;
             } else if (param_formats && param_formats[idx] == 1) {
                 /* binary format — quote as text with escaping */
                 const char *val = param_values[idx];
@@ -1742,7 +1742,7 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     }
 
     /* Internal test-only command: reset database to clean state */
-    if (strncmp(sql, "SELECT __reset_db()", 19) == 0) {
+    if (strncmp(sql, "SELECT __reset_db()", sizeof("SELECT __reset_db()") - 1) == 0) {
         db_reset(db);
         rcache_invalidate_all();
         if (!skip_row_desc) {

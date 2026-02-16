@@ -109,14 +109,17 @@ static inline uint16_t row_block_row_idx(const struct row_block *rb, uint16_t i)
     return rb->sel ? (uint16_t)rb->sel[i] : i;
 }
 
+#define FNV_OFFSET 2166136261u
+#define FNV_PRIME  16777619u
+
 /* FNV-1a hash for int32 */
 static inline uint32_t block_hash_i32(int32_t v)
 {
-    uint32_t h = 2166136261u;
+    uint32_t h = FNV_OFFSET;
     uint8_t *p = (uint8_t *)&v;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < (int)sizeof(int32_t); i++) {
         h ^= p[i];
-        h *= 16777619u;
+        h *= FNV_PRIME;
     }
     return h;
 }
@@ -124,11 +127,11 @@ static inline uint32_t block_hash_i32(int32_t v)
 /* FNV-1a hash for int64 */
 static inline uint32_t block_hash_i64(int64_t v)
 {
-    uint32_t h = 2166136261u;
+    uint32_t h = FNV_OFFSET;
     uint8_t *p = (uint8_t *)&v;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < (int)sizeof(int64_t); i++) {
         h ^= p[i];
-        h *= 16777619u;
+        h *= FNV_PRIME;
     }
     return h;
 }
@@ -136,11 +139,11 @@ static inline uint32_t block_hash_i64(int64_t v)
 /* FNV-1a hash for double */
 static inline uint32_t block_hash_f64(double v)
 {
-    uint32_t h = 2166136261u;
+    uint32_t h = FNV_OFFSET;
     uint8_t *p = (uint8_t *)&v;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < (int)sizeof(double); i++) {
         h ^= p[i];
-        h *= 16777619u;
+        h *= FNV_PRIME;
     }
     return h;
 }
@@ -148,11 +151,11 @@ static inline uint32_t block_hash_f64(double v)
 /* FNV-1a hash for string */
 static inline uint32_t block_hash_str(const char *s)
 {
-    uint32_t h = 2166136261u;
+    uint32_t h = FNV_OFFSET;
     if (!s) return h;
     while (*s) {
         h ^= (uint8_t)*s++;
-        h *= 16777619u;
+        h *= FNV_PRIME;
     }
     return h;
 }
@@ -182,10 +185,10 @@ static inline uint32_t block_hash_cell(const struct col_block *cb, uint16_t i)
             return block_hash_str(cb->data.str[i]);
         case COLUMN_TYPE_INTERVAL: {
             /* hash all 16 bytes of the interval struct */
-            uint32_t h = 2166136261u;
+            uint32_t h = FNV_OFFSET;
             uint8_t *p = (uint8_t *)&cb->data.iv[i];
             for (int j = 0; j < (int)sizeof(struct interval); j++) {
-                h ^= p[j]; h *= 16777619u;
+                h ^= p[j]; h *= FNV_PRIME;
             }
             return h;
         }

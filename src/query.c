@@ -1254,13 +1254,14 @@ static struct cell eval_arith_expr(sv expr, struct table *t, struct row *src)
     }
 
     /* tokenize: split on +, -, *, /, % keeping operators */
-    double vals[32];
-    char ops[32];
+    #define MAX_ARITH_OPERANDS 32
+    double vals[MAX_ARITH_OPERANDS];
+    char ops[MAX_ARITH_OPERANDS];
     int nvals = 0, nops = 0;
     int arith_has_null = 0;
 
     size_t start = 0;
-    for (size_t i = 0; i <= expr.len && nvals < 32; i++) {
+    for (size_t i = 0; i <= expr.len && nvals < MAX_ARITH_OPERANDS; i++) {
         char c = (i < expr.len) ? expr.data[i] : '\0';
         int is_op = (c == '+' || c == '-' || c == '/' || c == '*' || c == '%');
         /* '-' is unary (not binary) only when no operand text precedes it */
@@ -1277,7 +1278,7 @@ static struct cell eval_arith_expr(sv expr, struct table *t, struct row *src)
             sv operand = sv_from(expr.data + start, i - start);
             if (resolve_operand_is_null(operand, t, src)) arith_has_null = 1;
             vals[nvals++] = resolve_operand(operand, t, src);
-            if (is_op && nops < 32) ops[nops++] = c;
+            if (is_op && nops < MAX_ARITH_OPERANDS) ops[nops++] = c;
             start = i + 1;
         }
     }
@@ -1837,15 +1838,16 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         /* generate a v4 UUID: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx */
         static int uuid_seeded = 0;
         if (!uuid_seeded) { srand((unsigned)time(NULL)); uuid_seeded = 1; }
-        char buf[37];
+        #define UUID_STR_LEN 36
+        char buf[UUID_STR_LEN + 1];
         const char *hex = "0123456789abcdef";
-        for (int i = 0; i < 36; i++) {
+        for (int i = 0; i < UUID_STR_LEN; i++) {
             if (i == 8 || i == 13 || i == 18 || i == 23) buf[i] = '-';
             else if (i == 14) buf[i] = '4'; /* version 4 */
             else if (i == 19) buf[i] = hex[8 + (rand() & 3)]; /* variant 10xx */
             else buf[i] = hex[rand() & 15];
         }
-        buf[36] = '\0';
+        buf[UUID_STR_LEN] = '\0';
         struct cell r = {0};
         r.type = COLUMN_TYPE_UUID;
         r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
@@ -2303,18 +2305,23 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
 
     case FUNC_CONCAT: {
         /* CONCAT(a, b, ...) — NULLs treated as empty string */
-        char buf[4096];
-        size_t wp = 0;
+        size_t cap = 256, wp = 0;
+        char *buf = malloc(cap);
+        if (!buf) return cell_make_null();
         for (uint32_t i = 0; i < nargs; i++) {
             struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
             if (!cell_is_null(&c)) {
                 char *txt = cell_to_text_rb(&c, rb);
                 if (txt) {
                     size_t tlen = strlen(txt);
-                    if (wp + tlen < sizeof(buf)) {
-                        memcpy(buf + wp, txt, tlen);
-                        wp += tlen;
+                    if (wp + tlen >= cap) {
+                        while (wp + tlen >= cap) cap *= 2;
+                        char *tmp = realloc(buf, cap);
+                        if (!tmp) { free(buf); cell_release_rb(&c, rb); if (!rb) free(txt); return cell_make_null(); }
+                        buf = tmp;
                     }
+                    memcpy(buf + wp, txt, tlen);
+                    wp += tlen;
                     if (!rb) free(txt);
                 }
             }
@@ -2324,6 +2331,7 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         struct cell r = {0};
         r.type = COLUMN_TYPE_TEXT;
         r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+        free(buf);
         return r;
     }
 
@@ -2334,23 +2342,26 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         if (cell_is_null(&sep_c)) return sep_c;
         const char *sep = (column_type_is_text(sep_c.type) && sep_c.value.as_text) ? sep_c.value.as_text : "";
         size_t sep_len = strlen(sep);
-        char buf[4096];
-        size_t wp = 0;
+        size_t cap = 256, wp = 0;
+        char *buf = malloc(cap);
+        if (!buf) { cell_release_rb(&sep_c, rb); return cell_make_null(); }
         int first = 1;
         for (uint32_t i = 1; i < nargs; i++) {
             struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
             if (!cell_is_null(&c)) {
                 char *txt = cell_to_text_rb(&c, rb);
                 if (txt) {
-                    if (!first && wp + sep_len < sizeof(buf)) {
-                        memcpy(buf + wp, sep, sep_len);
-                        wp += sep_len;
-                    }
                     size_t tlen = strlen(txt);
-                    if (wp + tlen < sizeof(buf)) {
-                        memcpy(buf + wp, txt, tlen);
-                        wp += tlen;
+                    size_t need = wp + (first ? 0 : sep_len) + tlen;
+                    if (need >= cap) {
+                        while (need >= cap) cap *= 2;
+                        char *tmp = realloc(buf, cap);
+                        if (!tmp) { free(buf); cell_release_rb(&c, rb); if (!rb) free(txt); cell_release_rb(&sep_c, rb); return cell_make_null(); }
+                        buf = tmp;
                     }
+                    if (!first) { memcpy(buf + wp, sep, sep_len); wp += sep_len; }
+                    memcpy(buf + wp, txt, tlen);
+                    wp += tlen;
                     first = 0;
                     if (!rb) free(txt);
                 }
@@ -2362,6 +2373,7 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         struct cell r = {0};
         r.type = COLUMN_TYPE_TEXT;
         r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+        free(buf);
         return r;
     }
 
