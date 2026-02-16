@@ -323,26 +323,181 @@ def bench_set_ops():
     return setup, bench
 
 
+# ── complex benchmarks (shared bootstrap dataset) ───────────────────────────
+
+def bootstrap_setup():
+    """Generate setup SQL for the shared star-schema bootstrap dataset.
+
+    Dimension tables (customers, products) use TEXT and individual INSERTs.
+    Fact tables (orders, events, metrics, sales) are all-INT and bulk-loaded
+    via INSERT INTO ... SELECT ... FROM generate_series() for speed.
+    """
+    regions = ["north", "south", "east", "west"]
+    tiers = ["basic", "premium", "enterprise"]
+    categories = ["electronics", "clothing", "food", "books", "toys"]
+
+    setup = [
+        "DROP TABLE IF EXISTS sales;",
+        "DROP TABLE IF EXISTS metrics;",
+        "DROP TABLE IF EXISTS events;",
+        "DROP TABLE IF EXISTS orders;",
+        "DROP TABLE IF EXISTS products;",
+        "DROP TABLE IF EXISTS customers;",
+        # dimension tables (TEXT columns, small)
+        "CREATE TABLE customers (id INT, name TEXT, region TEXT, tier TEXT);",
+        "CREATE TABLE products (id INT, name TEXT, category TEXT, price INT);",
+        # fact tables (all-INT, bulk-loaded)
+        "CREATE TABLE orders (id INT, customer_id INT, product_id INT, quantity INT, amount INT);",
+        "CREATE TABLE events (id INT, user_id INT, event_type INT, amount INT, score INT);",
+        "CREATE TABLE metrics (id INT, sensor_id INT, v1 INT, v2 INT, v3 INT, v4 INT, v5 INT);",
+        "CREATE TABLE sales (id INT, rep_id INT, region_id INT, amount INT);",
+    ]
+
+    # customers: 2000 rows (individual INSERTs — small table)
+    for i in range(2000):
+        setup.append(
+            f"INSERT INTO customers VALUES ({i}, 'cust_{i}', "
+            f"'{regions[i % 4]}', '{tiers[i % 3]}');"
+        )
+
+    # products: 500 rows (individual INSERTs — small table)
+    for i in range(500):
+        setup.append(
+            f"INSERT INTO products VALUES ({i}, 'prod_{i}', "
+            f"'{categories[i % 5]}', {10 + (i * 17) % 490});"
+        )
+
+    # fact tables: 50K rows each via bulk INSERT...SELECT from generate_series
+    setup.append(
+        "INSERT INTO orders SELECT n, n % 2000, n % 500, "
+        "1 + (n * 7) % 20, 10 + (n * 13) % 990 "
+        "FROM generate_series(0, 49999) AS g(n);"
+    )
+    setup.append(
+        "INSERT INTO events SELECT n, n % 2000, n % 5, "
+        "(n * 11) % 1000, (n * 31337) % 10000 "
+        "FROM generate_series(0, 49999) AS g(n);"
+    )
+    setup.append(
+        "INSERT INTO metrics SELECT n, n % 100, "
+        "(n * 7) % 1000, (n * 13) % 1000, (n * 19) % 1000, "
+        "(n * 23) % 1000, (n * 29) % 1000 "
+        "FROM generate_series(0, 49999) AS g(n);"
+    )
+    setup.append(
+        "INSERT INTO sales SELECT n, n % 200, n % 4, "
+        "10 + (n * 17) % 990 "
+        "FROM generate_series(0, 49999) AS g(n);"
+    )
+
+    return setup
+
+
+def bench_multi_join():
+    setup = bootstrap_setup()
+    bench = [
+        "SELECT c.region, p.category, SUM(o.quantity * p.price) "
+        "FROM orders o "
+        "JOIN customers c ON o.customer_id = c.id "
+        "JOIN products p ON o.product_id = p.id "
+        "GROUP BY c.region, p.category "
+        "ORDER BY c.region, p.category;"
+    ] * 5
+    return setup, bench
+
+
+def bench_analytical_cte():
+    setup = bootstrap_setup()
+    bench = [
+        "WITH user_totals AS ("
+        "SELECT user_id, SUM(amount) AS total "
+        "FROM events WHERE event_type = 0 "
+        "GROUP BY user_id "
+        "HAVING SUM(amount) > 500"
+        ") SELECT * FROM user_totals ORDER BY total DESC LIMIT 100;"
+    ] * 20
+    return setup, bench
+
+
+def bench_wide_agg():
+    setup = bootstrap_setup()
+    bench = [
+        "SELECT sensor_id, COUNT(*), AVG(v1), SUM(v2), MIN(v3), MAX(v4), AVG(v5) "
+        "FROM metrics GROUP BY sensor_id ORDER BY sensor_id;"
+    ] * 20
+    return setup, bench
+
+
+def bench_large_sort():
+    setup = bootstrap_setup()
+    bench = [
+        "SELECT * FROM events ORDER BY score DESC, id ASC;"
+    ] * 10
+    return setup, bench
+
+
+def bench_subquery_complex():
+    setup = bootstrap_setup()
+    bench = [
+        "SELECT * FROM events "
+        "WHERE user_id IN (SELECT id FROM customers WHERE tier = 'premium') "
+        "AND amount > 100 "
+        "ORDER BY amount DESC LIMIT 500;"
+    ] * 20
+    return setup, bench
+
+
+def bench_window_rank():
+    setup = bootstrap_setup()
+    bench = [
+        "SELECT rep_id, region_id, amount, "
+        "RANK() OVER (PARTITION BY region_id ORDER BY amount DESC) "
+        "FROM sales;"
+    ] * 5
+    return setup, bench
+
+
+def bench_mixed_analytical():
+    setup = bootstrap_setup()
+    bench = [
+        "WITH order_summary AS ("
+        "SELECT o.customer_id, SUM(o.quantity * p.price) AS total "
+        "FROM orders o JOIN products p ON o.product_id = p.id "
+        "GROUP BY o.customer_id"
+        ") SELECT c.region, COUNT(*) AS num_customers, SUM(os.total) AS revenue "
+        "FROM order_summary os JOIN customers c ON os.customer_id = c.id "
+        "GROUP BY c.region ORDER BY revenue DESC;"
+    ] * 5
+    return setup, bench
+
+
 BENCHMARKS = [
-    ("insert_bulk",      bench_insert_bulk),
-    ("select_full_scan", bench_select_full_scan),
-    ("select_where",     bench_select_where),
-    ("aggregate",        bench_aggregate),
-    ("order_by",         bench_order_by),
-    ("join",             bench_join),
-    ("update",           bench_update),
-    ("index_lookup",     bench_index_lookup),
-    ("delete",           bench_delete),
-    ("transaction",      bench_transaction),
-    ("window_functions", bench_window_functions),
-    ("distinct",         bench_distinct),
-    ("subquery",         bench_subquery),
-    ("cte",              bench_cte),
-    ("generate_series",  bench_generate_series),
-    ("scalar_functions", bench_scalar_functions),
-    ("expression_agg",   bench_expression_agg),
-    ("multi_sort",       bench_multi_sort),
-    ("set_ops",          bench_set_ops),
+    ("insert_bulk",        bench_insert_bulk),
+    ("select_full_scan",   bench_select_full_scan),
+    ("select_where",       bench_select_where),
+    ("aggregate",          bench_aggregate),
+    ("order_by",           bench_order_by),
+    ("join",               bench_join),
+    ("update",             bench_update),
+    ("index_lookup",       bench_index_lookup),
+    ("delete",             bench_delete),
+    ("transaction",        bench_transaction),
+    ("window_functions",   bench_window_functions),
+    ("distinct",           bench_distinct),
+    ("subquery",           bench_subquery),
+    ("cte",                bench_cte),
+    ("generate_series",    bench_generate_series),
+    ("scalar_functions",   bench_scalar_functions),
+    ("expression_agg",     bench_expression_agg),
+    ("multi_sort",         bench_multi_sort),
+    ("set_ops",            bench_set_ops),
+    ("multi_join",         bench_multi_join),
+    ("analytical_cte",     bench_analytical_cte),
+    ("wide_agg",           bench_wide_agg),
+    ("large_sort",         bench_large_sort),
+    ("subquery_complex",   bench_subquery_complex),
+    ("window_rank",        bench_window_rank),
+    ("mixed_analytical",   bench_mixed_analytical),
 ]
 
 

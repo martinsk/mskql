@@ -61,7 +61,7 @@ static void exec(struct database *db, const char *sql)
     struct rows r = {0};
     int rc = db_exec_sql(db, sql, &r);
     rows_free(&r);
-    if (rc != 0) {
+    if (rc < 0) {
         fprintf(stderr, "FATAL (rc=%d): %s\n", rc, sql);
         fflush(stderr);
         exit(1);
@@ -759,6 +759,266 @@ static double bench_set_ops(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Bootstrap dataset for complex benchmarks                           */
+/* ------------------------------------------------------------------ */
+
+static void setup_bootstrap(struct database *db)
+{
+    const char *regions[] = {"north", "south", "east", "west"};
+    const char *tiers[] = {"basic", "premium", "enterprise"};
+    const char *categories[] = {"electronics", "clothing", "food", "books", "toys"};
+    char sql[512];
+
+    /* dimension tables (TEXT columns, small — individual INSERTs) */
+    exec(db, "CREATE TABLE customers (id INT, name TEXT, region TEXT, tier TEXT)");
+    exec(db, "CREATE TABLE products (id INT, name TEXT, category TEXT, price INT)");
+    /* fact tables (all-INT, bulk-loaded via INSERT...SELECT generate_series) */
+    exec(db, "CREATE TABLE orders (id INT, customer_id INT, product_id INT, quantity INT, amount INT)");
+    exec(db, "CREATE TABLE events (id INT, user_id INT, event_type INT, amount INT, score INT)");
+    exec(db, "CREATE TABLE metrics (id INT, sensor_id INT, v1 INT, v2 INT, v3 INT, v4 INT, v5 INT)");
+    exec(db, "CREATE TABLE sales (id INT, rep_id INT, region_id INT, amount INT)");
+
+    for (int i = 0; i < 2000; i++) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO customers VALUES (%d, 'cust_%d', '%s', '%s')",
+                 i, i, regions[i % 4], tiers[i % 3]);
+        exec(db, sql);
+    }
+    for (int i = 0; i < 500; i++) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO products VALUES (%d, 'prod_%d', '%s', %d)",
+                 i, i, categories[i % 5], 10 + (i * 17) % 490);
+        exec(db, sql);
+    }
+
+    /* bulk-load fact tables */
+    exec(db, "INSERT INTO orders SELECT n, n % 2000, n % 500, "
+             "1 + (n * 7) % 20, 10 + (n * 13) % 990 "
+             "FROM generate_series(0, 49999) AS g(n)");
+    exec(db, "INSERT INTO events SELECT n, n % 2000, n % 5, "
+             "(n * 11) % 1000, (n * 31337) % 10000 "
+             "FROM generate_series(0, 49999) AS g(n)");
+    exec(db, "INSERT INTO metrics SELECT n, n % 100, "
+             "(n * 7) % 1000, (n * 13) % 1000, (n * 19) % 1000, "
+             "(n * 23) % 1000, (n * 29) % 1000 "
+             "FROM generate_series(0, 49999) AS g(n)");
+    exec(db, "INSERT INTO sales SELECT n, n % 200, n % 4, "
+             "10 + (n * 17) % 990 "
+             "FROM generate_series(0, 49999) AS g(n)");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: multi_join (3-table join + aggregate)                   */
+/* ------------------------------------------------------------------ */
+
+static double bench_multi_join(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_bootstrap(&db);
+
+    const int N = 5;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT c.region, p.category, SUM(o.quantity * p.price) "
+            "FROM orders o "
+            "JOIN customers c ON o.customer_id = c.id "
+            "JOIN products p ON o.product_id = p.id "
+            "GROUP BY c.region, p.category "
+            "ORDER BY c.region, p.category", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: analytical_cte (multi-CTE pipeline)                     */
+/* ------------------------------------------------------------------ */
+
+static double bench_analytical_cte(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_bootstrap(&db);
+
+    const int N = 20;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "WITH user_totals AS ("
+            "SELECT user_id, SUM(amount) AS total "
+            "FROM events WHERE event_type = 0 "
+            "GROUP BY user_id "
+            "HAVING SUM(amount) > 500"
+            ") SELECT * FROM user_totals ORDER BY total DESC LIMIT 100", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: wide_agg (many-column aggregation)                      */
+/* ------------------------------------------------------------------ */
+
+static double bench_wide_agg(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_bootstrap(&db);
+
+    const int N = 20;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT sensor_id, COUNT(*), AVG(v1), SUM(v2), MIN(v3), MAX(v4), AVG(v5) "
+            "FROM metrics GROUP BY sensor_id ORDER BY sensor_id", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: large_sort (sorting 50K rows)                           */
+/* ------------------------------------------------------------------ */
+
+static double bench_large_sort(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_bootstrap(&db);
+
+    const int N = 10;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT * FROM events ORDER BY score DESC, id ASC", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: subquery_complex (semi-join + filter + sort + limit)     */
+/* ------------------------------------------------------------------ */
+
+static double bench_subquery_complex(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_bootstrap(&db);
+
+    const int N = 20;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT * FROM events "
+            "WHERE user_id IN (SELECT id FROM customers WHERE tier = 'premium') "
+            "AND amount > 100 "
+            "ORDER BY amount DESC LIMIT 500", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: window_rank (window function on large dataset)          */
+/* ------------------------------------------------------------------ */
+
+static double bench_window_rank(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_bootstrap(&db);
+
+    const int N = 5;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT rep_id, region_id, amount, "
+            "RANK() OVER (PARTITION BY region_id ORDER BY amount DESC) "
+            "FROM sales", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: mixed_analytical (CTE + join + agg + sort)              */
+/* ------------------------------------------------------------------ */
+
+static double bench_mixed_analytical(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_bootstrap(&db);
+
+    const int N = 5;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "WITH order_summary AS ("
+            "SELECT o.customer_id, SUM(o.quantity * p.price) AS total "
+            "FROM orders o JOIN products p ON o.product_id = p.id "
+            "GROUP BY o.customer_id"
+            ") SELECT c.region, COUNT(*) AS num_customers, SUM(os.total) AS revenue "
+            "FROM order_summary os JOIN customers c ON os.customer_id = c.id "
+            "GROUP BY c.region ORDER BY revenue DESC", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Registry                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -788,6 +1048,13 @@ static struct bench_entry benchmarks[] = {
     { "expression_agg",       bench_expression_agg },
     { "multi_sort",           bench_multi_sort },
     { "set_ops",              bench_set_ops },
+    { "multi_join",           bench_multi_join },
+    { "analytical_cte",       bench_analytical_cte },
+    { "wide_agg",             bench_wide_agg },
+    { "large_sort",           bench_large_sort },
+    { "subquery_complex",     bench_subquery_complex },
+    { "window_rank",          bench_window_rank },
+    { "mixed_analytical",     bench_mixed_analytical },
 };
 
 static int nbench = (int)(sizeof(benchmarks) / sizeof(benchmarks[0]));

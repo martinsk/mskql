@@ -452,30 +452,45 @@ static struct conn_target g_mskql_target;
 /*  Workload definitions                                               */
 /* ------------------------------------------------------------------ */
 
-/* Helper: generate INSERT statements into a static buffer pool */
-#define MAX_SETUP_SQLS 20000
-static char g_setup_buf[MAX_SETUP_SQLS][256];
-static const char *g_setup_ptrs[MAX_SETUP_SQLS];
+/* Helper: generate setup SQL into a heap-allocated buffer pool. */
+#define MAX_SETUP_SQLS 5000
+#define SETUP_SQL_LEN  256
+static char  *g_setup_pool = NULL;   /* flat array: MAX_SETUP_SQLS * SETUP_SQL_LEN */
+static const char **g_setup_ptrs = NULL;
 static int g_setup_count;
 
-static void setup_reset(void) { g_setup_count = 0; }
+static void setup_ensure_alloc(void)
+{
+    if (!g_setup_pool) {
+        g_setup_pool = malloc((size_t)MAX_SETUP_SQLS * SETUP_SQL_LEN);
+        g_setup_ptrs = malloc((size_t)MAX_SETUP_SQLS * sizeof(const char *));
+    }
+}
+
+static void setup_reset(void)
+{
+    setup_ensure_alloc();
+    g_setup_count = 0;
+}
 
 static void setup_add(const char *sql)
 {
     if (g_setup_count >= MAX_SETUP_SQLS) return;
-    snprintf(g_setup_buf[g_setup_count], sizeof(g_setup_buf[0]), "%s", sql);
-    g_setup_ptrs[g_setup_count] = g_setup_buf[g_setup_count];
+    char *dst = g_setup_pool + (size_t)g_setup_count * SETUP_SQL_LEN;
+    snprintf(dst, SETUP_SQL_LEN, "%s", sql);
+    g_setup_ptrs[g_setup_count] = dst;
     g_setup_count++;
 }
 
 static void setup_addf(const char *fmt, ...)
 {
     if (g_setup_count >= MAX_SETUP_SQLS) return;
+    char *dst = g_setup_pool + (size_t)g_setup_count * SETUP_SQL_LEN;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(g_setup_buf[g_setup_count], sizeof(g_setup_buf[0]), fmt, ap);
+    vsnprintf(dst, SETUP_SQL_LEN, fmt, ap);
     va_end(ap);
-    g_setup_ptrs[g_setup_count] = g_setup_buf[g_setup_count];
+    g_setup_ptrs[g_setup_count] = dst;
     g_setup_count++;
 }
 
@@ -666,17 +681,201 @@ static struct workload_def workload_mixed_rw(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Bootstrap dataset for complex workloads                            */
+/* ------------------------------------------------------------------ */
+
+static void setup_bootstrap_tp(void)
+{
+    const char *regions[] = {"north", "south", "east", "west"};
+    const char *tiers[] = {"basic", "premium", "enterprise"};
+    const char *categories[] = {"electronics", "clothing", "food", "books", "toys"};
+
+    setup_reset();
+    setup_add("DROP TABLE IF EXISTS sales");
+    setup_add("DROP TABLE IF EXISTS metrics");
+    setup_add("DROP TABLE IF EXISTS events");
+    setup_add("DROP TABLE IF EXISTS orders");
+    setup_add("DROP TABLE IF EXISTS products");
+    setup_add("DROP TABLE IF EXISTS customers");
+    /* dimension tables (TEXT columns, small) */
+    setup_add("CREATE TABLE customers (id INT, name TEXT, region TEXT, tier TEXT)");
+    setup_add("CREATE TABLE products (id INT, name TEXT, category TEXT, price INT)");
+    /* fact tables (all-INT, bulk-loaded) */
+    setup_add("CREATE TABLE orders (id INT, customer_id INT, product_id INT, quantity INT, amount INT)");
+    setup_add("CREATE TABLE events (id INT, user_id INT, event_type INT, amount INT, score INT)");
+    setup_add("CREATE TABLE metrics (id INT, sensor_id INT, v1 INT, v2 INT, v3 INT, v4 INT, v5 INT)");
+    setup_add("CREATE TABLE sales (id INT, rep_id INT, region_id INT, amount INT)");
+
+    /* dimension tables: individual INSERTs (2500 total) */
+    for (int i = 0; i < 2000; i++)
+        setup_addf("INSERT INTO customers VALUES (%d, 'cust_%d', '%s', '%s')",
+                   i, i, regions[i % 4], tiers[i % 3]);
+    for (int i = 0; i < 500; i++)
+        setup_addf("INSERT INTO products VALUES (%d, 'prod_%d', '%s', %d)",
+                   i, i, categories[i % 5], 10 + (i * 17) % 490);
+
+    /* fact tables: bulk INSERT...SELECT from generate_series */
+    setup_add("INSERT INTO orders SELECT n, n % 2000, n % 500, "
+              "1 + (n * 7) % 20, 10 + (n * 13) % 990 "
+              "FROM generate_series(0, 49999) AS g(n)");
+    setup_add("INSERT INTO events SELECT n, n % 2000, n % 5, "
+              "(n * 11) % 1000, (n * 31337) % 10000 "
+              "FROM generate_series(0, 49999) AS g(n)");
+    setup_add("INSERT INTO metrics SELECT n, n % 100, "
+              "(n * 7) % 1000, (n * 13) % 1000, (n * 19) % 1000, "
+              "(n * 23) % 1000, (n * 29) % 1000 "
+              "FROM generate_series(0, 49999) AS g(n)");
+    setup_add("INSERT INTO sales SELECT n, n % 200, n % 4, "
+              "10 + (n * 17) % 990 "
+              "FROM generate_series(0, 49999) AS g(n)");
+}
+
+/* --- multi_join: 3-table join + aggregate --- */
+
+static const char *g_multi_join_q[] = {
+    "SELECT c.region, p.category, SUM(o.quantity * p.price) "
+    "FROM orders o "
+    "JOIN customers c ON o.customer_id = c.id "
+    "JOIN products p ON o.product_id = p.id "
+    "GROUP BY c.region, p.category "
+    "ORDER BY c.region, p.category"
+};
+
+static struct workload_def workload_multi_join(void)
+{
+    setup_bootstrap_tp();
+    return (struct workload_def){
+        .setup_sqls = g_setup_ptrs, .nsetup = g_setup_count,
+        .hot_sqls = g_multi_join_q, .nhot = 1,
+    };
+}
+
+/* --- analytical_cte: multi-CTE pipeline --- */
+
+static const char *g_analytical_cte_q[] = {
+    "WITH user_totals AS ("
+    "SELECT user_id, SUM(amount) AS total "
+    "FROM events WHERE event_type = 0 "
+    "GROUP BY user_id "
+    "HAVING SUM(amount) > 500"
+    ") SELECT * FROM user_totals ORDER BY total DESC LIMIT 100"
+};
+
+static struct workload_def workload_analytical_cte(void)
+{
+    setup_bootstrap_tp();
+    return (struct workload_def){
+        .setup_sqls = g_setup_ptrs, .nsetup = g_setup_count,
+        .hot_sqls = g_analytical_cte_q, .nhot = 1,
+    };
+}
+
+/* --- wide_agg: many-column aggregation --- */
+
+static const char *g_wide_agg_q[] = {
+    "SELECT sensor_id, COUNT(*), AVG(v1), SUM(v2), MIN(v3), MAX(v4), AVG(v5) "
+    "FROM metrics GROUP BY sensor_id ORDER BY sensor_id"
+};
+
+static struct workload_def workload_wide_agg(void)
+{
+    setup_bootstrap_tp();
+    return (struct workload_def){
+        .setup_sqls = g_setup_ptrs, .nsetup = g_setup_count,
+        .hot_sqls = g_wide_agg_q, .nhot = 1,
+    };
+}
+
+/* --- large_sort: sorting 50K rows --- */
+
+static const char *g_large_sort_q[] = {
+    "SELECT * FROM events ORDER BY score DESC, id ASC"
+};
+
+static struct workload_def workload_large_sort(void)
+{
+    setup_bootstrap_tp();
+    return (struct workload_def){
+        .setup_sqls = g_setup_ptrs, .nsetup = g_setup_count,
+        .hot_sqls = g_large_sort_q, .nhot = 1,
+    };
+}
+
+/* --- subquery_complex: semi-join + filter + sort + limit --- */
+
+static const char *g_subquery_complex_q[] = {
+    "SELECT * FROM events "
+    "WHERE user_id IN (SELECT id FROM customers WHERE tier = 'premium') "
+    "AND amount > 100 "
+    "ORDER BY amount DESC LIMIT 500"
+};
+
+static struct workload_def workload_subquery_complex(void)
+{
+    setup_bootstrap_tp();
+    return (struct workload_def){
+        .setup_sqls = g_setup_ptrs, .nsetup = g_setup_count,
+        .hot_sqls = g_subquery_complex_q, .nhot = 1,
+    };
+}
+
+/* --- window_rank: window function on large dataset --- */
+
+static const char *g_window_rank_q[] = {
+    "SELECT rep_id, region_id, amount, "
+    "RANK() OVER (PARTITION BY region_id ORDER BY amount DESC) "
+    "FROM sales"
+};
+
+static struct workload_def workload_window_rank(void)
+{
+    setup_bootstrap_tp();
+    return (struct workload_def){
+        .setup_sqls = g_setup_ptrs, .nsetup = g_setup_count,
+        .hot_sqls = g_window_rank_q, .nhot = 1,
+    };
+}
+
+/* --- mixed_analytical: CTE + join + agg + sort --- */
+
+static const char *g_mixed_analytical_q[] = {
+    "WITH order_summary AS ("
+    "SELECT o.customer_id, SUM(o.quantity * p.price) AS total "
+    "FROM orders o JOIN products p ON o.product_id = p.id "
+    "GROUP BY o.customer_id"
+    ") SELECT c.region, COUNT(*) AS num_customers, SUM(os.total) AS revenue "
+    "FROM order_summary os JOIN customers c ON os.customer_id = c.id "
+    "GROUP BY c.region ORDER BY revenue DESC"
+};
+
+static struct workload_def workload_mixed_analytical(void)
+{
+    setup_bootstrap_tp();
+    return (struct workload_def){
+        .setup_sqls = g_setup_ptrs, .nsetup = g_setup_count,
+        .hot_sqls = g_mixed_analytical_q, .nhot = 1,
+    };
+}
+
+/* ------------------------------------------------------------------ */
 /*  Workload registry                                                  */
 /* ------------------------------------------------------------------ */
 
 static struct workload_entry workloads[] = {
-    { "point_read",     workload_point_read },
-    { "full_scan",      workload_full_scan },
-    { "filtered_scan",  workload_filtered_scan },
-    { "aggregate",      workload_aggregate },
-    { "join",           workload_join },
-    { "insert",         workload_insert },
-    { "mixed_rw",       workload_mixed_rw },
+    { "point_read",         workload_point_read },
+    { "full_scan",          workload_full_scan },
+    { "filtered_scan",      workload_filtered_scan },
+    { "aggregate",          workload_aggregate },
+    { "join",               workload_join },
+    { "insert",             workload_insert },
+    { "mixed_rw",           workload_mixed_rw },
+    { "multi_join",         workload_multi_join },
+    { "analytical_cte",     workload_analytical_cte },
+    { "wide_agg",           workload_wide_agg },
+    { "large_sort",         workload_large_sort },
+    { "subquery_complex",   workload_subquery_complex },
+    { "window_rank",        workload_window_rank },
+    { "mixed_analytical",   workload_mixed_analytical },
 };
 
 static int nworkloads = (int)(sizeof(workloads) / sizeof(workloads[0]));
@@ -990,6 +1189,9 @@ int main(int argc, char **argv)
         write_json(g_json_path, results, ran);
 
     if (g_auto_server) stop_server();
+
+    free(g_setup_pool);
+    free(g_setup_ptrs);
 
     return 0;
 }
