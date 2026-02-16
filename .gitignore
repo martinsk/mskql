@@ -1,2 +1,3 @@
 build/
 tests/test-failures.log
+.DS_Store
