@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "dynamic_array.h"
 #include "column.h"
+#include "datetime.h"
 
 struct bump_alloc; /* forward declaration — defined in arena.h */
 
@@ -16,9 +17,11 @@ union cell_value {
     int as_bool;
     long long as_bigint;
     double as_numeric;
-    char *as_date;      /* "YYYY-MM-DD" */
-    char *as_timestamp; /* "YYYY-MM-DD HH:MM:SS" */
-    char *as_uuid;      /* "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" */
+    int32_t as_date;            /* days since 2000-01-01 */
+    int64_t as_timestamp;       /* microseconds since 2000-01-01 00:00:00 */
+    int64_t as_time;            /* microseconds since midnight */
+    struct interval as_interval;
+    char *as_uuid;              /* "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" */
 };
 
 struct cell {

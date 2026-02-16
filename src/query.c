@@ -10,165 +10,6 @@
 #include <time.h>
 #include <math.h>
 
-/* ---- date/time helpers ---- */
-
-/* parse "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" into struct tm, return 1 on success */
-int parse_datetime(const char *s, struct tm *out)
-{
-    memset(out, 0, sizeof(*out));
-    if (!s) return 0;
-    int y, mo, d, h = 0, mi = 0, sec = 0;
-    int n = sscanf(s, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &sec);
-    if (n < 3) return 0;
-    out->tm_year = y - 1900;
-    out->tm_mon = mo - 1;
-    out->tm_mday = d;
-    out->tm_hour = h;
-    out->tm_min = mi;
-    out->tm_sec = sec;
-    out->tm_isdst = -1;
-    return 1;
-}
-
-/* format struct tm as "YYYY-MM-DD HH:MM:SS" into buf (at least 20 bytes) */
-static void format_timestamp(const struct tm *t, char *buf, size_t bufsz)
-{
-    snprintf(buf, bufsz, "%04d-%02d-%02d %02d:%02d:%02d",
-             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-             t->tm_hour, t->tm_min, t->tm_sec);
-}
-
-/* format struct tm as "YYYY-MM-DD" into buf (at least 11 bytes) */
-static void format_date(const struct tm *t, char *buf, size_t bufsz)
-{
-    snprintf(buf, bufsz, "%04d-%02d-%02d",
-             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday);
-}
-
-/* parse an interval string like "1 year 2 months 3 days 04:05:06"
- * returns total seconds (approximate: 1 year=365.25 days, 1 month=30 days) */
-double parse_interval_to_seconds(const char *s)
-{
-    if (!s) return 0.0;
-    double total = 0.0;
-    const char *p = s;
-    while (*p) {
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (!*p) break;
-        /* try HH:MM:SS pattern */
-        int hh, mm, ss;
-        if (sscanf(p, "%d:%d:%d", &hh, &mm, &ss) == 3) {
-            total += hh * 3600.0 + mm * 60.0 + ss;
-            while (*p && !isspace((unsigned char)*p)) p++;
-            continue;
-        }
-        /* try number + unit */
-        char *end;
-        double val = strtod(p, &end);
-        if (end == p) { p++; continue; } /* skip non-numeric */
-        p = end;
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (strncasecmp(p, "year", 4) == 0) {
-            total += val * 365.25 * 86400.0;
-            p += 4; if (*p == 's') p++;
-        } else if (strncasecmp(p, "mon", 3) == 0) {
-            total += val * 30.0 * 86400.0;
-            while (*p && isalpha((unsigned char)*p)) p++;
-        } else if (strncasecmp(p, "day", 3) == 0) {
-            total += val * 86400.0;
-            p += 3; if (*p == 's') p++;
-        } else if (strncasecmp(p, "hour", 4) == 0) {
-            total += val * 3600.0;
-            p += 4; if (*p == 's') p++;
-        } else if (strncasecmp(p, "minute", 6) == 0) {
-            total += val * 60.0;
-            p += 6; if (*p == 's') p++;
-        } else if (strncasecmp(p, "min", 3) == 0) {
-            total += val * 60.0;
-            p += 3; if (*p == 's') p++;
-        } else if (strncasecmp(p, "second", 6) == 0) {
-            total += val;
-            p += 6; if (*p == 's') p++;
-        } else if (strncasecmp(p, "sec", 3) == 0) {
-            total += val;
-            p += 3; if (*p == 's') p++;
-        } else {
-            /* bare number with no unit — treat as seconds */
-            total += val;
-        }
-    }
-    return total;
-}
-
-/* format a duration in seconds as a PostgreSQL-style interval string */
-static void format_interval(double seconds, char *buf, size_t bufsz)
-{
-    int neg = (seconds < 0);
-    if (neg) seconds = -seconds;
-    int total_sec = (int)seconds;
-    int days = total_sec / 86400;
-    int rem = total_sec % 86400;
-    int hours = rem / 3600;
-    rem %= 3600;
-    int mins = rem / 60;
-    int secs = rem % 60;
-
-    int years = days / 365;
-    days %= 365;
-    int months = days / 30;
-    days %= 30;
-
-    char *p = buf;
-    size_t left = bufsz;
-    if (neg) { *p++ = '-'; left--; }
-    int wrote = 0;
-    if (years > 0) {
-        int n = snprintf(p, left, "%d year%s ", years, years != 1 ? "s" : "");
-        p += n; left -= (size_t)n; wrote = 1;
-    }
-    if (months > 0) {
-        int n = snprintf(p, left, "%d mon%s ", months, months != 1 ? "s" : "");
-        p += n; left -= (size_t)n; wrote = 1;
-    }
-    if (days > 0) {
-        int n = snprintf(p, left, "%d day%s ", days, days != 1 ? "s" : "");
-        p += n; left -= (size_t)n; wrote = 1;
-    }
-    if (hours > 0 || mins > 0 || secs > 0) {
-        snprintf(p, left, "%02d:%02d:%02d", hours, mins, secs);
-    } else if (!wrote) {
-        snprintf(p, left, "00:00:00");
-    } else {
-        /* trim trailing space */
-        if (p > buf && p[-1] == ' ') p[-1] = '\0';
-    }
-}
-
-/* Helper: apply a delta (in seconds) to a parsed datetime and return a text cell.
- * result_type determines formatting: COLUMN_TYPE_DATE → YYYY-MM-DD, else timestamp. */
-static struct cell date_time_add(const char *dt_str, double delta_seconds,
-                                  enum column_type result_type, struct bump_alloc *rb)
-{
-    struct cell r = {0};
-    struct tm tm_val;
-    if (!parse_datetime(dt_str, &tm_val)) {
-        r.type = result_type;
-        r.is_null = 1;
-        return r;
-    }
-    time_t t_val = mktime(&tm_val);
-    t_val += (time_t)delta_seconds;
-    struct tm *result_tm = localtime(&t_val);
-    char buf[32];
-    if (result_type == COLUMN_TYPE_DATE)
-        format_date(result_tm, buf, sizeof(buf));
-    else
-        format_timestamp(result_tm, buf, sizeof(buf));
-    r.type = result_type;
-    r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-    return r;
-}
-
 /* forward declarations for cell helpers used by legacy eval functions */
 static void cell_release(struct cell *c);
 static void cell_release_rb(struct cell *c, struct bump_alloc *rb);
@@ -282,13 +123,38 @@ static int cell_to_sql_literal(const struct cell *cv, char *buf, size_t bufsize)
     case COLUMN_TYPE_SMALLINT:
         snprintf(buf, bufsize, "%d", (int)cv->value.as_smallint);
         return 0;
+    case COLUMN_TYPE_DATE: {
+        char tmp[32];
+        date_to_str(cv->value.as_date, tmp, sizeof(tmp));
+        snprintf(buf, bufsize, "'%s'", tmp);
+        return 0;
+    }
+    case COLUMN_TYPE_TIME: {
+        char tmp[32];
+        time_to_str(cv->value.as_time, tmp, sizeof(tmp));
+        snprintf(buf, bufsize, "'%s'", tmp);
+        return 0;
+    }
+    case COLUMN_TYPE_TIMESTAMP: {
+        char tmp[32];
+        timestamp_to_str(cv->value.as_timestamp, tmp, sizeof(tmp));
+        snprintf(buf, bufsize, "'%s'", tmp);
+        return 0;
+    }
+    case COLUMN_TYPE_TIMESTAMPTZ: {
+        char tmp[40];
+        timestamptz_to_str(cv->value.as_timestamp, tmp, sizeof(tmp));
+        snprintf(buf, bufsize, "'%s'", tmp);
+        return 0;
+    }
+    case COLUMN_TYPE_INTERVAL: {
+        char tmp[128];
+        interval_to_str(cv->value.as_interval, tmp, sizeof(tmp));
+        snprintf(buf, bufsize, "'%s'", tmp);
+        return 0;
+    }
     case COLUMN_TYPE_TEXT:
     case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:
-    case COLUMN_TYPE_TIME:
-    case COLUMN_TYPE_TIMESTAMP:
-    case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:
     case COLUMN_TYPE_UUID:
         if (!cv->value.as_text) return -1;
         {
@@ -1477,9 +1343,11 @@ static void cell_release(struct cell *c)
     }
 }
 
-/* When rb is non-NULL, text lives in the bump — just zero the pointer. */
+/* When rb is non-NULL, text lives in the bump — just zero the pointer.
+ * Temporal types have no heap text — nothing to release. */
 static void cell_release_rb(struct cell *c, struct bump_alloc *rb)
 {
+    if (column_type_is_temporal(c->type)) return;
     if (rb) {
         c->value.as_text = NULL;
     } else {
@@ -1557,14 +1425,16 @@ static double cell_to_double_val(const struct cell *c)
     case COLUMN_TYPE_FLOAT:   return c->value.as_float;
     case COLUMN_TYPE_BIGINT:  return (double)c->value.as_bigint;
     case COLUMN_TYPE_NUMERIC: return c->value.as_float;
-    case COLUMN_TYPE_BOOLEAN:
-    case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_DATE:    return (double)c->value.as_date;
     case COLUMN_TYPE_TIME:
     case COLUMN_TYPE_TIMESTAMP:
     case COLUMN_TYPE_TIMESTAMPTZ:
+        return (double)c->value.as_timestamp;
     case COLUMN_TYPE_INTERVAL:
+        return (double)interval_to_usec_approx(c->value.as_interval);
+    case COLUMN_TYPE_BOOLEAN:
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
     case COLUMN_TYPE_UUID:
         break;
     }
@@ -1586,13 +1456,13 @@ static char *cell_to_text(const struct cell *c)
     case COLUMN_TYPE_NUMERIC:  snprintf(buf, sizeof(buf), "%g", c->value.as_float); break;
     case COLUMN_TYPE_BIGINT:   snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint); break;
     case COLUMN_TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "true" : "false"); break;
+    case COLUMN_TYPE_DATE:     date_to_str(c->value.as_date, buf, sizeof(buf)); break;
+    case COLUMN_TYPE_TIME:     time_to_str(c->value.as_time, buf, sizeof(buf)); break;
+    case COLUMN_TYPE_TIMESTAMP: timestamp_to_str(c->value.as_timestamp, buf, sizeof(buf)); break;
+    case COLUMN_TYPE_TIMESTAMPTZ: timestamptz_to_str(c->value.as_timestamp, buf, sizeof(buf)); break;
+    case COLUMN_TYPE_INTERVAL: interval_to_str(c->value.as_interval, buf, sizeof(buf)); break;
     case COLUMN_TYPE_TEXT:
     case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:
-    case COLUMN_TYPE_TIME:
-    case COLUMN_TYPE_TIMESTAMP:
-    case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:
     case COLUMN_TYPE_UUID:
         buf[0] = '\0'; break;
     }
@@ -1614,13 +1484,13 @@ static char *cell_to_text_rb(const struct cell *c, struct bump_alloc *rb)
     case COLUMN_TYPE_NUMERIC:  snprintf(buf, sizeof(buf), "%g", c->value.as_float); break;
     case COLUMN_TYPE_BIGINT:   snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint); break;
     case COLUMN_TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "true" : "false"); break;
+    case COLUMN_TYPE_DATE:     date_to_str(c->value.as_date, buf, sizeof(buf)); break;
+    case COLUMN_TYPE_TIME:     time_to_str(c->value.as_time, buf, sizeof(buf)); break;
+    case COLUMN_TYPE_TIMESTAMP: timestamp_to_str(c->value.as_timestamp, buf, sizeof(buf)); break;
+    case COLUMN_TYPE_TIMESTAMPTZ: timestamptz_to_str(c->value.as_timestamp, buf, sizeof(buf)); break;
+    case COLUMN_TYPE_INTERVAL: interval_to_str(c->value.as_interval, buf, sizeof(buf)); break;
     case COLUMN_TYPE_TEXT:
     case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:
-    case COLUMN_TYPE_TIME:
-    case COLUMN_TYPE_TIMESTAMP:
-    case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:
     case COLUMN_TYPE_UUID:
         buf[0] = '\0'; break;
     }
@@ -1684,52 +1554,77 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
 
         /* date/timestamp +/- interval */
         if (lhs_is_dt && rhs_is_interval && (e->binary.op == OP_ADD || e->binary.op == OP_SUB)) {
-            const char *dt_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
-            const char *iv_str = (column_type_is_text(rhs.type) && rhs.value.as_text) ? rhs.value.as_text : "";
-            double secs = parse_interval_to_seconds(iv_str);
-            if (e->binary.op == OP_SUB) secs = -secs;
-            struct cell r = date_time_add(dt_str, secs, lhs.type, rb);
-            if (!r.is_null) { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return r; }
+            struct interval iv = rhs.value.as_interval;
+            if (e->binary.op == OP_SUB) iv = interval_negate(iv);
+            cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+            struct cell r = {0};
+            r.type = lhs.type;
+            if (lhs.type == COLUMN_TYPE_DATE) {
+                r.value.as_date = date_add_interval(lhs.value.as_date, iv);
+            } else {
+                r.value.as_timestamp = timestamp_add_interval(lhs.value.as_timestamp, iv);
+            }
+            return r;
         }
 
         /* interval + date/timestamp */
         if (lhs_is_interval && rhs_is_dt && e->binary.op == OP_ADD) {
-            const char *iv_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
-            const char *dt_str = (column_type_is_text(rhs.type) && rhs.value.as_text) ? rhs.value.as_text : "";
-            double secs = parse_interval_to_seconds(iv_str);
-            struct cell r = date_time_add(dt_str, secs, rhs.type, rb);
-            if (!r.is_null) { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return r; }
+            struct interval iv = lhs.value.as_interval;
+            cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+            struct cell r = {0};
+            r.type = rhs.type;
+            if (rhs.type == COLUMN_TYPE_DATE) {
+                r.value.as_date = date_add_interval(rhs.value.as_date, iv);
+            } else {
+                r.value.as_timestamp = timestamp_add_interval(rhs.value.as_timestamp, iv);
+            }
+            return r;
+        }
+
+        /* interval +/- interval */
+        if (lhs_is_interval && rhs_is_interval &&
+            (e->binary.op == OP_ADD || e->binary.op == OP_SUB)) {
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_INTERVAL;
+            if (e->binary.op == OP_ADD)
+                r.value.as_interval = interval_add(lhs.value.as_interval, rhs.value.as_interval);
+            else
+                r.value.as_interval = interval_sub(lhs.value.as_interval, rhs.value.as_interval);
+            return r;
         }
 
         /* timestamp - timestamp = interval */
         if (lhs_is_dt && rhs_is_dt && e->binary.op == OP_SUB) {
-            const char *sa = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
-            const char *sb = (column_type_is_text(rhs.type) && rhs.value.as_text) ? rhs.value.as_text : "";
-            struct tm tm_a, tm_b;
-            if (parse_datetime(sa, &tm_a) && parse_datetime(sb, &tm_b)) {
-                time_t ta = mktime(&tm_a);
-                time_t tb = mktime(&tm_b);
-                double diff = difftime(ta, tb);
-                char buf[128];
-                format_interval(diff, buf, sizeof(buf));
-                cell_release_rb(&lhs, rb);
-                cell_release_rb(&rhs, rb);
-                struct cell r = {0};
-                r.type = COLUMN_TYPE_INTERVAL;
-                r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-                return r;
-            }
+            int64_t a_usec = (lhs.type == COLUMN_TYPE_DATE)
+                ? (int64_t)lhs.value.as_date * USEC_PER_DAY : lhs.value.as_timestamp;
+            int64_t b_usec = (rhs.type == COLUMN_TYPE_DATE)
+                ? (int64_t)rhs.value.as_date * USEC_PER_DAY : rhs.value.as_timestamp;
+            int64_t diff = a_usec - b_usec;
+            cell_release_rb(&lhs, rb);
+            cell_release_rb(&rhs, rb);
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_INTERVAL;
+            /* decompose into days + sub-day usec */
+            r.value.as_interval.months = 0;
+            r.value.as_interval.days = (int32_t)(diff / USEC_PER_DAY);
+            r.value.as_interval.usec = diff % USEC_PER_DAY;
+            return r;
         }
 
         /* date/timestamp +/- integer days */
         if (lhs_is_dt && (rhs.type == COLUMN_TYPE_INT || rhs.type == COLUMN_TYPE_BIGINT) &&
             (e->binary.op == OP_ADD || e->binary.op == OP_SUB)) {
-            const char *dt_str = (column_type_is_text(lhs.type) && lhs.value.as_text) ? lhs.value.as_text : "";
-            int days = (rhs.type == COLUMN_TYPE_INT) ? rhs.value.as_int : (int)rhs.value.as_bigint;
-            double delta = (double)days * 86400.0;
-            if (e->binary.op == OP_SUB) delta = -delta;
-            struct cell r = date_time_add(dt_str, delta, lhs.type, rb);
-            if (!r.is_null) { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return r; }
+            int32_t d = (rhs.type == COLUMN_TYPE_INT) ? rhs.value.as_int : (int32_t)rhs.value.as_bigint;
+            if (e->binary.op == OP_SUB) d = -d;
+            cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+            struct cell r = {0};
+            r.type = lhs.type;
+            if (lhs.type == COLUMN_TYPE_DATE) {
+                r.value.as_date = lhs.value.as_date + d;
+            } else {
+                r.value.as_timestamp = lhs.value.as_timestamp + (int64_t)d * USEC_PER_DAY;
+            }
+            return r;
         }
     }
 
@@ -1961,19 +1856,16 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
 
     case FUNC_NOW: case FUNC_CURRENT_TIMESTAMP: case FUNC_CURRENT_DATE: {
         time_t now = time(NULL);
-        struct tm *lt = localtime(&now);
-        char buf[32];
+        int64_t now_usec = ((int64_t)now - PG_EPOCH_UNIX) * USEC_PER_SEC;
         if (fn == FUNC_CURRENT_DATE) {
-            format_date(lt, buf, sizeof(buf));
             struct cell r = {0};
             r.type = COLUMN_TYPE_DATE;
-            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+            r.value.as_date = (int32_t)(now_usec / USEC_PER_DAY);
             return r;
         } else {
-            format_timestamp(lt, buf, sizeof(buf));
             struct cell r = {0};
             r.type = COLUMN_TYPE_TIMESTAMP;
-            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+            r.value.as_timestamp = now_usec;
             return r;
         }
     }
@@ -1990,43 +1882,32 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         }
         const char *field = (column_type_is_text(field_c.type) && field_c.value.as_text)
                             ? field_c.value.as_text : "";
-        const char *src = (column_type_is_text(src_c.type) && src_c.value.as_text)
-                          ? src_c.value.as_text : "";
-        struct tm tm_val;
         double result_v = 0.0;
         if (src_c.type == COLUMN_TYPE_INTERVAL) {
-            /* EXTRACT from interval */
-            double secs = parse_interval_to_seconds(src);
-            if (strcasecmp(field, "epoch") == 0) result_v = secs;
-            else if (strcasecmp(field, "hour") == 0) result_v = (int)(secs / 3600) % 24;
-            else if (strcasecmp(field, "minute") == 0) result_v = (int)(secs / 60) % 60;
-            else if (strcasecmp(field, "second") == 0) result_v = (int)secs % 60;
-            else if (strcasecmp(field, "day") == 0) result_v = (int)(secs / 86400);
-        } else if (parse_datetime(src, &tm_val)) {
-            if (strcasecmp(field, "year") == 0) result_v = tm_val.tm_year + 1900;
-            else if (strcasecmp(field, "month") == 0) result_v = tm_val.tm_mon + 1;
-            else if (strcasecmp(field, "day") == 0) result_v = tm_val.tm_mday;
-            else if (strcasecmp(field, "hour") == 0) result_v = tm_val.tm_hour;
-            else if (strcasecmp(field, "minute") == 0) result_v = tm_val.tm_min;
-            else if (strcasecmp(field, "second") == 0) result_v = tm_val.tm_sec;
-            else if (strcasecmp(field, "dow") == 0) {
-                mktime(&tm_val);
-                result_v = tm_val.tm_wday;
-            } else if (strcasecmp(field, "doy") == 0) {
-                mktime(&tm_val);
-                result_v = tm_val.tm_yday + 1;
-            } else if (strcasecmp(field, "epoch") == 0) {
-                result_v = (double)mktime(&tm_val);
-            } else if (strcasecmp(field, "quarter") == 0) {
-                result_v = (tm_val.tm_mon / 3) + 1;
-            } else if (strcasecmp(field, "week") == 0) {
-                mktime(&tm_val);
-                result_v = (tm_val.tm_yday / 7) + 1;
-            }
+            struct interval iv = src_c.value.as_interval;
+            if (strcasecmp(field, "epoch") == 0)
+                result_v = (double)interval_to_usec_approx(iv) / (double)USEC_PER_SEC;
+            else if (strcasecmp(field, "year") == 0)
+                result_v = iv.months / 12;
+            else if (strcasecmp(field, "month") == 0)
+                result_v = iv.months % 12;
+            else if (strcasecmp(field, "day") == 0)
+                result_v = iv.days;
+            else if (strcasecmp(field, "hour") == 0)
+                result_v = (double)(iv.usec / USEC_PER_HOUR);
+            else if (strcasecmp(field, "minute") == 0)
+                result_v = (double)((iv.usec % USEC_PER_HOUR) / USEC_PER_MIN);
+            else if (strcasecmp(field, "second") == 0)
+                result_v = (double)((iv.usec % USEC_PER_MIN) / USEC_PER_SEC);
+        } else if (src_c.type == COLUMN_TYPE_DATE) {
+            result_v = date_extract(src_c.value.as_date, field);
+        } else if (src_c.type == COLUMN_TYPE_TIMESTAMP || src_c.type == COLUMN_TYPE_TIMESTAMPTZ) {
+            result_v = timestamp_extract(src_c.value.as_timestamp, field);
+        } else if (src_c.type == COLUMN_TYPE_TIME) {
+            result_v = timestamp_extract(src_c.value.as_time, field);
         }
         cell_release_rb(&field_c, rb);
         cell_release_rb(&src_c, rb);
-        /* EXTRACT returns float in PostgreSQL */
         struct cell r = {0};
         r.type = COLUMN_TYPE_FLOAT;
         r.value.as_float = result_v;
@@ -2044,36 +1925,19 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         }
         const char *field = (column_type_is_text(field_c.type) && field_c.value.as_text)
                             ? field_c.value.as_text : "";
-        const char *src = (column_type_is_text(src_c.type) && src_c.value.as_text)
-                          ? src_c.value.as_text : "";
-        struct tm tm_val;
-        if (parse_datetime(src, &tm_val)) {
-            if (strcasecmp(field, "year") == 0) {
-                tm_val.tm_mon = 0; tm_val.tm_mday = 1;
-                tm_val.tm_hour = 0; tm_val.tm_min = 0; tm_val.tm_sec = 0;
-            } else if (strcasecmp(field, "month") == 0) {
-                tm_val.tm_mday = 1;
-                tm_val.tm_hour = 0; tm_val.tm_min = 0; tm_val.tm_sec = 0;
-            } else if (strcasecmp(field, "day") == 0) {
-                tm_val.tm_hour = 0; tm_val.tm_min = 0; tm_val.tm_sec = 0;
-            } else if (strcasecmp(field, "hour") == 0) {
-                tm_val.tm_min = 0; tm_val.tm_sec = 0;
-            } else if (strcasecmp(field, "minute") == 0) {
-                tm_val.tm_sec = 0;
-            }
-            /* second: no truncation needed */
-            char buf[32];
-            format_timestamp(&tm_val, buf, sizeof(buf));
-            cell_release_rb(&field_c, rb);
-            cell_release_rb(&src_c, rb);
-            struct cell r = {0};
+        struct cell r = {0};
+        if (src_c.type == COLUMN_TYPE_DATE) {
             r.type = COLUMN_TYPE_TIMESTAMP;
-            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-            return r;
+            r.value.as_timestamp = (int64_t)date_trunc_days(src_c.value.as_date, field) * USEC_PER_DAY;
+        } else if (src_c.type == COLUMN_TYPE_TIMESTAMP || src_c.type == COLUMN_TYPE_TIMESTAMPTZ) {
+            r.type = src_c.type;
+            r.value.as_timestamp = timestamp_trunc_usec(src_c.value.as_timestamp, field);
+        } else {
+            r = cell_make_null();
         }
         cell_release_rb(&field_c, rb);
         cell_release_rb(&src_c, rb);
-        return cell_make_null();
+        return r;
     }
 
     case FUNC_AGE: {
@@ -2085,13 +1949,11 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         } else {
             /* AGE(timestamp) = AGE(CURRENT_DATE, timestamp) */
             time_t now = time(NULL);
-            struct tm *lt = localtime(&now);
-            char buf[32];
-            format_timestamp(lt, buf, sizeof(buf));
+            int64_t now_usec = ((int64_t)now - PG_EPOCH_UNIX) * USEC_PER_SEC;
             b_c = a_c;
             a_c = (struct cell){0};
             a_c.type = COLUMN_TYPE_TIMESTAMP;
-            a_c.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+            a_c.value.as_timestamp = now_usec;
         }
         if (cell_is_null(&a_c) || cell_is_null(&b_c)) {
             cell_release_rb(&a_c, rb);
@@ -2099,25 +1961,46 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
             struct cell r = {0}; r.type = COLUMN_TYPE_INTERVAL; r.is_null = 1;
             return r;
         }
-        struct tm tm_a, tm_b;
-        const char *sa = (column_type_is_text(a_c.type) && a_c.value.as_text) ? a_c.value.as_text : "";
-        const char *sb = (column_type_is_text(b_c.type) && b_c.value.as_text) ? b_c.value.as_text : "";
-        if (parse_datetime(sa, &tm_a) && parse_datetime(sb, &tm_b)) {
-            time_t ta = mktime(&tm_a);
-            time_t tb = mktime(&tm_b);
-            double diff = difftime(ta, tb);
-            char buf[128];
-            format_interval(diff, buf, sizeof(buf));
-            cell_release_rb(&a_c, rb);
-            cell_release_rb(&b_c, rb);
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_INTERVAL;
-            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-            return r;
+        /* PostgreSQL-style AGE: compute difference as years/months/days */
+        int32_t a_days, b_days;
+        int64_t a_time_usec = 0, b_time_usec = 0;
+        if (a_c.type == COLUMN_TYPE_DATE) {
+            a_days = a_c.value.as_date;
+        } else {
+            int64_t au = a_c.value.as_timestamp;
+            if (au >= 0) { a_days = (int32_t)(au / USEC_PER_DAY); a_time_usec = au % USEC_PER_DAY; }
+            else { a_days = (int32_t)((au - USEC_PER_DAY + 1) / USEC_PER_DAY); a_time_usec = au - (int64_t)a_days * USEC_PER_DAY; }
+        }
+        if (b_c.type == COLUMN_TYPE_DATE) {
+            b_days = b_c.value.as_date;
+        } else {
+            int64_t bu = b_c.value.as_timestamp;
+            if (bu >= 0) { b_days = (int32_t)(bu / USEC_PER_DAY); b_time_usec = bu % USEC_PER_DAY; }
+            else { b_days = (int32_t)((bu - USEC_PER_DAY + 1) / USEC_PER_DAY); b_time_usec = bu - (int64_t)b_days * USEC_PER_DAY; }
+        }
+        int ay, am, ad, by, bm, bd;
+        days_to_ymd(a_days, &ay, &am, &ad);
+        days_to_ymd(b_days, &by, &bm, &bd);
+        int64_t time_diff = a_time_usec - b_time_usec;
+        int result_months = (ay - by) * 12 + (am - bm);
+        int result_days = ad - bd;
+        if (time_diff < 0) { result_days--; time_diff += USEC_PER_DAY; }
+        if (result_days < 0) { result_months--; /* borrow a month: use previous month's day count */
+            int prev_m = am - 1; int prev_y = ay;
+            if (prev_m < 1) { prev_m = 12; prev_y--; }
+            int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+            int md = mdays[prev_m];
+            if (prev_m == 2 && ((prev_y % 4 == 0 && prev_y % 100 != 0) || prev_y % 400 == 0)) md = 29;
+            result_days += md;
         }
         cell_release_rb(&a_c, rb);
         cell_release_rb(&b_c, rb);
-        return cell_make_null();
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_INTERVAL;
+        r.value.as_interval.months = result_months;
+        r.value.as_interval.days = result_days;
+        r.value.as_interval.usec = time_diff;
+        return r;
     }
 
     case FUNC_TO_CHAR: {
@@ -2128,53 +2011,53 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
             cell_release_rb(&fmt_c, rb);
             return src_c;
         }
-        const char *src = (column_type_is_text(src_c.type) && src_c.value.as_text)
-                          ? src_c.value.as_text : "";
         const char *fmt = (column_type_is_text(fmt_c.type) && fmt_c.value.as_text)
                           ? fmt_c.value.as_text : "";
-        struct tm tm_val;
-        if (parse_datetime(src, &tm_val)) {
-            /* simple PG format conversion: YYYY, MM, DD, HH24, MI, SS */
-            char buf[256] = {0};
-            char *out = buf;
-            const char *fp = fmt;
-            while (*fp && (size_t)(out - buf) < sizeof(buf) - 10) {
-                if (strncasecmp(fp, "YYYY", 4) == 0) {
-                    out += sprintf(out, "%04d", tm_val.tm_year + 1900);
-                    fp += 4;
-                } else if (strncasecmp(fp, "MM", 2) == 0) {
-                    out += sprintf(out, "%02d", tm_val.tm_mon + 1);
-                    fp += 2;
-                } else if (strncasecmp(fp, "DD", 2) == 0) {
-                    out += sprintf(out, "%02d", tm_val.tm_mday);
-                    fp += 2;
-                } else if (strncasecmp(fp, "HH24", 4) == 0) {
-                    out += sprintf(out, "%02d", tm_val.tm_hour);
-                    fp += 4;
-                } else if (strncasecmp(fp, "HH", 2) == 0) {
-                    out += sprintf(out, "%02d", tm_val.tm_hour);
-                    fp += 2;
-                } else if (strncasecmp(fp, "MI", 2) == 0) {
-                    out += sprintf(out, "%02d", tm_val.tm_min);
-                    fp += 2;
-                } else if (strncasecmp(fp, "SS", 2) == 0) {
-                    out += sprintf(out, "%02d", tm_val.tm_sec);
-                    fp += 2;
-                } else {
-                    *out++ = *fp++;
-                }
-            }
-            *out = '\0';
-            cell_release_rb(&src_c, rb);
-            cell_release_rb(&fmt_c, rb);
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_TEXT;
-            r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
-            return r;
+        /* extract y/m/d/h/mi/s from the source cell */
+        int y = 0, mo = 0, d = 0, hh = 0, mi = 0, ss = 0;
+        if (src_c.type == COLUMN_TYPE_DATE) {
+            days_to_ymd(src_c.value.as_date, &y, &mo, &d);
+        } else if (src_c.type == COLUMN_TYPE_TIMESTAMP || src_c.type == COLUMN_TYPE_TIMESTAMPTZ) {
+            int64_t usec = src_c.value.as_timestamp;
+            int32_t days;
+            int64_t time_part;
+            if (usec >= 0) { days = (int32_t)(usec / USEC_PER_DAY); time_part = usec % USEC_PER_DAY; }
+            else { days = (int32_t)((usec - USEC_PER_DAY + 1) / USEC_PER_DAY); time_part = usec - (int64_t)days * USEC_PER_DAY; }
+            days_to_ymd(days, &y, &mo, &d);
+            hh = (int)(time_part / USEC_PER_HOUR);
+            mi = (int)((time_part % USEC_PER_HOUR) / USEC_PER_MIN);
+            ss = (int)((time_part % USEC_PER_MIN) / USEC_PER_SEC);
         }
+        /* simple PG format conversion: YYYY, MM, DD, HH24, MI, SS */
+        char buf[256] = {0};
+        char *out = buf;
+        const char *fp = fmt;
+        while (*fp && (size_t)(out - buf) < sizeof(buf) - 10) {
+            if (strncasecmp(fp, "YYYY", 4) == 0) {
+                out += sprintf(out, "%04d", y); fp += 4;
+            } else if (strncasecmp(fp, "MM", 2) == 0) {
+                out += sprintf(out, "%02d", mo); fp += 2;
+            } else if (strncasecmp(fp, "DD", 2) == 0) {
+                out += sprintf(out, "%02d", d); fp += 2;
+            } else if (strncasecmp(fp, "HH24", 4) == 0) {
+                out += sprintf(out, "%02d", hh); fp += 4;
+            } else if (strncasecmp(fp, "HH", 2) == 0) {
+                out += sprintf(out, "%02d", hh); fp += 2;
+            } else if (strncasecmp(fp, "MI", 2) == 0) {
+                out += sprintf(out, "%02d", mi); fp += 2;
+            } else if (strncasecmp(fp, "SS", 2) == 0) {
+                out += sprintf(out, "%02d", ss); fp += 2;
+            } else {
+                *out++ = *fp++;
+            }
+        }
+        *out = '\0';
         cell_release_rb(&src_c, rb);
         cell_release_rb(&fmt_c, rb);
-        return cell_make_null();
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+        return r;
     }
 
     case FUNC_SUBSTRING: {
@@ -2930,7 +2813,64 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
         return cell_make_int(v);
     }
 
-    /* text → text-like (DATE, TIMESTAMP, etc.) — just change the type tag */
+    /* text → temporal: parse string into integer/struct */
+    if (column_type_is_temporal(target) && column_type_is_text(src.type) && src.value.as_text) {
+        const char *s = src.value.as_text;
+        struct cell r = {0};
+        r.type = target;
+        switch (target) {
+        case COLUMN_TYPE_DATE:        r.value.as_date = date_from_str(s); break;
+        case COLUMN_TYPE_TIME:        r.value.as_time = time_from_str(s); break;
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: r.value.as_timestamp = timestamp_from_str(s); break;
+        case COLUMN_TYPE_INTERVAL:    r.value.as_interval = interval_from_str(s); break;
+        case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_UUID:
+            break;
+        }
+        cell_release_rb(&src, rb);
+        return r;
+    }
+
+    /* temporal → text: format integer/struct to string */
+    if (column_type_is_text(target) && column_type_is_temporal(src.type)) {
+        char buf[64];
+        switch (src.type) {
+        case COLUMN_TYPE_DATE:        date_to_str(src.value.as_date, buf, sizeof(buf)); break;
+        case COLUMN_TYPE_TIME:        time_to_str(src.value.as_time, buf, sizeof(buf)); break;
+        case COLUMN_TYPE_TIMESTAMP:   timestamp_to_str(src.value.as_timestamp, buf, sizeof(buf)); break;
+        case COLUMN_TYPE_TIMESTAMPTZ: timestamptz_to_str(src.value.as_timestamp, buf, sizeof(buf)); break;
+        case COLUMN_TYPE_INTERVAL:    interval_to_str(src.value.as_interval, buf, sizeof(buf)); break;
+        case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_UUID:
+            buf[0] = '\0'; break;
+        }
+        struct cell r = {0};
+        r.type = target;
+        r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+        return r;
+    }
+
+    /* DATE ↔ TIMESTAMP promotion */
+    if (target == COLUMN_TYPE_TIMESTAMP && src.type == COLUMN_TYPE_DATE) {
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TIMESTAMP;
+        r.value.as_timestamp = (int64_t)src.value.as_date * USEC_PER_DAY;
+        return r;
+    }
+    if (target == COLUMN_TYPE_DATE && (src.type == COLUMN_TYPE_TIMESTAMP || src.type == COLUMN_TYPE_TIMESTAMPTZ)) {
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_DATE;
+        if (src.value.as_timestamp >= 0)
+            r.value.as_date = (int32_t)(src.value.as_timestamp / USEC_PER_DAY);
+        else
+            r.value.as_date = (int32_t)((src.value.as_timestamp - USEC_PER_DAY + 1) / USEC_PER_DAY);
+        return r;
+    }
+
+    /* text → text-like (TEXT, ENUM, UUID) — just change the type tag */
     if (column_type_is_text(target) && column_type_is_text(src.type)) {
         src.type = target;
         return src;
@@ -2963,13 +2903,25 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
         r.value.as_bool = (txt && (strcasecmp(txt, "true") == 0 || strcmp(txt, "1") == 0)) ? 1 : 0;
         if (!rb && txt) free(txt);
         break;
-    case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
     case COLUMN_TYPE_DATE:
+        r.value.as_date = txt ? date_from_str(txt) : 0;
+        if (!rb && txt) free(txt);
+        break;
     case COLUMN_TYPE_TIME:
+        r.value.as_time = txt ? time_from_str(txt) : 0;
+        if (!rb && txt) free(txt);
+        break;
     case COLUMN_TYPE_TIMESTAMP:
     case COLUMN_TYPE_TIMESTAMPTZ:
+        r.value.as_timestamp = txt ? timestamp_from_str(txt) : 0;
+        if (!rb && txt) free(txt);
+        break;
     case COLUMN_TYPE_INTERVAL:
+        r.value.as_interval = txt ? interval_from_str(txt) : (struct interval){0,0,0};
+        if (!rb && txt) free(txt);
+        break;
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
     case COLUMN_TYPE_UUID:
         r.value.as_text = txt;
         break;
@@ -4630,9 +4582,17 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                 case AGG_NONE: break;
             }
             int ac_idx = gagg_cols[a];
-            enum column_type ctype = (ac_idx >= 0 &&
-                t->columns.items[ac_idx].type == COLUMN_TYPE_FLOAT)
-                ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_INT;
+            enum column_type ctype = COLUMN_TYPE_INT;
+            if (ac_idx >= 0)
+                ctype = t->columns.items[ac_idx].type;
+            if (ae->func == AGG_SUM) {
+                if (ctype == COLUMN_TYPE_FLOAT || ctype == COLUMN_TYPE_NUMERIC)
+                    ctype = COLUMN_TYPE_FLOAT;
+                else if (ctype == COLUMN_TYPE_BIGINT)
+                    ctype = COLUMN_TYPE_BIGINT;
+                else
+                    ctype = COLUMN_TYPE_INT;
+            }
             if (ae->func == AGG_AVG)
                 ctype = COLUMN_TYPE_FLOAT;
             if (ae->func == AGG_COUNT)
@@ -6076,15 +6036,50 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                 }
             }
         }
-        /* type coercion: promote TEXT cells to the column's temporal/UUID type */
+        /* type coercion: convert TEXT cells to the column's temporal/UUID type */
         for (size_t i = 0; i < t->columns.count && i < copy.cells.count; i++) {
             struct cell *c = &copy.cells.items[i];
             enum column_type ct = t->columns.items[i].type;
-            if (c->type == COLUMN_TYPE_TEXT && !c->is_null && c->value.as_text &&
-                (ct == COLUMN_TYPE_DATE || ct == COLUMN_TYPE_TIME ||
-                 ct == COLUMN_TYPE_TIMESTAMP || ct == COLUMN_TYPE_TIMESTAMPTZ ||
-                 ct == COLUMN_TYPE_INTERVAL || ct == COLUMN_TYPE_UUID)) {
-                c->type = ct;
+            if (c->type == COLUMN_TYPE_TEXT && !c->is_null && c->value.as_text) {
+                const char *s = c->value.as_text;
+                switch (ct) {
+                case COLUMN_TYPE_DATE: {
+                    int32_t v = date_from_str(s);
+                    free((char *)s);
+                    c->type = ct;
+                    c->value.as_date = v;
+                    break;
+                }
+                case COLUMN_TYPE_TIME: {
+                    int64_t v = time_from_str(s);
+                    free((char *)s);
+                    c->type = ct;
+                    c->value.as_time = v;
+                    break;
+                }
+                case COLUMN_TYPE_TIMESTAMP:
+                case COLUMN_TYPE_TIMESTAMPTZ: {
+                    int64_t v = timestamp_from_str(s);
+                    free((char *)s);
+                    c->type = ct;
+                    c->value.as_timestamp = v;
+                    break;
+                }
+                case COLUMN_TYPE_INTERVAL: {
+                    struct interval v = interval_from_str(s);
+                    free((char *)s);
+                    c->type = ct;
+                    c->value.as_interval = v;
+                    break;
+                }
+                case COLUMN_TYPE_UUID:
+                    c->type = ct;
+                    break;
+                case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_BIGINT:
+                case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_BOOLEAN:
+                case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM:
+                    break;
+                }
             }
         }
         /* auto-increment SERIAL/BIGSERIAL columns */

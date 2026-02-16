@@ -228,13 +228,28 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c)
             len = (size_t)snprintf(buf, sizeof(buf), "%g", c->value.as_numeric);
             txt = buf;
             break;
+        case COLUMN_TYPE_DATE:
+            date_to_str(c->value.as_date, buf, sizeof(buf));
+            txt = buf; len = strlen(buf);
+            break;
+        case COLUMN_TYPE_TIME:
+            time_to_str(c->value.as_time, buf, sizeof(buf));
+            txt = buf; len = strlen(buf);
+            break;
+        case COLUMN_TYPE_TIMESTAMP:
+            timestamp_to_str(c->value.as_timestamp, buf, sizeof(buf));
+            txt = buf; len = strlen(buf);
+            break;
+        case COLUMN_TYPE_TIMESTAMPTZ:
+            timestamptz_to_str(c->value.as_timestamp, buf, sizeof(buf));
+            txt = buf; len = strlen(buf);
+            break;
+        case COLUMN_TYPE_INTERVAL:
+            interval_to_str(c->value.as_interval, buf, sizeof(buf));
+            txt = buf; len = strlen(buf);
+            break;
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_DATE:
-        case COLUMN_TYPE_TIME:
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ:
-        case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
             if (!c->value.as_text) {
                 msgbuf_push_u32(m, (uint32_t)-1);
@@ -819,13 +834,28 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
         len = (size_t)snprintf(buf, sizeof(buf), "%g", cb->data.f64[ri]);
         txt = buf;
         break;
+    case COLUMN_TYPE_DATE:
+        date_to_str(cb->data.i32[ri], buf, sizeof(buf));
+        txt = buf; len = strlen(buf);
+        break;
+    case COLUMN_TYPE_TIME:
+        time_to_str(cb->data.i64[ri], buf, sizeof(buf));
+        txt = buf; len = strlen(buf);
+        break;
+    case COLUMN_TYPE_TIMESTAMP:
+        timestamp_to_str(cb->data.i64[ri], buf, sizeof(buf));
+        txt = buf; len = strlen(buf);
+        break;
+    case COLUMN_TYPE_TIMESTAMPTZ:
+        timestamptz_to_str(cb->data.i64[ri], buf, sizeof(buf));
+        txt = buf; len = strlen(buf);
+        break;
+    case COLUMN_TYPE_INTERVAL:
+        interval_to_str(cb->data.iv[ri], buf, sizeof(buf));
+        txt = buf; len = strlen(buf);
+        break;
     case COLUMN_TYPE_TEXT:
     case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:
-    case COLUMN_TYPE_TIME:
-    case COLUMN_TYPE_TIMESTAMP:
-    case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:
     case COLUMN_TYPE_UUID:
         if (!cb->data.str[ri]) {
             msgbuf_push_u32(m, (uint32_t)-1);
@@ -1500,6 +1530,21 @@ static int handle_copy_to_stdout(int fd, struct database *db, struct query *q,
                 if (column_type_is_text(cell->type)) {
                     val = cell->value.as_text;
                     vlen = strlen(val);
+                } else if (cell->type == COLUMN_TYPE_DATE) {
+                    date_to_str(cell->value.as_date, buf, sizeof(buf));
+                    val = buf; vlen = strlen(buf);
+                } else if (cell->type == COLUMN_TYPE_TIME) {
+                    time_to_str(cell->value.as_time, buf, sizeof(buf));
+                    val = buf; vlen = strlen(buf);
+                } else if (cell->type == COLUMN_TYPE_TIMESTAMP) {
+                    timestamp_to_str(cell->value.as_timestamp, buf, sizeof(buf));
+                    val = buf; vlen = strlen(buf);
+                } else if (cell->type == COLUMN_TYPE_TIMESTAMPTZ) {
+                    timestamptz_to_str(cell->value.as_timestamp, buf, sizeof(buf));
+                    val = buf; vlen = strlen(buf);
+                } else if (cell->type == COLUMN_TYPE_INTERVAL) {
+                    interval_to_str(cell->value.as_interval, buf, sizeof(buf));
+                    val = buf; vlen = strlen(buf);
                 } else if (cell->type == COLUMN_TYPE_INT) {
                     vlen = (size_t)snprintf(buf, sizeof(buf), "%d", cell->value.as_int);
                     val = buf;
@@ -1873,6 +1918,14 @@ static void copy_in_process_line(struct client_state *c, struct database *db, co
                 cell.value.as_bool = (fstr[0] == 't' || fstr[0] == 'T' || fstr[0] == '1');
             } else if (ctype == COLUMN_TYPE_SMALLINT) {
                 cell.value.as_smallint = (int16_t)atoi(fstr);
+            } else if (ctype == COLUMN_TYPE_DATE) {
+                cell.value.as_date = date_from_str(fstr);
+            } else if (ctype == COLUMN_TYPE_TIME) {
+                cell.value.as_time = time_from_str(fstr);
+            } else if (ctype == COLUMN_TYPE_TIMESTAMP || ctype == COLUMN_TYPE_TIMESTAMPTZ) {
+                cell.value.as_timestamp = timestamp_from_str(fstr);
+            } else if (ctype == COLUMN_TYPE_INTERVAL) {
+                cell.value.as_interval = interval_from_str(fstr);
             } else {
                 cell.type = COLUMN_TYPE_TEXT;
                 cell.value.as_text = strdup(fstr);

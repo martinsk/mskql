@@ -65,7 +65,7 @@ int cell_compare(const struct cell *a, const struct cell *b)
         if (va > vb) return  1;
         return 0;
     }
-    /* allow cross-comparison between text-based types (TEXT, DATE, TIME, etc.) */
+    /* allow cross-comparison between text-based types (TEXT, UUID, ENUM) */
     if (a->type != b->type) {
         if (column_type_is_text(a->type) && column_type_is_text(b->type)) {
             if (!a->value.as_text && !b->value.as_text) return 0;
@@ -73,6 +73,46 @@ int cell_compare(const struct cell *a, const struct cell *b)
             if (!b->value.as_text) return  1;
             int cmp = strcmp(a->value.as_text, b->value.as_text);
             return (cmp < 0) ? -1 : (cmp > 0) ? 1 : 0;
+        }
+        /* DATE vs TIMESTAMP: promote date to midnight timestamp */
+        if ((a->type == COLUMN_TYPE_DATE && (b->type == COLUMN_TYPE_TIMESTAMP || b->type == COLUMN_TYPE_TIMESTAMPTZ)) ||
+            ((a->type == COLUMN_TYPE_TIMESTAMP || a->type == COLUMN_TYPE_TIMESTAMPTZ) && b->type == COLUMN_TYPE_DATE)) {
+            int64_t va = (a->type == COLUMN_TYPE_DATE) ? (int64_t)a->value.as_date * USEC_PER_DAY : a->value.as_timestamp;
+            int64_t vb = (b->type == COLUMN_TYPE_DATE) ? (int64_t)b->value.as_date * USEC_PER_DAY : b->value.as_timestamp;
+            if (va < vb) return -1;
+            if (va > vb) return  1;
+            return 0;
+        }
+        /* Temporal vs TEXT: coerce text to temporal for comparison */
+        if (column_type_is_temporal(a->type) && column_type_is_text(b->type) && b->value.as_text) {
+            struct cell coerced = *b;
+            const char *s = b->value.as_text;
+            switch (a->type) {
+            case COLUMN_TYPE_DATE:        coerced.type = a->type; coerced.value.as_date = date_from_str(s); break;
+            case COLUMN_TYPE_TIME:        coerced.type = a->type; coerced.value.as_time = time_from_str(s); break;
+            case COLUMN_TYPE_TIMESTAMP:
+            case COLUMN_TYPE_TIMESTAMPTZ: coerced.type = a->type; coerced.value.as_timestamp = timestamp_from_str(s); break;
+            case COLUMN_TYPE_INTERVAL:    coerced.type = a->type; coerced.value.as_interval = interval_from_str(s); break;
+            case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_BIGINT:
+            case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_BOOLEAN:
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID: break;
+            }
+            return cell_compare(a, &coerced);
+        }
+        if (column_type_is_temporal(b->type) && column_type_is_text(a->type) && a->value.as_text) {
+            struct cell coerced = *a;
+            const char *s = a->value.as_text;
+            switch (b->type) {
+            case COLUMN_TYPE_DATE:        coerced.type = b->type; coerced.value.as_date = date_from_str(s); break;
+            case COLUMN_TYPE_TIME:        coerced.type = b->type; coerced.value.as_time = time_from_str(s); break;
+            case COLUMN_TYPE_TIMESTAMP:
+            case COLUMN_TYPE_TIMESTAMPTZ: coerced.type = b->type; coerced.value.as_timestamp = timestamp_from_str(s); break;
+            case COLUMN_TYPE_INTERVAL:    coerced.type = b->type; coerced.value.as_interval = interval_from_str(s); break;
+            case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_BIGINT:
+            case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_BOOLEAN:
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID: break;
+            }
+            return cell_compare(&coerced, b);
         }
         /* INT/BIGINT vs TEXT: coerce text to number for comparison */
         int a_num = (a->type == COLUMN_TYPE_INT || a->type == COLUMN_TYPE_SMALLINT || a->type == COLUMN_TYPE_BIGINT);
@@ -122,13 +162,20 @@ int cell_compare(const struct cell *a, const struct cell *b)
             if (a->value.as_numeric < b->value.as_numeric) return -1;
             if (a->value.as_numeric > b->value.as_numeric) return  1;
             return 0;
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+            if (a->value.as_date < b->value.as_date) return -1;
+            if (a->value.as_date > b->value.as_date) return  1;
+            return 0;
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
+            if (a->value.as_timestamp < b->value.as_timestamp) return -1;
+            if (a->value.as_timestamp > b->value.as_timestamp) return  1;
+            return 0;
         case COLUMN_TYPE_INTERVAL:
+            return interval_compare(a->value.as_interval, b->value.as_interval);
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_UUID:
             if (!a->value.as_text && !b->value.as_text) return 0;
             if (!a->value.as_text) return -1;
@@ -171,13 +218,18 @@ int cell_equal(const struct cell *a, const struct cell *b)
         case COLUMN_TYPE_BOOLEAN: return a->value.as_bool == b->value.as_bool;
         case COLUMN_TYPE_BIGINT:  return a->value.as_bigint == b->value.as_bigint;
         case COLUMN_TYPE_NUMERIC: return a->value.as_numeric == b->value.as_numeric;
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+            return a->value.as_date == b->value.as_date;
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
+            return a->value.as_timestamp == b->value.as_timestamp;
         case COLUMN_TYPE_INTERVAL:
+            return a->value.as_interval.months == b->value.as_interval.months &&
+                   a->value.as_interval.days == b->value.as_interval.days &&
+                   a->value.as_interval.usec == b->value.as_interval.usec;
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_UUID:
             if (!a->value.as_text || !b->value.as_text) return a->value.as_text == b->value.as_text;
             return strcmp(a->value.as_text, b->value.as_text) == 0;

@@ -25,9 +25,31 @@ enum column_type {
 static inline int column_type_is_text(enum column_type t)
 {
     return t == COLUMN_TYPE_TEXT || t == COLUMN_TYPE_ENUM ||
-           t == COLUMN_TYPE_DATE || t == COLUMN_TYPE_TIME ||
-           t == COLUMN_TYPE_TIMESTAMP || t == COLUMN_TYPE_TIMESTAMPTZ ||
-           t == COLUMN_TYPE_INTERVAL || t == COLUMN_TYPE_UUID;
+           t == COLUMN_TYPE_UUID;
+}
+
+/* returns 1 if the column type is a temporal type stored as integer/struct */
+static inline int column_type_is_temporal(enum column_type t)
+{
+    switch (t) {
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+        return 1;
+    case COLUMN_TYPE_SMALLINT:
+    case COLUMN_TYPE_INT:
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_BOOLEAN:
+    case COLUMN_TYPE_BIGINT:
+    case COLUMN_TYPE_NUMERIC:
+    case COLUMN_TYPE_UUID:
+        return 0;
+    }
+    __builtin_unreachable();
 }
 
 /* Unified PostgreSQL type metadata table — single source of truth for
@@ -48,11 +70,11 @@ static const struct pg_type_info pg_type_table[] = {
     /* [COLUMN_TYPE_BOOLEAN]     */ { 16,   "bool",        "boolean",                     1 },
     /* [COLUMN_TYPE_BIGINT]      */ { 20,   "int8",        "bigint",                      8 },
     /* [COLUMN_TYPE_NUMERIC]     */ { 1700, "numeric",     "numeric",                    -1 },
-    /* [COLUMN_TYPE_DATE]        */ { 1082, "date",        "date",                       -1 },
-    /* [COLUMN_TYPE_TIME]        */ { 1083, "time",        "time without time zone",     -1 },
-    /* [COLUMN_TYPE_TIMESTAMP]   */ { 1114, "timestamp",   "timestamp without time zone",-1 },
-    /* [COLUMN_TYPE_TIMESTAMPTZ] */ { 1184, "timestamptz", "timestamp with time zone",   -1 },
-    /* [COLUMN_TYPE_INTERVAL]    */ { 1186, "interval",    "interval",                   -1 },
+    /* [COLUMN_TYPE_DATE]        */ { 1082, "date",        "date",                        4 },
+    /* [COLUMN_TYPE_TIME]        */ { 1083, "time",        "time without time zone",      8 },
+    /* [COLUMN_TYPE_TIMESTAMP]   */ { 1114, "timestamp",   "timestamp without time zone", 8 },
+    /* [COLUMN_TYPE_TIMESTAMPTZ] */ { 1184, "timestamptz", "timestamp with time zone",    8 },
+    /* [COLUMN_TYPE_INTERVAL]    */ { 1186, "interval",    "interval",                   16 },
     /* [COLUMN_TYPE_UUID]        */ { 2950, "uuid",        "uuid",                       -1 },
 };
 

@@ -17,13 +17,16 @@ static inline void cell_to_cb_at(struct col_block *cb, uint16_t i, const struct 
     case COLUMN_TYPE_SMALLINT:  cb->data.i16[i] = cell->value.as_smallint; break;
     case COLUMN_TYPE_INT:       cb->data.i32[i] = cell->value.as_int; break;
     case COLUMN_TYPE_BOOLEAN:   cb->data.i32[i] = cell->value.as_bool; break;
+    case COLUMN_TYPE_DATE:      cb->data.i32[i] = cell->value.as_date; break;
     case COLUMN_TYPE_BIGINT:    cb->data.i64[i] = cell->value.as_bigint; break;
+    case COLUMN_TYPE_TIME:      cb->data.i64[i] = cell->value.as_time; break;
+    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+        cb->data.i64[i] = cell->value.as_timestamp; break;
     case COLUMN_TYPE_FLOAT:     cb->data.f64[i] = cell->value.as_float; break;
     case COLUMN_TYPE_NUMERIC:   cb->data.f64[i] = cell->value.as_numeric; break;
+    case COLUMN_TYPE_INTERVAL:  cb->data.iv[i] = cell->value.as_interval; break;
     case COLUMN_TYPE_TEXT:  case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:  case COLUMN_TYPE_TIME:
-    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:  case COLUMN_TYPE_UUID:
+    case COLUMN_TYPE_UUID:
         cb->data.str[i] = cell->value.as_text; break;
     }
 }
@@ -37,13 +40,16 @@ static inline void cb_to_cell_at(const struct col_block *cb, uint16_t i, struct 
     case COLUMN_TYPE_SMALLINT:  cell->value.as_smallint = cb->data.i16[i]; break;
     case COLUMN_TYPE_INT:       cell->value.as_int = cb->data.i32[i]; break;
     case COLUMN_TYPE_BOOLEAN:   cell->value.as_bool = cb->data.i32[i]; break;
+    case COLUMN_TYPE_DATE:      cell->value.as_date = cb->data.i32[i]; break;
     case COLUMN_TYPE_BIGINT:    cell->value.as_bigint = cb->data.i64[i]; break;
+    case COLUMN_TYPE_TIME:      cell->value.as_time = cb->data.i64[i]; break;
+    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+        cell->value.as_timestamp = cb->data.i64[i]; break;
     case COLUMN_TYPE_FLOAT:     cell->value.as_float = cb->data.f64[i]; break;
     case COLUMN_TYPE_NUMERIC:   cell->value.as_numeric = cb->data.f64[i]; break;
+    case COLUMN_TYPE_INTERVAL:  cell->value.as_interval = cb->data.iv[i]; break;
     case COLUMN_TYPE_TEXT:  case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:  case COLUMN_TYPE_TIME:
-    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:  case COLUMN_TYPE_UUID:
+    case COLUMN_TYPE_UUID:
         cell->value.as_text = cb->data.str[i]; break;
     }
 }
@@ -55,13 +61,16 @@ static inline void cell_to_flat_at(void *data, size_t i, const struct cell *cell
     case COLUMN_TYPE_SMALLINT:  ((int16_t *)data)[i] = cell->value.as_smallint; break;
     case COLUMN_TYPE_INT:       ((int32_t *)data)[i] = cell->value.as_int; break;
     case COLUMN_TYPE_BOOLEAN:   ((int32_t *)data)[i] = cell->value.as_bool; break;
+    case COLUMN_TYPE_DATE:      ((int32_t *)data)[i] = cell->value.as_date; break;
     case COLUMN_TYPE_BIGINT:    ((int64_t *)data)[i] = cell->value.as_bigint; break;
+    case COLUMN_TYPE_TIME:      ((int64_t *)data)[i] = cell->value.as_time; break;
+    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+        ((int64_t *)data)[i] = cell->value.as_timestamp; break;
     case COLUMN_TYPE_FLOAT:     ((double *)data)[i] = cell->value.as_float; break;
     case COLUMN_TYPE_NUMERIC:   ((double *)data)[i] = cell->value.as_numeric; break;
+    case COLUMN_TYPE_INTERVAL:  ((struct interval *)data)[i] = cell->value.as_interval; break;
     case COLUMN_TYPE_TEXT:  case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:  case COLUMN_TYPE_TIME:
-    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:  case COLUMN_TYPE_UUID:
+    case COLUMN_TYPE_UUID:
         ((char **)data)[i] = cell->value.as_text; break;
     }
 }
@@ -104,23 +113,7 @@ static void scan_cache_build(struct table *t)
         }
         sc->col_types[c] = ct;
 
-        size_t elem_sz;
-        switch (ct) {
-        case COLUMN_TYPE_SMALLINT: elem_sz = sizeof(int16_t); break;
-        case COLUMN_TYPE_INT:
-        case COLUMN_TYPE_BOOLEAN:  elem_sz = sizeof(int32_t); break;
-        case COLUMN_TYPE_BIGINT:   elem_sz = sizeof(int64_t); break;
-        case COLUMN_TYPE_FLOAT:
-        case COLUMN_TYPE_NUMERIC:  elem_sz = sizeof(double); break;
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_DATE:
-        case COLUMN_TYPE_TIME:
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ:
-        case COLUMN_TYPE_INTERVAL:
-        case COLUMN_TYPE_UUID:     elem_sz = sizeof(char *); break;
-        }
+        size_t elem_sz = col_type_elem_size(ct);
 
         sc->col_data[c] = calloc(nrows ? nrows : 1, elem_sz);
         sc->col_nulls[c] = (uint8_t *)calloc(nrows ? nrows : 1, 1);
@@ -199,15 +192,47 @@ static void scan_cache_build(struct table *t)
             }
             break;
         }
+        case COLUMN_TYPE_DATE: {
+            int32_t *dst = (int32_t *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != ct) { sc->col_nulls[c][r] = 1; }
+                else { dst[r] = cell->value.as_date; }
+            }
+            break;
+        }
+        case COLUMN_TYPE_TIME: {
+            int64_t *dst = (int64_t *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != ct) { sc->col_nulls[c][r] = 1; }
+                else { dst[r] = cell->value.as_time; }
+            }
+            break;
+        }
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            int64_t *dst = (int64_t *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || (cell->type != COLUMN_TYPE_TIMESTAMP && cell->type != COLUMN_TYPE_TIMESTAMPTZ)) {
+                    sc->col_nulls[c][r] = 1;
+                } else { dst[r] = cell->value.as_timestamp; }
+            }
+            break;
+        }
+        case COLUMN_TYPE_INTERVAL: {
+            struct interval *dst = (struct interval *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != ct) { sc->col_nulls[c][r] = 1; }
+                else { dst[r] = cell->value.as_interval; }
+            }
+            break;
+        }
         case COLUMN_TYPE_TEXT:
         case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_DATE:
-        case COLUMN_TYPE_TIME:
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ:
-        case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID: {
-            /* text types */
             char **dst = (char **)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[r].cells.items[c];
@@ -215,7 +240,7 @@ static void scan_cache_build(struct table *t)
                     || (column_type_is_text(cell->type) && !cell->value.as_text)) {
                     sc->col_nulls[c][r] = 1;
                 } else {
-                    dst[r] = cell->value.as_text; /* pointer into table — valid as long as table exists */
+                    dst[r] = cell->value.as_text;
                 }
             }
             break;
@@ -283,13 +308,16 @@ static uint16_t scan_cache_read(struct scan_cache *sc, size_t *cursor,
         case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_NUMERIC:
             memcpy(cb->data.f64, (double *)sc->col_data[tc] + start, nrows * sizeof(double)); break;
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+            memcpy(cb->data.i32, (int32_t *)sc->col_data[tc] + start, nrows * sizeof(int32_t)); break;
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
+            memcpy(cb->data.i64, (int64_t *)sc->col_data[tc] + start, nrows * sizeof(int64_t)); break;
         case COLUMN_TYPE_INTERVAL:
+            memcpy(cb->data.iv, (struct interval *)sc->col_data[tc] + start, nrows * sizeof(struct interval)); break;
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_UUID:
             memcpy(cb->data.str, (char **)sc->col_data[tc] + start, nrows * sizeof(char *)); break;
         }
@@ -326,15 +354,17 @@ static inline double cb_to_double(const struct col_block *cb, uint16_t i)
     case COLUMN_TYPE_SMALLINT: return (double)cb->data.i16[i];
     case COLUMN_TYPE_INT:
     case COLUMN_TYPE_BOOLEAN:  return (double)cb->data.i32[i];
-    case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_DATE:     return (double)cb->data.i32[i];
     case COLUMN_TYPE_TIME:
     case COLUMN_TYPE_TIMESTAMP:
     case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:
+        return (double)cb->data.i64[i];
+    case COLUMN_TYPE_INTERVAL: return (double)interval_to_usec_approx(cb->data.iv[i]);
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
     case COLUMN_TYPE_UUID:     return 0.0;
     }
+    __builtin_unreachable();
 }
 
 /* Helper: get output column count for a plan node. */
@@ -679,6 +709,23 @@ static int index_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* Coerce a TEXT comparison cell to the column's temporal type in-place. */
+static void coerce_cmp_to_temporal(struct cell *c, enum column_type ct)
+{
+    if (!c || c->is_null || c->type != COLUMN_TYPE_TEXT || !c->value.as_text) return;
+    const char *s = c->value.as_text;
+    switch (ct) {
+    case COLUMN_TYPE_DATE:        c->type = ct; c->value.as_date = date_from_str(s); break;
+    case COLUMN_TYPE_TIME:        c->type = ct; c->value.as_time = time_from_str(s); break;
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ: c->type = ct; c->value.as_timestamp = timestamp_from_str(s); break;
+    case COLUMN_TYPE_INTERVAL:    c->type = ct; c->value.as_interval = interval_from_str(s); break;
+    case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_BIGINT:
+    case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_BOOLEAN:
+    case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID: break;
+    }
+}
+
 /* Evaluate a single COND_COMPARE leaf against columnar data.
  * Returns number of matching rows written to sel. */
 static uint16_t filter_eval_leaf(struct col_block *cb, int op,
@@ -688,6 +735,14 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                                   uint32_t *cand, uint16_t cand_count,
                                   uint32_t *sel)
 {
+    /* Coerce TEXT comparison values to the column's temporal type */
+    if (column_type_is_temporal(cb->type)) {
+        coerce_cmp_to_temporal(cmp_val, cb->type);
+        coerce_cmp_to_temporal(between_high, cb->type);
+        for (uint32_t j = 0; j < in_count; j++)
+            coerce_cmp_to_temporal(&in_values[j], cb->type);
+    }
+
     uint16_t sel_count = 0;
 
     #define FLEAF_LOOP(COND) \
@@ -741,13 +796,24 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
             FLEAF_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
             break;
         }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_DATE: {
+            int32_t lo = cmp_val->value.as_date, hi = between_high->value.as_date;
+            const int32_t *vals = cb->data.i32;
+            FLEAF_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+            break;
+        }
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            int64_t lo = cmp_val->value.as_timestamp, hi = between_high->value.as_timestamp;
+            const int64_t *vals = cb->data.i64;
+            FLEAF_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+            break;
+        }
         case COLUMN_TYPE_INTERVAL:
+            break; /* BETWEEN on interval not meaningful */
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_UUID: {
             const char *lo = cmp_val->value.as_text ? cmp_val->value.as_text : "";
             const char *hi = between_high->value.as_text ? between_high->value.as_text : "";
@@ -784,13 +850,43 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
             }
             break;
         }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_DATE: {
+            const int32_t *vals = cb->data.i32;
+            for (uint16_t _c = 0; _c < cand_count; _c++) {
+                uint16_t r = (uint16_t)cand[_c];
+                if (nulls[r]) continue;
+                for (uint32_t j = 0; j < in_count; j++)
+                    if (!in_values[j].is_null && in_values[j].value.as_date == vals[r]) { sel[sel_count++] = r; break; }
+            }
+            break;
+        }
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ:
-        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            const int64_t *vals = cb->data.i64;
+            for (uint16_t _c = 0; _c < cand_count; _c++) {
+                uint16_t r = (uint16_t)cand[_c];
+                if (nulls[r]) continue;
+                for (uint32_t j = 0; j < in_count; j++)
+                    if (!in_values[j].is_null && in_values[j].value.as_timestamp == vals[r]) { sel[sel_count++] = r; break; }
+            }
+            break;
+        }
+        case COLUMN_TYPE_INTERVAL: {
+            const struct interval *vals = cb->data.iv;
+            for (uint16_t _c = 0; _c < cand_count; _c++) {
+                uint16_t r = (uint16_t)cand[_c];
+                if (nulls[r]) continue;
+                for (uint32_t j = 0; j < in_count; j++)
+                    if (!in_values[j].is_null &&
+                        vals[r].months == in_values[j].value.as_interval.months &&
+                        vals[r].days == in_values[j].value.as_interval.days &&
+                        vals[r].usec == in_values[j].value.as_interval.usec) { sel[sel_count++] = r; break; }
+            }
+            break;
+        }
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_UUID: {
             char * const *vals = cb->data.str;
             for (uint16_t _c = 0; _c < cand_count; _c++) {
@@ -901,13 +997,61 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
             }
             break;
         }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_DATE: {
+            int32_t cv = cmp_val->value.as_date;
+            const int32_t *vals = cb->data.i32;
+            switch (op) {
+                case CMP_EQ: FLEAF_LOOP(!nulls[r] && vals[r] == cv); break;
+                case CMP_NE: FLEAF_LOOP(!nulls[r] && vals[r] != cv); break;
+                case CMP_LT: FLEAF_LOOP(!nulls[r] && vals[r] <  cv); break;
+                case CMP_GT: FLEAF_LOOP(!nulls[r] && vals[r] >  cv); break;
+                case CMP_LE: FLEAF_LOOP(!nulls[r] && vals[r] <= cv); break;
+                case CMP_GE: FLEAF_LOOP(!nulls[r] && vals[r] >= cv); break;
+                case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+            }
+            break;
+        }
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ:
-        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            int64_t cv = cmp_val->value.as_timestamp;
+            const int64_t *vals = cb->data.i64;
+            switch (op) {
+                case CMP_EQ: FLEAF_LOOP(!nulls[r] && vals[r] == cv); break;
+                case CMP_NE: FLEAF_LOOP(!nulls[r] && vals[r] != cv); break;
+                case CMP_LT: FLEAF_LOOP(!nulls[r] && vals[r] <  cv); break;
+                case CMP_GT: FLEAF_LOOP(!nulls[r] && vals[r] >  cv); break;
+                case CMP_LE: FLEAF_LOOP(!nulls[r] && vals[r] <= cv); break;
+                case CMP_GE: FLEAF_LOOP(!nulls[r] && vals[r] >= cv); break;
+                case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+            }
+            break;
+        }
+        case COLUMN_TYPE_INTERVAL: {
+            /* For interval comparisons, use approximate usec */
+            int64_t cv = interval_to_usec_approx(cmp_val->value.as_interval);
+            switch (op) {
+                case CMP_EQ: FLEAF_LOOP(!nulls[r] && interval_to_usec_approx(cb->data.iv[r]) == cv); break;
+                case CMP_NE: FLEAF_LOOP(!nulls[r] && interval_to_usec_approx(cb->data.iv[r]) != cv); break;
+                case CMP_LT: FLEAF_LOOP(!nulls[r] && interval_to_usec_approx(cb->data.iv[r]) <  cv); break;
+                case CMP_GT: FLEAF_LOOP(!nulls[r] && interval_to_usec_approx(cb->data.iv[r]) >  cv); break;
+                case CMP_LE: FLEAF_LOOP(!nulls[r] && interval_to_usec_approx(cb->data.iv[r]) <= cv); break;
+                case CMP_GE: FLEAF_LOOP(!nulls[r] && interval_to_usec_approx(cb->data.iv[r]) >= cv); break;
+                case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+            }
+            break;
+        }
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_UUID: {
             const char *cv = cmp_val->value.as_text;
             if (!cv) cv = "";
@@ -1079,6 +1223,12 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         struct col_block *cb = &out->cols[pn->filter.col_idx];
         int op = pn->filter.cmp_op;
 
+        /* Coerce TEXT comparison values to the column's temporal type */
+        if (column_type_is_temporal(cb->type)) {
+            coerce_cmp_to_temporal(&pn->filter.cmp_val, cb->type);
+            coerce_cmp_to_temporal(&pn->filter.between_high, cb->type);
+        }
+
         /* Macro: iterate over candidate rows */
         #define FILTER_LOOP(COND) \
             for (uint16_t _c = 0; _c < cand_count; _c++) { \
@@ -1135,13 +1285,26 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 FILTER_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
                 break;
             }
-            case COLUMN_TYPE_TEXT:
-            case COLUMN_TYPE_ENUM:
-            case COLUMN_TYPE_DATE:
+            case COLUMN_TYPE_DATE: {
+                int32_t lo = pn->filter.cmp_val.value.as_date;
+                int32_t hi = pn->filter.between_high.value.as_date;
+                const int32_t *vals = cb->data.i32;
+                FILTER_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+                break;
+            }
             case COLUMN_TYPE_TIME:
             case COLUMN_TYPE_TIMESTAMP:
-            case COLUMN_TYPE_TIMESTAMPTZ:
+            case COLUMN_TYPE_TIMESTAMPTZ: {
+                int64_t lo = pn->filter.cmp_val.value.as_timestamp;
+                int64_t hi = pn->filter.between_high.value.as_timestamp;
+                const int64_t *vals = cb->data.i64;
+                FILTER_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+                break;
+            }
             case COLUMN_TYPE_INTERVAL:
+                break;
+            case COLUMN_TYPE_TEXT:
+            case COLUMN_TYPE_ENUM:
             case COLUMN_TYPE_UUID: {
                 const char *lo = pn->filter.cmp_val.value.as_text ? pn->filter.cmp_val.value.as_text : "";
                 const char *hi = pn->filter.between_high.value.as_text ? pn->filter.between_high.value.as_text : "";
@@ -1220,13 +1383,43 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
                 break;
             }
-            case COLUMN_TYPE_TEXT:
-            case COLUMN_TYPE_ENUM:
-            case COLUMN_TYPE_DATE:
+            case COLUMN_TYPE_DATE: {
+                const int32_t *vals = cb->data.i32;
+                for (uint16_t _c = 0; _c < cand_count; _c++) {
+                    uint16_t r = (uint16_t)cand[_c];
+                    if (nulls[r]) continue;
+                    for (uint32_t j = 0; j < nv; j++)
+                        if (!inv[j].is_null && inv[j].value.as_date == vals[r]) { sel[sel_count++] = r; break; }
+                }
+                break;
+            }
             case COLUMN_TYPE_TIME:
             case COLUMN_TYPE_TIMESTAMP:
-            case COLUMN_TYPE_TIMESTAMPTZ:
-            case COLUMN_TYPE_INTERVAL:
+            case COLUMN_TYPE_TIMESTAMPTZ: {
+                const int64_t *vals = cb->data.i64;
+                for (uint16_t _c = 0; _c < cand_count; _c++) {
+                    uint16_t r = (uint16_t)cand[_c];
+                    if (nulls[r]) continue;
+                    for (uint32_t j = 0; j < nv; j++)
+                        if (!inv[j].is_null && inv[j].value.as_timestamp == vals[r]) { sel[sel_count++] = r; break; }
+                }
+                break;
+            }
+            case COLUMN_TYPE_INTERVAL: {
+                const struct interval *vals = cb->data.iv;
+                for (uint16_t _c = 0; _c < cand_count; _c++) {
+                    uint16_t r = (uint16_t)cand[_c];
+                    if (nulls[r]) continue;
+                    for (uint32_t j = 0; j < nv; j++)
+                        if (!inv[j].is_null &&
+                            vals[r].months == inv[j].value.as_interval.months &&
+                            vals[r].days == inv[j].value.as_interval.days &&
+                            vals[r].usec == inv[j].value.as_interval.usec) { sel[sel_count++] = r; break; }
+                }
+                break;
+            }
+            case COLUMN_TYPE_TEXT:
+            case COLUMN_TYPE_ENUM:
             case COLUMN_TYPE_UUID: {
                 char * const *vals = cb->data.str;
                 for (uint16_t _c = 0; _c < cand_count; _c++) {
@@ -1341,13 +1534,48 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
                 goto done;
             }
-            case COLUMN_TYPE_TEXT:
-            case COLUMN_TYPE_ENUM:
-            case COLUMN_TYPE_DATE:
+            case COLUMN_TYPE_DATE: {
+                int32_t cv = pn->filter.cmp_val.value.as_date;
+                const int32_t *vals = cb->data.i32;
+                const uint8_t *nulls = cb->nulls;
+                switch (op) {
+                    case CMP_EQ: FILTER_LOOP(!nulls[r] && vals[r] == cv); break;
+                    case CMP_NE: FILTER_LOOP(!nulls[r] && vals[r] != cv); break;
+                    case CMP_LT: FILTER_LOOP(!nulls[r] && vals[r] <  cv); break;
+                    case CMP_GT: FILTER_LOOP(!nulls[r] && vals[r] >  cv); break;
+                    case CMP_LE: FILTER_LOOP(!nulls[r] && vals[r] <= cv); break;
+                    case CMP_GE: FILTER_LOOP(!nulls[r] && vals[r] >= cv); break;
+                    case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                    case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                    case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: goto fallback;
+                }
+                goto done;
+            }
             case COLUMN_TYPE_TIME:
             case COLUMN_TYPE_TIMESTAMP:
-            case COLUMN_TYPE_TIMESTAMPTZ:
+            case COLUMN_TYPE_TIMESTAMPTZ: {
+                int64_t cv = pn->filter.cmp_val.value.as_timestamp;
+                const int64_t *vals = cb->data.i64;
+                const uint8_t *nulls = cb->nulls;
+                switch (op) {
+                    case CMP_EQ: FILTER_LOOP(!nulls[r] && vals[r] == cv); break;
+                    case CMP_NE: FILTER_LOOP(!nulls[r] && vals[r] != cv); break;
+                    case CMP_LT: FILTER_LOOP(!nulls[r] && vals[r] <  cv); break;
+                    case CMP_GT: FILTER_LOOP(!nulls[r] && vals[r] >  cv); break;
+                    case CMP_LE: FILTER_LOOP(!nulls[r] && vals[r] <= cv); break;
+                    case CMP_GE: FILTER_LOOP(!nulls[r] && vals[r] >= cv); break;
+                    case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                    case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                    case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: goto fallback;
+                }
+                goto done;
+            }
             case COLUMN_TYPE_INTERVAL:
+                goto fallback;
+            case COLUMN_TYPE_TEXT:
+            case COLUMN_TYPE_ENUM:
             case COLUMN_TYPE_UUID: {
                 const char *cmp_str = pn->filter.cmp_val.value.as_text;
                 char * const *vals = cb->data.str;
@@ -1492,16 +1720,7 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 memset(&cell->value, 0, sizeof(cell->value));
             } else {
                 cell->is_null = 0;
-                if (cb->type == COLUMN_TYPE_SMALLINT)
-                    cell->value.as_smallint = cb->data.i16[ri];
-                else if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN)
-                    cell->value.as_int = cb->data.i32[ri];
-                else if (cb->type == COLUMN_TYPE_BIGINT)
-                    cell->value.as_bigint = cb->data.i64[ri];
-                else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC)
-                    cell->value.as_float = cb->data.f64[ri];
-                else
-                    cell->value.as_text = cb->data.str[ri];
+                cb_to_cell_at(cb, ri, cell);
             }
         }
 
@@ -1565,12 +1784,14 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         ocb->data.f64[r] = (double)result.value.as_bigint;
                     else
                         ocb->data.f64[r] = 0.0;
+                } else if (column_type_is_temporal(result.type)) {
+                    ocb->type = result.type;
+                    cell_to_cb_at(ocb, r, &result);
                 } else {
                     /* Text-like types */
-                    if (column_type_is_text(result.type) || result.type == COLUMN_TYPE_DATE ||
-                        result.type == COLUMN_TYPE_TIMESTAMP || result.type == COLUMN_TYPE_TIMESTAMPTZ ||
-                        result.type == COLUMN_TYPE_INTERVAL || result.type == COLUMN_TYPE_UUID ||
-                        result.type == COLUMN_TYPE_ENUM || result.type == COLUMN_TYPE_TIME) {
+                    if (column_type_is_text(result.type) ||
+                        result.type == COLUMN_TYPE_UUID ||
+                        result.type == COLUMN_TYPE_ENUM) {
                         ocb->data.str[r] = result.value.as_text;
                         ocb->type = result.type;
                     } else {
@@ -1724,13 +1945,18 @@ static int flat_col_eq(const struct flat_col *a, uint32_t ai,
     case COLUMN_TYPE_BIGINT:   return ((int64_t *)a->data)[ai] == b->data.i64[bi];
     case COLUMN_TYPE_FLOAT:
     case COLUMN_TYPE_NUMERIC:  return ((double *)a->data)[ai] == b->data.f64[bi];
-    case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_DATE:     return ((int32_t *)a->data)[ai] == b->data.i32[bi];
     case COLUMN_TYPE_TIME:
     case COLUMN_TYPE_TIMESTAMP:
     case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:
+        return ((int64_t *)a->data)[ai] == b->data.i64[bi];
+    case COLUMN_TYPE_INTERVAL: {
+        struct interval ia = ((const struct interval *)a->data)[ai];
+        struct interval ib = b->data.iv[bi];
+        return ia.months == ib.months && ia.days == ib.days && ia.usec == ib.usec;
+    }
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
     case COLUMN_TYPE_UUID: {
         const char *sa = ((const char **)a->data)[ai];
         const char *sb = b->data.str[bi];
@@ -2117,13 +2343,23 @@ static uint64_t distinct_hash_cell(struct col_block *cb, uint16_t ri)
             h ^= bits;
             break;
         }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+            h ^= (uint64_t)(uint32_t)cb->data.i32[ri]; break;
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
-        case COLUMN_TYPE_INTERVAL:
+            h ^= (uint64_t)cb->data.i64[ri]; break;
+        case COLUMN_TYPE_INTERVAL: {
+            struct interval iv = cb->data.iv[ri];
+            h ^= (uint64_t)(uint32_t)iv.months;
+            h *= 1099511628211ULL;
+            h ^= (uint64_t)(uint32_t)iv.days;
+            h *= 1099511628211ULL;
+            h ^= (uint64_t)iv.usec;
+            break;
+        }
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_UUID:
             if (cb->data.str[ri]) {
                 const char *s = cb->data.str[ri];
@@ -2322,16 +2558,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 memset(&cell->value, 0, sizeof(cell->value));
                             } else {
                                 cell->is_null = 0;
-                                if (cb->type == COLUMN_TYPE_SMALLINT)
-                                    cell->value.as_smallint = cb->data.i16[ri];
-                                else if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN)
-                                    cell->value.as_int = cb->data.i32[ri];
-                                else if (cb->type == COLUMN_TYPE_BIGINT)
-                                    cell->value.as_bigint = cb->data.i64[ri];
-                                else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC)
-                                    cell->value.as_float = cb->data.f64[ri];
-                                else
-                                    cell->value.as_text = cb->data.str[ri];
+                                cb_to_cell_at(cb, ri, cell);
                             }
                         }
                         struct cell cv = eval_expr(ae->expr_idx, ctx->arena,
@@ -2347,13 +2574,15 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             case COLUMN_TYPE_FLOAT:
                             case COLUMN_TYPE_NUMERIC:  v = cv.value.as_float; break;
                             case COLUMN_TYPE_BOOLEAN:  v = (double)cv.value.as_bool; break;
-                            case COLUMN_TYPE_TEXT:
-                            case COLUMN_TYPE_ENUM:
-                            case COLUMN_TYPE_DATE:
+                            case COLUMN_TYPE_DATE:     v = (double)cv.value.as_date; break;
                             case COLUMN_TYPE_TIME:
                             case COLUMN_TYPE_TIMESTAMP:
                             case COLUMN_TYPE_TIMESTAMPTZ:
+                                v = (double)cv.value.as_timestamp; break;
                             case COLUMN_TYPE_INTERVAL:
+                                v = (double)interval_to_usec_approx(cv.value.as_interval); break;
+                            case COLUMN_TYPE_TEXT:
+                            case COLUMN_TYPE_ENUM:
                             case COLUMN_TYPE_UUID:
                                 break;
                         }
@@ -2389,6 +2618,29 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 st->text_maxs[idx] = s;
                             st->minmax_init[idx] = 1;
                         }
+                    } else if (acb->type == COLUMN_TYPE_DATE) {
+                        int32_t v = acb->data.i32[ri];
+                        st->sums[idx] += (double)v;
+                        if (!st->minmax_init[idx] || v < (int32_t)st->mins[idx]) st->mins[idx] = (double)v;
+                        if (!st->minmax_init[idx] || v > (int32_t)st->maxs[idx]) st->maxs[idx] = (double)v;
+                        st->minmax_init[idx] = 1;
+                    } else if (acb->type == COLUMN_TYPE_TIME ||
+                               acb->type == COLUMN_TYPE_TIMESTAMP ||
+                               acb->type == COLUMN_TYPE_TIMESTAMPTZ) {
+                        int64_t v = acb->data.i64[ri];
+                        int64_t cur_min, cur_max;
+                        memcpy(&cur_min, &st->mins[idx], sizeof(int64_t));
+                        memcpy(&cur_max, &st->maxs[idx], sizeof(int64_t));
+                        if (!st->minmax_init[idx] || v < cur_min) memcpy(&st->mins[idx], &v, sizeof(double));
+                        if (!st->minmax_init[idx] || v > cur_max) memcpy(&st->maxs[idx], &v, sizeof(double));
+                        st->minmax_init[idx] = 1;
+                    } else if (acb->type == COLUMN_TYPE_INTERVAL) {
+                        int64_t v = interval_to_usec_approx(acb->data.iv[ri]);
+                        double dv = (double)v;
+                        st->sums[idx] += dv;
+                        if (!st->minmax_init[idx] || dv < st->mins[idx]) st->mins[idx] = dv;
+                        if (!st->minmax_init[idx] || dv > st->maxs[idx]) st->maxs[idx] = dv;
+                        st->minmax_init[idx] = 1;
                     } else {
                         double v = cb_to_double(acb, ri);
                         st->sums[idx] += v;
@@ -2497,11 +2749,20 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         dst->type = COLUMN_TYPE_FLOAT;
                         dst->nulls[out_count] = 0;
                         dst->data.f64[out_count] = mv;
-                    } else if (src_type_mm == COLUMN_TYPE_BIGINT) {
-                        double mv = ae->func == AGG_MIN ? st->mins[idx] : st->maxs[idx];
-                        dst->type = COLUMN_TYPE_BIGINT;
+                    } else if (src_type_mm == COLUMN_TYPE_BIGINT ||
+                               src_type_mm == COLUMN_TYPE_TIME ||
+                               src_type_mm == COLUMN_TYPE_TIMESTAMP ||
+                               src_type_mm == COLUMN_TYPE_TIMESTAMPTZ) {
+                        int64_t mv;
+                        memcpy(&mv, ae->func == AGG_MIN ? &st->mins[idx] : &st->maxs[idx], sizeof(int64_t));
+                        dst->type = src_type_mm;
                         dst->nulls[out_count] = 0;
-                        dst->data.i64[out_count] = (int64_t)mv;
+                        dst->data.i64[out_count] = mv;
+                    } else if (src_type_mm == COLUMN_TYPE_DATE) {
+                        double mv = ae->func == AGG_MIN ? st->mins[idx] : st->maxs[idx];
+                        dst->type = COLUMN_TYPE_DATE;
+                        dst->nulls[out_count] = 0;
+                        dst->data.i32[out_count] = (int32_t)mv;
                     } else {
                         double mv = ae->func == AGG_MIN ? st->mins[idx] : st->maxs[idx];
                         dst->type = COLUMN_TYPE_INT;
@@ -2602,16 +2863,7 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 memset(&cell->value, 0, sizeof(cell->value));
                             } else {
                                 cell->is_null = 0;
-                                if (cb->type == COLUMN_TYPE_SMALLINT)
-                                    cell->value.as_smallint = cb->data.i16[ri];
-                                else if (cb->type == COLUMN_TYPE_INT || cb->type == COLUMN_TYPE_BOOLEAN)
-                                    cell->value.as_int = cb->data.i32[ri];
-                                else if (cb->type == COLUMN_TYPE_BIGINT)
-                                    cell->value.as_bigint = cb->data.i64[ri];
-                                else if (cb->type == COLUMN_TYPE_FLOAT || cb->type == COLUMN_TYPE_NUMERIC)
-                                    cell->value.as_float = cb->data.f64[ri];
-                                else
-                                    cell->value.as_text = cb->data.str[ri];
+                                cb_to_cell_at(cb, ri, cell);
                             }
                         }
                         struct cell cv = eval_expr(ae->expr_idx, ctx->arena,
@@ -2626,13 +2878,15 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             case COLUMN_TYPE_FLOAT:
                             case COLUMN_TYPE_NUMERIC:  v = cv.value.as_float; break;
                             case COLUMN_TYPE_BOOLEAN:  v = (double)cv.value.as_bool; break;
-                            case COLUMN_TYPE_TEXT:
-                            case COLUMN_TYPE_ENUM:
-                            case COLUMN_TYPE_DATE:
+                            case COLUMN_TYPE_DATE:     v = (double)cv.value.as_date; break;
                             case COLUMN_TYPE_TIME:
                             case COLUMN_TYPE_TIMESTAMP:
                             case COLUMN_TYPE_TIMESTAMPTZ:
+                                v = (double)cv.value.as_timestamp; break;
                             case COLUMN_TYPE_INTERVAL:
+                                v = (double)interval_to_usec_approx(cv.value.as_interval); break;
+                            case COLUMN_TYPE_TEXT:
+                            case COLUMN_TYPE_ENUM:
                             case COLUMN_TYPE_UUID:     break;
                         }
                         /* COUNT(DISTINCT expr): hash the result and deduplicate */
@@ -2671,6 +2925,32 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 st->text_maxs[a] = s;
                             st->minmax_init[a] = 1;
                         }
+                    } else if (acb->type == COLUMN_TYPE_DATE) {
+                        int32_t v = acb->data.i32[ri];
+                        st->sums[a] += (double)v;
+                        if (!st->minmax_init[a] || v < (int32_t)st->mins[a]) st->mins[a] = (double)v;
+                        if (!st->minmax_init[a] || v > (int32_t)st->maxs[a]) st->maxs[a] = (double)v;
+                        st->minmax_init[a] = 1;
+                    } else if (acb->type == COLUMN_TYPE_TIME ||
+                               acb->type == COLUMN_TYPE_TIMESTAMP ||
+                               acb->type == COLUMN_TYPE_TIMESTAMPTZ) {
+                        int64_t v = acb->data.i64[ri];
+                        st->nonnull[a]--; /* undo the increment above; we handle nonnull here */
+                        st->nonnull[a]++;
+                        /* Store as int64 bits in the double slot */
+                        int64_t cur_min, cur_max;
+                        memcpy(&cur_min, &st->mins[a], sizeof(int64_t));
+                        memcpy(&cur_max, &st->maxs[a], sizeof(int64_t));
+                        if (!st->minmax_init[a] || v < cur_min) memcpy(&st->mins[a], &v, sizeof(double));
+                        if (!st->minmax_init[a] || v > cur_max) memcpy(&st->maxs[a], &v, sizeof(double));
+                        st->minmax_init[a] = 1;
+                    } else if (acb->type == COLUMN_TYPE_INTERVAL) {
+                        int64_t v = interval_to_usec_approx(acb->data.iv[ri]);
+                        double dv = (double)v;
+                        st->sums[a] += dv;
+                        if (!st->minmax_init[a] || dv < st->mins[a]) st->mins[a] = dv;
+                        if (!st->minmax_init[a] || dv > st->maxs[a]) st->maxs[a] = dv;
+                        st->minmax_init[a] = 1;
                     } else {
                         double v = cb_to_double(acb, ri);
                         st->sums[a] += v;
@@ -2759,11 +3039,20 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     dst->type = COLUMN_TYPE_FLOAT;
                     dst->nulls[0] = 0;
                     dst->data.f64[0] = mv;
-                } else if (src_type_mm == COLUMN_TYPE_BIGINT) {
-                    double mv = ae->func == AGG_MIN ? st->mins[a] : st->maxs[a];
-                    dst->type = COLUMN_TYPE_BIGINT;
+                } else if (src_type_mm == COLUMN_TYPE_BIGINT ||
+                           src_type_mm == COLUMN_TYPE_TIME ||
+                           src_type_mm == COLUMN_TYPE_TIMESTAMP ||
+                           src_type_mm == COLUMN_TYPE_TIMESTAMPTZ) {
+                    int64_t mv;
+                    memcpy(&mv, ae->func == AGG_MIN ? &st->mins[a] : &st->maxs[a], sizeof(int64_t));
+                    dst->type = src_type_mm;
                     dst->nulls[0] = 0;
-                    dst->data.i64[0] = (int64_t)mv;
+                    dst->data.i64[0] = mv;
+                } else if (src_type_mm == COLUMN_TYPE_DATE) {
+                    double mv = ae->func == AGG_MIN ? st->mins[a] : st->maxs[a];
+                    dst->type = COLUMN_TYPE_DATE;
+                    dst->nulls[0] = 0;
+                    dst->data.i32[0] = (int32_t)mv;
                 } else {
                     double mv = ae->func == AGG_MIN ? st->mins[a] : st->maxs[a];
                     dst->type = COLUMN_TYPE_INT;
@@ -2836,13 +3125,24 @@ static int sort_flat_cmp(const void *a, const void *b)
             int32_t va = ((const int32_t *)_bsort_ctx.flat_keys[k])[ia];
             int32_t vb = ((const int32_t *)_bsort_ctx.flat_keys[k])[ib];
             cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
-        } else if (kt == COLUMN_TYPE_BIGINT) {
+        } else if (kt == COLUMN_TYPE_BIGINT ||
+                   kt == COLUMN_TYPE_TIME ||
+                   kt == COLUMN_TYPE_TIMESTAMP ||
+                   kt == COLUMN_TYPE_TIMESTAMPTZ) {
             int64_t va = ((const int64_t *)_bsort_ctx.flat_keys[k])[ia];
             int64_t vb = ((const int64_t *)_bsort_ctx.flat_keys[k])[ib];
             cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
         } else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC) {
             double va = ((const double *)_bsort_ctx.flat_keys[k])[ia];
             double vb = ((const double *)_bsort_ctx.flat_keys[k])[ib];
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_DATE) {
+            int32_t va = ((const int32_t *)_bsort_ctx.flat_keys[k])[ia];
+            int32_t vb = ((const int32_t *)_bsort_ctx.flat_keys[k])[ib];
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_INTERVAL) {
+            int64_t va = interval_to_usec_approx(((const struct interval *)_bsort_ctx.flat_keys[k])[ia]);
+            int64_t vb = interval_to_usec_approx(((const struct interval *)_bsort_ctx.flat_keys[k])[ib]);
             cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
         } else {
             const char *sa = ((const char **)_bsort_ctx.flat_keys[k])[ia];
@@ -2949,17 +3249,7 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 kt = st->collected[0].cols[ci].type;
             _bsort_ctx.flat_col_types[ci] = kt;
 
-            size_t elem_sz;
-            if (kt == COLUMN_TYPE_SMALLINT)
-                elem_sz = sizeof(int16_t);
-            else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
-                elem_sz = sizeof(int32_t);
-            else if (kt == COLUMN_TYPE_BIGINT)
-                elem_sz = sizeof(int64_t);
-            else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC)
-                elem_sz = sizeof(double);
-            else
-                elem_sz = sizeof(char *);
+            size_t elem_sz = col_type_elem_size(kt);
 
             _bsort_ctx.flat_col_data[ci] = bump_alloc(&ctx->arena->scratch,
                                                        (total ? total : 1) * elem_sz);
@@ -2971,16 +3261,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 struct col_block *src = &_bsort_ctx.all_cols[b * child_ncols + ci];
                 uint16_t cnt = st->collected[b].count;
                 memcpy(_bsort_ctx.flat_col_nulls[ci] + fi, src->nulls, cnt);
-                if (kt == COLUMN_TYPE_SMALLINT)
-                    memcpy((int16_t *)_bsort_ctx.flat_col_data[ci] + fi, src->data.i16, cnt * sizeof(int16_t));
-                else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
-                    memcpy((int32_t *)_bsort_ctx.flat_col_data[ci] + fi, src->data.i32, cnt * sizeof(int32_t));
-                else if (kt == COLUMN_TYPE_BIGINT)
-                    memcpy((int64_t *)_bsort_ctx.flat_col_data[ci] + fi, src->data.i64, cnt * sizeof(int64_t));
-                else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC)
-                    memcpy((double *)_bsort_ctx.flat_col_data[ci] + fi, src->data.f64, cnt * sizeof(double));
-                else
-                    memcpy((char **)_bsort_ctx.flat_col_data[ci] + fi, src->data.str, cnt * sizeof(char *));
+                memcpy((uint8_t *)_bsort_ctx.flat_col_data[ci] + fi * elem_sz,
+                       cb_data_ptr(src, 0), cnt * elem_sz);
                 fi += cnt;
             }
         }
@@ -3021,16 +3303,9 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         for (uint16_t c = 0; c < child_ncols; c++) {
             out->cols[c].nulls[out_count] = _bsort_ctx.flat_col_nulls[c][fi];
             enum column_type ct = _bsort_ctx.flat_col_types[c];
-            if (ct == COLUMN_TYPE_SMALLINT)
-                out->cols[c].data.i16[out_count] = ((const int16_t *)_bsort_ctx.flat_col_data[c])[fi];
-            else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
-                out->cols[c].data.i32[out_count] = ((const int32_t *)_bsort_ctx.flat_col_data[c])[fi];
-            else if (ct == COLUMN_TYPE_BIGINT)
-                out->cols[c].data.i64[out_count] = ((const int64_t *)_bsort_ctx.flat_col_data[c])[fi];
-            else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
-                out->cols[c].data.f64[out_count] = ((const double *)_bsort_ctx.flat_col_data[c])[fi];
-            else
-                out->cols[c].data.str[out_count] = ((char **)_bsort_ctx.flat_col_data[c])[fi];
+            size_t esz = col_type_elem_size(ct);
+            memcpy(cb_data_ptr(&out->cols[c], (uint32_t)out_count),
+                   (const uint8_t *)_bsort_ctx.flat_col_data[c] + fi * esz, esz);
         }
         out_count++;
     }
@@ -3108,13 +3383,24 @@ static int window_sort_cmp(const void *a, const void *b)
                 int32_t va = ((int32_t *)_wsort_ctx.ord_data)[ia];
                 int32_t vb = ((int32_t *)_wsort_ctx.ord_data)[ib];
                 cmp = (va > vb) - (va < vb);
-            } else if (ot == COLUMN_TYPE_BIGINT) {
+            } else if (ot == COLUMN_TYPE_BIGINT ||
+                       ot == COLUMN_TYPE_TIME ||
+                       ot == COLUMN_TYPE_TIMESTAMP ||
+                       ot == COLUMN_TYPE_TIMESTAMPTZ) {
                 int64_t va = ((int64_t *)_wsort_ctx.ord_data)[ia];
                 int64_t vb = ((int64_t *)_wsort_ctx.ord_data)[ib];
                 cmp = (va > vb) - (va < vb);
             } else if (ot == COLUMN_TYPE_FLOAT || ot == COLUMN_TYPE_NUMERIC) {
                 double va = ((double *)_wsort_ctx.ord_data)[ia];
                 double vb = ((double *)_wsort_ctx.ord_data)[ib];
+                cmp = (va > vb) - (va < vb);
+            } else if (ot == COLUMN_TYPE_DATE) {
+                int32_t va = ((int32_t *)_wsort_ctx.ord_data)[ia];
+                int32_t vb = ((int32_t *)_wsort_ctx.ord_data)[ib];
+                cmp = (va > vb) - (va < vb);
+            } else if (ot == COLUMN_TYPE_INTERVAL) {
+                int64_t va = interval_to_usec_approx(((struct interval *)_wsort_ctx.ord_data)[ia]);
+                int64_t vb = interval_to_usec_approx(((struct interval *)_wsort_ctx.ord_data)[ib]);
                 cmp = (va > vb) - (va < vb);
             } else {
                 const char *sa = ((char **)_wsort_ctx.ord_data)[ia];
@@ -3154,12 +3440,24 @@ static inline int flat_col_ord_cmp(void *data, enum column_type ct, uint8_t *nul
         int32_t va = ((int32_t *)data)[a], vb = ((int32_t *)data)[b];
         return (va > vb) - (va < vb);
     }
-    if (ct == COLUMN_TYPE_BIGINT) {
+    if (ct == COLUMN_TYPE_BIGINT ||
+        ct == COLUMN_TYPE_TIME ||
+        ct == COLUMN_TYPE_TIMESTAMP ||
+        ct == COLUMN_TYPE_TIMESTAMPTZ) {
         int64_t va = ((int64_t *)data)[a], vb = ((int64_t *)data)[b];
         return (va > vb) - (va < vb);
     }
     if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) {
         double va = ((double *)data)[a], vb = ((double *)data)[b];
+        return (va > vb) - (va < vb);
+    }
+    if (ct == COLUMN_TYPE_DATE) {
+        int32_t va = ((int32_t *)data)[a], vb = ((int32_t *)data)[b];
+        return (va > vb) - (va < vb);
+    }
+    if (ct == COLUMN_TYPE_INTERVAL) {
+        int64_t va = interval_to_usec_approx(((struct interval *)data)[a]);
+        int64_t vb = interval_to_usec_approx(((struct interval *)data)[b]);
         return (va > vb) - (va < vb);
     }
     /* TEXT types */
@@ -3231,12 +3529,7 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         for (uint16_t ci = 0; ci < child_ncols; ci++) {
             enum column_type kt = nblocks > 0 ? collected[0].cols[ci].type : COLUMN_TYPE_INT;
             st->flat_types[ci] = kt;
-            size_t esz;
-            if (kt == COLUMN_TYPE_SMALLINT) esz = sizeof(int16_t);
-            else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN) esz = sizeof(int32_t);
-            else if (kt == COLUMN_TYPE_BIGINT) esz = sizeof(int64_t);
-            else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC) esz = sizeof(double);
-            else esz = sizeof(char *);
+            size_t esz = col_type_elem_size(kt);
 
             st->flat_data[ci] = bump_alloc(&ctx->arena->scratch, total * esz);
             st->flat_nulls[ci] = (uint8_t *)bump_alloc(&ctx->arena->scratch, total);
@@ -3246,16 +3539,8 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 struct col_block *src = &collected[b].cols[ci];
                 uint16_t cnt = collected[b].count;
                 memcpy(st->flat_nulls[ci] + fi, src->nulls, cnt);
-                if (kt == COLUMN_TYPE_SMALLINT)
-                    memcpy((int16_t *)st->flat_data[ci] + fi, src->data.i16, cnt * sizeof(int16_t));
-                else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN)
-                    memcpy((int32_t *)st->flat_data[ci] + fi, src->data.i32, cnt * sizeof(int32_t));
-                else if (kt == COLUMN_TYPE_BIGINT)
-                    memcpy((int64_t *)st->flat_data[ci] + fi, src->data.i64, cnt * sizeof(int64_t));
-                else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC)
-                    memcpy((double *)st->flat_data[ci] + fi, src->data.f64, cnt * sizeof(double));
-                else
-                    memcpy((char **)st->flat_data[ci] + fi, src->data.str, cnt * sizeof(char *));
+                memcpy((uint8_t *)st->flat_data[ci] + fi * esz,
+                       cb_data_ptr(src, 0), cnt * esz);
                 fi += cnt;
             }
         }
@@ -3594,16 +3879,9 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             int sci = pn->window.pass_cols[c];
             out->cols[c].nulls[out_count] = st->flat_nulls[sci][fi];
             enum column_type ct = st->flat_types[sci];
-            if (ct == COLUMN_TYPE_SMALLINT)
-                out->cols[c].data.i16[out_count] = ((int16_t *)st->flat_data[sci])[fi];
-            else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
-                out->cols[c].data.i32[out_count] = ((int32_t *)st->flat_data[sci])[fi];
-            else if (ct == COLUMN_TYPE_BIGINT)
-                out->cols[c].data.i64[out_count] = ((int64_t *)st->flat_data[sci])[fi];
-            else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
-                out->cols[c].data.f64[out_count] = ((double *)st->flat_data[sci])[fi];
-            else
-                out->cols[c].data.str[out_count] = ((char **)st->flat_data[sci])[fi];
+            size_t esz = col_type_elem_size(ct);
+            memcpy(cb_data_ptr(&out->cols[c], out_count),
+                   (const uint8_t *)st->flat_data[sci] + fi * esz, esz);
         }
 
         /* Window result columns */
@@ -3655,13 +3933,22 @@ static inline uint32_t semi_hash_flat(enum column_type type, const void *data, u
         case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_NUMERIC:
             return block_hash_f64(((const double *)data)[i]);
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+            return block_hash_i32(((const int32_t *)data)[i]);
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
-        case COLUMN_TYPE_INTERVAL:
+            return block_hash_i64(((const int64_t *)data)[i]);
+        case COLUMN_TYPE_INTERVAL: {
+            struct interval iv = ((const struct interval *)data)[i];
+            uint64_t h = 14695981039346656037ULL;
+            h ^= (uint64_t)(uint32_t)iv.months; h *= 1099511628211ULL;
+            h ^= (uint64_t)(uint32_t)iv.days; h *= 1099511628211ULL;
+            h ^= (uint64_t)iv.usec; h *= 1099511628211ULL;
+            return h;
+        }
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_UUID:
             return block_hash_str(((const char **)data)[i]);
     }
@@ -3684,13 +3971,19 @@ static inline int semi_eq_cb_flat(const struct col_block *cb, uint16_t oi,
         case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_NUMERIC:
             return cb->data.f64[oi] == ((const double *)data)[fi];
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+            return cb->data.i32[oi] == ((const int32_t *)data)[fi];
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
-        case COLUMN_TYPE_INTERVAL:
+            return cb->data.i64[oi] == ((const int64_t *)data)[fi];
+        case COLUMN_TYPE_INTERVAL: {
+            struct interval ia = cb->data.iv[oi];
+            struct interval ib = ((const struct interval *)data)[fi];
+            return ia.months == ib.months && ia.days == ib.days && ia.usec == ib.usec;
+        }
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_UUID: {
             const char *a = cb->data.str[oi];
             const char *b = ((const char **)data)[fi];
@@ -3714,13 +4007,16 @@ static size_t semi_elem_size(enum column_type type)
         case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_NUMERIC:
             return sizeof(double);
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
+            return sizeof(int32_t);
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
+            return sizeof(int64_t);
         case COLUMN_TYPE_INTERVAL:
+            return sizeof(struct interval);
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_UUID:
             return sizeof(char *);
     }
@@ -3797,13 +4093,19 @@ static void hash_semi_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
                 case COLUMN_TYPE_NUMERIC:
                     ((double *)st->key_data)[di] = src_key->data.f64[ri];
                     break;
-                case COLUMN_TYPE_TEXT:
-                case COLUMN_TYPE_ENUM:
                 case COLUMN_TYPE_DATE:
+                    ((int32_t *)st->key_data)[di] = src_key->data.i32[ri];
+                    break;
                 case COLUMN_TYPE_TIME:
                 case COLUMN_TYPE_TIMESTAMP:
                 case COLUMN_TYPE_TIMESTAMPTZ:
+                    ((int64_t *)st->key_data)[di] = src_key->data.i64[ri];
+                    break;
                 case COLUMN_TYPE_INTERVAL:
+                    ((struct interval *)st->key_data)[di] = src_key->data.iv[ri];
+                    break;
+                case COLUMN_TYPE_TEXT:
+                case COLUMN_TYPE_ENUM:
                 case COLUMN_TYPE_UUID:
                     ((char **)st->key_data)[di] = src_key->data.str[ri];
                     break;
@@ -4540,13 +4842,28 @@ static int cell_value_to_str(const struct cell *c, char *buf, int buflen)
     case COLUMN_TYPE_FLOAT:
     case COLUMN_TYPE_NUMERIC:  return snprintf(buf, buflen, "%g", c->value.as_float);
     case COLUMN_TYPE_BOOLEAN:  return snprintf(buf, buflen, "%s", c->value.as_bool ? "true" : "false");
+    case COLUMN_TYPE_DATE: {
+        char tmp[32]; date_to_str(c->value.as_date, tmp, sizeof(tmp));
+        return snprintf(buf, buflen, "'%s'", tmp);
+    }
+    case COLUMN_TYPE_TIME: {
+        char tmp[32]; time_to_str(c->value.as_time, tmp, sizeof(tmp));
+        return snprintf(buf, buflen, "'%s'", tmp);
+    }
+    case COLUMN_TYPE_TIMESTAMP: {
+        char tmp[32]; timestamp_to_str(c->value.as_timestamp, tmp, sizeof(tmp));
+        return snprintf(buf, buflen, "'%s'", tmp);
+    }
+    case COLUMN_TYPE_TIMESTAMPTZ: {
+        char tmp[40]; timestamptz_to_str(c->value.as_timestamp, tmp, sizeof(tmp));
+        return snprintf(buf, buflen, "'%s'", tmp);
+    }
+    case COLUMN_TYPE_INTERVAL: {
+        char tmp[64]; interval_to_str(c->value.as_interval, tmp, sizeof(tmp));
+        return snprintf(buf, buflen, "'%s'", tmp);
+    }
     case COLUMN_TYPE_TEXT:
     case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:
-    case COLUMN_TYPE_TIME:
-    case COLUMN_TYPE_TIMESTAMP:
-    case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:
     case COLUMN_TYPE_UUID:
         if (c->value.as_text)
             return snprintf(buf, buflen, "'%s'", c->value.as_text);
@@ -5373,13 +5690,6 @@ static int find_col_in_tables_a(sv col, struct table **tables, uint16_t *offsets
         }
     }
     return find_col_in_tables_q(prefix, bare, tables, offsets, aliases, ntables);
-}
-
-/* Convenience wrapper: no aliases, parses prefix from col. */
-static int find_col_in_tables(sv col, struct table **tables, uint16_t *offsets,
-                              int ntables)
-{
-    return find_col_in_tables_a(col, tables, offsets, NULL, ntables);
 }
 
 /* Extract equi-join key columns from a join_info.

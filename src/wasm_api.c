@@ -208,13 +208,28 @@ static int format_cell(char *buf, int buf_len, int pos, struct cell *cell) {
     case COLUMN_TYPE_BOOLEAN:
         text = cell->value.as_bool ? "t" : "f";
         break;
+    case COLUMN_TYPE_DATE:
+        date_to_str(cell->value.as_date, tmp, sizeof(tmp));
+        text = tmp;
+        break;
+    case COLUMN_TYPE_TIME:
+        time_to_str(cell->value.as_time, tmp, sizeof(tmp));
+        text = tmp;
+        break;
+    case COLUMN_TYPE_TIMESTAMP:
+        timestamp_to_str(cell->value.as_timestamp, tmp, sizeof(tmp));
+        text = tmp;
+        break;
+    case COLUMN_TYPE_TIMESTAMPTZ:
+        timestamptz_to_str(cell->value.as_timestamp, tmp, sizeof(tmp));
+        text = tmp;
+        break;
+    case COLUMN_TYPE_INTERVAL:
+        interval_to_str(cell->value.as_interval, tmp, sizeof(tmp));
+        text = tmp;
+        break;
     case COLUMN_TYPE_TEXT:
     case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_DATE:
-    case COLUMN_TYPE_TIME:
-    case COLUMN_TYPE_TIMESTAMP:
-    case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_INTERVAL:
     case COLUMN_TYPE_UUID:
         text = cell->value.as_text ? cell->value.as_text : "NULL";
         break;

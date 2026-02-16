@@ -11,9 +11,9 @@ ifeq ($(origin CC),default)
 endif
 CFLAGS  ?= -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O1 -g -fsanitize=address -fno-omit-frame-pointer
 BUILDDIR = ../build
-SRCS     = main.c database.c table.c query.c row.c parser.c pgwire.c index.c column.c plan.c catalog.c
+SRCS     = main.c database.c table.c query.c row.c parser.c pgwire.c index.c column.c plan.c catalog.c datetime.c
 OBJS     = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
-LIB_SRCS = database.c table.c query.c row.c parser.c index.c column.c plan.c catalog.c
+LIB_SRCS = database.c table.c query.c row.c parser.c index.c column.c plan.c catalog.c datetime.c
 LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/%.o,$(LIB_SRCS))
 TARGET   = $(BUILDDIR)/mskql_debug
 BENCH    = $(BUILDDIR)/mskql_bench
@@ -72,7 +72,7 @@ WASM_LDFLAGS = -Wl,--no-entry \
                -Wl,--initial-memory=16777216 \
                -Wl,--max-memory=268435456
 WASM_SRCS    = wasm_api.c wasm_libc.c database.c table.c query.c row.c \
-               parser.c index.c column.c plan.c catalog.c
+               parser.c index.c column.c plan.c catalog.c datetime.c
 WASM_TARGET  = $(BUILDDIR)/mskql.wasm
 
 wasm: wasm-stubs $(WASM_TARGET)

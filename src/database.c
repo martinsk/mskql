@@ -2342,14 +2342,12 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 struct cell c_stop  = eval_expr(s->gs_stop_expr, &q->arena, NULL, NULL, db, NULL);
                 long long gs_step_val = 1;
                 int is_ts = 0; /* 1 if timestamp/date series */
-                double ts_step_sec = 0.0;
+                struct interval ts_step_iv = {0, 0, 0};
                 if (s->gs_step_expr != IDX_NONE) {
                     struct cell c_step = eval_expr(s->gs_step_expr, &q->arena, NULL, NULL, db, NULL);
-                    if (c_step.type == COLUMN_TYPE_INTERVAL ||
-                        (column_type_is_text(c_step.type) && c_step.value.as_text)) {
+                    if (c_step.type == COLUMN_TYPE_INTERVAL) {
                         is_ts = 1;
-                        if (c_step.type == COLUMN_TYPE_INTERVAL || column_type_is_text(c_step.type))
-                            ts_step_sec = parse_interval_to_seconds(c_step.value.as_text);
+                        ts_step_iv = c_step.value.as_interval;
                     } else {
                         gs_step_val = (c_step.type == COLUMN_TYPE_BIGINT) ? c_step.value.as_bigint
                                     : (c_step.type == COLUMN_TYPE_FLOAT)  ? (long long)c_step.value.as_float
@@ -2361,7 +2359,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                c_start.type == COLUMN_TYPE_TIMESTAMP ||
                                c_start.type == COLUMN_TYPE_TIMESTAMPTZ)) {
                     is_ts = 1;
-                    if (ts_step_sec == 0.0) ts_step_sec = 86400.0; /* default 1 day */
+                    if (interval_is_zero(ts_step_iv))
+                        ts_step_iv = (struct interval){0, 1, 0}; /* default 1 day */
                 }
 
                 /* determine column name */
@@ -2390,42 +2389,48 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 da_init(&gt.indexes);
 
                 if (is_ts) {
-                    /* timestamp/date series */
+                    /* timestamp/date series — integer arithmetic */
                     struct column col = {0};
                     col.name = strdup(col_name);
                     col.type = c_start.type;
                     da_push(&gt.columns, col);
 
-                    struct tm tm_start, tm_stop;
-                    const char *s_start = c_start.value.as_text ? c_start.value.as_text : "";
-                    const char *s_stop  = c_stop.value.as_text  ? c_stop.value.as_text  : "";
-                    parse_datetime(s_start, &tm_start);
-                    parse_datetime(s_stop, &tm_stop);
-                    time_t t_cur = mktime(&tm_start);
-                    time_t t_end = mktime(&tm_stop);
-                    long long step_sec = (long long)ts_step_sec;
-                    if (step_sec == 0) step_sec = 86400;
-                    int max_rows = 10000000;
-                    while ((step_sec > 0 && t_cur <= t_end) ||
-                           (step_sec < 0 && t_cur >= t_end)) {
-                        if (--max_rows < 0) break;
-                        struct tm *cur_tm = localtime(&t_cur);
-                        char buf[32];
-                        if (c_start.type == COLUMN_TYPE_DATE)
-                            snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
-                                     cur_tm->tm_year + 1900, cur_tm->tm_mon + 1, cur_tm->tm_mday);
-                        else
-                            snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-                                     cur_tm->tm_year + 1900, cur_tm->tm_mon + 1, cur_tm->tm_mday,
-                                     cur_tm->tm_hour, cur_tm->tm_min, cur_tm->tm_sec);
-                        struct row r = {0};
-                        da_init(&r.cells);
-                        struct cell c = {0};
-                        c.type = c_start.type;
-                        c.value.as_text = strdup(buf);
-                        da_push(&r.cells, c);
-                        da_push(&gt.rows, r);
-                        t_cur += step_sec;
+                    int64_t step_approx = interval_to_usec_approx(ts_step_iv);
+                    if (step_approx == 0) ts_step_iv = (struct interval){0, 1, 0};
+                    step_approx = interval_to_usec_approx(ts_step_iv);
+
+                    if (c_start.type == COLUMN_TYPE_DATE) {
+                        int32_t cur = c_start.value.as_date;
+                        int32_t stop = c_stop.value.as_date;
+                        int max_rows = 10000000;
+                        while ((step_approx > 0 && cur <= stop) ||
+                               (step_approx < 0 && cur >= stop)) {
+                            if (--max_rows < 0) break;
+                            struct row r = {0};
+                            da_init(&r.cells);
+                            struct cell c = {0};
+                            c.type = COLUMN_TYPE_DATE;
+                            c.value.as_date = cur;
+                            da_push(&r.cells, c);
+                            da_push(&gt.rows, r);
+                            cur = date_add_interval(cur, ts_step_iv);
+                        }
+                    } else {
+                        int64_t cur = c_start.value.as_timestamp;
+                        int64_t stop = c_stop.value.as_timestamp;
+                        int max_rows = 10000000;
+                        while ((step_approx > 0 && cur <= stop) ||
+                               (step_approx < 0 && cur >= stop)) {
+                            if (--max_rows < 0) break;
+                            struct row r = {0};
+                            da_init(&r.cells);
+                            struct cell c = {0};
+                            c.type = c_start.type;
+                            c.value.as_timestamp = cur;
+                            da_push(&r.cells, c);
+                            da_push(&gt.rows, r);
+                            cur = timestamp_add_interval(cur, ts_step_iv);
+                        }
                     }
                 } else {
                     /* integer series */
