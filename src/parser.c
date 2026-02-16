@@ -4292,7 +4292,7 @@ static int parse_insert(struct lexer *l, struct query *out)
     for (;;) {
         struct row r = {0};
         if (parse_value_tuple(l, &r, &out->arena) != 0) {
-            row_free(&r);
+            da_free(&r.cells); /* text values are bump-allocated, don't free() them */
             return -1;
         }
         arena_push_row(&out->arena, r);

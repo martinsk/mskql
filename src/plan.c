@@ -1208,46 +1208,117 @@ static size_t jc_elem_size(enum column_type ct)
     return sizeof(int32_t); /* INT, BOOLEAN, etc. */
 }
 
-/* Helper: copy data from heap cache array into col_block's fixed union array */
-static void jc_copy_to_colblock(struct col_block *dst, void *src_data,
-                                 uint8_t *src_nulls, enum column_type ct,
-                                 uint32_t nrows)
+/* ---- flat_col helpers for hash join build side ---- */
+
+static void flat_col_init(struct flat_col *fc, enum column_type type,
+                          uint32_t cap, struct bump_alloc *scratch)
 {
-    dst->type = ct;
-    dst->count = (uint16_t)(nrows < BLOCK_CAPACITY ? nrows : BLOCK_CAPACITY);
-    size_t esz = jc_elem_size(ct);
-    memcpy(dst->nulls, src_nulls, nrows);
-    /* Copy into the union — the col_block is bump-allocated with enough space
-     * because hash_join_build already uses indices > BLOCK_CAPACITY */
-    if (column_type_is_text(ct))
-        memcpy(dst->data.str, src_data, esz * nrows);
-    else if (ct == COLUMN_TYPE_SMALLINT)
-        memcpy(dst->data.i16, src_data, esz * nrows);
-    else if (ct == COLUMN_TYPE_BIGINT)
-        memcpy(dst->data.i64, src_data, esz * nrows);
-    else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
-        memcpy(dst->data.f64, src_data, esz * nrows);
-    else
-        memcpy(dst->data.i32, src_data, esz * nrows);
+    fc->type = type;
+    fc->nulls = (uint8_t *)bump_calloc(scratch, cap, 1);
+    fc->data = bump_calloc(scratch, cap, jc_elem_size(type));
 }
 
-/* Helper: copy data from col_block's union array to heap cache array */
-static void *jc_copy_from_colblock(const struct col_block *src, uint32_t nrows)
+static void flat_col_grow(struct flat_col *fc, uint32_t old_cap, uint32_t new_cap,
+                          struct bump_alloc *scratch)
 {
-    size_t esz = jc_elem_size(src->type);
-    void *dst = malloc(esz * nrows);
-    if (!dst) return NULL;
-    if (column_type_is_text(src->type))
-        memcpy(dst, src->data.str, esz * nrows);
-    else if (src->type == COLUMN_TYPE_SMALLINT)
-        memcpy(dst, src->data.i16, esz * nrows);
-    else if (src->type == COLUMN_TYPE_BIGINT)
-        memcpy(dst, src->data.i64, esz * nrows);
-    else if (src->type == COLUMN_TYPE_FLOAT || src->type == COLUMN_TYPE_NUMERIC)
-        memcpy(dst, src->data.f64, esz * nrows);
-    else
-        memcpy(dst, src->data.i32, esz * nrows);
-    return dst;
+    size_t esz = jc_elem_size(fc->type);
+    uint8_t *new_nulls = (uint8_t *)bump_calloc(scratch, new_cap, 1);
+    void *new_data = bump_calloc(scratch, new_cap, esz);
+    memcpy(new_nulls, fc->nulls, old_cap);
+    memcpy(new_data, fc->data, old_cap * esz);
+    fc->nulls = new_nulls;
+    fc->data = new_data;
+}
+
+static void flat_col_set_from_cb(struct flat_col *fc, uint32_t dst_i,
+                                  const struct col_block *src, uint16_t src_i)
+{
+    fc->nulls[dst_i] = src->nulls[src_i];
+    switch (fc->type) {
+    case COLUMN_TYPE_SMALLINT: ((int16_t *)fc->data)[dst_i] = src->data.i16[src_i]; break;
+    case COLUMN_TYPE_BIGINT:   ((int64_t *)fc->data)[dst_i] = src->data.i64[src_i]; break;
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:  ((double *)fc->data)[dst_i] = src->data.f64[src_i]; break;
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:     ((char **)fc->data)[dst_i] = src->data.str[src_i]; break;
+    case COLUMN_TYPE_INT:
+    case COLUMN_TYPE_BOOLEAN:
+    default:                   ((int32_t *)fc->data)[dst_i] = src->data.i32[src_i]; break;
+    }
+}
+
+static uint32_t flat_col_hash(const struct flat_col *fc, uint32_t idx)
+{
+    if (fc->nulls[idx]) return 0x9e3779b9u;
+    uint32_t h = 2166136261u;
+    if (column_type_is_text(fc->type)) {
+        const char *s = ((const char **)fc->data)[idx];
+        if (s) for (; *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; }
+    } else {
+        size_t esz = jc_elem_size(fc->type);
+        const uint8_t *p = (const uint8_t *)fc->data + idx * esz;
+        for (size_t i = 0; i < esz; i++) { h ^= p[i]; h *= 16777619u; }
+    }
+    return h;
+}
+
+static int flat_col_eq(const struct flat_col *a, uint32_t ai,
+                       const struct col_block *b, uint16_t bi)
+{
+    if (a->nulls[ai] != b->nulls[bi]) return 0;
+    if (a->nulls[ai]) return 1;
+    switch (a->type) {
+    case COLUMN_TYPE_SMALLINT: return ((int16_t *)a->data)[ai] == b->data.i16[bi];
+    case COLUMN_TYPE_BIGINT:   return ((int64_t *)a->data)[ai] == b->data.i64[bi];
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:  return ((double *)a->data)[ai] == b->data.f64[bi];
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID: {
+        const char *sa = ((const char **)a->data)[ai];
+        const char *sb = b->data.str[bi];
+        if (!sa && !sb) return 1;
+        if (!sa || !sb) return 0;
+        return strcmp(sa, sb) == 0;
+    }
+    case COLUMN_TYPE_INT:
+    case COLUMN_TYPE_BOOLEAN:
+    default: return ((int32_t *)a->data)[ai] == b->data.i32[bi];
+    }
+}
+
+static void flat_col_copy_to_out(const struct flat_col *fc, uint32_t src_i,
+                                  struct col_block *dst, uint16_t dst_i)
+{
+    dst->nulls[dst_i] = fc->nulls[src_i];
+    switch (fc->type) {
+    case COLUMN_TYPE_SMALLINT: dst->data.i16[dst_i] = ((int16_t *)fc->data)[src_i]; break;
+    case COLUMN_TYPE_BIGINT:   dst->data.i64[dst_i] = ((int64_t *)fc->data)[src_i]; break;
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:  dst->data.f64[dst_i] = ((double *)fc->data)[src_i]; break;
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:     dst->data.str[dst_i] = ((char **)fc->data)[src_i]; break;
+    case COLUMN_TYPE_INT:
+    case COLUMN_TYPE_BOOLEAN:
+    default:                   dst->data.i32[dst_i] = ((int32_t *)fc->data)[src_i]; break;
+    }
 }
 
 /* Restore hash join state from a table's join_cache into bump-allocated state */
@@ -1258,11 +1329,16 @@ static int hash_join_restore_from_cache(struct plan_exec_ctx *ctx,
     st->build_ncols = jc->ncols;
     st->build_count = jc->nrows;
     st->build_cap = jc->nrows;
-    st->build_cols = (struct col_block *)bump_calloc(&ctx->arena->scratch,
-                                                     jc->ncols, sizeof(struct col_block));
-    for (uint16_t c = 0; c < jc->ncols; c++)
-        jc_copy_to_colblock(&st->build_cols[c], jc->col_data[c], jc->col_nulls[c],
-                            jc->col_types[c], jc->nrows);
+    st->build_cols = (struct flat_col *)bump_calloc(&ctx->arena->scratch,
+                                                    jc->ncols, sizeof(struct flat_col));
+    for (uint16_t c = 0; c < jc->ncols; c++) {
+        st->build_cols[c].type = jc->col_types[c];
+        size_t esz = jc_elem_size(jc->col_types[c]);
+        st->build_cols[c].nulls = (uint8_t *)bump_alloc(&ctx->arena->scratch, jc->nrows);
+        memcpy(st->build_cols[c].nulls, jc->col_nulls[c], jc->nrows);
+        st->build_cols[c].data = bump_alloc(&ctx->arena->scratch, esz * jc->nrows);
+        memcpy(st->build_cols[c].data, jc->col_data[c], esz * jc->nrows);
+    }
 
     /* Restore hash table */
     st->ht.nbuckets = jc->nbuckets;
@@ -1309,7 +1385,9 @@ static void hash_join_save_to_cache(struct hash_join_state *st,
 
     for (uint16_t c = 0; c < st->build_ncols; c++) {
         jc->col_types[c] = st->build_cols[c].type;
-        jc->col_data[c] = jc_copy_from_colblock(&st->build_cols[c], st->build_count);
+        size_t esz = jc_elem_size(st->build_cols[c].type);
+        jc->col_data[c] = malloc(esz * st->build_count);
+        memcpy(jc->col_data[c], st->build_cols[c].data, esz * st->build_count);
         jc->col_nulls[c] = (uint8_t *)malloc(st->build_count);
         memcpy(jc->col_nulls[c], st->build_cols[c].nulls, st->build_count);
     }
@@ -1347,31 +1425,35 @@ static void hash_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
     if (inner->op == PLAN_SEQ_SCAN) inner_ncols = inner->seq_scan.ncols;
     else inner_ncols = 16; /* fallback estimate */
 
-    /* Collect all rows from inner side into col_blocks */
+    /* Collect all rows from inner side into flat columns */
     uint32_t cap = 1024;
     st->build_ncols = inner_ncols;
-    st->build_cols = (struct col_block *)bump_calloc(&ctx->arena->scratch,
-                                                     inner_ncols, sizeof(struct col_block));
+    st->build_cols = (struct flat_col *)bump_calloc(&ctx->arena->scratch,
+                                                    inner_ncols, sizeof(struct flat_col));
     st->build_cap = cap;
     st->build_count = 0;
+    int types_inited = 0;
 
     struct row_block inner_block;
     row_block_alloc(&inner_block, inner_ncols, &ctx->arena->scratch);
 
     while (plan_next_block(ctx, pn->right, &inner_block) == 0) {
         uint16_t active = row_block_active_count(&inner_block);
-        /* Grow build col_blocks if needed */
+
+        /* Init flat_col types from first block */
+        if (!types_inited && active > 0) {
+            for (uint16_t c = 0; c < inner_ncols; c++)
+                flat_col_init(&st->build_cols[c], inner_block.cols[c].type,
+                              cap, &ctx->arena->scratch);
+            types_inited = 1;
+        }
+
+        /* Grow flat columns if needed */
         while (st->build_count + active > st->build_cap) {
-            uint32_t new_cap = st->build_cap * 2;
-            struct col_block *new_cols = (struct col_block *)bump_calloc(
-                &ctx->arena->scratch, inner_ncols, sizeof(struct col_block));
-            /* Copy existing data */
-            for (uint16_t c = 0; c < inner_ncols; c++) {
-                new_cols[c].type = st->build_cols[c].type;
-                new_cols[c].count = (uint16_t)st->build_count;
-                cb_bulk_copy(&new_cols[c], &st->build_cols[c], st->build_count);
-            }
-            st->build_cols = new_cols;
+            uint32_t old_cap = st->build_cap;
+            uint32_t new_cap = old_cap * 2;
+            for (uint16_t c = 0; c < inner_ncols; c++)
+                flat_col_grow(&st->build_cols[c], old_cap, new_cap, &ctx->arena->scratch);
             st->build_cap = new_cap;
         }
 
@@ -1379,13 +1461,8 @@ static void hash_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
         for (uint16_t i = 0; i < active; i++) {
             uint16_t ri = row_block_row_idx(&inner_block, i);
             uint32_t di = st->build_count++;
-            for (uint16_t c = 0; c < inner_ncols; c++) {
-                struct col_block *src_cb = &inner_block.cols[c];
-                struct col_block *dst_cb = &st->build_cols[c];
-                if (di == 0) dst_cb->type = src_cb->type;
-                cb_copy_value(dst_cb, di, src_cb, ri);
-                dst_cb->count = (uint16_t)(di + 1);
-            }
+            for (uint16_t c = 0; c < inner_ncols; c++)
+                flat_col_set_from_cb(&st->build_cols[c], di, &inner_block.cols[c], ri);
         }
         row_block_reset(&inner_block);
     }
@@ -1394,9 +1471,9 @@ static void hash_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
     block_ht_init(&st->ht, st->build_count > 0 ? st->build_count : 1,
                   &ctx->arena->scratch);
 
-    struct col_block *key_cb = &st->build_cols[key_col];
+    struct flat_col *key_fc = &st->build_cols[key_col];
     for (uint32_t i = 0; i < st->build_count; i++) {
-        uint32_t h = block_hash_cell(key_cb, (uint16_t)i);
+        uint32_t h = flat_col_hash(key_fc, i);
         uint32_t bucket = h & (st->ht.nbuckets - 1);
         st->ht.hashes[i] = h;
         st->ht.nexts[i] = st->ht.buckets[bucket];
@@ -1440,7 +1517,7 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     int outer_key = pn->hash_join.outer_key_col;
     int inner_key = pn->hash_join.inner_key_col;
     struct col_block *outer_key_cb = &outer_block.cols[outer_key];
-    struct col_block *inner_key_cb = &st->build_cols[inner_key];
+    struct flat_col *inner_key_fc = &st->build_cols[inner_key];
 
     row_block_reset(out);
     uint16_t out_count = 0;
@@ -1456,7 +1533,7 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
         while (entry != IDX_NONE && entry != 0xFFFFFFFF && out_count < BLOCK_CAPACITY) {
             if (st->ht.hashes[entry] == h &&
-                block_cell_eq(outer_key_cb, oi, inner_key_cb, (uint16_t)entry)) {
+                flat_col_eq(inner_key_fc, entry, outer_key_cb, oi)) {
                 /* Match: emit combined row [outer cols | inner cols] */
                 for (uint16_t c = 0; c < outer_ncols; c++) {
                     out->cols[c].type = outer_block.cols[c].type;
@@ -1464,8 +1541,8 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
                 for (uint16_t c = 0; c < st->build_ncols; c++) {
                     out->cols[outer_ncols + c].type = st->build_cols[c].type;
-                    cb_copy_value(&out->cols[outer_ncols + c], out_count,
-                                  &st->build_cols[c], (uint16_t)entry);
+                    flat_col_copy_to_out(&st->build_cols[c], entry,
+                                         &out->cols[outer_ncols + c], out_count);
                 }
                 out_count++;
             }
@@ -1515,10 +1592,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
     /* Phase 1: consume all input blocks */
     if (!st->input_done) {
-        struct plan_node *child = &PLAN_NODE(ctx->arena, pn->left);
-        uint16_t child_ncols = 0;
-        if (child->op == PLAN_SEQ_SCAN) child_ncols = child->seq_scan.ncols;
-        else child_ncols = pn->hash_agg.ngroup_cols; /* minimum */
+        uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
 
         struct row_block input;
         row_block_alloc(&input, child_ncols, &ctx->arena->scratch);
@@ -1566,6 +1640,62 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
 
                 if (group_idx == IDX_NONE) {
+                    /* Resize if at capacity */
+                    if (st->ngroups >= st->group_cap) {
+                        uint32_t old_cap = st->group_cap;
+                        uint32_t new_cap = old_cap * 2;
+
+                        /* Grow accumulator arrays */
+                        #define GROW_ARR(type, field) do { \
+                            type *_new = (type *)bump_calloc(&ctx->arena->scratch, \
+                                (size_t)agg_n * new_cap, sizeof(type)); \
+                            for (uint32_t _a = 0; _a < agg_n; _a++) \
+                                memcpy(_new + _a * new_cap, st->field + _a * old_cap, \
+                                       old_cap * sizeof(type)); \
+                            st->field = _new; \
+                        } while(0)
+                        GROW_ARR(double, sums);
+                        GROW_ARR(double, mins);
+                        GROW_ARR(double, maxs);
+                        GROW_ARR(size_t, nonnull);
+                        GROW_ARR(int, minmax_init);
+                        #undef GROW_ARR
+
+                        size_t *new_counts = (size_t *)bump_calloc(&ctx->arena->scratch,
+                            new_cap, sizeof(size_t));
+                        memcpy(new_counts, st->grp_counts, old_cap * sizeof(size_t));
+                        st->grp_counts = new_counts;
+
+                        /* Grow group key col_blocks — allocate fresh and bulk copy */
+                        struct col_block *new_keys = (struct col_block *)bump_calloc(
+                            &ctx->arena->scratch, ngrp, sizeof(struct col_block));
+                        for (uint16_t g = 0; g < ngrp; g++) {
+                            new_keys[g].type = st->group_keys[g].type;
+                            new_keys[g].count = (uint16_t)(old_cap < BLOCK_CAPACITY ? old_cap : BLOCK_CAPACITY);
+                            cb_bulk_copy(&new_keys[g], &st->group_keys[g], old_cap < BLOCK_CAPACITY ? old_cap : BLOCK_CAPACITY);
+                        }
+                        st->group_keys = new_keys;
+
+                        /* Rebuild hash table with new capacity */
+                        block_ht_init(&st->ht, new_cap, &ctx->arena->scratch);
+                        for (uint32_t gi = 0; gi < st->ngroups; gi++) {
+                            uint32_t gh = 2166136261u;
+                            for (uint16_t g = 0; g < ngrp; g++) {
+                                gh ^= block_hash_cell(&st->group_keys[g], (uint16_t)gi);
+                                gh *= 16777619u;
+                            }
+                            st->ht.hashes[gi] = gh;
+                            uint32_t gb = gh & (st->ht.nbuckets - 1);
+                            st->ht.nexts[gi] = st->ht.buckets[gb];
+                            st->ht.buckets[gb] = gi;
+                            st->ht.count++;
+                        }
+
+                        st->group_cap = new_cap;
+                        /* Recompute bucket for current row after rehash */
+                        bucket = h & (st->ht.nbuckets - 1);
+                    }
+
                     /* New group */
                     group_idx = st->ngroups++;
                     /* Store group key values */
@@ -1704,10 +1834,22 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         ? (int32_t)st->grp_counts[g]
                         : (int32_t)st->nonnull[idx];
                     break;
-                case AGG_SUM:
+                case AGG_SUM: {
+                    /* Determine source column type for correct output type */
+                    int src_col = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
+                    int src_is_float = 0;
+                    if (src_col >= 0 && pn->hash_agg.table) {
+                        enum column_type sct = pn->hash_agg.table->columns.items[src_col].type;
+                        if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
+                            src_is_float = 1;
+                    }
                     if (st->nonnull[idx] == 0) {
-                        dst->type = COLUMN_TYPE_BIGINT;
+                        dst->type = src_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_BIGINT;
                         dst->nulls[out_count] = 1;
+                    } else if (src_is_float) {
+                        dst->type = COLUMN_TYPE_FLOAT;
+                        dst->nulls[out_count] = 0;
+                        dst->data.f64[out_count] = st->sums[idx];
                     } else {
                         double sv = st->sums[idx];
                         if (sv == (double)(int32_t)sv && sv >= -2147483648.0 && sv <= 2147483647.0) {
@@ -1721,6 +1863,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         }
                     }
                     break;
+                }
                 case AGG_AVG:
                     dst->type = COLUMN_TYPE_FLOAT;
                     if (st->nonnull[idx] == 0) {
@@ -1731,17 +1874,30 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     }
                     break;
                 case AGG_MIN:
-                case AGG_MAX:
+                case AGG_MAX: {
+                    double mv = ae->func == AGG_MIN ? st->mins[idx] : st->maxs[idx];
+                    int src_col_mm = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
+                    enum column_type src_type_mm = COLUMN_TYPE_INT;
+                    if (src_col_mm >= 0 && pn->hash_agg.table)
+                        src_type_mm = pn->hash_agg.table->columns.items[src_col_mm].type;
                     if (st->nonnull[idx] == 0) {
-                        dst->type = COLUMN_TYPE_INT;
+                        dst->type = src_type_mm;
                         dst->nulls[out_count] = 1;
+                    } else if (src_type_mm == COLUMN_TYPE_FLOAT || src_type_mm == COLUMN_TYPE_NUMERIC) {
+                        dst->type = COLUMN_TYPE_FLOAT;
+                        dst->nulls[out_count] = 0;
+                        dst->data.f64[out_count] = mv;
+                    } else if (src_type_mm == COLUMN_TYPE_BIGINT) {
+                        dst->type = COLUMN_TYPE_BIGINT;
+                        dst->nulls[out_count] = 0;
+                        dst->data.i64[out_count] = (int64_t)mv;
                     } else {
                         dst->type = COLUMN_TYPE_INT;
                         dst->nulls[out_count] = 0;
-                        dst->data.i32[out_count] = (int32_t)(ae->func == AGG_MIN
-                            ? st->mins[idx] : st->maxs[idx]);
+                        dst->data.i32[out_count] = (int32_t)mv;
                     }
                     break;
+                }
                 case AGG_STRING_AGG:
                 case AGG_ARRAY_AGG:
                     /* not supported in plan executor — fall back to legacy path */
@@ -3863,21 +4019,134 @@ static uint32_t append_sort_node(uint32_t current, struct query_arena *arena,
 
 /* ---- Plan builder: join path ---- */
 
-/* Try to build a plan for a single equi-join query.
+/* Build a lightweight merged table descriptor on the bump allocator for
+ * eval_expr column resolution across multiple joined tables.
+ * Column names are bump-allocated strings: both "alias.col" qualified names
+ * and bare "col" names are added so eval_expr can resolve either form.
+ * The table has no rows — only column metadata for name lookup. */
+static struct table *build_merged_table_desc(struct table **tables, int ntables,
+                                              sv *aliases, uint16_t cum_cols,
+                                              struct query_arena *arena)
+{
+    struct table *mt = (struct table *)bump_calloc(&arena->scratch, 1, sizeof(struct table));
+    mt->columns.items = (struct column *)bump_calloc(&arena->scratch, cum_cols, sizeof(struct column));
+    mt->columns.count = cum_cols;
+    mt->columns.capacity = cum_cols;
+
+    size_t ci = 0;
+    for (int ti = 0; ti < ntables; ti++) {
+        sv alias = aliases[ti];
+        for (size_t c = 0; c < tables[ti]->columns.count; c++) {
+            const char *base = tables[ti]->columns.items[c].name;
+            size_t base_len = strlen(base);
+            if (alias.len > 0) {
+                /* "alias.col" qualified name */
+                size_t qlen = alias.len + 1 + base_len + 1;
+                char *qname = (char *)bump_alloc(&arena->scratch, qlen);
+                memcpy(qname, alias.data, alias.len);
+                qname[alias.len] = '.';
+                memcpy(qname + alias.len + 1, base, base_len);
+                qname[qlen - 1] = '\0';
+                mt->columns.items[ci].name = qname;
+            } else {
+                /* bare column name (bump-copy) */
+                char *name = (char *)bump_alloc(&arena->scratch, base_len + 1);
+                memcpy(name, base, base_len + 1);
+                mt->columns.items[ci].name = name;
+            }
+            mt->columns.items[ci].type = tables[ti]->columns.items[c].type;
+            ci++;
+        }
+    }
+    return mt;
+}
+
+/* Find a column name in the merged column space of multiple tables.
+ * tables[0..ntables-1] are the tables, offsets[0..ntables-1] are the
+ * cumulative column offsets.  Returns the merged column index, or -1. */
+static int find_col_in_tables(sv col, struct table **tables, uint16_t *offsets,
+                              int ntables)
+{
+    /* Strip table alias prefix (e.g. "o.customer_id" → "customer_id") */
+    sv bare = col;
+    for (size_t p = 0; p < col.len; p++)
+        if (col.data[p] == '.') { bare = sv_from(col.data + p + 1, col.len - p - 1); break; }
+
+    for (int ti = 0; ti < ntables; ti++) {
+        int ci = table_find_column_sv(tables[ti], bare);
+        if (ci >= 0) return offsets[ti] + ci;
+        /* Also try with full qualified name against table name prefix */
+        if (bare.data != col.data) {
+            ci = table_find_column_sv(tables[ti], col);
+            if (ci >= 0) return offsets[ti] + ci;
+        }
+    }
+    return -1;
+}
+
+/* Extract equi-join key columns from a join_info.
+ * On success, sets *outer_key (index in left table) and *inner_key (index in right table).
+ * Returns 0 on success, -1 on failure. */
+static int extract_join_keys(struct join_info *ji, struct query_arena *arena,
+                             struct table **left_tables, uint16_t *left_offsets, int left_ntables,
+                             struct table *right_table,
+                             int *outer_key, int *inner_key)
+{
+    if (ji->join_on_cond != IDX_NONE) {
+        struct condition *cond = &COND(arena, ji->join_on_cond);
+        if (cond->type != COND_COMPARE || cond->op != CMP_EQ) return -1;
+        if (cond->lhs_expr != IDX_NONE) return -1;
+        if (cond->column.len == 0 || cond->rhs_column.len == 0) return -1;
+
+        int lhs_left = find_col_in_tables(cond->column, left_tables, left_offsets, left_ntables);
+        int lhs_right = table_find_column_sv(right_table, cond->column);
+        int rhs_left = find_col_in_tables(cond->rhs_column, left_tables, left_offsets, left_ntables);
+        int rhs_right = table_find_column_sv(right_table, cond->rhs_column);
+
+        /* Strip prefix for right-table lookup */
+        if (lhs_right < 0) {
+            sv bare = cond->column;
+            for (size_t p = 0; p < cond->column.len; p++)
+                if (cond->column.data[p] == '.') { bare = sv_from(cond->column.data + p + 1, cond->column.len - p - 1); break; }
+            lhs_right = table_find_column_sv(right_table, bare);
+        }
+        if (rhs_right < 0) {
+            sv bare = cond->rhs_column;
+            for (size_t p = 0; p < cond->rhs_column.len; p++)
+                if (cond->rhs_column.data[p] == '.') { bare = sv_from(cond->rhs_column.data + p + 1, cond->rhs_column.len - p - 1); break; }
+            rhs_right = table_find_column_sv(right_table, bare);
+        }
+
+        if (lhs_left >= 0 && rhs_right >= 0) {
+            *outer_key = lhs_left; *inner_key = rhs_right; return 0;
+        } else if (rhs_left >= 0 && lhs_right >= 0) {
+            *outer_key = rhs_left; *inner_key = lhs_right; return 0;
+        }
+        return -1;
+    } else if (ji->join_left_col.len > 0 && ji->join_right_col.len > 0 &&
+               ji->join_op == CMP_EQ) {
+        int left_l = find_col_in_tables(ji->join_left_col, left_tables, left_offsets, left_ntables);
+        int left_r = table_find_column_sv(right_table, ji->join_left_col);
+        int right_l = find_col_in_tables(ji->join_right_col, left_tables, left_offsets, left_ntables);
+        int right_r = table_find_column_sv(right_table, ji->join_right_col);
+        if (left_l >= 0 && right_r >= 0) {
+            *outer_key = left_l; *inner_key = right_r; return 0;
+        } else if (right_l >= 0 && left_r >= 0) {
+            *outer_key = right_l; *inner_key = left_r; return 0;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+/* Try to build a plan for a join query (single or multi-table).
+ * Supports: INNER equi-joins, post-join GROUP BY + aggregates, ORDER BY.
  * Returns root plan node index, or IDX_NONE if the query is too complex. */
 static uint32_t build_join(struct table *t, struct query_select *s,
                             struct query_arena *arena, struct database *db)
 {
-    struct join_info *ji = &arena->joins.items[s->joins_start];
-    /* Only handle: INNER JOIN, equi-join (CMP_EQ), not LATERAL, not NATURAL, not USING */
-    if (ji->join_type != 0) return IDX_NONE;       /* not INNER */
-    if (ji->is_lateral)     return IDX_NONE;
-    if (ji->is_natural)     return IDX_NONE;
-    if (ji->has_using)      return IDX_NONE;
-    /* Bail out for complex queries on joined results */
+    /* Bail out for unsupported features */
     if (s->select_exprs_count > 0) return IDX_NONE; /* window functions */
-    if (s->has_group_by)        return IDX_NONE;
-    if (s->aggregates_count > 0) return IDX_NONE;
     if (s->has_set_op)          return IDX_NONE;
     if (s->ctes_count > 0)     return IDX_NONE;
     if (s->cte_sql != IDX_NONE) return IDX_NONE;
@@ -3885,119 +4154,243 @@ static uint32_t build_join(struct table *t, struct query_select *s,
     if (s->has_recursive_cte)   return IDX_NONE;
     if (s->has_distinct)        return IDX_NONE;
     if (s->has_distinct_on)     return IDX_NONE;
-    if (s->where.has_where)     return IDX_NONE;    /* WHERE on joined result — complex */
-    if (s->has_order_by)        return IDX_NONE;    /* ORDER BY on joined result — complex */
+    if (s->where.has_where)     return IDX_NONE;
     if (s->insert_rows_count > 0) return IDX_NONE;
+    if (s->has_having)          return IDX_NONE;
+    if (s->group_by_rollup || s->group_by_cube) return IDX_NONE;
 
     struct table *t1 = t;
     if (!t1) return IDX_NONE;
-    struct table *t2 = db_find_table_sv(db, ji->join_table);
-    if (!t2) return IDX_NONE;
-    if (t2->view_sql) return IDX_NONE; /* view — need materialization */
+    if (table_has_mixed_types(t1)) return IDX_NONE;
 
-    /* Extract join key columns — need simple equi-join on two column refs */
-    int t1_key = -1, t2_key = -1;
+    /* Collect all tables, aliases, and validate all joins are INNER equi-joins */
+    #define MAX_JOIN_TABLES 8
+    struct table *tables[MAX_JOIN_TABLES];
+    uint16_t offsets[MAX_JOIN_TABLES]; /* cumulative column offset per table */
+    sv aliases[MAX_JOIN_TABLES];       /* table aliases for eval_expr resolution */
+    int ntables = 0;
 
-    if (ji->join_on_cond != IDX_NONE) {
-        struct condition *cond = &COND(arena, ji->join_on_cond);
-        if (cond->type != COND_COMPARE || cond->op != CMP_EQ)
-            return IDX_NONE;
-        if (cond->lhs_expr != IDX_NONE) return IDX_NONE;
-        if (cond->column.len == 0 || cond->rhs_column.len == 0)
-            return IDX_NONE;
-        /* Try both orderings: col might be in t1 or t2 */
-        int lhs_in_t1 = table_find_column_sv(t1, cond->column);
-        int lhs_in_t2 = table_find_column_sv(t2, cond->column);
-        int rhs_in_t1 = table_find_column_sv(t1, cond->rhs_column);
-        int rhs_in_t2 = table_find_column_sv(t2, cond->rhs_column);
-        if (lhs_in_t1 >= 0 && rhs_in_t2 >= 0) {
-            t1_key = lhs_in_t1; t2_key = rhs_in_t2;
-        } else if (lhs_in_t2 >= 0 && rhs_in_t1 >= 0) {
-            t1_key = rhs_in_t1; t2_key = lhs_in_t2;
-        } else {
-            return IDX_NONE;
-        }
-    } else if (ji->join_left_col.len > 0 && ji->join_right_col.len > 0 &&
-               ji->join_op == CMP_EQ) {
-        int left_in_t1 = table_find_column_sv(t1, ji->join_left_col);
-        int left_in_t2 = table_find_column_sv(t2, ji->join_left_col);
-        int right_in_t1 = table_find_column_sv(t1, ji->join_right_col);
-        int right_in_t2 = table_find_column_sv(t2, ji->join_right_col);
-        if (left_in_t1 >= 0 && right_in_t2 >= 0) {
-            t1_key = left_in_t1; t2_key = right_in_t2;
-        } else if (left_in_t2 >= 0 && right_in_t1 >= 0) {
-            t1_key = right_in_t1; t2_key = left_in_t2;
-        } else {
-            return IDX_NONE;
-        }
-    } else {
-        return IDX_NONE;
+    tables[ntables] = t1;
+    offsets[ntables] = 0;
+    aliases[ntables] = s->table_alias;
+    ntables++;
+
+    uint16_t cum_cols = (uint16_t)t1->columns.count;
+
+    for (uint32_t j = 0; j < s->joins_count && ntables < MAX_JOIN_TABLES; j++) {
+        struct join_info *ji = &arena->joins.items[s->joins_start + j];
+        if (ji->join_type != 0) return IDX_NONE; /* not INNER */
+        if (ji->is_lateral)     return IDX_NONE;
+        if (ji->is_natural)     return IDX_NONE;
+        if (ji->has_using)      return IDX_NONE;
+
+        struct table *tn = db_find_table_sv(db, ji->join_table);
+        if (!tn) return IDX_NONE;
+        if (tn->view_sql) return IDX_NONE;
+        if (table_has_mixed_types(tn)) return IDX_NONE;
+
+        tables[ntables] = tn;
+        offsets[ntables] = cum_cols;
+        aliases[ntables] = ji->join_alias;
+        ntables++;
+        cum_cols += (uint16_t)tn->columns.count;
     }
 
-    /* Resolve projection columns across merged column space [t1 cols | t2 cols] */
-    uint16_t t1_ncols = (uint16_t)t1->columns.count;
+    /* Extract join keys for each join */
+    int outer_keys[MAX_JOIN_TABLES];
+    int inner_keys[MAX_JOIN_TABLES];
+    for (uint32_t j = 0; j < s->joins_count; j++) {
+        struct join_info *ji = &arena->joins.items[s->joins_start + j];
+        if (extract_join_keys(ji, arena, tables, offsets, (int)(j + 1),
+                              tables[j + 1], &outer_keys[j], &inner_keys[j]) != 0)
+            return IDX_NONE;
+    }
+
+    /* --- Resolve post-join operations --- */
+
+    int has_agg = (s->has_group_by && s->aggregates_count > 0);
     int select_all_join = sv_eq_cstr(s->columns, "*");
+
+    /* If we have aggregates, validate them */
+    int *agg_col_idxs = NULL;
+    int *grp_col_idxs = NULL;
+    if (has_agg) {
+        /* Validate aggregates */
+        agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
+        for (uint32_t a = 0; a < s->aggregates_count; a++) {
+            struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+            if (ae->func == AGG_STRING_AGG || ae->func == AGG_ARRAY_AGG || ae->func == AGG_NONE)
+                return IDX_NONE;
+            if (ae->has_distinct) return IDX_NONE;
+            if (ae->expr_idx != IDX_NONE) {
+                agg_col_idxs[a] = -2; /* expression-based aggregate */
+            } else if (sv_eq_cstr(ae->column, "*")) {
+                agg_col_idxs[a] = -1; /* COUNT(*) */
+            } else {
+                int ci = find_col_in_tables(ae->column, tables, offsets, ntables);
+                if (ci < 0) return IDX_NONE;
+                if ((ae->func == AGG_MIN || ae->func == AGG_MAX) &&
+                    ci < cum_cols) {
+                    /* Find the actual table and column to check type */
+                    for (int ti = ntables - 1; ti >= 0; ti--) {
+                        if (ci >= offsets[ti]) {
+                            int local = ci - offsets[ti];
+                            if (column_type_is_text(tables[ti]->columns.items[local].type))
+                                return IDX_NONE;
+                            break;
+                        }
+                    }
+                }
+                agg_col_idxs[a] = ci;
+            }
+        }
+
+        /* Validate GROUP BY columns */
+        grp_col_idxs = (int *)bump_alloc(&arena->scratch, s->group_by_count * sizeof(int));
+        for (uint32_t g = 0; g < s->group_by_count; g++) {
+            sv gcol = arena->svs.items[s->group_by_start + g];
+            grp_col_idxs[g] = find_col_in_tables(gcol, tables, offsets, ntables);
+            if (grp_col_idxs[g] < 0) return IDX_NONE;
+        }
+    }
+
+    /* Resolve projection if no aggregates */
     int need_project_join = 0;
     int *proj_map_join = NULL;
     uint16_t proj_ncols_join = 0;
 
-    if (select_all_join) {
-        /* No projection — return all columns from both tables */
-    } else if (s->parsed_columns_count > 0) {
-        proj_ncols_join = (uint16_t)s->parsed_columns_count;
-        proj_map_join = (int *)bump_alloc(&arena->scratch, proj_ncols_join * sizeof(int));
-        for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
-            struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
-            if (sc->expr_idx == IDX_NONE) return IDX_NONE;
-            struct expr *e = &EXPR(arena, sc->expr_idx);
-            if (e->type != EXPR_COLUMN_REF) return IDX_NONE;
-            /* Try to find in t1 first, then t2 (with offset) */
-            int ci = table_find_column_sv(t1, e->column_ref.column);
-            if (ci >= 0) {
+    if (!has_agg) {
+        if (s->has_order_by) return IDX_NONE; /* ORDER BY without agg not yet supported */
+        if (select_all_join) {
+            /* No projection */
+        } else if (s->parsed_columns_count > 0) {
+            proj_ncols_join = (uint16_t)s->parsed_columns_count;
+            proj_map_join = (int *)bump_alloc(&arena->scratch, proj_ncols_join * sizeof(int));
+            for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+                struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
+                if (sc->expr_idx == IDX_NONE) return IDX_NONE;
+                struct expr *e = &EXPR(arena, sc->expr_idx);
+                if (e->type != EXPR_COLUMN_REF) return IDX_NONE;
+                int ci = find_col_in_tables(e->column_ref.column, tables, offsets, ntables);
+                if (ci < 0) return IDX_NONE;
                 proj_map_join[i] = ci;
-            } else {
-                ci = table_find_column_sv(t2, e->column_ref.column);
-                if (ci >= 0) {
-                    proj_map_join[i] = t1_ncols + ci;
-                } else {
-                    return IDX_NONE;
-                }
             }
+            need_project_join = 1;
+        } else {
+            return IDX_NONE;
         }
-        need_project_join = 1;
-    } else {
-        return IDX_NONE; /* legacy text-based column list */
     }
-
-    /* Bail out if either table has mixed cell types */
-    if (table_has_mixed_types(t1) || table_has_mixed_types(t2))
-        return IDX_NONE;
 
     /* --- All validation passed, build plan nodes --- */
 
-    /* SEQ_SCAN for t1 (outer / left / probe side) */
-    uint32_t scan1 = build_seq_scan(t1, arena);
+    /* Build left-deep hash join tree */
+    uint32_t current = build_seq_scan(tables[0], arena);
 
-    /* SEQ_SCAN for t2 (inner / right / build side) */
-    uint32_t scan2 = build_seq_scan(t2, arena);
+    for (uint32_t j = 0; j < s->joins_count; j++) {
+        uint32_t right_scan = build_seq_scan(tables[j + 1], arena);
 
-    /* HASH_JOIN node */
-    uint32_t join_idx = plan_alloc_node(arena, PLAN_HASH_JOIN);
-    PLAN_NODE(arena, join_idx).left = scan1;   /* outer (probe) */
-    PLAN_NODE(arena, join_idx).right = scan2;  /* inner (build) */
-    PLAN_NODE(arena, join_idx).hash_join.outer_key_col = t1_key;
-    PLAN_NODE(arena, join_idx).hash_join.inner_key_col = t2_key;
-    PLAN_NODE(arena, join_idx).hash_join.join_type = 0; /* INNER */
+        uint32_t join_idx = plan_alloc_node(arena, PLAN_HASH_JOIN);
+        PLAN_NODE(arena, join_idx).left = current;
+        PLAN_NODE(arena, join_idx).right = right_scan;
+        PLAN_NODE(arena, join_idx).hash_join.outer_key_col = outer_keys[j];
+        PLAN_NODE(arena, join_idx).hash_join.inner_key_col = inner_keys[j];
+        PLAN_NODE(arena, join_idx).hash_join.join_type = 0; /* INNER */
+        current = join_idx;
+    }
 
-    uint32_t current = join_idx;
+    if (has_agg) {
+        /* Append HASH_AGG node */
+        uint32_t agg_idx = plan_alloc_node(arena, PLAN_HASH_AGG);
+        PLAN_NODE(arena, agg_idx).left = current;
+        PLAN_NODE(arena, agg_idx).hash_agg.ngroup_cols = (uint16_t)s->group_by_count;
+        PLAN_NODE(arena, agg_idx).hash_agg.group_cols = grp_col_idxs;
+        PLAN_NODE(arena, agg_idx).hash_agg.agg_start = s->aggregates_start;
+        PLAN_NODE(arena, agg_idx).hash_agg.agg_count = s->aggregates_count;
+        PLAN_NODE(arena, agg_idx).hash_agg.agg_before_cols = s->agg_before_cols;
+        PLAN_NODE(arena, agg_idx).hash_agg.agg_col_indices = agg_col_idxs;
+        /* Build merged table descriptor for eval_expr column resolution */
+        PLAN_NODE(arena, agg_idx).hash_agg.table =
+            build_merged_table_desc(tables, ntables, aliases, cum_cols, arena);
+        current = agg_idx;
 
-    /* PROJECT node if specific columns selected */
-    if (need_project_join)
-        current = append_project_node(current, arena, proj_ncols_join, proj_map_join);
+        /* Append SORT if ORDER BY present */
+        if (s->has_order_by && s->order_by_count > 0) {
+            uint16_t ngrp = (uint16_t)s->group_by_count;
+            uint32_t agg_n = s->aggregates_count;
+            uint16_t agg_offset = s->agg_before_cols ? 0 : ngrp;
+            uint16_t grp_offset = s->agg_before_cols ? (uint16_t)agg_n : 0;
+
+            int sort_cols_buf[32];
+            int sort_descs_buf[32];
+            uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+            int sort_ok = 1;
+
+            for (uint16_t k = 0; k < sort_nord; k++) {
+                struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
+                sort_cols_buf[k] = -1;
+                sort_descs_buf[k] = obi->desc;
+
+                /* Match GROUP BY columns */
+                for (uint32_t g = 0; g < s->group_by_count; g++) {
+                    sv gcol = arena->svs.items[s->group_by_start + g];
+                    if (sv_eq_ignorecase(obi->column, gcol)) {
+                        sort_cols_buf[k] = (int)(grp_offset + g);
+                        break;
+                    }
+                    /* Strip prefixes and compare */
+                    sv bare_ord = obi->column, bare_grp = gcol;
+                    for (size_t p = 0; p < obi->column.len; p++)
+                        if (obi->column.data[p] == '.') { bare_ord = sv_from(obi->column.data + p + 1, obi->column.len - p - 1); break; }
+                    for (size_t p = 0; p < gcol.len; p++)
+                        if (gcol.data[p] == '.') { bare_grp = sv_from(gcol.data + p + 1, gcol.len - p - 1); break; }
+                    if (sv_eq_ignorecase(bare_ord, bare_grp)) {
+                        sort_cols_buf[k] = (int)(grp_offset + g);
+                        break;
+                    }
+                }
+
+                /* Match aggregate aliases or function names */
+                if (sort_cols_buf[k] < 0) {
+                    for (uint32_t a = 0; a < agg_n; a++) {
+                        struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+                        if (ae->alias.len > 0 && sv_eq_ignorecase(obi->column, ae->alias)) {
+                            sort_cols_buf[k] = (int)(agg_offset + a);
+                            break;
+                        }
+                        const char *fname = NULL;
+                        switch (ae->func) {
+                            case AGG_SUM:        fname = "sum";   break;
+                            case AGG_COUNT:      fname = "count"; break;
+                            case AGG_AVG:        fname = "avg";   break;
+                            case AGG_MIN:        fname = "min";   break;
+                            case AGG_MAX:        fname = "max";   break;
+                            case AGG_STRING_AGG: break;
+                            case AGG_ARRAY_AGG:  break;
+                            case AGG_NONE:       break;
+                        }
+                        if (fname && sv_eq_ignorecase(obi->column, sv_from_cstr(fname))) {
+                            sort_cols_buf[k] = (int)(agg_offset + a);
+                            break;
+                        }
+                    }
+                }
+
+                if (sort_cols_buf[k] < 0) { sort_ok = 0; break; }
+            }
+
+            if (sort_ok && sort_nord > 0)
+                current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, NULL, sort_nord);
+        }
+    } else {
+        /* No aggregates — just projection */
+        if (need_project_join)
+            current = append_project_node(current, arena, proj_ncols_join, proj_map_join);
+    }
 
     current = build_limit(current, s, arena);
 
     return current;
+    #undef MAX_JOIN_TABLES
 }
 
 /* ---- Plan builder: set operations path ---- */
@@ -4400,6 +4793,10 @@ static uint32_t build_aggregate(struct table *t, struct query_select *s,
         } else {
             int ci = table_find_column_sv(t, ae->column);
             if (ci < 0) { agg_ok = 0; break; }
+            /* MIN/MAX on TEXT columns can't use double-based accumulation */
+            if ((ae->func == AGG_MIN || ae->func == AGG_MAX) &&
+                column_type_is_text(t->columns.items[ci].type))
+                { agg_ok = 0; break; }
             agg_col_idxs[a] = ci;
         }
     }
@@ -4431,6 +4828,83 @@ static uint32_t build_aggregate(struct table *t, struct query_select *s,
     PLAN_NODE(arena, agg_idx).hash_agg.table = t;
 
     uint32_t current = agg_idx;
+
+    /* Add SORT node if ORDER BY is present */
+    if (s->has_order_by && s->order_by_count > 0) {
+        uint16_t ngrp = (uint16_t)s->group_by_count;
+        uint32_t agg_n = s->aggregates_count;
+        uint16_t agg_offset = s->agg_before_cols ? 0 : ngrp;
+        uint16_t grp_offset = s->agg_before_cols ? (uint16_t)agg_n : 0;
+
+        int sort_cols_buf[32];
+        int sort_descs_buf[32];
+        uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+        int sort_ok = 1;
+
+        for (uint16_t k = 0; k < sort_nord; k++) {
+            struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
+            sort_cols_buf[k] = -1;
+            sort_descs_buf[k] = obi->desc;
+
+            /* Try matching against GROUP BY column names */
+            for (uint32_t g = 0; g < s->group_by_count; g++) {
+                sv gcol = arena->svs.items[s->group_by_start + g];
+                if (sv_eq_ignorecase(obi->column, gcol)) {
+                    sort_cols_buf[k] = (int)(grp_offset + g);
+                    break;
+                }
+            }
+
+            /* Try matching against aggregate aliases or function names */
+            if (sort_cols_buf[k] < 0) {
+                for (uint32_t a = 0; a < agg_n; a++) {
+                    struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+                    if (ae->alias.len > 0 && sv_eq_ignorecase(obi->column, ae->alias)) {
+                        sort_cols_buf[k] = (int)(agg_offset + a);
+                        break;
+                    }
+                    /* Match bare function name: sum, count, avg, min, max */
+                    const char *fname = NULL;
+                    switch (ae->func) {
+                        case AGG_SUM:        fname = "sum";   break;
+                        case AGG_COUNT:      fname = "count"; break;
+                        case AGG_AVG:        fname = "avg";   break;
+                        case AGG_MIN:        fname = "min";   break;
+                        case AGG_MAX:        fname = "max";   break;
+                        case AGG_STRING_AGG: break;
+                        case AGG_ARRAY_AGG:  break;
+                        case AGG_NONE:       break;
+                    }
+                    if (fname && sv_eq_ignorecase(obi->column, sv_from_cstr(fname))) {
+                        sort_cols_buf[k] = (int)(agg_offset + a);
+                        break;
+                    }
+                }
+            }
+
+            /* Try matching GROUP BY column base names (strip table prefix) */
+            if (sort_cols_buf[k] < 0) {
+                sv bare_ord = obi->column;
+                for (size_t p = 0; p < obi->column.len; p++)
+                    if (obi->column.data[p] == '.') { bare_ord = sv_from(obi->column.data + p + 1, obi->column.len - p - 1); break; }
+                for (uint32_t g = 0; g < s->group_by_count; g++) {
+                    sv gcol = arena->svs.items[s->group_by_start + g];
+                    sv bare_grp = gcol;
+                    for (size_t p = 0; p < gcol.len; p++)
+                        if (gcol.data[p] == '.') { bare_grp = sv_from(gcol.data + p + 1, gcol.len - p - 1); break; }
+                    if (sv_eq_ignorecase(bare_ord, bare_grp)) {
+                        sort_cols_buf[k] = (int)(grp_offset + g);
+                        break;
+                    }
+                }
+            }
+
+            if (sort_cols_buf[k] < 0) { sort_ok = 0; break; }
+        }
+
+        if (sort_ok && sort_nord > 0)
+            current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, NULL, sort_nord);
+    }
 
     current = build_limit(current, s, arena);
 
@@ -4927,8 +5401,8 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         return current;
     }
 
-    /* ---- Single equi-join fast path ---- */
-    if (s->has_join && s->joins_count == 1 && db) {
+    /* ---- Join fast path (single or multi-table) ---- */
+    if (s->has_join && s->joins_count >= 1 && db) {
         uint32_t join_plan = build_join(t, s, arena, db);
         if (join_plan != IDX_NONE) return join_plan;
         return IDX_NONE;
@@ -4964,7 +5438,7 @@ uint32_t plan_build_select(struct table *t, struct query_select *s,
         s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
         !s->has_distinct && !s->has_distinct_on &&
         !s->group_by_rollup && !s->group_by_cube &&
-        !s->has_having && !s->has_order_by) {
+        !s->has_having) {
         uint32_t agg_plan = build_aggregate(t, s, arena);
         if (agg_plan != IDX_NONE) return agg_plan;
     }

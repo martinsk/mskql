@@ -146,13 +146,21 @@ struct filter_state {
     int dummy;
 };
 
+/* Flat column storage for hash join build side — no BLOCK_CAPACITY limit.
+ * Data arrays are bump-allocated and can grow via realloc-style copy. */
+struct flat_col {
+    enum column_type type;
+    uint8_t         *nulls;   /* bump: [cap] */
+    void            *data;    /* bump: int32_t[cap] / int64_t[cap] / double[cap] / char*[cap] */
+};
+
 struct hash_join_state {
     struct block_hash_table ht;
-    /* build-side rows stored as col_blocks */
-    struct col_block *build_cols;
+    /* build-side rows stored as flat columns (no BLOCK_CAPACITY limit) */
+    struct flat_col  *build_cols;
     uint16_t          build_ncols;
     uint32_t          build_count;   /* total rows in build side */
-    uint32_t          build_cap;     /* capacity of build col_blocks */
+    uint32_t          build_cap;     /* capacity of flat col arrays */
     /* probe state */
     int               build_done;
     size_t            probe_cursor;  /* for nested-loop fallback */
