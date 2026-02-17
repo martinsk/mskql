@@ -306,26 +306,58 @@ static inline int cmp_result_matches_op(int r, enum cmp_op op)
     case CMP_NOT_EXISTS:
     case CMP_REGEX_MATCH:
     case CMP_REGEX_NOT_MATCH:
+    case CMP_IS_NOT_TRUE:
+    case CMP_IS_NOT_FALSE:
         return 0;
     }
     return 0;
 }
 
+static double cell_to_double_val(const struct cell *c);
+
+/* Tri-state condition evaluation: -1 = UNKNOWN (NULL), 0 = false, 1 = true.
+ * SQL three-valued logic: NOT UNKNOWN = UNKNOWN, UNKNOWN AND x = UNKNOWN/false,
+ * UNKNOWN OR x = UNKNOWN/true. */
+static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
+                           struct row *row, struct table *t,
+                           struct database *db);
+
 int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                    struct row *row, struct table *t,
                    struct database *db)
 {
+    int r = eval_condition3(cond_idx, arena, row, t, db);
+    return r > 0 ? 1 : 0; /* collapse UNKNOWN (-1) to false */
+}
+
+static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
+                           struct row *row, struct table *t,
+                           struct database *db)
+{
     if (cond_idx == IDX_NONE) return 1;
     struct condition *cond = &COND(arena, cond_idx);
     switch (cond->type) {
-        case COND_AND:
-            return eval_condition(cond->left, arena, row, t, db) &&
-                   eval_condition(cond->right, arena, row, t, db);
-        case COND_OR:
-            return eval_condition(cond->left, arena, row, t, db) ||
-                   eval_condition(cond->right, arena, row, t, db);
-        case COND_NOT:
-            return !eval_condition(cond->left, arena, row, t, db);
+        case COND_AND: {
+            int l = eval_condition3(cond->left, arena, row, t, db);
+            if (l == 0) return 0; /* false AND x = false */
+            int r = eval_condition3(cond->right, arena, row, t, db);
+            if (r == 0) return 0; /* x AND false = false */
+            if (l < 0 || r < 0) return -1; /* UNKNOWN AND true = UNKNOWN */
+            return 1;
+        }
+        case COND_OR: {
+            int l = eval_condition3(cond->left, arena, row, t, db);
+            if (l > 0) return 1; /* true OR x = true */
+            int r = eval_condition3(cond->right, arena, row, t, db);
+            if (r > 0) return 1; /* x OR true = true */
+            if (l < 0 || r < 0) return -1; /* UNKNOWN OR false = UNKNOWN */
+            return 0;
+        }
+        case COND_NOT: {
+            int v = eval_condition3(cond->left, arena, row, t, db);
+            if (v < 0) return -1; /* NOT UNKNOWN = UNKNOWN */
+            return v ? 0 : 1;
+        }
         case COND_MULTI_IN: {
             /* multi-column IN: (a, b) IN ((1,2), (3,4)) */
             int width = cond->multi_tuple_width;
@@ -411,22 +443,39 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                 c = &row->cells.items[col_idx];
             }
             int cond_result = 0;
+            int lhs_is_null = c->is_null || (column_type_is_text(c->type) && !c->value.as_text);
             if (cond->op == CMP_IS_NULL) {
-                cond_result = c->is_null || (column_type_is_text(c->type)
-                       ? (c->value.as_text == NULL) : 0);
+                cond_result = lhs_is_null;
                 goto cond_cleanup;
             }
             if (cond->op == CMP_IS_NOT_NULL) {
-                cond_result = !c->is_null && (column_type_is_text(c->type)
-                       ? (c->value.as_text != NULL) : 1);
+                cond_result = !lhs_is_null;
+                goto cond_cleanup;
+            }
+            /* IS NOT TRUE: true when value is false or NULL */
+            if (cond->op == CMP_IS_NOT_TRUE) {
+                if (lhs_is_null) { cond_result = 1; goto cond_cleanup; }
+                /* treat non-boolean as truthy if non-zero */
+                if (c->type == COLUMN_TYPE_BOOLEAN)
+                    cond_result = !c->value.as_bool;
+                else
+                    cond_result = (cell_to_double_val(c) == 0.0);
+                goto cond_cleanup;
+            }
+            /* IS NOT FALSE: true when value is true or NULL */
+            if (cond->op == CMP_IS_NOT_FALSE) {
+                if (lhs_is_null) { cond_result = 1; goto cond_cleanup; }
+                if (c->type == COLUMN_TYPE_BOOLEAN)
+                    cond_result = c->value.as_bool;
+                else
+                    cond_result = (cell_to_double_val(c) != 0.0);
                 goto cond_cleanup;
             }
             /* IN / NOT IN */
             if (cond->op == CMP_IN || cond->op == CMP_NOT_IN) {
-                /* SQL standard: NULL IN (...) → UNKNOWN (false);
-                 * NULL NOT IN (...) → UNKNOWN (false) */
-                if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
-                    goto cond_cleanup;
+                /* SQL standard: NULL IN (...) → UNKNOWN;
+                 * NULL NOT IN (...) → UNKNOWN */
+                if (lhs_is_null) { cond_result = -1; goto cond_cleanup; }
                 int found = 0;
                 for (uint32_t i = 0; i < cond->in_values_count; i++) {
                     struct cell *iv = &ACELL(arena, cond->in_values_start + i);
@@ -439,6 +488,7 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
             }
             /* BETWEEN */
             if (cond->op == CMP_BETWEEN) {
+                if (lhs_is_null) { cond_result = -1; goto cond_cleanup; }
                 int lo = cell_compare(c, &cond->value);
                 int hi = cell_compare(c, &cond->between_high);
                 if (lo == -2 || hi == -2) goto cond_cleanup;
@@ -474,6 +524,7 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
             }
             /* LIKE / ILIKE */
             if (cond->op == CMP_LIKE || cond->op == CMP_ILIKE) {
+                if (lhs_is_null) { cond_result = -1; goto cond_cleanup; }
                 if (!column_type_is_text(c->type) || !c->value.as_text)
                     goto cond_cleanup;
                 if (!cond->value.value.as_text) goto cond_cleanup;
@@ -604,9 +655,8 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                 query_free(&sq);
                 goto cond_cleanup; /* subquery returned no rows or failed */
             }
-            /* SQL three-valued logic: any comparison with NULL → UNKNOWN (false) */
-            if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
-                goto cond_cleanup;
+            /* SQL three-valued logic: any comparison with NULL → UNKNOWN */
+            if (lhs_is_null) { cond_result = -1; goto cond_cleanup; }
             {
                 int r = cell_compare(c, &cond->value);
                 if (r != -2)
@@ -1631,6 +1681,55 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
 
     int use_float = (lhs.type == COLUMN_TYPE_FLOAT || rhs.type == COLUMN_TYPE_FLOAT ||
                      lhs.type == COLUMN_TYPE_NUMERIC || rhs.type == COLUMN_TYPE_NUMERIC);
+
+    /* BIGINT integer arithmetic: preserve precision for large integers */
+    int use_bigint = !use_float &&
+        (lhs.type == COLUMN_TYPE_BIGINT || rhs.type == COLUMN_TYPE_BIGINT);
+    if (use_bigint) {
+        long long la = (lhs.type == COLUMN_TYPE_BIGINT) ? lhs.value.as_bigint :
+                       (lhs.type == COLUMN_TYPE_INT) ? (long long)lhs.value.as_int :
+                       (long long)lhs.value.as_smallint;
+        long long ra = (rhs.type == COLUMN_TYPE_BIGINT) ? rhs.value.as_bigint :
+                       (rhs.type == COLUMN_TYPE_INT) ? (long long)rhs.value.as_int :
+                       (long long)rhs.value.as_smallint;
+        long long res = 0;
+        switch (e->binary.op) {
+        case OP_ADD: res = la + ra; break;
+        case OP_SUB: res = la - ra; break;
+        case OP_MUL: res = la * ra; break;
+        case OP_DIV:
+            if (ra == 0) {
+                cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+                arena_set_error(arena, "22012", "division by zero");
+                return cell_make_null();
+            }
+            res = la / ra; break;
+        case OP_MOD:
+            if (ra == 0) {
+                cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+                arena_set_error(arena, "22012", "division by zero");
+                return cell_make_null();
+            }
+            res = la % ra; break;
+        case OP_EXP: {
+            cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+            return cell_make_float(pow((double)la, (double)ra));
+        }
+        case OP_EQ: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(la == ra); }
+        case OP_NE: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(la != ra); }
+        case OP_LT: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(la < ra); }
+        case OP_GT: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(la > ra); }
+        case OP_LE: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(la <= ra); }
+        case OP_GE: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(la >= ra); }
+        case OP_CONCAT: case OP_NEG: break;
+        }
+        cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+        struct cell c = {0};
+        c.type = COLUMN_TYPE_BIGINT;
+        c.value.as_bigint = res;
+        return c;
+    }
+
     double lv = cell_to_double_val(&lhs);
     double rv = cell_to_double_val(&rhs);
     double result_v = 0.0;
@@ -1639,14 +1738,24 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         case OP_SUB: result_v = lv - rv; break;
         case OP_MUL: result_v = lv * rv; break;
         case OP_DIV:
-            if (rv != 0.0) {
-                if (!use_float)
-                    result_v = (double)((long long)lv / (long long)rv);
-                else
-                    result_v = lv / rv;
+            if (rv == 0.0 && !use_float) {
+                cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+                arena_set_error(arena, "22012", "division by zero");
+                return cell_make_null();
             }
+            if (!use_float)
+                result_v = (double)((long long)lv / (long long)rv);
+            else
+                result_v = lv / rv;
             break;
-        case OP_MOD: result_v = (rv != 0.0) ? (double)((long long)lv % (long long)rv) : 0.0; break;
+        case OP_MOD:
+            if (rv == 0.0) {
+                cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+                arena_set_error(arena, "22012", "division by zero");
+                return cell_make_null();
+            }
+            result_v = (double)((long long)lv % (long long)rv);
+            break;
         case OP_EXP: result_v = pow(lv, rv); use_float = 1; break;
         case OP_CONCAT: break; /* handled above */
         case OP_NEG: break;    /* not a binary op */
@@ -2784,6 +2893,25 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
          target == COLUMN_TYPE_FLOAT || target == COLUMN_TYPE_NUMERIC) &&
         column_type_is_text(src.type) && src.value.as_text) {
         const char *s = src.value.as_text;
+        /* validate: skip leading whitespace, optional sign, require at least one digit */
+        const char *p = s;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '+' || *p == '-') p++;
+        int has_digit = 0;
+        while (*p >= '0' && *p <= '9') { has_digit = 1; p++; }
+        if (*p == '.') { p++; while (*p >= '0' && *p <= '9') { has_digit = 1; p++; } }
+        if (*p == 'e' || *p == 'E') { p++; if (*p == '+' || *p == '-') p++; while (*p >= '0' && *p <= '9') p++; }
+        while (*p == ' ' || *p == '\t') p++;
+        if (!has_digit || *p != '\0') {
+            const char *type_name = "integer";
+            if (target == COLUMN_TYPE_SMALLINT) type_name = "smallint";
+            else if (target == COLUMN_TYPE_BIGINT) type_name = "bigint";
+            else if (target == COLUMN_TYPE_FLOAT) type_name = "double precision";
+            else if (target == COLUMN_TYPE_NUMERIC) type_name = "numeric";
+            arena_set_error(arena, "22P02", "invalid input syntax for type %s: \"%s\"", type_name, s);
+            cell_release_rb(&src, rb);
+            return cell_make_null();
+        }
         struct cell r = {0};
         r.type = target;
         switch (target) {
@@ -3521,7 +3649,8 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
         struct cell c = {0};
         int col_is_float = (agg_col[a] >= 0 &&
-                            t->columns.items[agg_col[a]].type == COLUMN_TYPE_FLOAT);
+                            (t->columns.items[agg_col[a]].type == COLUMN_TYPE_FLOAT ||
+                             t->columns.items[agg_col[a]].type == COLUMN_TYPE_NUMERIC));
         int col_is_bigint = (agg_col[a] >= 0 &&
                              t->columns.items[agg_col[a]].type == COLUMN_TYPE_BIGINT);
         int col_is_text = (agg_col[a] >= 0 &&
@@ -4933,7 +5062,8 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             struct cell c = {0};
             int ac_idx = gagg_cols[a];
             int col_is_float = (ac_idx >= 0 &&
-                                t->columns.items[ac_idx].type == COLUMN_TYPE_FLOAT);
+                                (t->columns.items[ac_idx].type == COLUMN_TYPE_FLOAT ||
+                                 t->columns.items[ac_idx].type == COLUMN_TYPE_NUMERIC));
             int col_is_bigint = (ac_idx >= 0 &&
                                  t->columns.items[ac_idx].type == COLUMN_TYPE_BIGINT);
             int col_is_text = (ac_idx >= 0 &&
@@ -5209,6 +5339,40 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
             ord_res[k] = grp_find_result_col(t, grp_cols, ngrp, s, arena,
                                              obi->column);
+            /* expression-based ORDER BY (e.g. ORDER BY SUM(val)):
+             * match EXPR_FUNC_CALL with FUNC_AGG_* to the aggregate list */
+            if (ord_res[k] < 0 && obi->expr_idx != IDX_NONE) {
+                struct expr *oe = &EXPR(arena, obi->expr_idx);
+                if (oe->type == EXPR_FUNC_CALL) {
+                    enum agg_func af = AGG_NONE;
+                    if (oe->func_call.func == FUNC_AGG_SUM)        af = AGG_SUM;
+                    else if (oe->func_call.func == FUNC_AGG_COUNT) af = AGG_COUNT;
+                    else if (oe->func_call.func == FUNC_AGG_AVG)   af = AGG_AVG;
+                    else if (oe->func_call.func == FUNC_AGG_MIN)   af = AGG_MIN;
+                    else if (oe->func_call.func == FUNC_AGG_MAX)   af = AGG_MAX;
+                    if (af != AGG_NONE) {
+                        size_t agg_offset = s->agg_before_cols ? 0 : ngrp;
+                        /* resolve the argument column name */
+                        sv arg_col = sv_from(NULL, 0);
+                        if (oe->func_call.args_count == 1) {
+                            uint32_t ai = arena->arg_indices.items[oe->func_call.args_start];
+                            if (ai != IDX_NONE) {
+                                struct expr *arg = &EXPR(arena, ai);
+                                if (arg->type == EXPR_COLUMN_REF)
+                                    arg_col = arg->column_ref.column;
+                            }
+                        }
+                        for (uint32_t a = 0; a < s->aggregates_count; a++) {
+                            struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+                            if (ae->func == af &&
+                                (arg_col.data == NULL || sv_eq_ignorecase(ae->column, arg_col))) {
+                                ord_res[k] = (int)(agg_offset + a);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             ord_descs[k] = obi->desc;
             ord_nf[k] = obi->nulls_first;
         }
@@ -5562,6 +5726,12 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
     struct rows tmp = {0};
     for (size_t i = 0; i < match_count; i++) {
         emit_row(t, s, arena, &t->rows.items[match_items[i]], &tmp, select_all, db, rb);
+        if (arena->errmsg[0]) {
+            for (size_t ri = 0; ri < tmp.count; ri++)
+                if (!rb) row_free(&tmp.data[ri]);
+            free(tmp.data);
+            return -1;
+        }
     }
 
     /* sort projected result rows if ORDER BY references a SELECT alias or expression */
@@ -5627,12 +5797,28 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
 
     /* DISTINCT ON: keep first row per distinct value of the ON columns */
     if (s->has_distinct_on && s->distinct_on_count > 0 && tmp.count > 1) {
-        /* resolve DISTINCT ON column indices */
+        /* resolve DISTINCT ON column indices against result row layout */
         int don_cols[16];
         uint32_t don_n = s->distinct_on_count < 16 ? s->distinct_on_count : 16;
         for (uint32_t di = 0; di < don_n; di++) {
             sv col_name = ASV(arena, s->distinct_on_start + di);
-            don_cols[di] = table_find_column_sv(t, col_name);
+            don_cols[di] = -1;
+            /* match against SELECT column names/aliases */
+            for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
+                if (sc->alias.len > 0 && sv_eq_ignorecase(sc->alias, col_name)) {
+                    don_cols[di] = (int)pc; break;
+                }
+                if (sc->expr_idx != IDX_NONE) {
+                    struct expr *e = &EXPR(arena, sc->expr_idx);
+                    if (e->type == EXPR_COLUMN_REF && sv_eq_ignorecase(e->column_ref.column, col_name)) {
+                        don_cols[di] = (int)pc; break;
+                    }
+                }
+            }
+            /* fallback to source table index (for SELECT *) */
+            if (don_cols[di] < 0)
+                don_cols[di] = table_find_column_sv(t, col_name);
         }
         struct rows deduped = {0};
         for (size_t i = 0; i < tmp.count; i++) {

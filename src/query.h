@@ -112,7 +112,9 @@ enum cmp_op {
     CMP_EXISTS,
     CMP_NOT_EXISTS,
     CMP_REGEX_MATCH,
-    CMP_REGEX_NOT_MATCH
+    CMP_REGEX_NOT_MATCH,
+    CMP_IS_NOT_TRUE,
+    CMP_IS_NOT_FALSE
 };
 
 enum cond_type {

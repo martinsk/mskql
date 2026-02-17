@@ -1791,16 +1791,12 @@ static uint32_t parse_cond_is(struct lexer *l, struct query_arena *a, uint32_t c
         }
         if (next2.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(next2.value, "TRUE")) {
             lexer_next(l); /* consume TRUE */
-            COND(a, ci).op = CMP_NE;
-            COND(a, ci).value.type = COLUMN_TYPE_BOOLEAN;
-            COND(a, ci).value.value.as_int = 1;
+            COND(a, ci).op = CMP_IS_NOT_TRUE;
             return ci;
         }
         if (next2.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(next2.value, "FALSE")) {
             lexer_next(l); /* consume FALSE */
-            COND(a, ci).op = CMP_NE;
-            COND(a, ci).value.type = COLUMN_TYPE_BOOLEAN;
-            COND(a, ci).value.value.as_int = 0;
+            COND(a, ci).op = CMP_IS_NOT_FALSE;
             return ci;
         }
         next = lexer_next(l);
@@ -4063,8 +4059,44 @@ after_table_alias:
                 s->joins_start = (uint32_t)(a->joins.count - 1);
                 s->joins_count = 1;
                 s->join_type = 4; /* CROSS */
+            } else if (lat_peek.type == TOK_IDENTIFIER || lat_peek.type == TOK_KEYWORD) {
+                /* implicit comma join: FROM t1, t2 → CROSS JOIN t2 */
+                struct token t2_tok = lexer_next(l);
+                struct join_info ji = {0};
+                ji.join_type = 4; /* CROSS (WHERE provides the filter) */
+                ji.is_lateral = 0;
+                ji.join_on_cond = IDX_NONE;
+                ji.lateral_subquery_sql = IDX_NONE;
+                ji.join_table = t2_tok.value;
+                ji.join_alias = t2_tok.value;
+                /* optional alias */
+                struct token ap = lexer_peek(l);
+                if (ap.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(ap.value, "AS")) {
+                    lexer_next(l);
+                    struct token al = lexer_next(l);
+                    ji.join_alias = al.value;
+                } else if (ap.type == TOK_IDENTIFIER &&
+                           !sv_eq_ignorecase_cstr(ap.value, "WHERE") &&
+                           !sv_eq_ignorecase_cstr(ap.value, "ON") &&
+                           !sv_eq_ignorecase_cstr(ap.value, "JOIN") &&
+                           !sv_eq_ignorecase_cstr(ap.value, "LEFT") &&
+                           !sv_eq_ignorecase_cstr(ap.value, "RIGHT") &&
+                           !sv_eq_ignorecase_cstr(ap.value, "INNER") &&
+                           !sv_eq_ignorecase_cstr(ap.value, "CROSS") &&
+                           !sv_eq_ignorecase_cstr(ap.value, "ORDER") &&
+                           !sv_eq_ignorecase_cstr(ap.value, "GROUP") &&
+                           !sv_eq_ignorecase_cstr(ap.value, "LIMIT")) {
+                    struct token al = lexer_next(l);
+                    ji.join_alias = al.value;
+                }
+                arena_push_join(a, ji);
+                s->has_join = 1;
+                s->joins_start = (uint32_t)(a->joins.count - 1);
+                s->joins_count = 1;
+                s->join_type = 4; /* CROSS */
+                s->join_table = ji.join_table;
             } else {
-                /* not LATERAL after comma — restore position */
+                /* not a table after comma — restore position */
                 l->pos = saved_pos;
             }
         }

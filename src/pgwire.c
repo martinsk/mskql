@@ -1363,6 +1363,8 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
 
     int rc = plan_next_block(&ctx, pr.node, &block);
     if (rc != 0) {
+        /* Check for execution error (e.g. division by zero) */
+        if (q->arena.errmsg[0]) goto cte_restore_bail;
         /* No rows — send empty RowDescription + zero data rows */
         enum column_type types[64];
         for (uint16_t i = 0; i < ncols && i < 64; i++)
@@ -1434,8 +1436,14 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         }
 
         row_block_reset(&block);
-        if (plan_next_block(&ctx, pr.node, &block) != 0)
+        if (plan_next_block(&ctx, pr.node, &block) != 0) {
+            if (q->arena.errmsg[0]) {
+                msgbuf_free(&wire);
+                msgbuf_free(&cache_buf);
+                goto cte_restore_bail;
+            }
             break;
+        }
     }
 
     if (wire.len > 0) {
@@ -1818,6 +1826,13 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
             snprintf(tag, sizeof(tag), "SELECT %d", plan_rows);
             send_command_complete(fd, m, tag);
             return 0;
+        }
+        /* If the plan executor hit a real error, send it now instead of retrying via legacy */
+        if (q.arena.errmsg[0]) {
+            const char *code = q.arena.sqlstate[0] ? q.arena.sqlstate : "XX000";
+            send_error(fd, m, "ERROR", code, q.arena.errmsg);
+            *conn_arena = q.arena;
+            return -1;
         }
     }
 

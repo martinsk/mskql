@@ -314,6 +314,8 @@ static int join_cmp_match(const struct cell *a, const struct cell *b, enum cmp_o
         case CMP_NOT_EXISTS:
         case CMP_REGEX_MATCH:
         case CMP_REGEX_NOT_MATCH:
+        case CMP_IS_NOT_TRUE:
+        case CMP_IS_NOT_FALSE:
             return r == 0;
     }
     return 0;
@@ -1887,6 +1889,28 @@ static void apply_set_operations(struct database *db, struct query *q,
                 }
                 result->count = w;
                 free(rhs_used);
+                /* plain INTERSECT (not ALL): deduplicate */
+                if (!s->set_all && result->count > 1) {
+                    size_t dw = 0;
+                    for (size_t i = 0; i < result->count; i++) {
+                        int dup = 0;
+                        for (size_t j = 0; j < dw; j++) {
+                            if (row_equal_nullsafe(&result->data[i], &result->data[j])) {
+                                dup = 1; break;
+                            }
+                        }
+                        if (!dup) {
+                            if (dw != i) result->data[dw] = result->data[i];
+                            dw++;
+                        } else {
+                            if (result->arena_owns_text)
+                                da_free(&result->data[i].cells);
+                            else
+                                row_free(&result->data[i]);
+                        }
+                    }
+                    result->count = dw;
+                }
             } else if (s->set_op == 2) {
                 /* EXCEPT [ALL] — keep LHS rows not in RHS. */
                 uint8_t *rhs_used = calloc(rhs_rows.count, 1);

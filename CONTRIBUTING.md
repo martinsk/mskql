@@ -62,7 +62,7 @@ Tagged unions exist so the compiler can enforce exhaustive handling via `-Wswitc
 
 **Indices**: `uint32_t` indices into arena arrays instead of pointers. `IDX_NONE` (`0xFFFFFFFF`) as null sentinel.
 
-**Error handling**: `arena_set_error(arena, sqlstate, fmt, ...)` — first error wins. Functions return `-1` for failure, `0` for success.
+**Error handling**: `arena_set_error(arena, sqlstate, fmt, ...)` — first error wins. Functions return `-1` for failure, `0` for success. Returning an error is always preferable to returning wrong results.
 
 **Comments**: Brief `/* ... */` for non-obvious logic. Section headers: `/* ---- Section name ---- */`. `// TODO:` for known improvements. No doc-comments or Doxygen.
 
@@ -80,6 +80,25 @@ Tagged unions exist so the compiler can enforce exhaustive handling via `-Wswitc
 
 **Caching**: Columnar scan cache on `struct table`, invalidated by a generation counter (bumped on every INSERT/UPDATE/DELETE). Result cache keyed by SQL text + sum of table generations.
 
+## Bug fix philosophy
+
+**Fix the root cause, not the symptom.** A bug report identifies where the problem is *observed*, not where it *originates*. Trace the issue upstream to its source and fix it there. Do not add downstream guards, special-case checks, or workarounds at the call site that triggered the report.
+
+- A one-line fix is fine — if it's at the right level. A 200-line fix is fine — if the bug is structural.
+- If your fix only touches the function that produced the wrong output, ask whether the real bug is in the data it received.
+- Never mask a wrong-result bug by bailing out to a different code path. If the fast path produces incorrect output, fix the fast path.
+- Every bug fix must include a regression test (see *Testing* below).
+
+## Trustworthy results
+
+A query must either return **correct results** or return **an error**. There is no middle ground — silent wrong results, partial output, or empty result sets for queries that should have matched rows are all bugs.
+
+Unimplemented features must produce a clear error (via `arena_set_error` with an appropriate SQLSTATE), not silently return wrong or empty results. If a user runs a query and gets an answer, that answer must be trustworthy.
+
+This applies across both execution paths:
+- **Plan executor**: `PLAN_RES_NOTIMPL` falling back to legacy is acceptable only when the legacy path handles the query correctly. If neither path handles a query shape, the user must get an error.
+- **Legacy executor**: If a code path encounters a construct it cannot evaluate correctly, it must error — not skip it, not return NULL, not return zero rows.
+
 ## Adding a new feature
 
 **New SQL syntax**: Add token(s) to the lexer → parse function in `parser.c` → AST fields in `query.h` → evaluation in `query.c` or `database.c`.
@@ -88,7 +107,7 @@ Tagged unions exist so the compiler can enforce exhaustive handling via `-Wswitc
 
 **New scalar function**: Add `FUNC_*` enum → keyword registration in `parser.c` → evaluation case in `eval_expr()`.
 
-**Bail-out pattern**: When the plan executor can't handle a query shape, return `IDX_NONE` from `plan_build_select`. The legacy path handles it. Never crash on unsupported queries. See *Fail-fast* and *Validation-then-build* below.
+**Bail-out pattern**: When the plan executor can't handle a query shape, return `PLAN_RES_NOTIMPL` from the builder. The legacy path handles it. Never crash on unsupported queries. Bail-outs are a transitional mechanism — they are acceptable only when the legacy path produces correct results for that query shape. If neither path handles a query correctly, the result must be an error, not garbage. Bail-outs must never be used to hide bugs in the fast path. If the fast path returns wrong results, fix it; don't fall back to legacy. See *Fail-fast*, *Validation-then-build*, and *Trustworthy results* above.
 
 ### Fail-fast
 
@@ -122,6 +141,8 @@ SELECT * FROM t ORDER BY id;
 **Running**: `make test` runs the full suite in parallel with ASAN. Each test gets a fresh database (reset between tests via `SELECT __reset_db()`).
 
 **Expected output**: Pipe-delimited columns, one row per line. NULL renders as an empty field. Compared against `psql -tA` output.
+
+**Bug fix PRs** must include a test that fails before the fix and passes after. The test should exercise the root cause, not just the symptom.
 
 **Always run the full suite** before committing — regressions in unrelated areas are common due to shared parser/evaluator state.
 

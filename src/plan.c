@@ -943,7 +943,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                 case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                 case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
             }
             break;
         }
@@ -960,7 +961,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                 case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                 case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
             }
             break;
         }
@@ -978,7 +980,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                 case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                 case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
             }
             break;
         }
@@ -995,7 +998,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                 case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                 case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
             }
             break;
         }
@@ -1012,7 +1016,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                 case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                 case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
             }
             break;
         }
@@ -1031,7 +1036,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                 case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                 case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
             }
             break;
         }
@@ -1048,7 +1054,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                 case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                 case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
             }
             break;
         }
@@ -1068,7 +1075,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                 case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                 case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
             }
             break;
         }
@@ -1083,6 +1091,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
     case CMP_NOT_EXISTS:
     case CMP_REGEX_MATCH:
     case CMP_REGEX_NOT_MATCH:
+    case CMP_IS_NOT_TRUE:
+    case CMP_IS_NOT_FALSE:
         break;
     }
 
@@ -1481,7 +1491,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                     case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                     case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: break;
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
                 }
                 break;
             }
@@ -1500,7 +1511,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                     case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                     case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: goto fallback;
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                    case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: goto fallback;
                 }
                 goto done;
             }
@@ -1523,7 +1535,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                     case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                     case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: goto fallback;
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                    case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: goto fallback;
                 }
                 goto done;
             }
@@ -1544,7 +1557,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                     case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                     case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: goto fallback;
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                    case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: goto fallback;
                 }
                 goto done;
             }
@@ -1562,7 +1576,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                     case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                     case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: goto fallback;
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                    case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: goto fallback;
                 }
                 goto done;
             }
@@ -1582,7 +1597,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                     case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                     case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: goto fallback;
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                    case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: goto fallback;
                 }
                 goto done;
             }
@@ -1605,7 +1621,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                     case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                     case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
-                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: goto fallback;
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                    case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: goto fallback;
                 }
                 goto done;
             }
@@ -1620,6 +1637,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         case CMP_NOT_EXISTS:
         case CMP_REGEX_MATCH:
         case CMP_REGEX_NOT_MATCH:
+        case CMP_IS_NOT_TRUE:
+        case CMP_IS_NOT_FALSE:
             break;
         }
 
@@ -1742,6 +1761,7 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         for (uint16_t c = 0; c < out_ncols; c++) {
             struct cell result = eval_expr(expr_indices[c], ctx->arena, t, &tmp_row,
                                            ctx->db, &ctx->arena->scratch);
+            if (ctx->arena->errmsg[0]) return -1;
             struct col_block *ocb = &out->cols[c];
 
             if (r == 0) {
@@ -4705,10 +4725,7 @@ static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             st->row_count--;
                     }
                 } else if (op == 1) {
-                    /* INTERSECT / INTERSECT ALL: mark LHS rows that match this RHS row.
-                     * For ALL: mark only ONE unmarked LHS row per RHS row.
-                     * For non-ALL: mark all matching LHS rows. */
-                    int set_all = pn->set_op.set_all;
+                    /* INTERSECT / INTERSECT ALL: mark one LHS row per RHS row. */
                     uint32_t h = 2166136261u;
                     for (uint16_t c2 = 0; c2 < st->ncols; c2++) {
                         struct col_block *cb = &rhs_block.cols[c2];
@@ -4740,12 +4757,9 @@ static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                     if (strcmp(sa, sb) != 0) { eq = 0; break; }
                                 }
                             }
-                            if (eq) {
-                                if (set_all && !st->matched[entry]) {
-                                    st->matched[entry] = 1;
-                                    break; /* only mark one per RHS row */
-                                }
+                            if (eq && !st->matched[entry]) {
                                 st->matched[entry] = 1;
+                                break; /* mark one LHS row per RHS row */
                             }
                         }
                         entry = st->ht.nexts[entry];
@@ -5147,6 +5161,8 @@ static const char *cmp_op_str(enum cmp_op op)
     case CMP_NOT_EXISTS:     return "NOT EXISTS";
     case CMP_REGEX_MATCH:    return "~";
     case CMP_REGEX_NOT_MATCH: return "!~";
+    case CMP_IS_NOT_TRUE:    return "IS NOT TRUE";
+    case CMP_IS_NOT_FALSE:   return "IS NOT FALSE";
     }
     __builtin_unreachable();
 }
@@ -5599,6 +5615,8 @@ static uint32_t try_append_extended_filter_r(uint32_t current, struct col_resolv
     case CMP_NOT_EXISTS:
     case CMP_REGEX_MATCH:
     case CMP_REGEX_NOT_MATCH:
+    case CMP_IS_NOT_TRUE:
+    case CMP_IS_NOT_FALSE:
         break;
     }
 
@@ -5686,6 +5704,8 @@ static int validate_compound_filter_r(struct col_resolver *cr, struct query_aren
     case CMP_NOT_EXISTS:
     case CMP_REGEX_MATCH:
     case CMP_REGEX_NOT_MATCH:
+    case CMP_IS_NOT_TRUE:
+    case CMP_IS_NOT_FALSE:
         return 0;
     }
     __builtin_unreachable();
@@ -6262,6 +6282,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
 
             int sort_cols_buf[MAX_SORT_KEYS];
             int sort_descs_buf[MAX_SORT_KEYS];
+            int sort_nf_buf[MAX_SORT_KEYS];
             uint16_t sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
             int sort_ok = 1;
 
@@ -6269,6 +6290,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
                 struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
                 sort_cols_buf[k] = -1;
                 sort_descs_buf[k] = obi->desc;
+                sort_nf_buf[k] = obi->nulls_first;
 
                 /* Match GROUP BY columns */
                 for (uint32_t g = 0; g < s->group_by_count; g++) {
@@ -6319,7 +6341,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
             }
 
             if (sort_ok && sort_nord > 0)
-                current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, NULL, sort_nord);
+                current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, sort_nf_buf, sort_nord);
         }
     } else {
         /* No aggregates — sort on merged columns, then project */
@@ -6540,10 +6562,12 @@ static struct plan_result build_set_op(struct table *t, struct query_select *s,
         uint16_t sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
         int sort_cols_buf2[MAX_SORT_KEYS];
         int sort_descs_buf2[MAX_SORT_KEYS];
+        int sort_nf_buf2[MAX_SORT_KEYS];
         int sort_ok = 1;
         for (uint16_t k = 0; k < sort_nord; k++) {
             struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
             sort_descs_buf2[k] = obi->desc;
+            sort_nf_buf2[k] = obi->nulls_first;
             sort_cols_buf2[k] = -1;
             if (select_all_lhs) {
                 sort_cols_buf2[k] = table_find_column_sv(t, obi->column);
@@ -6560,7 +6584,7 @@ static struct plan_result build_set_op(struct table *t, struct query_select *s,
             if (sort_cols_buf2[k] < 0) { sort_ok = 0; break; }
         }
         if (sort_ok && sort_nord > 0)
-            current = append_sort_node(current, arena, sort_cols_buf2, sort_descs_buf2, NULL, sort_nord);
+            current = append_sort_node(current, arena, sort_cols_buf2, sort_descs_buf2, sort_nf_buf2, sort_nord);
     }
 
     current = build_limit(current, s, arena);
@@ -6681,12 +6705,14 @@ static struct plan_result build_window(struct table *t, struct query_select *s,
          * We need to map ORDER BY column names to these output indices. */
         int sort_cols_buf[MAX_SORT_KEYS];
         int sort_descs_buf[MAX_SORT_KEYS];
+        int sort_nf_buf[MAX_SORT_KEYS];
         uint16_t sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
         int sort_ok = 1;
         for (uint16_t k = 0; k < sort_nord; k++) {
             struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
             sort_cols_buf[k] = -1;
             sort_descs_buf[k] = obi->desc;
+            sort_nf_buf[k] = obi->nulls_first;
             /* Walk select_exprs to find the output column index */
             uint16_t pass_i = 0, win_i = 0;
             for (size_t e = 0; e < nexprs; e++) {
@@ -6712,7 +6738,7 @@ static struct plan_result build_window(struct table *t, struct query_select *s,
             if (sort_cols_buf[k] < 0) { sort_ok = 0; break; }
         }
         if (sort_ok && sort_nord > 0)
-            current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, NULL, sort_nord);
+            current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, sort_nf_buf, sort_nord);
     }
 
     current = build_limit(current, s, arena);
@@ -6908,6 +6934,8 @@ static uint32_t try_append_having_filter(uint32_t current,
     case CMP_NOT_EXISTS:
     case CMP_REGEX_MATCH:
     case CMP_REGEX_NOT_MATCH:
+    case CMP_IS_NOT_TRUE:
+    case CMP_IS_NOT_FALSE:
         break;
     }
     return IDX_NONE;
@@ -7053,6 +7081,7 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
 
         int sort_cols_buf[MAX_SORT_KEYS];
         int sort_descs_buf[MAX_SORT_KEYS];
+        int sort_nf_buf[MAX_SORT_KEYS];
         uint16_t sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
         int sort_ok = 1;
 
@@ -7060,6 +7089,7 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
             struct order_by_item *obi = &arena->order_items.items[s->order_by_start + k];
             sort_cols_buf[k] = -1;
             sort_descs_buf[k] = obi->desc;
+            sort_nf_buf[k] = obi->nulls_first;
 
             /* Try matching against GROUP BY column names */
             for (uint32_t g = 0; g < s->group_by_count; g++) {
@@ -7114,11 +7144,44 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
                 }
             }
 
+            /* expression-based ORDER BY (e.g. ORDER BY SUM(val)):
+             * match EXPR_FUNC_CALL with FUNC_AGG_* to the aggregate list */
+            if (sort_cols_buf[k] < 0 && obi->expr_idx != IDX_NONE) {
+                struct expr *oe = &EXPR(arena, obi->expr_idx);
+                if (oe->type == EXPR_FUNC_CALL) {
+                    enum agg_func af = AGG_NONE;
+                    if (oe->func_call.func == FUNC_AGG_SUM)        af = AGG_SUM;
+                    else if (oe->func_call.func == FUNC_AGG_COUNT) af = AGG_COUNT;
+                    else if (oe->func_call.func == FUNC_AGG_AVG)   af = AGG_AVG;
+                    else if (oe->func_call.func == FUNC_AGG_MIN)   af = AGG_MIN;
+                    else if (oe->func_call.func == FUNC_AGG_MAX)   af = AGG_MAX;
+                    if (af != AGG_NONE) {
+                        sv arg_col = sv_from(NULL, 0);
+                        if (oe->func_call.args_count == 1) {
+                            uint32_t ai2 = arena->arg_indices.items[oe->func_call.args_start];
+                            if (ai2 != IDX_NONE) {
+                                struct expr *arg = &EXPR(arena, ai2);
+                                if (arg->type == EXPR_COLUMN_REF)
+                                    arg_col = arg->column_ref.column;
+                            }
+                        }
+                        for (uint32_t a = 0; a < agg_n; a++) {
+                            struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+                            if (ae->func == af &&
+                                (arg_col.data == NULL || sv_eq_ignorecase(ae->column, arg_col))) {
+                                sort_cols_buf[k] = (int)(agg_offset + a);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             if (sort_cols_buf[k] < 0) { sort_ok = 0; break; }
         }
 
         if (sort_ok && sort_nord > 0)
-            current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, NULL, sort_nord);
+            current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, sort_nf_buf, sort_nord);
     }
 
     current = build_limit(current, s, arena);

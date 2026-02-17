@@ -5,4 +5,4 @@ INSERT INTO t_big VALUES (9223372036854775807);
 -- input:
 SELECT v + 0 FROM t_big;
 -- expected output:
-9.22337e+18
+9223372036854775807
