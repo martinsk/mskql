@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Tutorial: String &amp; Math Functions</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        :root { --body-width: 55%; --fg: #111; --fg-dim: #555; --bg: #fffff8; --accent: #a00; --rule: #ccc; --code-bg: #f3f1eb; --nav-width: 180px; }
+        html { font-size: 15px; }
+        body { font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif; background: var(--bg); color: var(--fg); width: var(--body-width); margin-left: auto; margin-right: auto; padding: 3rem 0 5rem 0; }
+        .sidebar { float: left; width: var(--nav-width); margin-left: calc(-1 * var(--nav-width) - 40px); position: sticky; top: 2rem; }
+        .sidebar-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.3rem; }
+        .sidebar-title a { color: var(--fg); text-decoration: none; background: none; }
+        .sidebar-title a:hover { color: var(--accent); }
+        .sidebar-subtitle { font-size: 0.8rem; color: var(--fg-dim); font-style: italic; margin-bottom: 1.2rem; }
+        .sidebar-subtitle a { color: var(--fg-dim); text-decoration: none; background: none; }
+        .sidebar-subtitle a:hover { color: var(--accent); }
+        .sidebar nav ul { list-style: none; padding: 0; }
+        .sidebar nav li { margin-bottom: 0.15rem; }
+        .sidebar nav a { font-size: 0.82rem; color: var(--fg-dim); text-decoration: none; background: none; display: block; padding: 0.2rem 0.5rem; border-radius: 3px; line-height: 1.4; }
+        .sidebar nav a:hover { color: var(--accent); background: var(--code-bg); }
+        .sidebar nav a.active { color: var(--accent); font-weight: 600; background: var(--code-bg); }
+        .sidebar nav .nav-label { font-family: 'Menlo', 'Consolas', monospace; font-size: 0.6rem; font-weight: 700; color: var(--fg-dim); letter-spacing: 0.06em; text-transform: uppercase; padding: 0.6rem 0.5rem 0.2rem; }
+        p, ol, ul { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+        li { margin-bottom: 0.3rem; }
+        ol, ul { padding-left: 1.6rem; }
+        a { color: var(--fg); text-decoration: none; background-image: linear-gradient(var(--accent), var(--accent)); background-size: 1px 1px; background-repeat: repeat-x; background-position: 0 1.15em; }
+        a:hover { color: var(--accent); }
+        strong { font-weight: 600; }
+        h1 { font-weight: 400; font-size: 2.2rem; line-height: 1.15; margin-bottom: 0.4rem; }
+        .subtitle { font-style: italic; font-size: 1.15rem; color: var(--fg-dim); display: block; margin-bottom: 0.6rem; line-height: 1.4; }
+        .byline { font-size: 0.95rem; color: var(--fg-dim); margin-bottom: 2rem; }
+        .title-rule { border: none; height: 3px; background: var(--accent); width: 60px; margin: 0 0 2rem 0; }
+        h2 { font-weight: 400; font-style: italic; font-size: 1.5rem; margin-top: 2.8rem; margin-bottom: 0.6rem; }
+        h3 { font-weight: 600; font-style: normal; font-size: 1.15rem; margin-top: 1.6rem; margin-bottom: 0.4rem; }
+        code { font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace; font-size: 0.82rem; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 2px; }
+        pre { background: var(--code-bg); border-left: 3px solid var(--accent); padding: 1rem 1.2rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.55; margin: 1rem 0 1.4rem 0; }
+        pre code { background: none; padding: 0; border-radius: 0; }
+        pre code.hljs { background: var(--code-bg); padding: 0; }
+        .hljs { background: var(--code-bg); }
+        .result-table { font-family: 'EB Garamond', Georgia, serif; font-size: 0.92rem; border-collapse: collapse; margin: 0.6rem 0 1.2rem 0; width: 100%; border-top: 2px solid var(--fg); border-bottom: 2px solid var(--fg); }
+        .result-table th { font-weight: 400; font-size: 0.78rem; font-variant: small-caps; text-transform: lowercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--fg); padding: 0.3rem 0.6rem 0.25rem; text-align: left; color: var(--fg); }
+        .result-table td { padding: 0.22rem 0.6rem; border: none; white-space: nowrap; }
+        .result-table .null-val { color: #999; font-style: italic; }
+        .result-table .num-val { text-align: right; font-variant-numeric: tabular-nums; }
+        .result-label { font-size: 0.8rem; font-style: italic; color: var(--fg-dim); margin: 0 0 0.3rem 0; }
+        .query-pair { display: flex; gap: 1.2rem; align-items: stretch; margin: 0.8rem 0 1.4rem 0; }
+        .query-pair pre { flex: 1 1 50%; min-width: 0; margin: 0; }
+        .query-pair .result-wrap { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+        .query-pair .result-table { margin: 0; }
+        .tutorial-nav { display: flex; justify-content: space-between; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.95rem; }
+        .tutorial-nav a { background: none; }
+        .tutorial-nav .prev::before { content: '\2190\00a0'; }
+        .tutorial-nav .next::after { content: '\00a0\2192'; }
+        footer.site-footer { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.85rem; color: var(--fg-dim); }
+        footer.site-footer a { font-size: 0.85rem; }
+        hr { border: none; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+        @media (max-width: 1100px) { body { width: 80%; } .sidebar { float: none; margin-left: 0; width: auto; position: static; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--rule); } .sidebar nav ul { display: flex; flex-wrap: wrap; gap: 0.2rem 0.8rem; } .sidebar nav .nav-label { padding-top: 0.3rem; } }
+        @media (max-width: 700px) { body { width: 90%; padding: 2rem 0 3rem 0; } h1 { font-size: 2rem; } .query-pair { flex-direction: column; } }
+    </style>
+    <link rel="stylesheet" href="tutorial-interactive.css">
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-title"><a href="../index.html">mskql</a></div>
+    <div class="sidebar-subtitle"><a href="index.html">Tutorials</a></div>
+    <nav>
+        <ul>
+            <li><a href="task-tracker.html">1. Task Tracker</a></li>
+            <li><a href="reporting-dashboard.html">2. Reporting Dashboard</a></li>
+            <li><a href="time-series.html">3. Time-Series Analytics</a></li>
+            <li><a href="multi-table-joins.html">4. Multi-Table Joins</a></li>
+            <li><a href="schema-evolution.html">5. Schema Evolution</a></li>
+            <li><a href="recursive-ctes.html">6. Recursive CTEs</a></li>
+            <li><a href="set-operations.html">7. Set Operations</a></li>
+            <li><a href="string-math-functions.html" class="active">8. String &amp; Math</a></li>
+            <li><a href="indexes-performance.html">9. Indexes</a></li>
+            <li><a href="sequences-enums.html">10. Sequences &amp; Enums</a></li>
+        </ul>
+        <div class="nav-label">Reference</div>
+        <ul>
+            <li><a href="../grammar.html">SQL Grammar</a></li>
+            <li><a href="../bench-vs-pg.html">vs PostgreSQL</a></li>
+        </ul>
+    </nav>
+</aside>
+
+<h1>String &amp; Math Functions</h1>
+<span class="subtitle">Transform, format, and compute in pure SQL</span>
+<p class="byline">Tutorial 8 of 10</p>
+<hr class="title-rule">
+
+<p>
+    mskql supports 30+ built-in scalar functions for string manipulation,
+    math, and conditional logic. This tutorial walks through the most useful
+    ones with a product catalog dataset. Every function runs in the
+    block-oriented executor&mdash;35% faster than PostgreSQL on the
+    scalar_functions benchmark.
+</p>
+
+<!-- ─── Schema ──────────────────────────────────────────────── -->
+
+<h2>1. Schema and seed data</h2>
+
+<pre><code class="language-sql">CREATE TABLE products (
+    id       SERIAL PRIMARY KEY,
+    name     TEXT NOT NULL,
+    sku      TEXT NOT NULL,
+    price    FLOAT NOT NULL,
+    discount FLOAT,
+    category TEXT,
+    notes    TEXT
+);
+
+INSERT INTO products (name, sku, price, discount, category, notes) VALUES
+    ('Wireless Mouse',     'WM-2024-PRO',  49.99,  0.10, 'Electronics', 'Best seller'),
+    ('USB-C Hub',          'HUB-7PORT',    34.50,  NULL, 'Electronics', 'New arrival'),
+    ('Standing Desk',      'DESK-ADJ-60',  599.00, 0.15, 'Furniture',   NULL),
+    ('Ergonomic Chair',    'CHAIR-ERG-V2', 449.99, 0.20, 'Furniture',   'Updated model'),
+    ('Mechanical Keyboard','KB-MX-BLUE',    89.95, 0.05, 'Electronics', 'Cherry MX Blue'),
+    ('Monitor Arm',        'ARM-DUAL-27',  129.00, NULL, 'Accessories', NULL),
+    ('Desk Lamp',          'LAMP-LED-DIM', 45.00,  0.10, 'Accessories', 'Dimmable LED');</code></pre>
+
+<!-- ─── String functions ───────────────────────────────────── -->
+
+<h2>2. String case and length</h2>
+
+<p>
+    <code>UPPER</code>, <code>LOWER</code>, and <code>LENGTH</code> are the
+    workhorses of string processing. Use them for normalization, display
+    formatting, and validation.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT name,
+       UPPER(name) AS upper_name,
+       LOWER(sku) AS lower_sku,
+       LENGTH(name) AS name_len
+FROM products
+WHERE LENGTH(name) > 10
+ORDER BY name_len DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>upper_name</th><th>lower_sku</th><th>name_len</th></tr></thead>
+<tbody>
+<tr><td>Mechanical Keyboard</td><td>MECHANICAL KEYBOARD</td><td>kb-mx-blue</td><td class="num-val">19</td></tr>
+<tr><td>Ergonomic Chair</td><td>ERGONOMIC CHAIR</td><td>chair-erg-v2</td><td class="num-val">15</td></tr>
+<tr><td>Wireless Mouse</td><td>WIRELESS MOUSE</td><td>wm-2024-pro</td><td class="num-val">14</td></tr>
+<tr><td>Standing Desk</td><td>STANDING DESK</td><td>desk-adj-60</td><td class="num-val">13</td></tr>
+<tr><td>Monitor Arm</td><td>MONITOR ARM</td><td>arm-dual-27</td><td class="num-val">11</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── SUBSTRING and REPLACE ──────────────────────────────── -->
+
+<h2>3. SUBSTRING and REPLACE</h2>
+
+<p>
+    <code>SUBSTRING(str FROM start FOR length)</code> extracts a portion.
+    <code>REPLACE(str, from, to)</code> swaps substrings.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT sku,
+       SUBSTRING(sku FROM 1 FOR 3)
+         AS prefix,
+       REPLACE(sku, '-', '/')
+         AS slash_sku
+FROM products
+ORDER BY sku;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>sku</th><th>prefix</th><th>slash_sku</th></tr></thead>
+<tbody>
+<tr><td>ARM-DUAL-27</td><td>ARM</td><td>ARM/DUAL/27</td></tr>
+<tr><td>CHAIR-ERG-V2</td><td>CHA</td><td>CHAIR/ERG/V2</td></tr>
+<tr><td>DESK-ADJ-60</td><td>DES</td><td>DESK/ADJ/60</td></tr>
+<tr><td>HUB-7PORT</td><td>HUB</td><td>HUB/7PORT</td></tr>
+<tr><td>KB-MX-BLUE</td><td>KB-</td><td>KB/MX/BLUE</td></tr>
+<tr><td>LAMP-LED-DIM</td><td>LAM</td><td>LAMP/LED/DIM</td></tr>
+<tr><td>WM-2024-PRO</td><td>WM-</td><td>WM/2024/PRO</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── CONCAT ─────────────────────────────────────────────── -->
+
+<h2>4. CONCAT and string concatenation</h2>
+
+<p>
+    <code>CONCAT(a, b, ...)</code> joins strings together. Unlike the
+    <code>||</code> operator, <code>CONCAT</code> treats <code>NULL</code>
+    as an empty string.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT name,
+       CONCAT(category, ': ', name)
+         AS full_label
+FROM products
+ORDER BY category, name;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>full_label</th></tr></thead>
+<tbody>
+<tr><td>Desk Lamp</td><td>Accessories: Desk Lamp</td></tr>
+<tr><td>Monitor Arm</td><td>Accessories: Monitor Arm</td></tr>
+<tr><td>Mechanical Keyboard</td><td>Electronics: Mechanical Keyboard</td></tr>
+<tr><td>USB-C Hub</td><td>Electronics: USB-C Hub</td></tr>
+<tr><td>Wireless Mouse</td><td>Electronics: Wireless Mouse</td></tr>
+<tr><td>Ergonomic Chair</td><td>Furniture: Ergonomic Chair</td></tr>
+<tr><td>Standing Desk</td><td>Furniture: Standing Desk</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Math functions ─────────────────────────────────────── -->
+
+<h2>5. Math functions: ABS, ROUND, POWER, MOD</h2>
+
+<p>
+    Compute discounted prices with <code>ROUND</code>, use <code>ABS</code>
+    for absolute values, and <code>MOD</code> for modular arithmetic.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT name, price,
+       COALESCE(discount, 0) AS disc,
+       ROUND(price * (1 - COALESCE(
+         discount, 0))::numeric, 2)
+         AS sale_price,
+       ABS(price - 100) AS dist_from_100,
+       MOD(id, 3) AS group_num
+FROM products
+ORDER BY sale_price DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>price</th><th>disc</th><th>sale_price</th><th>dist_from_100</th><th>group_num</th></tr></thead>
+<tbody>
+<tr><td>Standing Desk</td><td class="num-val">599</td><td class="num-val">0.15</td><td class="num-val">509.15</td><td class="num-val">499</td><td class="num-val">0</td></tr>
+<tr><td>Ergonomic Chair</td><td class="num-val">449.99</td><td class="num-val">0.2</td><td class="num-val">359.99</td><td class="num-val">349.99</td><td class="num-val">1</td></tr>
+<tr><td>Monitor Arm</td><td class="num-val">129</td><td class="num-val">0</td><td class="num-val">129</td><td class="num-val">29</td><td class="num-val">0</td></tr>
+<tr><td>Mechanical Keyboard</td><td class="num-val">89.95</td><td class="num-val">0.05</td><td class="num-val">85.45</td><td class="num-val">10.05</td><td class="num-val">2</td></tr>
+<tr><td>Wireless Mouse</td><td class="num-val">49.99</td><td class="num-val">0.1</td><td class="num-val">44.99</td><td class="num-val">50.01</td><td class="num-val">1</td></tr>
+<tr><td>Desk Lamp</td><td class="num-val">45</td><td class="num-val">0.1</td><td class="num-val">40.5</td><td class="num-val">55</td><td class="num-val">1</td></tr>
+<tr><td>USB-C Hub</td><td class="num-val">34.5</td><td class="num-val">0</td><td class="num-val">34.5</td><td class="num-val">65.5</td><td class="num-val">2</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── COALESCE and NULLIF ────────────────────────────────── -->
+
+<h2>6. COALESCE and NULLIF</h2>
+
+<p>
+    <code>COALESCE(a, b, ...)</code> returns the first non-NULL argument.
+    <code>NULLIF(a, b)</code> returns NULL if <code>a = b</code>, otherwise
+    returns <code>a</code>. Together they handle missing data gracefully.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT name,
+       COALESCE(notes, 'No notes')
+         AS display_notes,
+       COALESCE(discount, 0) * 100
+         AS disc_pct,
+       NULLIF(category, 'Electronics')
+         AS non_elec_cat
+FROM products
+ORDER BY name;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>display_notes</th><th>disc_pct</th><th>non_elec_cat</th></tr></thead>
+<tbody>
+<tr><td>Desk Lamp</td><td>Dimmable LED</td><td class="num-val">10</td><td>Accessories</td></tr>
+<tr><td>Ergonomic Chair</td><td>Updated model</td><td class="num-val">20</td><td>Furniture</td></tr>
+<tr><td>Mechanical Keyboard</td><td>Cherry MX Blue</td><td class="num-val">5</td><td class="null-val">NULL</td></tr>
+<tr><td>Monitor Arm</td><td>No notes</td><td class="num-val">0</td><td>Accessories</td></tr>
+<tr><td>Standing Desk</td><td>No notes</td><td class="num-val">15</td><td>Furniture</td></tr>
+<tr><td>USB-C Hub</td><td>New arrival</td><td class="num-val">0</td><td class="null-val">NULL</td></tr>
+<tr><td>Wireless Mouse</td><td>Best seller</td><td class="num-val">10</td><td class="null-val">NULL</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── CASE WHEN ──────────────────────────────────────────── -->
+
+<h2>7. CASE WHEN for conditional logic</h2>
+
+<p>
+    <code>CASE WHEN</code> is SQL&rsquo;s if/else. Use it to categorize,
+    bucket, or transform values conditionally.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT name, price,
+       CASE
+         WHEN price >= 400 THEN 'premium'
+         WHEN price >= 80  THEN 'mid-range'
+         ELSE 'budget'
+       END AS tier,
+       CASE
+         WHEN discount IS NULL THEN 'full price'
+         WHEN discount >= 0.15 THEN 'big sale'
+         ELSE 'small discount'
+       END AS pricing
+FROM products
+ORDER BY price DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>price</th><th>tier</th><th>pricing</th></tr></thead>
+<tbody>
+<tr><td>Standing Desk</td><td class="num-val">599</td><td>premium</td><td>big sale</td></tr>
+<tr><td>Ergonomic Chair</td><td class="num-val">449.99</td><td>premium</td><td>big sale</td></tr>
+<tr><td>Monitor Arm</td><td class="num-val">129</td><td>mid-range</td><td>full price</td></tr>
+<tr><td>Mechanical Keyboard</td><td class="num-val">89.95</td><td>mid-range</td><td>small discount</td></tr>
+<tr><td>Wireless Mouse</td><td class="num-val">49.99</td><td>budget</td><td>small discount</td></tr>
+<tr><td>Desk Lamp</td><td class="num-val">45</td><td>budget</td><td>small discount</td></tr>
+<tr><td>USB-C Hub</td><td class="num-val">34.5</td><td>budget</td><td>full price</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Wrap-up ─────────────────────────────────────────────── -->
+
+<h2>What you learned</h2>
+
+<p>
+    In this tutorial you transformed a 7-product catalog using 12 scalar
+    functions and conditional expressions:
+</p>
+
+<ul>
+    <li><strong><code>UPPER</code> / <code>LOWER</code></strong> for case normalization</li>
+    <li><strong><code>LENGTH</code></strong> for string measurement and filtering</li>
+    <li><strong><code>SUBSTRING</code></strong> for extracting portions of strings</li>
+    <li><strong><code>REPLACE</code></strong> for find-and-replace within strings</li>
+    <li><strong><code>CONCAT</code></strong> for NULL-safe string joining</li>
+    <li><strong><code>ABS</code> / <code>ROUND</code> / <code>MOD</code></strong> for numeric computation</li>
+    <li><strong><code>COALESCE</code></strong> for default values on NULLs</li>
+    <li><strong><code>NULLIF</code></strong> for conditional NULL generation</li>
+    <li><strong><code>CASE WHEN</code></strong> for inline conditional logic</li>
+</ul>
+
+<div class="tutorial-nav">
+    <a class="prev" href="set-operations.html">Set Operations</a>
+    <a class="next" href="indexes-performance.html">Indexes &amp; Performance</a>
+</div>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+<script src="../wasm/mskql-wasm.js"></script>
+<script src="tutorial-interactive.js"></script>
+</body>
+</html>

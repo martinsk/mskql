@@ -1,0 +1,21 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+*.swp
+*.swo
+*~
+*.bak
+
+# Build artifacts
+build/
+*.o
+*.tmp
+
+# Environment
+.env
+node_modules/
+
+# Logs
+*.log

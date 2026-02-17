@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>mskql &mdash; Tutorial: Build a Task Tracker</title>
+    <title>mskql &mdash; Tutorial: Recursive CTEs &amp; Tree Queries</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
@@ -302,12 +302,12 @@
     <div class="sidebar-subtitle"><a href="index.html">Tutorials</a></div>
     <nav>
         <ul>
-            <li><a href="task-tracker.html" class="active">1. Task Tracker</a></li>
+            <li><a href="task-tracker.html">1. Task Tracker</a></li>
             <li><a href="reporting-dashboard.html">2. Reporting Dashboard</a></li>
             <li><a href="time-series.html">3. Time-Series Analytics</a></li>
             <li><a href="multi-table-joins.html">4. Multi-Table Joins</a></li>
             <li><a href="schema-evolution.html">5. Schema Evolution</a></li>
-            <li><a href="recursive-ctes.html">6. Recursive CTEs</a></li>
+            <li><a href="recursive-ctes.html" class="active">6. Recursive CTEs</a></li>
             <li><a href="set-operations.html">7. Set Operations</a></li>
             <li><a href="string-math-functions.html">8. String &amp; Math</a></li>
             <li><a href="indexes-performance.html">9. Indexes</a></li>
@@ -321,304 +321,321 @@
     </nav>
 </aside>
 
-<h1>Build a Task Tracker</h1>
-<span class="subtitle">CRUD, constraints, upserts, and RETURNING</span>
-<p class="byline">Tutorial 1 of 5</p>
+<h1>Recursive CTEs &amp; Tree Queries</h1>
+<span class="subtitle">Hierarchical data, depth tracking, and path building</span>
+<p class="byline">Tutorial 6 of 10</p>
 <hr class="title-rule">
 
 <p>
-    This tutorial builds a small project-management database from scratch:
-    projects, tasks, labels, and assignments. By the end you will have used
-    <code>SERIAL</code> primary keys, foreign keys, <code>CHECK</code>
-    constraints, <code>ON&nbsp;CONFLICT</code> upserts, <code>RETURNING</code>,
-    and basic CRUD operations&mdash;all through a standard <code>psql</code>
-    connection.
+    Many real-world datasets are hierarchical: org charts, category trees,
+    bill-of-materials. A <code>WITH RECURSIVE</code> CTE lets you walk these
+    trees in pure SQL&mdash;no application-level loops, no stored procedures.
+    This tutorial builds an employee org chart and queries it 7 different ways.
 </p>
 
 <!-- ─── Schema ──────────────────────────────────────────────── -->
 
-<h2>1. Design the schema</h2>
+<h2>1. Schema and seed data</h2>
 
 <p>
-    Three tables: <strong>projects</strong> to group work,
-    <strong>tasks</strong> with a status constraint, and
-    <strong>labels</strong> that can be attached to tasks.
+    One table with a self-referencing foreign key: each employee points to
+    their manager. The CEO has <code>manager_id = NULL</code>.
 </p>
 
-<pre><code class="language-sql">CREATE TABLE projects (
-    id    SERIAL PRIMARY KEY,
-    name  TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE tasks (
+<pre><code class="language-sql">CREATE TABLE employees (
     id          SERIAL PRIMARY KEY,
-    project_id  INT NOT NULL REFERENCES projects(id),
+    name        TEXT NOT NULL,
     title       TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'todo'
-                CHECK (status IN ('todo', 'in_progress', 'done')),
-    priority    INT DEFAULT 0,
-    created_at  DATE DEFAULT '2025-01-15'
+    manager_id  INT REFERENCES employees(id),
+    salary      INT NOT NULL
 );
 
-CREATE TABLE labels (
-    id    SERIAL PRIMARY KEY,
-    name  TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE task_labels (
-    task_id   INT NOT NULL REFERENCES tasks(id),
-    label_id  INT NOT NULL REFERENCES labels(id)
-);</code></pre>
+INSERT INTO employees (name, title, manager_id, salary) VALUES
+    ('Alice',   'CEO',              NULL, 200000),
+    ('Bob',     'VP Engineering',   1,    160000),
+    ('Charlie', 'VP Sales',         1,    155000),
+    ('Diana',   'Tech Lead',        2,    130000),
+    ('Eve',     'Senior Engineer',  2,    120000),
+    ('Frank',   'Sales Manager',    3,    110000),
+    ('Grace',   'Engineer',         4,    100000),
+    ('Hank',    'Engineer',         4,     95000),
+    ('Ivy',     'Sales Rep',        6,     80000),
+    ('Jack',    'Sales Rep',        6,     75000);</code></pre>
 
 <p>
-    The <code>CHECK</code> constraint on <code>status</code> limits values to
-    exactly three strings. The foreign key on <code>project_id</code> ensures
-    every task belongs to a real project.
+    10 employees across 4 levels. Alice manages Bob and Charlie directly;
+    Bob manages Diana and Eve; Diana manages Grace and Hank; and so on.
 </p>
 
-<!-- ─── Seed data ───────────────────────────────────────────── -->
+<!-- ─── Basic recursive CTE ────────────────────────────────── -->
 
-<h2>2. Seed the data</h2>
-
-<pre><code class="language-sql">INSERT INTO projects (name) VALUES
-    ('Website Redesign'),
-    ('Mobile App'),
-    ('API Platform');
-
-INSERT INTO labels (name) VALUES
-    ('bug'), ('feature'), ('urgent'), ('backend'), ('frontend');
-
-INSERT INTO tasks (project_id, title, status, priority, created_at) VALUES
-    (1, 'Update landing page',    'in_progress', 2, '2025-01-10'),
-    (1, 'Fix nav overflow',       'todo',        3, '2025-01-12'),
-    (1, 'Add dark mode',          'todo',        1, '2025-01-14'),
-    (2, 'Login screen',           'done',        2, '2025-01-05'),
-    (2, 'Push notifications',     'in_progress', 3, '2025-01-08'),
-    (2, 'Offline sync',           'todo',        1, '2025-01-15'),
-    (3, 'Rate limiting',          'todo',        3, '2025-01-11'),
-    (3, 'OAuth2 integration',     'in_progress', 2, '2025-01-09'),
-    (3, 'Batch endpoint',         'done',        1, '2025-01-06');
-
-INSERT INTO task_labels (task_id, label_id) VALUES
-    (1, 5), (2, 1), (2, 5), (2, 3),
-    (3, 2), (4, 2), (5, 2), (5, 4),
-    (6, 2), (6, 4), (7, 4), (7, 3),
-    (8, 4), (9, 4);</code></pre>
-
-<!-- ─── Basic queries ───────────────────────────────────────── -->
-
-<h2>3. Query tasks by project</h2>
-
-<p>List all tasks for the &ldquo;Website Redesign&rdquo; project, ordered by priority.</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">SELECT t.title, t.status,
-       t.priority
-FROM tasks t
-JOIN projects p
-  ON t.project_id = p.id
-WHERE p.name = 'Website Redesign'
-ORDER BY t.priority DESC;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>title</th><th>status</th><th>priority</th></tr></thead>
-<tbody>
-<tr><td>Fix nav overflow</td><td>todo</td><td class="num-val">3</td></tr>
-<tr><td>Update landing page</td><td>in_progress</td><td class="num-val">2</td></tr>
-<tr><td>Add dark mode</td><td>todo</td><td class="num-val">1</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<!-- ─── Labels join ─────────────────────────────────────────── -->
-
-<h2>4. Tasks with their labels</h2>
-
-<p>Join through the many-to-many table to show each task&rsquo;s labels.</p>
-
-<div class="query-pair">
-<pre><code class="language-sql">SELECT t.title,
-       l.name AS label
-FROM tasks t
-JOIN task_labels tl
-  ON t.id = tl.task_id
-JOIN labels l
-  ON tl.label_id = l.id
-WHERE t.status = 'todo'
-ORDER BY t.priority DESC,
-         t.title;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>title</th><th>label</th></tr></thead>
-<tbody>
-<tr><td>Fix nav overflow</td><td>bug</td></tr>
-<tr><td>Fix nav overflow</td><td>frontend</td></tr>
-<tr><td>Fix nav overflow</td><td>urgent</td></tr>
-<tr><td>Rate limiting</td><td>backend</td></tr>
-<tr><td>Rate limiting</td><td>urgent</td></tr>
-<tr><td>Add dark mode</td><td>feature</td></tr>
-<tr><td>Offline sync</td><td>feature</td></tr>
-<tr><td>Offline sync</td><td>backend</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<!-- ─── Update with RETURNING ───────────────────────────────── -->
-
-<h2>5. Update status with RETURNING</h2>
+<h2>2. Walk the full org chart</h2>
 
 <p>
-    Mark a task as done and get the updated row back in one round-trip.
+    A recursive CTE has two parts: the <strong>anchor</strong> (the starting
+    rows) and the <strong>recursive term</strong> (the join that walks one
+    level deeper). Here we start from the CEO and walk down.
 </p>
 
 <div class="query-pair">
-<pre><code class="language-sql">UPDATE tasks
-SET status = 'done'
-WHERE title = 'Fix nav overflow'
-RETURNING id, title, status;</code></pre>
+<pre><code class="language-sql">WITH RECURSIVE org AS (
+    SELECT id, name, title,
+           manager_id, 0 AS depth
+    FROM employees
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    SELECT e.id, e.name, e.title,
+           e.manager_id, o.depth + 1
+    FROM employees e
+    JOIN org o ON e.manager_id = o.id
+)
+SELECT name, title, depth
+FROM org
+ORDER BY depth, name;</code></pre>
 <div class="result-wrap">
 <p class="result-label">Result</p>
 <table class="result-table">
-<thead><tr><th>id</th><th>title</th><th>status</th></tr></thead>
+<thead><tr><th>name</th><th>title</th><th>depth</th></tr></thead>
 <tbody>
-<tr><td class="num-val">2</td><td>Fix nav overflow</td><td>done</td></tr>
-</tbody>
-</table>
-</div>
-</div>
-
-<!-- ─── Upsert ──────────────────────────────────────────────── -->
-
-<h2>6. Upsert a label</h2>
-
-<p>
-    Insert a label, or if it already exists, do nothing. Then insert one that
-    does not exist yet.
-</p>
-
-<pre><code class="language-sql">INSERT INTO labels (name) VALUES ('bug')
-ON CONFLICT (name) DO NOTHING;
-
-INSERT INTO labels (name) VALUES ('design')
-ON CONFLICT (name) DO NOTHING;</code></pre>
-
-<div class="query-pair">
-<pre><code class="language-sql">SELECT * FROM labels
-ORDER BY id;</code></pre>
-<div class="result-wrap">
-<p class="result-label">Result</p>
-<table class="result-table">
-<thead><tr><th>id</th><th>name</th></tr></thead>
-<tbody>
-<tr><td class="num-val">1</td><td>bug</td></tr>
-<tr><td class="num-val">2</td><td>feature</td></tr>
-<tr><td class="num-val">3</td><td>urgent</td></tr>
-<tr><td class="num-val">4</td><td>backend</td></tr>
-<tr><td class="num-val">5</td><td>frontend</td></tr>
-<tr><td class="num-val">6</td><td>design</td></tr>
+<tr><td>Alice</td><td>CEO</td><td class="num-val">0</td></tr>
+<tr><td>Bob</td><td>VP Engineering</td><td class="num-val">1</td></tr>
+<tr><td>Charlie</td><td>VP Sales</td><td class="num-val">1</td></tr>
+<tr><td>Diana</td><td>Tech Lead</td><td class="num-val">2</td></tr>
+<tr><td>Eve</td><td>Senior Engineer</td><td class="num-val">2</td></tr>
+<tr><td>Frank</td><td>Sales Manager</td><td class="num-val">2</td></tr>
+<tr><td>Grace</td><td>Engineer</td><td class="num-val">3</td></tr>
+<tr><td>Hank</td><td>Engineer</td><td class="num-val">3</td></tr>
+<tr><td>Ivy</td><td>Sales Rep</td><td class="num-val">3</td></tr>
+<tr><td>Jack</td><td>Sales Rep</td><td class="num-val">3</td></tr>
 </tbody>
 </table>
 </div>
 </div>
 
 <p>
-    The &ldquo;bug&rdquo; row was silently skipped (it already existed with
-    <code>id=1</code>). The &ldquo;design&rdquo; row was inserted as
-    <code>id=6</code>.
+    The <code>depth</code> column starts at 0 for the CEO and increments by 1
+    at each level. The recursion terminates naturally when no more children
+    are found.
 </p>
 
-<!-- ─── ON CONFLICT DO UPDATE ───────────────────────────────── -->
+<!-- ─── Subtree ────────────────────────────────────────────── -->
 
-<h2>7. Upsert with DO UPDATE</h2>
+<h2>3. Subtree under a specific manager</h2>
 
 <p>
-    Bump a task&rsquo;s priority if it already exists, using
-    <code>ON&nbsp;CONFLICT&nbsp;DO&nbsp;UPDATE</code>.
+    Change the anchor to start from Bob instead of the CEO. This gives you
+    only the engineering subtree&mdash;4 employees instead of 10.
 </p>
 
 <div class="query-pair">
-<pre><code class="language-sql">INSERT INTO tasks
-  (id, project_id, title,
-   status, priority)
-VALUES
-  (7, 3, 'Rate limiting',
-   'todo', 5)
-ON CONFLICT (id) DO UPDATE
-  SET priority = 5;
+<pre><code class="language-sql">WITH RECURSIVE team AS (
+    SELECT id, name, title, 0 AS depth
+    FROM employees
+    WHERE name = 'Bob'
 
-SELECT id, title, priority
-FROM tasks
-WHERE id = 7;</code></pre>
+    UNION ALL
+
+    SELECT e.id, e.name, e.title,
+           t.depth + 1
+    FROM employees e
+    JOIN team t ON e.manager_id = t.id
+)
+SELECT name, title, depth
+FROM team
+ORDER BY depth, name;</code></pre>
 <div class="result-wrap">
 <p class="result-label">Result</p>
 <table class="result-table">
-<thead><tr><th>id</th><th>title</th><th>priority</th></tr></thead>
+<thead><tr><th>name</th><th>title</th><th>depth</th></tr></thead>
 <tbody>
-<tr><td class="num-val">7</td><td>Rate limiting</td><td class="num-val">5</td></tr>
+<tr><td>Bob</td><td>VP Engineering</td><td class="num-val">0</td></tr>
+<tr><td>Diana</td><td>Tech Lead</td><td class="num-val">1</td></tr>
+<tr><td>Eve</td><td>Senior Engineer</td><td class="num-val">1</td></tr>
+<tr><td>Grace</td><td>Engineer</td><td class="num-val">2</td></tr>
+<tr><td>Hank</td><td>Engineer</td><td class="num-val">2</td></tr>
 </tbody>
 </table>
 </div>
 </div>
 
-<!-- ─── Delete ──────────────────────────────────────────────── -->
+<!-- ─── Walk upward ────────────────────────────────────────── -->
 
-<h2>8. Delete with RETURNING</h2>
+<h2>4. Walk upward to the root</h2>
 
-<p>Remove completed tasks and see what was deleted.</p>
+<p>
+    Reverse the direction: start from a leaf node and walk <em>up</em> to the
+    CEO. This answers &ldquo;who is Grace&rsquo;s management chain?&rdquo;
+</p>
 
 <div class="query-pair">
-<pre><code class="language-sql">DELETE FROM task_labels
-WHERE task_id IN (
-  SELECT id FROM tasks
-  WHERE status = 'done'
-);
+<pre><code class="language-sql">WITH RECURSIVE chain AS (
+    SELECT id, name, title,
+           manager_id, 0 AS depth
+    FROM employees
+    WHERE name = 'Grace'
 
-DELETE FROM tasks
-WHERE status = 'done'
-RETURNING id, title;</code></pre>
+    UNION ALL
+
+    SELECT e.id, e.name, e.title,
+           e.manager_id, c.depth + 1
+    FROM employees e
+    JOIN chain c
+      ON e.id = c.manager_id
+)
+SELECT name, title, depth
+FROM chain
+ORDER BY depth;</code></pre>
 <div class="result-wrap">
 <p class="result-label">Result</p>
 <table class="result-table">
-<thead><tr><th>id</th><th>title</th></tr></thead>
+<thead><tr><th>name</th><th>title</th><th>depth</th></tr></thead>
 <tbody>
-<tr><td class="num-val">2</td><td>Fix nav overflow</td></tr>
-<tr><td class="num-val">4</td><td>Login screen</td></tr>
-<tr><td class="num-val">9</td><td>Batch endpoint</td></tr>
+<tr><td>Grace</td><td>Engineer</td><td class="num-val">0</td></tr>
+<tr><td>Diana</td><td>Tech Lead</td><td class="num-val">1</td></tr>
+<tr><td>Bob</td><td>VP Engineering</td><td class="num-val">2</td></tr>
+<tr><td>Alice</td><td>CEO</td><td class="num-val">3</td></tr>
 </tbody>
 </table>
 </div>
 </div>
 
-<!-- ─── Summary query ───────────────────────────────────────── -->
+<p>
+    The join is flipped: <code>e.id = c.manager_id</code> walks from child to
+    parent instead of parent to child.
+</p>
 
-<h2>9. Project summary</h2>
+<!-- ─── Aggregate subtree ──────────────────────────────────── -->
 
-<p>Count remaining tasks per project and status.</p>
+<h2>5. Aggregate over a subtree</h2>
+
+<p>
+    Combine the recursive CTE with an aggregate to compute the total salary
+    cost of each manager&rsquo;s entire subtree (including themselves).
+</p>
 
 <div class="query-pair">
-<pre><code class="language-sql">SELECT p.name AS project,
-       t.status,
-       COUNT(*) AS tasks
-FROM tasks t
-JOIN projects p
-  ON t.project_id = p.id
-GROUP BY p.name, t.status
-ORDER BY p.name, t.status;</code></pre>
+<pre><code class="language-sql">WITH RECURSIVE team AS (
+    SELECT id, name, id AS root_id
+    FROM employees
+    WHERE id IN (1, 2, 3)
+
+    UNION ALL
+
+    SELECT e.id, e.name, t.root_id
+    FROM employees e
+    JOIN team t ON e.manager_id = t.id
+)
+SELECT m.name AS manager,
+       COUNT(*) AS team_size,
+       SUM(e.salary) AS total_cost
+FROM team t
+JOIN employees e ON t.id = e.id
+JOIN employees m ON t.root_id = m.id
+GROUP BY m.name
+ORDER BY total_cost DESC;</code></pre>
 <div class="result-wrap">
 <p class="result-label">Result</p>
 <table class="result-table">
-<thead><tr><th>project</th><th>status</th><th>tasks</th></tr></thead>
+<thead><tr><th>manager</th><th>team_size</th><th>total_cost</th></tr></thead>
 <tbody>
-<tr><td>API Platform</td><td>in_progress</td><td class="num-val">1</td></tr>
-<tr><td>API Platform</td><td>todo</td><td class="num-val">1</td></tr>
-<tr><td>Mobile App</td><td>in_progress</td><td class="num-val">1</td></tr>
-<tr><td>Mobile App</td><td>todo</td><td class="num-val">1</td></tr>
-<tr><td>Website Redesign</td><td>in_progress</td><td class="num-val">1</td></tr>
-<tr><td>Website Redesign</td><td>todo</td><td class="num-val">1</td></tr>
+<tr><td>Alice</td><td class="num-val">10</td><td class="num-val">1125000</td></tr>
+<tr><td>Bob</td><td class="num-val">5</td><td class="num-val">605000</td></tr>
+<tr><td>Charlie</td><td class="num-val">4</td><td class="num-val">420000</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p>
+    Alice&rsquo;s subtree is the entire company: 10 people, $1,125,000 total.
+    Bob&rsquo;s engineering org is 5 people at $605,000. Charlie&rsquo;s sales
+    team is 4 people at $420,000.
+</p>
+
+<!-- ─── Depth limit ────────────────────────────────────────── -->
+
+<h2>6. Limit recursion depth</h2>
+
+<p>
+    Add a <code>WHERE</code> clause on the recursive term to stop after 2
+    levels. This is useful for large trees where you only need nearby nodes.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">WITH RECURSIVE org AS (
+    SELECT id, name, title, 0 AS depth
+    FROM employees
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    SELECT e.id, e.name, e.title,
+           o.depth + 1
+    FROM employees e
+    JOIN org o ON e.manager_id = o.id
+    WHERE o.depth < 2
+)
+SELECT name, title, depth
+FROM org
+ORDER BY depth, name;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>title</th><th>depth</th></tr></thead>
+<tbody>
+<tr><td>Alice</td><td>CEO</td><td class="num-val">0</td></tr>
+<tr><td>Bob</td><td>VP Engineering</td><td class="num-val">1</td></tr>
+<tr><td>Charlie</td><td>VP Sales</td><td class="num-val">1</td></tr>
+<tr><td>Diana</td><td>Tech Lead</td><td class="num-val">2</td></tr>
+<tr><td>Eve</td><td>Senior Engineer</td><td class="num-val">2</td></tr>
+<tr><td>Frank</td><td>Sales Manager</td><td class="num-val">2</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<p>
+    Only 6 rows instead of 10&mdash;the level-3 employees (Grace, Hank, Ivy,
+    Jack) are excluded by the <code>WHERE o.depth &lt; 2</code> guard.
+</p>
+
+<!-- ─── Non-recursive CTE ──────────────────────────────────── -->
+
+<h2>7. Non-recursive CTEs for readability</h2>
+
+<p>
+    Not every CTE needs <code>RECURSIVE</code>. A plain CTE is just a named
+    subquery&mdash;useful for breaking complex queries into readable steps.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">WITH dept_salary AS (
+    SELECT manager_id,
+           COUNT(*) AS reports,
+           AVG(salary) AS avg_salary
+    FROM employees
+    WHERE manager_id IS NOT NULL
+    GROUP BY manager_id
+)
+SELECT e.name, e.title,
+       d.reports,
+       d.avg_salary
+FROM employees e
+JOIN dept_salary d
+  ON e.id = d.manager_id
+ORDER BY d.reports DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>name</th><th>title</th><th>reports</th><th>avg_salary</th></tr></thead>
+<tbody>
+<tr><td>Alice</td><td>CEO</td><td class="num-val">2</td><td class="num-val">157500</td></tr>
+<tr><td>Bob</td><td>VP Engineering</td><td class="num-val">2</td><td class="num-val">125000</td></tr>
+<tr><td>Diana</td><td>Tech Lead</td><td class="num-val">2</td><td class="num-val">97500</td></tr>
+<tr><td>Frank</td><td>Sales Manager</td><td class="num-val">2</td><td class="num-val">77500</td></tr>
+<tr><td>Charlie</td><td>VP Sales</td><td class="num-val">1</td><td class="num-val">110000</td></tr>
 </tbody>
 </table>
 </div>
@@ -629,23 +646,24 @@ ORDER BY p.name, t.status;</code></pre>
 <h2>What you learned</h2>
 
 <p>
-    In this tutorial you built a task tracker with four tables and exercised
-    the core CRUD workflow:
+    In this tutorial you modeled a 10-person org chart and queried it with
+    recursive and non-recursive CTEs:
 </p>
 
 <ul>
-    <li><strong><code>SERIAL</code> + <code>PRIMARY KEY</code></strong> for auto-incrementing IDs</li>
-    <li><strong><code>REFERENCES</code></strong> for foreign-key integrity</li>
-    <li><strong><code>CHECK</code></strong> constraints to limit column values</li>
-    <li><strong><code>ON CONFLICT DO NOTHING</code></strong> for idempotent inserts</li>
-    <li><strong><code>ON CONFLICT DO UPDATE</code></strong> for true upserts</li>
-    <li><strong><code>RETURNING</code></strong> to get affected rows in one round-trip</li>
-    <li><strong>Multi-table JOINs</strong> through a many-to-many relationship</li>
+    <li><strong><code>WITH RECURSIVE</code></strong> to walk a self-referencing tree top-down</li>
+    <li><strong>Anchor + recursive term</strong> pattern with <code>UNION ALL</code></li>
+    <li><strong>Depth tracking</strong> via an incrementing counter column</li>
+    <li><strong>Subtree queries</strong> by changing the anchor&rsquo;s <code>WHERE</code> clause</li>
+    <li><strong>Upward traversal</strong> by flipping the join direction</li>
+    <li><strong>Aggregation over subtrees</strong> by carrying a <code>root_id</code> through the recursion</li>
+    <li><strong>Depth limiting</strong> with a <code>WHERE</code> guard on the recursive term</li>
+    <li><strong>Plain CTEs</strong> for readable multi-step queries without recursion</li>
 </ul>
 
 <div class="tutorial-nav">
-    <span></span>
-    <a class="next" href="reporting-dashboard.html">Reporting Dashboard</a>
+    <a class="prev" href="schema-evolution.html">Schema Evolution</a>
+    <a class="next" href="set-operations.html">Set Operations</a>
 </div>
 
 <footer class="site-footer">

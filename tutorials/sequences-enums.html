@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Tutorial: Sequences, Enums &amp; Custom Types</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        :root { --body-width: 55%; --fg: #111; --fg-dim: #555; --bg: #fffff8; --accent: #a00; --rule: #ccc; --code-bg: #f3f1eb; --nav-width: 180px; }
+        html { font-size: 15px; }
+        body { font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif; background: var(--bg); color: var(--fg); width: var(--body-width); margin-left: auto; margin-right: auto; padding: 3rem 0 5rem 0; }
+        .sidebar { float: left; width: var(--nav-width); margin-left: calc(-1 * var(--nav-width) - 40px); position: sticky; top: 2rem; }
+        .sidebar-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.3rem; }
+        .sidebar-title a { color: var(--fg); text-decoration: none; background: none; }
+        .sidebar-title a:hover { color: var(--accent); }
+        .sidebar-subtitle { font-size: 0.8rem; color: var(--fg-dim); font-style: italic; margin-bottom: 1.2rem; }
+        .sidebar-subtitle a { color: var(--fg-dim); text-decoration: none; background: none; }
+        .sidebar-subtitle a:hover { color: var(--accent); }
+        .sidebar nav ul { list-style: none; padding: 0; }
+        .sidebar nav li { margin-bottom: 0.15rem; }
+        .sidebar nav a { font-size: 0.82rem; color: var(--fg-dim); text-decoration: none; background: none; display: block; padding: 0.2rem 0.5rem; border-radius: 3px; line-height: 1.4; }
+        .sidebar nav a:hover { color: var(--accent); background: var(--code-bg); }
+        .sidebar nav a.active { color: var(--accent); font-weight: 600; background: var(--code-bg); }
+        .sidebar nav .nav-label { font-family: 'Menlo', 'Consolas', monospace; font-size: 0.6rem; font-weight: 700; color: var(--fg-dim); letter-spacing: 0.06em; text-transform: uppercase; padding: 0.6rem 0.5rem 0.2rem; }
+        p, ol, ul { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+        li { margin-bottom: 0.3rem; }
+        ol, ul { padding-left: 1.6rem; }
+        a { color: var(--fg); text-decoration: none; background-image: linear-gradient(var(--accent), var(--accent)); background-size: 1px 1px; background-repeat: repeat-x; background-position: 0 1.15em; }
+        a:hover { color: var(--accent); }
+        strong { font-weight: 600; }
+        h1 { font-weight: 400; font-size: 2.2rem; line-height: 1.15; margin-bottom: 0.4rem; }
+        .subtitle { font-style: italic; font-size: 1.15rem; color: var(--fg-dim); display: block; margin-bottom: 0.6rem; line-height: 1.4; }
+        .byline { font-size: 0.95rem; color: var(--fg-dim); margin-bottom: 2rem; }
+        .title-rule { border: none; height: 3px; background: var(--accent); width: 60px; margin: 0 0 2rem 0; }
+        h2 { font-weight: 400; font-style: italic; font-size: 1.5rem; margin-top: 2.8rem; margin-bottom: 0.6rem; }
+        h3 { font-weight: 600; font-style: normal; font-size: 1.15rem; margin-top: 1.6rem; margin-bottom: 0.4rem; }
+        code { font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace; font-size: 0.82rem; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 2px; }
+        pre { background: var(--code-bg); border-left: 3px solid var(--accent); padding: 1rem 1.2rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.55; margin: 1rem 0 1.4rem 0; }
+        pre code { background: none; padding: 0; border-radius: 0; }
+        pre code.hljs { background: var(--code-bg); padding: 0; }
+        .hljs { background: var(--code-bg); }
+        .result-table { font-family: 'EB Garamond', Georgia, serif; font-size: 0.92rem; border-collapse: collapse; margin: 0.6rem 0 1.2rem 0; width: 100%; border-top: 2px solid var(--fg); border-bottom: 2px solid var(--fg); }
+        .result-table th { font-weight: 400; font-size: 0.78rem; font-variant: small-caps; text-transform: lowercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--fg); padding: 0.3rem 0.6rem 0.25rem; text-align: left; color: var(--fg); }
+        .result-table td { padding: 0.22rem 0.6rem; border: none; white-space: nowrap; }
+        .result-table .null-val { color: #999; font-style: italic; }
+        .result-table .num-val { text-align: right; font-variant-numeric: tabular-nums; }
+        .result-label { font-size: 0.8rem; font-style: italic; color: var(--fg-dim); margin: 0 0 0.3rem 0; }
+        .query-pair { display: flex; gap: 1.2rem; align-items: stretch; margin: 0.8rem 0 1.4rem 0; }
+        .query-pair pre { flex: 1 1 50%; min-width: 0; margin: 0; }
+        .query-pair .result-wrap { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+        .query-pair .result-table { margin: 0; }
+        .tutorial-nav { display: flex; justify-content: space-between; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.95rem; }
+        .tutorial-nav a { background: none; }
+        .tutorial-nav .prev::before { content: '\2190\00a0'; }
+        .tutorial-nav .next::after { content: '\00a0\2192'; }
+        footer.site-footer { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.85rem; color: var(--fg-dim); }
+        footer.site-footer a { font-size: 0.85rem; }
+        hr { border: none; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+        @media (max-width: 1100px) { body { width: 80%; } .sidebar { float: none; margin-left: 0; width: auto; position: static; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--rule); } .sidebar nav ul { display: flex; flex-wrap: wrap; gap: 0.2rem 0.8rem; } .sidebar nav .nav-label { padding-top: 0.3rem; } }
+        @media (max-width: 700px) { body { width: 90%; padding: 2rem 0 3rem 0; } h1 { font-size: 2rem; } .query-pair { flex-direction: column; } }
+    </style>
+    <link rel="stylesheet" href="tutorial-interactive.css">
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-title"><a href="../index.html">mskql</a></div>
+    <div class="sidebar-subtitle"><a href="index.html">Tutorials</a></div>
+    <nav>
+        <ul>
+            <li><a href="task-tracker.html">1. Task Tracker</a></li>
+            <li><a href="reporting-dashboard.html">2. Reporting Dashboard</a></li>
+            <li><a href="time-series.html">3. Time-Series Analytics</a></li>
+            <li><a href="multi-table-joins.html">4. Multi-Table Joins</a></li>
+            <li><a href="schema-evolution.html">5. Schema Evolution</a></li>
+            <li><a href="recursive-ctes.html">6. Recursive CTEs</a></li>
+            <li><a href="set-operations.html">7. Set Operations</a></li>
+            <li><a href="string-math-functions.html">8. String &amp; Math</a></li>
+            <li><a href="indexes-performance.html">9. Indexes</a></li>
+            <li><a href="sequences-enums.html" class="active">10. Sequences &amp; Enums</a></li>
+        </ul>
+        <div class="nav-label">Reference</div>
+        <ul>
+            <li><a href="../grammar.html">SQL Grammar</a></li>
+            <li><a href="../bench-vs-pg.html">vs PostgreSQL</a></li>
+        </ul>
+    </nav>
+</aside>
+
+<h1>Sequences, Enums &amp; Custom Types</h1>
+<span class="subtitle">SERIAL deep dive, CREATE SEQUENCE, and CREATE TYPE AS ENUM</span>
+<p class="byline">Tutorial 10 of 10</p>
+<hr class="title-rule">
+
+<p>
+    Every <code>SERIAL</code> column you have used in previous tutorials is
+    backed by a <strong>sequence</strong>&mdash;a named counter that generates
+    unique integers. This tutorial peels back the abstraction, shows you how
+    to create and control sequences directly, and introduces
+    <strong>enum types</strong> for columns with a fixed set of allowed values.
+</p>
+
+<!-- ─── SERIAL deep dive ───────────────────────────────────── -->
+
+<h2>1. SERIAL under the hood</h2>
+
+<p>
+    <code>SERIAL</code> is syntactic sugar. When you write
+    <code>id SERIAL PRIMARY KEY</code>, mskql creates a sequence named
+    <code>&lt;table&gt;_&lt;column&gt;_seq</code> and sets the column&rsquo;s
+    default to <code>NEXTVAL('&lt;seq&gt;')</code>.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE items (
+    id   SERIAL PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+INSERT INTO items (name) VALUES ('Alpha'), ('Beta'), ('Gamma');</code></pre>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT * FROM items ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; IDs auto-assigned 1, 2, 3</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>name</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>Alpha</td></tr>
+<tr><td class="num-val">2</td><td>Beta</td></tr>
+<tr><td class="num-val">3</td><td>Gamma</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── CREATE SEQUENCE ────────────────────────────────────── -->
+
+<h2>2. CREATE SEQUENCE explicitly</h2>
+
+<p>
+    Create a sequence with custom start, increment, and bounds. This is
+    useful when you need invoice numbers starting at 1000, or IDs that
+    increment by 10.
+</p>
+
+<pre><code class="language-sql">CREATE SEQUENCE invoice_seq START 1000 INCREMENT 1;
+
+CREATE TABLE invoices (
+    id       INT PRIMARY KEY DEFAULT NEXTVAL('invoice_seq'),
+    customer TEXT NOT NULL,
+    amount   INT NOT NULL
+);
+
+INSERT INTO invoices (customer, amount) VALUES
+    ('Acme Corp',  500),
+    ('Globex Inc', 1200),
+    ('Initech',    750);</code></pre>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT * FROM invoices ORDER BY id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; IDs start at 1000</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>customer</th><th>amount</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1000</td><td>Acme Corp</td><td class="num-val">500</td></tr>
+<tr><td class="num-val">1001</td><td>Globex Inc</td><td class="num-val">1200</td></tr>
+<tr><td class="num-val">1002</td><td>Initech</td><td class="num-val">750</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── NEXTVAL directly ───────────────────────────────────── -->
+
+<h2>3. Using NEXTVAL directly</h2>
+
+<p>
+    You can call <code>NEXTVAL</code> in any expression&mdash;not just as a
+    column default. This is useful for generating IDs before inserting, or
+    for numbering rows in a query.
+</p>
+
+<pre><code class="language-sql">CREATE SEQUENCE batch_seq START 1;
+
+SELECT NEXTVAL('batch_seq') AS batch_1;
+SELECT NEXTVAL('batch_seq') AS batch_2;
+SELECT NEXTVAL('batch_seq') AS batch_3;</code></pre>
+
+<p>
+    Each call returns the next value: 1, 2, 3. The sequence never goes
+    backward&mdash;even if a transaction rolls back, consumed values are gone.
+</p>
+
+<!-- ─── CREATE TYPE AS ENUM ────────────────────────────────── -->
+
+<h2>4. CREATE TYPE AS ENUM</h2>
+
+<p>
+    An enum type restricts a column to a fixed set of string values. Unlike a
+    <code>CHECK</code> constraint, the allowed values are defined once and
+    reused across multiple tables. Internally, mskql stores enums as 4-byte
+    ordinals&mdash;not strings&mdash;so comparisons and sorting are integer-fast.
+</p>
+
+<pre><code class="language-sql">CREATE TYPE priority AS ENUM ('low', 'medium', 'high', 'critical');
+CREATE TYPE status AS ENUM ('open', 'in_progress', 'resolved', 'closed');
+
+CREATE TABLE tickets (
+    id       SERIAL PRIMARY KEY,
+    title    TEXT NOT NULL,
+    priority priority NOT NULL DEFAULT 'medium',
+    status   status NOT NULL DEFAULT 'open'
+);
+
+INSERT INTO tickets (title, priority, status) VALUES
+    ('Login page broken',     'critical', 'open'),
+    ('Update docs',           'low',      'in_progress'),
+    ('Add dark mode',         'medium',   'open'),
+    ('Fix memory leak',       'high',     'resolved'),
+    ('Refactor auth module',  'medium',   'in_progress'),
+    ('Upgrade dependencies',  'low',      'closed');</code></pre>
+
+<!-- ─── Query with enum ────────────────────────────────────── -->
+
+<h2>5. Querying enum columns</h2>
+
+<p>
+    Enum values behave like strings in <code>WHERE</code> clauses and
+    <code>ORDER BY</code>. Ordering follows the declaration order (low &lt;
+    medium &lt; high &lt; critical), not alphabetical.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT title, priority, status
+FROM tickets
+WHERE priority IN ('high', 'critical')
+ORDER BY priority, title;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; ordinal order, not alphabetical</p>
+<table class="result-table">
+<thead><tr><th>title</th><th>priority</th><th>status</th></tr></thead>
+<tbody>
+<tr><td>Fix memory leak</td><td>high</td><td>resolved</td></tr>
+<tr><td>Login page broken</td><td>critical</td><td>open</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Enum aggregation ───────────────────────────────────── -->
+
+<h2>6. Aggregating by enum</h2>
+
+<p>
+    Group by an enum column to get counts per status or priority level.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT status,
+       COUNT(*) AS ticket_count
+FROM tickets
+GROUP BY status
+ORDER BY status;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; ordered by enum declaration</p>
+<table class="result-table">
+<thead><tr><th>status</th><th>ticket_count</th></tr></thead>
+<tbody>
+<tr><td>open</td><td class="num-val">2</td></tr>
+<tr><td>in_progress</td><td class="num-val">2</td></tr>
+<tr><td>resolved</td><td class="num-val">1</td></tr>
+<tr><td>closed</td><td class="num-val">1</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Update enum ────────────────────────────────────────── -->
+
+<h2>7. Updating enum values</h2>
+
+<p>
+    Update an enum column just like a text column. The value must be one of
+    the declared enum values&mdash;anything else is an error.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">UPDATE tickets
+SET status = 'resolved',
+    priority = 'high'
+WHERE title = 'Login page broken'
+RETURNING title, priority, status;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>title</th><th>priority</th><th>status</th></tr></thead>
+<tbody>
+<tr><td>Login page broken</td><td>high</td><td>resolved</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Drop type ──────────────────────────────────────────── -->
+
+<h2>8. Drop a sequence or type</h2>
+
+<p>
+    Clean up with <code>DROP SEQUENCE</code> and <code>DROP TYPE</code>.
+    You must drop tables using the type first.
+</p>
+
+<pre><code class="language-sql">DROP SEQUENCE batch_seq;</code></pre>
+
+<p>
+    The sequence is removed. Any column defaulting to
+    <code>NEXTVAL('batch_seq')</code> will error on the next insert.
+</p>
+
+<!-- ─── Wrap-up ─────────────────────────────────────────────── -->
+
+<h2>What you learned</h2>
+
+<p>
+    In this tutorial you explored the type system behind auto-incrementing
+    IDs and constrained string columns:
+</p>
+
+<ul>
+    <li><strong><code>SERIAL</code></strong> is syntactic sugar for a sequence + default</li>
+    <li><strong><code>CREATE SEQUENCE</code></strong> with custom <code>START</code> and <code>INCREMENT</code></li>
+    <li><strong><code>NEXTVAL('seq')</code></strong> to consume the next value from a sequence</li>
+    <li><strong><code>CREATE TYPE AS ENUM</code></strong> for fixed-set string columns</li>
+    <li><strong>Enum ordering</strong> follows declaration order, not alphabetical</li>
+    <li><strong>Enum storage</strong>: 4-byte ordinals internally, string display externally</li>
+    <li><strong><code>DROP SEQUENCE</code> / <code>DROP TYPE</code></strong> for cleanup</li>
+</ul>
+
+<div class="tutorial-nav">
+    <a class="prev" href="indexes-performance.html">Indexes &amp; Performance</a>
+    <span></span>
+</div>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+<script src="../wasm/mskql-wasm.js"></script>
+<script src="tutorial-interactive.js"></script>
+</body>
+</html>

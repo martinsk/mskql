@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Tutorial: Set Operations &amp; Data Comparison</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --body-width: 55%;
+            --fg: #111;
+            --fg-dim: #555;
+            --bg: #fffff8;
+            --accent: #a00;
+            --rule: #ccc;
+            --code-bg: #f3f1eb;
+            --nav-width: 180px;
+        }
+
+        html { font-size: 15px; }
+
+        body {
+            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+            background: var(--bg);
+            color: var(--fg);
+            width: var(--body-width);
+            margin-left: auto;
+            margin-right: auto;
+            padding: 3rem 0 5rem 0;
+        }
+
+        .sidebar {
+            float: left;
+            width: var(--nav-width);
+            margin-left: calc(-1 * var(--nav-width) - 40px);
+            position: sticky;
+            top: 2rem;
+        }
+        .sidebar-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.3rem; }
+        .sidebar-title a { color: var(--fg); text-decoration: none; background: none; }
+        .sidebar-title a:hover { color: var(--accent); }
+        .sidebar-subtitle { font-size: 0.8rem; color: var(--fg-dim); font-style: italic; margin-bottom: 1.2rem; }
+        .sidebar-subtitle a { color: var(--fg-dim); text-decoration: none; background: none; }
+        .sidebar-subtitle a:hover { color: var(--accent); }
+        .sidebar nav ul { list-style: none; padding: 0; }
+        .sidebar nav li { margin-bottom: 0.15rem; }
+        .sidebar nav a { font-size: 0.82rem; color: var(--fg-dim); text-decoration: none; background: none; display: block; padding: 0.2rem 0.5rem; border-radius: 3px; line-height: 1.4; }
+        .sidebar nav a:hover { color: var(--accent); background: var(--code-bg); }
+        .sidebar nav a.active { color: var(--accent); font-weight: 600; background: var(--code-bg); }
+        .sidebar nav .nav-label { font-family: 'Menlo', 'Consolas', monospace; font-size: 0.6rem; font-weight: 700; color: var(--fg-dim); letter-spacing: 0.06em; text-transform: uppercase; padding: 0.6rem 0.5rem 0.2rem; }
+
+        p, ol, ul { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+        li { margin-bottom: 0.3rem; }
+        ol, ul { padding-left: 1.6rem; }
+        a { color: var(--fg); text-decoration: none; background-image: linear-gradient(var(--accent), var(--accent)); background-size: 1px 1px; background-repeat: repeat-x; background-position: 0 1.15em; }
+        a:hover { color: var(--accent); }
+        strong { font-weight: 600; }
+        h1 { font-weight: 400; font-size: 2.2rem; line-height: 1.15; margin-bottom: 0.4rem; }
+        .subtitle { font-style: italic; font-size: 1.15rem; color: var(--fg-dim); display: block; margin-bottom: 0.6rem; line-height: 1.4; }
+        .byline { font-size: 0.95rem; color: var(--fg-dim); margin-bottom: 2rem; }
+        .byline a { font-size: 0.95rem; }
+        .title-rule { border: none; height: 3px; background: var(--accent); width: 60px; margin: 0 0 2rem 0; }
+        h2 { font-weight: 400; font-style: italic; font-size: 1.5rem; margin-top: 2.8rem; margin-bottom: 0.6rem; }
+        h3 { font-weight: 600; font-style: normal; font-size: 1.15rem; margin-top: 1.6rem; margin-bottom: 0.4rem; }
+        code { font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace; font-size: 0.82rem; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 2px; }
+        pre { background: var(--code-bg); border-left: 3px solid var(--accent); padding: 1rem 1.2rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.55; margin: 1rem 0 1.4rem 0; }
+        pre code { background: none; padding: 0; border-radius: 0; }
+        pre code.hljs { background: var(--code-bg); padding: 0; }
+        .hljs { background: var(--code-bg); }
+        .result-table { font-family: 'EB Garamond', Georgia, serif; font-size: 0.92rem; border-collapse: collapse; margin: 0.6rem 0 1.2rem 0; width: 100%; border-top: 2px solid var(--fg); border-bottom: 2px solid var(--fg); }
+        .result-table th { font-weight: 400; font-size: 0.78rem; font-variant: small-caps; text-transform: lowercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--fg); padding: 0.3rem 0.6rem 0.25rem; text-align: left; color: var(--fg); }
+        .result-table td { padding: 0.22rem 0.6rem; border: none; white-space: nowrap; }
+        .result-table .null-val { color: #999; font-style: italic; }
+        .result-table .num-val { text-align: right; font-variant-numeric: tabular-nums; }
+        .result-label { font-size: 0.8rem; font-style: italic; color: var(--fg-dim); margin: 0 0 0.3rem 0; }
+        .query-pair { display: flex; gap: 1.2rem; align-items: stretch; margin: 0.8rem 0 1.4rem 0; }
+        .query-pair pre { flex: 1 1 50%; min-width: 0; margin: 0; }
+        .query-pair .result-wrap { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+        .query-pair .result-table { margin: 0; }
+        .tutorial-nav { display: flex; justify-content: space-between; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.95rem; }
+        .tutorial-nav a { background: none; }
+        .tutorial-nav .prev::before { content: '\2190\00a0'; }
+        .tutorial-nav .next::after { content: '\00a0\2192'; }
+        footer.site-footer { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.85rem; color: var(--fg-dim); }
+        footer.site-footer a { font-size: 0.85rem; }
+        hr { border: none; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+        @media (max-width: 1100px) {
+            body { width: 80%; }
+            .sidebar { float: none; margin-left: 0; width: auto; position: static; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--rule); }
+            .sidebar nav ul { display: flex; flex-wrap: wrap; gap: 0.2rem 0.8rem; }
+            .sidebar nav .nav-label { padding-top: 0.3rem; }
+        }
+        @media (max-width: 700px) {
+            body { width: 90%; padding: 2rem 0 3rem 0; }
+            h1 { font-size: 2rem; }
+            .query-pair { flex-direction: column; }
+        }
+    </style>
+    <link rel="stylesheet" href="tutorial-interactive.css">
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-title"><a href="../index.html">mskql</a></div>
+    <div class="sidebar-subtitle"><a href="index.html">Tutorials</a></div>
+    <nav>
+        <ul>
+            <li><a href="task-tracker.html">1. Task Tracker</a></li>
+            <li><a href="reporting-dashboard.html">2. Reporting Dashboard</a></li>
+            <li><a href="time-series.html">3. Time-Series Analytics</a></li>
+            <li><a href="multi-table-joins.html">4. Multi-Table Joins</a></li>
+            <li><a href="schema-evolution.html">5. Schema Evolution</a></li>
+            <li><a href="recursive-ctes.html">6. Recursive CTEs</a></li>
+            <li><a href="set-operations.html" class="active">7. Set Operations</a></li>
+            <li><a href="string-math-functions.html">8. String &amp; Math</a></li>
+            <li><a href="indexes-performance.html">9. Indexes</a></li>
+            <li><a href="sequences-enums.html">10. Sequences &amp; Enums</a></li>
+        </ul>
+        <div class="nav-label">Reference</div>
+        <ul>
+            <li><a href="../grammar.html">SQL Grammar</a></li>
+            <li><a href="../bench-vs-pg.html">vs PostgreSQL</a></li>
+        </ul>
+    </nav>
+</aside>
+
+<h1>Set Operations &amp; Data Comparison</h1>
+<span class="subtitle">UNION, INTERSECT, EXCEPT &mdash; combining and comparing result sets</span>
+<p class="byline">Tutorial 7 of 10</p>
+<hr class="title-rule">
+
+<p>
+    Set operations combine the results of two or more <code>SELECT</code>
+    statements. They answer questions like &ldquo;which items appear in both
+    lists?&rdquo; or &ldquo;which items are in list A but not list B?&rdquo;
+    &mdash;without writing complex joins. This tutorial uses a product
+    inventory scenario with two warehouses.
+</p>
+
+<!-- ─── Schema ──────────────────────────────────────────────── -->
+
+<h2>1. Schema and seed data</h2>
+
+<p>
+    Two warehouses, each with its own inventory table. Some products overlap,
+    some are exclusive to one warehouse.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE warehouse_east (
+    product_id   INT PRIMARY KEY,
+    product_name TEXT NOT NULL,
+    quantity     INT NOT NULL
+);
+
+CREATE TABLE warehouse_west (
+    product_id   INT PRIMARY KEY,
+    product_name TEXT NOT NULL,
+    quantity     INT NOT NULL
+);
+
+INSERT INTO warehouse_east VALUES
+    (1, 'Widget A',  100),
+    (2, 'Widget B',  200),
+    (3, 'Gadget X',   50),
+    (4, 'Gadget Y',   75),
+    (5, 'Gizmo Z',   30);
+
+INSERT INTO warehouse_west VALUES
+    (2, 'Widget B',  150),
+    (3, 'Gadget X',   80),
+    (5, 'Gizmo Z',   60),
+    (6, 'Doohickey', 120),
+    (7, 'Thingamajig', 90);</code></pre>
+
+<p>
+    5 products in each warehouse. Products 2, 3, and 5 appear in both.
+    Products 1 and 4 are East-only; 6 and 7 are West-only.
+</p>
+
+<!-- ─── UNION ──────────────────────────────────────────────── -->
+
+<h2>2. UNION &mdash; all unique products</h2>
+
+<p>
+    <code>UNION</code> combines two result sets and removes duplicates.
+    This gives us a complete product catalog across both warehouses.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT product_id, product_name
+FROM warehouse_east
+UNION
+SELECT product_id, product_name
+FROM warehouse_west
+ORDER BY product_id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; 7 unique products</p>
+<table class="result-table">
+<thead><tr><th>product_id</th><th>product_name</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>Widget A</td></tr>
+<tr><td class="num-val">2</td><td>Widget B</td></tr>
+<tr><td class="num-val">3</td><td>Gadget X</td></tr>
+<tr><td class="num-val">4</td><td>Gadget Y</td></tr>
+<tr><td class="num-val">5</td><td>Gizmo Z</td></tr>
+<tr><td class="num-val">6</td><td>Doohickey</td></tr>
+<tr><td class="num-val">7</td><td>Thingamajig</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── UNION ALL ──────────────────────────────────────────── -->
+
+<h2>3. UNION ALL &mdash; preserving duplicates</h2>
+
+<p>
+    <code>UNION ALL</code> keeps all rows, including duplicates. This is
+    useful when you want to see every inventory record, or when you know
+    there are no duplicates and want to skip the deduplication cost.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT product_name, quantity,
+       'east' AS warehouse
+FROM warehouse_east
+UNION ALL
+SELECT product_name, quantity,
+       'west' AS warehouse
+FROM warehouse_west
+ORDER BY product_name, warehouse;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; 10 rows (3 products appear twice)</p>
+<table class="result-table">
+<thead><tr><th>product_name</th><th>quantity</th><th>warehouse</th></tr></thead>
+<tbody>
+<tr><td>Doohickey</td><td class="num-val">120</td><td>west</td></tr>
+<tr><td>Gadget X</td><td class="num-val">50</td><td>east</td></tr>
+<tr><td>Gadget X</td><td class="num-val">80</td><td>west</td></tr>
+<tr><td>Gadget Y</td><td class="num-val">75</td><td>east</td></tr>
+<tr><td>Gizmo Z</td><td class="num-val">30</td><td>east</td></tr>
+<tr><td>Gizmo Z</td><td class="num-val">60</td><td>west</td></tr>
+<tr><td>Thingamajig</td><td class="num-val">90</td><td>west</td></tr>
+<tr><td>Widget A</td><td class="num-val">100</td><td>east</td></tr>
+<tr><td>Widget B</td><td class="num-val">200</td><td>east</td></tr>
+<tr><td>Widget B</td><td class="num-val">150</td><td>west</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── INTERSECT ──────────────────────────────────────────── -->
+
+<h2>4. INTERSECT &mdash; products in both warehouses</h2>
+
+<p>
+    <code>INTERSECT</code> returns only rows that appear in <em>both</em>
+    result sets. This answers &ldquo;which products do we stock in both
+    locations?&rdquo;
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT product_id, product_name
+FROM warehouse_east
+INTERSECT
+SELECT product_id, product_name
+FROM warehouse_west
+ORDER BY product_id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; 3 shared products</p>
+<table class="result-table">
+<thead><tr><th>product_id</th><th>product_name</th></tr></thead>
+<tbody>
+<tr><td class="num-val">2</td><td>Widget B</td></tr>
+<tr><td class="num-val">3</td><td>Gadget X</td></tr>
+<tr><td class="num-val">5</td><td>Gizmo Z</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── EXCEPT ─────────────────────────────────────────────── -->
+
+<h2>5. EXCEPT &mdash; products only in East</h2>
+
+<p>
+    <code>EXCEPT</code> returns rows from the first query that do <em>not</em>
+    appear in the second. This finds East-exclusive products.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT product_id, product_name
+FROM warehouse_east
+EXCEPT
+SELECT product_id, product_name
+FROM warehouse_west
+ORDER BY product_id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; 2 East-only products</p>
+<table class="result-table">
+<thead><tr><th>product_id</th><th>product_name</th></tr></thead>
+<tbody>
+<tr><td class="num-val">1</td><td>Widget A</td></tr>
+<tr><td class="num-val">4</td><td>Gadget Y</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Reverse EXCEPT ─────────────────────────────────────── -->
+
+<h2>6. EXCEPT reversed &mdash; products only in West</h2>
+
+<p>
+    Swap the operands to find West-exclusive products. Order matters with
+    <code>EXCEPT</code>&mdash;it is not symmetric.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT product_id, product_name
+FROM warehouse_west
+EXCEPT
+SELECT product_id, product_name
+FROM warehouse_east
+ORDER BY product_id;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; 2 West-only products</p>
+<table class="result-table">
+<thead><tr><th>product_id</th><th>product_name</th></tr></thead>
+<tbody>
+<tr><td class="num-val">6</td><td>Doohickey</td></tr>
+<tr><td class="num-val">7</td><td>Thingamajig</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Combined inventory ─────────────────────────────────── -->
+
+<h2>7. Combined inventory with totals</h2>
+
+<p>
+    Use <code>UNION ALL</code> inside a subquery, then aggregate to get
+    total stock across both warehouses for each product.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT product_name,
+       SUM(quantity) AS total_stock,
+       COUNT(*) AS warehouses
+FROM (
+    SELECT product_name, quantity
+    FROM warehouse_east
+    UNION ALL
+    SELECT product_name, quantity
+    FROM warehouse_west
+) AS combined
+GROUP BY product_name
+ORDER BY total_stock DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>product_name</th><th>total_stock</th><th>warehouses</th></tr></thead>
+<tbody>
+<tr><td>Widget B</td><td class="num-val">350</td><td class="num-val">2</td></tr>
+<tr><td>Gadget X</td><td class="num-val">130</td><td class="num-val">2</td></tr>
+<tr><td>Doohickey</td><td class="num-val">120</td><td class="num-val">1</td></tr>
+<tr><td>Widget A</td><td class="num-val">100</td><td class="num-val">1</td></tr>
+<tr><td>Gizmo Z</td><td class="num-val">90</td><td class="num-val">2</td></tr>
+<tr><td>Thingamajig</td><td class="num-val">90</td><td class="num-val">1</td></tr>
+<tr><td>Gadget Y</td><td class="num-val">75</td><td class="num-val">1</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Wrap-up ─────────────────────────────────────────────── -->
+
+<h2>What you learned</h2>
+
+<p>
+    In this tutorial you compared two warehouse inventories using all four
+    set operations:
+</p>
+
+<ul>
+    <li><strong><code>UNION</code></strong> to merge result sets with automatic deduplication</li>
+    <li><strong><code>UNION ALL</code></strong> to merge without deduplication (faster, preserves all rows)</li>
+    <li><strong><code>INTERSECT</code></strong> to find rows common to both sets</li>
+    <li><strong><code>EXCEPT</code></strong> to find rows in one set but not the other</li>
+    <li><strong>Subquery + aggregate</strong> pattern to summarize combined data</li>
+    <li><strong>Tagging rows</strong> with a literal column (<code>'east' AS warehouse</code>) before combining</li>
+</ul>
+
+<div class="tutorial-nav">
+    <a class="prev" href="recursive-ctes.html">Recursive CTEs</a>
+    <a class="next" href="string-math-functions.html">String &amp; Math Functions</a>
+</div>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+<script src="../wasm/mskql-wasm.js"></script>
+<script src="tutorial-interactive.js"></script>
+</body>
+</html>

@@ -78,11 +78,11 @@
 <p class="breadcrumb"><a href="../index.html">&larr; mskql</a></p>
 
 <h1>Tutorials</h1>
-<span class="subtitle">Five hands-on SQL workflows, from schema to finished queries</span>
+<span class="subtitle">Ten hands-on SQL workflows, from schema to finished queries</span>
 <hr class="title-rule">
 
 <p>
-    <strong>Five self-contained tutorials. Every query runs live in the browser
+    <strong>Ten self-contained tutorials. Every query runs live in the browser
     via WebAssembly.</strong> Edit the SQL and re-run. No server required.
 </p>
 
@@ -171,6 +171,91 @@
             <span class="card-tag">CAST</span>
             <span class="card-tag">TRANSACTIONS</span>
             <span class="card-tag">MIGRATION</span>
+        </div>
+    </a>
+
+    <a class="tutorial-card" href="recursive-ctes.html">
+        <span class="card-number">Tutorial 6</span>
+        <div class="card-title">Recursive CTEs &amp; Tree Queries</div>
+        <p class="card-desc">
+            Model an org chart with self-referencing foreign keys and
+            query it with <code>WITH&nbsp;RECURSIVE</code>. Walk trees
+            top-down and bottom-up, track depth, aggregate subtrees,
+            and limit recursion depth.
+        </p>
+        <div class="card-tags">
+            <span class="card-tag">WITH RECURSIVE</span>
+            <span class="card-tag">HIERARCHY</span>
+            <span class="card-tag">CTE</span>
+            <span class="card-tag">SELF-JOIN</span>
+        </div>
+    </a>
+
+    <a class="tutorial-card" href="set-operations.html">
+        <span class="card-number">Tutorial 7</span>
+        <div class="card-title">Set Operations &amp; Data Comparison</div>
+        <p class="card-desc">
+            Compare two warehouse inventories with <code>UNION</code>,
+            <code>UNION&nbsp;ALL</code>, <code>INTERSECT</code>, and
+            <code>EXCEPT</code>. Find shared products, exclusive items,
+            and aggregate combined stock.
+        </p>
+        <div class="card-tags">
+            <span class="card-tag">UNION</span>
+            <span class="card-tag">INTERSECT</span>
+            <span class="card-tag">EXCEPT</span>
+            <span class="card-tag">SUBQUERY</span>
+        </div>
+    </a>
+
+    <a class="tutorial-card" href="string-math-functions.html">
+        <span class="card-number">Tutorial 8</span>
+        <div class="card-title">String &amp; Math Functions</div>
+        <p class="card-desc">
+            Transform a product catalog with <code>UPPER</code>,
+            <code>SUBSTRING</code>, <code>REPLACE</code>, <code>CONCAT</code>,
+            <code>ABS</code>, <code>ROUND</code>, <code>COALESCE</code>,
+            <code>NULLIF</code>, and <code>CASE&nbsp;WHEN</code>.
+        </p>
+        <div class="card-tags">
+            <span class="card-tag">STRING</span>
+            <span class="card-tag">MATH</span>
+            <span class="card-tag">COALESCE</span>
+            <span class="card-tag">CASE WHEN</span>
+        </div>
+    </a>
+
+    <a class="tutorial-card" href="indexes-performance.html">
+        <span class="card-number">Tutorial 9</span>
+        <div class="card-title">Indexes &amp; Query Performance</div>
+        <p class="card-desc">
+            Create B-tree indexes, use <code>EXPLAIN</code> to see
+            query plans, understand when indexes help and when they
+            hurt. Covers <code>IF&nbsp;NOT&nbsp;EXISTS</code>,
+            primary key indexes, and <code>DROP&nbsp;INDEX</code>.
+        </p>
+        <div class="card-tags">
+            <span class="card-tag">CREATE INDEX</span>
+            <span class="card-tag">EXPLAIN</span>
+            <span class="card-tag">B-TREE</span>
+            <span class="card-tag">PERFORMANCE</span>
+        </div>
+    </a>
+
+    <a class="tutorial-card" href="sequences-enums.html">
+        <span class="card-number">Tutorial 10</span>
+        <div class="card-title">Sequences, Enums &amp; Custom Types</div>
+        <p class="card-desc">
+            Peek behind <code>SERIAL</code> to see sequences, create
+            custom sequences with <code>START</code>/<code>INCREMENT</code>,
+            and define <code>ENUM</code> types for fixed-set columns
+            with ordinal ordering.
+        </p>
+        <div class="card-tags">
+            <span class="card-tag">SEQUENCE</span>
+            <span class="card-tag">SERIAL</span>
+            <span class="card-tag">ENUM</span>
+            <span class="card-tag">NEXTVAL</span>
         </div>
     </a>
 

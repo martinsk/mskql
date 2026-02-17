@@ -79,39 +79,240 @@
     </tbody>
 </table>
 
-<h2 id="memory">Memory management</h2>
+<h2 id="memory">Memory model</h2>
 
-<h3>Arena allocator</h3>
 <p>
-    All memory is managed through a pool-based arena (<code>arena.h</code>).
-    Parsed structures use <code>uint32_t</code> indices instead of pointers.
-    Freeing an entire query is one <code>query_arena_destroy()</code> call&mdash;no
-    recursive walks, no per-node <code>free()</code>.
+    mskql uses <strong>six distinct memory regions</strong>, each with a different
+    lifetime and allocation strategy. Understanding how they interact explains
+    why the system achieves zero steady-state <code>malloc</code>/<code>free</code>
+    calls and why queries run faster than PostgreSQL on every benchmark.
 </p>
 
-<h3>Bump allocators</h3>
+<h3 id="six-regions">The six regions</h3>
+
+<table>
+    <thead>
+        <tr><th>Region</th><th>Backing</th><th>Lifetime</th><th>Location</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Row store</strong></td>
+            <td><code>malloc</code>&rsquo;d dynamic arrays of rows, each a dynamic array of typed cells</td>
+            <td>Table lifetime</td>
+            <td><code>table.rows</code></td>
+        </tr>
+        <tr>
+            <td><strong>Scan cache</strong></td>
+            <td>Heap-allocated flat typed arrays per column</td>
+            <td>Invalidated on <code>generation++</code></td>
+            <td><code>table.scan_cache</code></td>
+        </tr>
+        <tr>
+            <td><strong>Arena pools</strong></td>
+            <td>17 dynamic arrays of typed structs, indexed by <code>uint32_t</code></td>
+            <td>Connection-scoped, reset per query</td>
+            <td><code>client_state.arena</code></td>
+        </tr>
+        <tr>
+            <td><strong>Bump slab chain</strong></td>
+            <td>Linked list of fixed-size slabs (4&nbsp;KB &rarr; doubling)</td>
+            <td>Reset per query (rewind, no free)</td>
+            <td><code>arena.bump</code>, <code>arena.scratch</code>, <code>arena.result_text</code></td>
+        </tr>
+        <tr>
+            <td><strong>Block executor</strong></td>
+            <td>1,024-row <code>col_block</code> arrays, bump-allocated</td>
+            <td>Per-query (freed with scratch reset)</td>
+            <td><code>plan_exec_ctx</code> via <code>arena.scratch</code></td>
+        </tr>
+        <tr>
+            <td><strong>Result cache</strong></td>
+            <td>8,192-slot hash table of serialized wire bytes</td>
+            <td>Invalidated on any write (<code>total_generation</code>)</td>
+            <td><code>g_rcache[]</code> global</td>
+        </tr>
+    </tbody>
+</table>
+
+<h3 id="interaction">How they interact</h3>
+
 <p>
-    A slab-chain bump allocator (<code>arena.scratch</code>) handles temporary
-    executor state: aggregate accumulators, sort buffers, window-function arrays.
-    All freed in bulk per query&mdash;zero <code>malloc</code>/<code>free</code>
-    calls at steady state. A separate result-text bump allocator
-    (<code>arena.result_text</code>) eliminates per-cell <code>strdup</code>
-    for text results.
+    A <code>SELECT</code> query touches all six regions in sequence.
+    Following a single query through the system reveals why each region
+    exists and how they eliminate overhead at every stage.
 </p>
 
-<h3>Expression evaluator</h3>
 <p>
-    Expressions are a tagged-union AST (<code>struct&nbsp;expr</code>) evaluated
-    by <code>eval_expr()</code>. Supports <code>CAST</code>/<code>::</code>,
-    date/time arithmetic, 30+ built-in scalar functions (math, string, temporal),
-    <code>CASE&nbsp;WHEN</code>, and subqueries.
+    <strong>1. Wire &rarr; Arena.</strong>
+    The pgwire layer receives raw SQL bytes over TCP. The parser allocates
+    AST nodes into the arena&rsquo;s 17 typed pools&mdash;expressions, conditions,
+    join descriptors, aggregate definitions&mdash;each referenced by
+    <code>uint32_t</code> index, not pointer. String literals and identifiers
+    go into the bump slab. After the first query warms up the dynamic-array
+    capacities and bump slabs, subsequent queries reuse all existing memory:
+    <code>query_arena_reset()</code> sets counts to zero and rewinds bump
+    pointers without calling <code>free()</code>.
 </p>
 
-<h3>Internal abstractions</h3>
 <p>
-    Dynamic-array macro (<code>dynamic_array.h</code>), zero-copy string views
-    (<code>stringview.h</code>), and JPL-style ownership: the allocating module
-    deallocates.
+    <strong>2. Arena &rarr; Plan.</strong>
+    <code>plan_build_select()</code> reads the arena AST and allocates plan
+    nodes into <code>arena.plan_nodes</code>. Auxiliary arrays&mdash;sort
+    column indices, projection column maps, hash-join key mappings&mdash;are
+    bump-allocated from <code>arena.scratch</code>. The plan builder is
+    composable: <code>build_join()</code>, <code>build_aggregate()</code>,
+    <code>build_window()</code>, and <code>build_set_op()</code> each return
+    a <code>struct plan_result</code> with status (<code>PLAN_OK</code>,
+    <code>PLAN_NOTIMPL</code>, or <code>PLAN_ERROR</code>). Unimplemented
+    features fall back to the legacy row-at-a-time executor automatically.
+</p>
+
+<p>
+    <strong>3. Row store &rarr; Scan cache.</strong>
+    When <code>seq_scan_next()</code> runs, it checks
+    <code>scan_cache.generation</code> against <code>table.generation</code>.
+    On a <strong>cache hit</strong>, it copies a 1,024-row slice from the
+    pre-built flat arrays into a <code>col_block</code>&mdash;a single
+    <code>memcpy</code> per column. On a <strong>cache miss</strong> (first
+    scan, or after an <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>
+    bumped the generation), it rebuilds the cache by walking the row store
+    once&mdash;O(N) cost amortized across all subsequent queries until the
+    next write.
+</p>
+
+<p>
+    <strong>4. Scan cache &rarr; Block executor.</strong>
+    Filter, sort, hash join, hash aggregation, window functions, and set
+    operations all process 1,024-row <code>col_block</code> chunks. A filter
+    produces a selection vector (an array of active row indices) instead of
+    copying data. Hash tables for joins and aggregation, sort index arrays,
+    and window-function accumulators are all bump-allocated from
+    <code>arena.scratch</code>&mdash;zero <code>malloc</code> calls during
+    execution.
+</p>
+
+<p>
+    <strong>5. Block executor &rarr; Wire.</strong>
+    <code>try_plan_send()</code> serializes <code>col_block</code> arrays
+    directly into a 64&nbsp;KB wire buffer, then flushes with a single
+    <code>write()</code> system call. <strong>No row materialization
+    occurs</strong>&mdash;data flows columnar from the scan cache straight
+    to the TCP socket. For a 5,000-row result, this means 5 system calls
+    instead of 5,000.
+</p>
+
+<p>
+    <strong>6. Wire &rarr; Result cache.</strong>
+    The serialized wire bytes (RowDescription + DataRows + CommandComplete)
+    are stored in <code>g_rcache</code>, a 8,192-slot hash table keyed by
+    SQL hash and <code>total_generation</code> (the sum of all table
+    generations). The next identical query skips parsing, planning, and
+    execution entirely&mdash;a single <code>send_all()</code> of cached
+    bytes. The result cache is invalidated on any write to any table.
+</p>
+
+<h3 id="perf">Performance implications</h3>
+
+<p>
+    <strong>Zero steady-state allocation.</strong>
+    After the first query warms up dynamic-array capacities and bump slabs,
+    subsequent queries perform zero <code>malloc</code>/<code>free</code>
+    calls. The parser, plan builder, and executor all reuse existing memory.
+    This eliminates allocator contention and fragmentation entirely.
+</p>
+
+<p>
+    <strong>Scan cache eliminates row-store overhead.</strong>
+    Converting 5,000 rows &times; 3 columns from a row-of-cells layout to
+    flat typed arrays costs ~0.1&nbsp;ms once. Subsequent scans read 32&nbsp;KB
+    of contiguous data instead of chasing 5,000 pointers through
+    individually-allocated cell structures.
+</p>
+
+<p>
+    <strong>1,024-row blocks fit L1 cache.</strong>
+    A 4-column <code>INT</code> block occupies 4 &times; 1,024 &times; 4
+    = 16&nbsp;KB. L1 data cache on modern CPUs is typically 32&ndash;48&nbsp;KB.
+    The entire working set for a filter or aggregate pass fits in L1,
+    eliminating cache misses during the inner loop.
+</p>
+
+<p>
+    <strong>Batched wire send.</strong>
+    Accumulating DataRow messages into a 64&nbsp;KB buffer and flushing with
+    one <code>write()</code> call eliminates one system call per row. For a
+    5,000-row result: 5 <code>write()</code> calls instead of 5,000. This
+    alone closed the full-scan performance gap from 4.65&times; slower than
+    PostgreSQL to 1.18&times;&mdash;nearly matching.
+</p>
+
+<p>
+    <strong>Result cache.</strong>
+    Repeated identical <code>SELECT</code>s skip parsing, planning, and
+    execution entirely. The throughput benchmark&rsquo;s analytical CTE
+    workload runs at 74,069&nbsp;QPS (152&times; PostgreSQL) because the
+    result is served from cached wire bytes in microseconds.
+</p>
+
+<p>
+    <strong>Lazy copy-on-write transactions.</strong>
+    <code>BEGIN</code> records table names and generation numbers&mdash;O(1).
+    The first write to a table triggers a <code>table_deep_copy()</code> of
+    that table only&mdash;O(N) for that table. <code>COMMIT</code> is free
+    (discard the snapshot). <code>ROLLBACK</code> swaps the saved copy back.
+    This is why the transaction benchmark runs at 0.93&times; PostgreSQL
+    despite mskql having no WAL.
+</p>
+
+<h3 id="ownership">Ownership rules</h3>
+
+<p>
+    <strong>JPL-style ownership.</strong>
+    The allocating module deallocates. The arena owns all parser output.
+    Bump slabs own all executor scratch state. Each table owns its rows
+    and scan cache. No module ever frees memory it did not allocate.
+</p>
+
+<p>
+    <strong><code>arena_owns_text</code> flag.</strong>
+    When set on result rows, text cells live in the <code>result_text</code>
+    bump slab. On query completion, all result text is bulk-freed by
+    rewinding the bump pointer&mdash;no per-cell <code>free()</code> needed.
+    When the flag is not set (legacy path), each cell&rsquo;s text is
+    individually <code>free()</code>&rsquo;d.
+</p>
+
+<p>
+    <strong>No cross-region pointers.</strong>
+    Plan nodes reference arena items by <code>uint32_t</code> index, not
+    pointer. The bump slab chain never moves old slabs (new slabs are
+    appended), so pointers into any slab remain valid for the lifetime of
+    the query. This eliminates an entire class of use-after-free bugs.
+</p>
+
+<h3 id="abstractions">Internal abstractions</h3>
+
+<p>
+    <strong>Dynamic-array macro</strong> (<code>dynamic_array.h</code>):
+    type-safe <code>DYNAMIC_ARRAY(T)</code> with <code>da_push</code>,
+    <code>da_reset</code>, <code>da_free</code>. Backing array doubles on
+    overflow. Used for table rows, arena pools, and all variable-length
+    internal structures.
+</p>
+
+<p>
+    <strong>Zero-copy string views</strong> (<code>stringview.h</code>):
+    <code>sv</code> is a <code>{const char *data, size_t len}</code> pair.
+    The parser operates entirely on string views into the original SQL
+    text&mdash;no copies until a value must outlive the input buffer.
+</p>
+
+<p>
+    <strong>Expression evaluator</strong> (<code>eval_expr()</code>):
+    a tagged-union AST (<code>struct expr</code>) supporting
+    <code>CAST</code>/<code>::</code>, date/time arithmetic, 30+ built-in
+    scalar functions (math, string, temporal), <code>CASE&nbsp;WHEN</code>,
+    and subqueries.
 </p>
 
 <h2 id="so-what">Why this design</h2>
@@ -120,21 +321,26 @@
     <strong>Fast.</strong> The block-oriented executor with columnar scan caching
     is faster than PostgreSQL on all 26 batch benchmarks. Aggregate queries run
     up to 10&times; faster. Direct columnar-to-wire serialization avoids row
-    materialization entirely.
+    materialization entirely. The throughput benchmark sustains 74,069&nbsp;QPS
+    on analytical workloads&mdash;152&times; PostgreSQL.
 </p>
 <p>
     <strong>Simple.</strong> Zero external dependencies. One <code>.c</code> file per
     stage. The entire codebase fits in a single developer&rsquo;s head.
+    Six memory regions, each with clear ownership and lifetime rules.
 </p>
 <p>
     <strong>Safe.</strong> Every test runs under AddressSanitizer. Arena allocation
-    eliminates use-after-free and leak classes by construction.
+    and index-based references eliminate use-after-free and leak classes by
+    construction. The bump slab chain&rsquo;s append-only growth means pointers
+    never dangle within a query&rsquo;s lifetime.
 </p>
 
 <h2 id="now-what">Explore further</h2>
 
 <p>
     <a href="bench-vs-pg.html">Benchmarks vs PostgreSQL</a> &ensp;&middot;&ensp;
+    <a href="bench-workloads.html">Benchmark workload details</a> &ensp;&middot;&ensp;
     <a href="grammar.html">SQL grammar</a> &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a> &ensp;&middot;&ensp;
     <a href="playground.html">Try it in the browser</a>

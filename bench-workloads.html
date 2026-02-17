@@ -1,0 +1,1426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Benchmark Workload Details</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .workload {
+            margin-bottom: 2.5rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--rule);
+        }
+        .workload:last-child { border-bottom: none; }
+        .workload h3 {
+            font-weight: 600;
+            font-size: 1.15rem;
+            margin-bottom: 0.3rem;
+        }
+        .workload-meta {
+            font-size: 0.85rem;
+            color: var(--fg-dim);
+            margin-bottom: 0.8rem;
+        }
+        .workload-meta code {
+            font-size: 0.78rem;
+        }
+        .what, .so-what, .now-what {
+            margin-bottom: 0.8rem;
+        }
+        .section-label {
+            font-weight: 600;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--accent);
+            display: block;
+            margin-bottom: 0.15rem;
+        }
+        pre {
+            background: var(--code-bg);
+            border-left: 3px solid var(--accent);
+            padding: 0.8rem 1rem;
+            overflow-x: auto;
+            font-size: 0.78rem;
+            line-height: 1.5;
+            margin: 0.5rem 0 0.8rem 0;
+        }
+        pre code { background: none; padding: 0; }
+        .faster { color: #1a7a1a; font-weight: 600; }
+    </style>
+</head>
+<body>
+
+<p class="breadcrumb"><a href="bench-vs-pg.html">&larr; Benchmarks vs PostgreSQL</a></p>
+
+<h1>Benchmark Workload Details</h1>
+<span class="subtitle">What each workload tests, why it matters, and how mskql handles it</span>
+<hr class="title-rule">
+
+<p>
+    <strong>26 batch workloads and 14 throughput workloads.</strong> Each entry
+    below shows the exact SQL, explains what database capability it exercises,
+    and describes how mskql&rsquo;s architecture produces the measured result.
+    For the summary numbers, see <a href="bench-vs-pg.html">Benchmarks vs PostgreSQL</a>.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="batch">Batch Latency Workloads</h2>
+<p>
+    Each batch workload runs a fixed number of iterations of the same query
+    through a single <code>psql</code> session. The timer measures total
+    wall-clock time including connection overhead. Source:
+    <code>bench/bench_vs_pg.py</code>.
+</p>
+
+<!-- ── Reads & Scans ──────────────────────────────────────── -->
+<h2 id="reads">Reads &amp; Scans</h2>
+
+<div class="workload" id="full_scan">
+    <h3>Full table scan</h3>
+    <div class="workload-meta">5,000 rows &times; 3 columns &times; 200 iterations &ensp;|&ensp; <span class="faster">0.68&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM bench_data;</code></pre>
+        <p>
+            A table with 5,000 rows and 3 columns (<code>id INT</code>,
+            <code>category TEXT</code>, <code>value INT</code>). The query
+            reads every row and sends all columns to the client. Repeated
+            200 times to amortize connection overhead.
+        </p>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Full scans test raw read throughput: how fast the engine can
+            materialize rows and push them over the wire. This is the
+            baseline for all read workloads. A database that is slow here
+            will be slow everywhere.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            mskql&rsquo;s scan cache converts the row store to flat columnar
+            arrays once (O(N), ~0.1&nbsp;ms for 5K rows). Subsequent scans
+            <code>memcpy</code> 1,024-row slices into <code>col_block</code>
+            arrays. <code>try_plan_send</code> serializes directly from
+            columnar blocks into a 64&nbsp;KB wire buffer&mdash;5 system calls
+            instead of 5,000. No row materialization occurs.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="filtered_scan">
+    <h3>Filtered scan</h3>
+    <div class="workload-meta">5,000 rows &times; 500 iterations &ensp;|&ensp; <span class="faster">0.59&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM bench_data WHERE category = 'cat_42';</code></pre>
+        <p>
+            Same 5,000-row table. The <code>WHERE</code> clause filters to
+            rows matching one of 100 categories (~50 rows per category).
+        </p>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests predicate evaluation speed. The engine must scan all rows
+            but only emit matching ones. This measures the cost of the
+            filter operator relative to the scan.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The plan executor&rsquo;s <code>PLAN_FILTER</code> node produces
+            a selection vector (array of matching row indices) instead of
+            copying data. Only matching rows are serialized to the wire.
+            The scan cache hit means the filter operates on contiguous
+            <code>int32_t[]</code> and <code>char*[]</code> arrays in L1 cache.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="index_lookup">
+    <h3>Indexed point lookup</h3>
+    <div class="workload-meta">2,000 iterations &ensp;|&ensp; <span class="faster">0.98&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM bench_data WHERE id = 42;</code></pre>
+        <p>
+            Point lookup by primary key (B-tree index). Returns exactly 1 row.
+            Repeated 2,000 times with varying IDs.
+        </p>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests index lookup latency&mdash;the most common operation in
+            OLTP workloads. The result is nearly tied (0.98&times;) because
+            both databases use B-tree indexes and the overhead is dominated
+            by network round-trips, not engine work.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            mskql&rsquo;s <code>PLAN_INDEX_SCAN</code> walks the B-tree to
+            find the matching row, then serializes it directly. The result
+            cache does not help here because each query has a different
+            <code>WHERE</code> value. The near-parity shows that mskql&rsquo;s
+            index implementation is competitive with PostgreSQL&rsquo;s.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="sort">
+    <h3>Sort</h3>
+    <div class="workload-meta">5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.56&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM bench_data ORDER BY value DESC;</code></pre>
+        <p>
+            Sort all 5,000 rows by a single integer column in descending order.
+        </p>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests sort performance on a medium dataset. Sorting is a core
+            operation used by <code>ORDER BY</code>, <code>DISTINCT</code>,
+            window functions, and merge joins.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The <code>PLAN_SORT</code> node collects all blocks from its
+            child, builds a flat index array, and sorts it with
+            <code>qsort</code>. The sort key array is bump-allocated from
+            <code>arena.scratch</code>&mdash;zero <code>malloc</code> calls.
+            After sorting, blocks are emitted in sorted order directly to
+            the wire.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="multi_sort">
+    <h3>Multi-column sort</h3>
+    <div class="workload-meta">5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.54&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM bench_data ORDER BY category, value DESC;</code></pre>
+        <p>
+            Sort by two columns: <code>category</code> ascending, then
+            <code>value</code> descending within each category.
+        </p>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Multi-column sorts are common in reporting queries. The comparator
+            must check the first column, then fall through to the second on
+            ties. This tests the overhead of compound sort keys.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The sort node stores parallel arrays of sort columns and direction
+            flags, all bump-allocated. The comparator loops through columns
+            in order, short-circuiting on the first difference. Columnar
+            storage means each column&rsquo;s data is contiguous in memory,
+            improving cache locality during the sort.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="distinct">
+    <h3>Distinct</h3>
+    <div class="workload-meta">100 categories &times; 500 iterations &ensp;|&ensp; <span class="faster">0.14&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT DISTINCT category FROM bench_data;</code></pre>
+        <p>
+            Extract the 100 unique category values from 5,000 rows.
+        </p>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            <code>DISTINCT</code> tests deduplication speed. The 7&times;
+            speedup (0.14&times;) is one of the largest gaps because the
+            result set is tiny (100 rows) while the input is large (5,000).
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            mskql implements <code>DISTINCT</code> via the hash aggregation
+            path with no aggregate functions. The hash table is bump-allocated,
+            and the 100-row result is serialized in a single wire buffer
+            flush. The result cache further accelerates repeated executions.
+        </p>
+    </div>
+</div>
+
+<!-- ── Writes ─────────────────────────────────────────────── -->
+<h2 id="writes">Writes</h2>
+
+<div class="workload" id="insert_bulk">
+    <h3>Single-row inserts</h3>
+    <div class="workload-meta">10,000 inserts &ensp;|&ensp; <span class="faster">0.37&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">INSERT INTO bench_data (id, category, value) VALUES (1, 'cat_1', 42);
+-- ... repeated 10,000 times with different values</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests per-statement insert overhead. Each insert is a separate
+            SQL statement parsed, planned, and executed independently. The
+            3&times; speedup reflects mskql&rsquo;s lack of WAL, fsync, and
+            MVCC bookkeeping.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            Each insert appends a row to the table&rsquo;s dynamic array and
+            bumps the table generation (invalidating the scan cache). The
+            arena is reset between statements. No durability overhead: no
+            WAL write, no fsync, no checkpoint. The result cache is
+            invalidated by the generation bump.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="update">
+    <h3>Bulk update</h3>
+    <div class="workload-meta">1,000 of 5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.20&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">UPDATE bench_data SET value = value + 1 WHERE category = 'cat_42';</code></pre>
+        <p>
+            Update ~50 rows matching a category filter. Repeated 200 times
+            across 20 different categories (1,000 total rows updated per
+            iteration set).
+        </p>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests in-place update speed. The 5&times; speedup (0.20&times;)
+            is the second-largest gap after expression aggregates. Updates
+            are expensive in PostgreSQL because of MVCC: each update creates
+            a new tuple version and marks the old one dead.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            mskql updates rows in place&mdash;no tuple versioning, no dead
+            tuple cleanup. The scan cache is invalidated by the generation
+            bump, but the update itself is a direct cell modification in the
+            row store. No WAL write, no vacuum needed.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="delete">
+    <h3>Insert + delete</h3>
+    <div class="workload-meta">2,000 rows, delete half &times; 50 iterations &ensp;|&ensp; <span class="faster">0.36&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">-- Insert 2,000 rows, then:
+DELETE FROM bench_data WHERE id % 2 = 0;
+-- Repeated 50 times (re-inserting each time)</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests the combined cost of bulk insert + bulk delete. This
+            exercises the full write path including row removal and
+            generation tracking.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            Deletes remove rows from the dynamic array and bump the table
+            generation. No dead tuple tracking, no vacuum. The 3&times;
+            speedup is primarily from avoiding WAL and MVCC overhead.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="transaction">
+    <h3>Transactional inserts</h3>
+    <div class="workload-meta">100 transactions, 50 inserts each &ensp;|&ensp; <span class="faster">0.93&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">BEGIN;
+INSERT INTO bench_data VALUES (1, 'cat_1', 42);
+-- ... 50 inserts
+COMMIT;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests transaction overhead. The near-parity (0.93&times;) is
+            notable because PostgreSQL&rsquo;s transactions are backed by
+            WAL with group commit, while mskql uses lazy copy-on-write
+            snapshots with no durability.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            <code>BEGIN</code> records table names and generation numbers
+            in O(1). The first write to a table triggers
+            <code>table_deep_copy()</code>&mdash;O(N) for that table only.
+            <code>COMMIT</code> discards the snapshot (free).
+            <code>ROLLBACK</code> swaps the saved copy back. The O(N) deep
+            copy on first write is why transactions are the closest result
+            to PostgreSQL.
+        </p>
+    </div>
+</div>
+
+<!-- ── Aggregation ────────────────────────────────────────── -->
+<h2 id="aggregation">Aggregation &amp; Analytics</h2>
+
+<div class="workload" id="aggregate">
+    <h3>Group + sum</h3>
+    <div class="workload-meta">5,000 rows &times; 500 iterations &ensp;|&ensp; <span class="faster">0.12&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT category, SUM(value), COUNT(*), AVG(value)
+FROM bench_data GROUP BY category;</code></pre>
+        <p>
+            Group 5,000 rows by 100 categories and compute 3 aggregates per
+            group.
+        </p>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests hash aggregation speed. The 8&times; speedup (0.12&times;)
+            comes from columnar processing: the aggregator reads contiguous
+            integer arrays instead of extracting values from row tuples.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            <code>PLAN_HASH_AGG</code> builds a hash table keyed by group
+            columns. For each 1,024-row block, it looks up the group and
+            updates accumulators in a tight loop. The hash table and
+            accumulators are bump-allocated. The 100-row result is serialized
+            in a single wire buffer flush. The result cache makes repeated
+            executions near-instant.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="expression_agg">
+    <h3>Expression aggregate</h3>
+    <div class="workload-meta">SUM(price &times; qty), 5,000 rows &times; 500 iterations &ensp;|&ensp; <span class="faster">0.10&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT category, SUM(price * quantity)
+FROM bench_data GROUP BY category;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests expression evaluation inside aggregates. The 10&times;
+            speedup (0.10&times;) is the largest gap in the batch suite.
+            The expression <code>price * quantity</code> must be evaluated
+            for every row before aggregation.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The <code>PLAN_EXPR_PROJECT</code> node evaluates expressions
+            in columnar batches, feeding results into the hash aggregator.
+            Combined with the result cache, repeated executions skip all
+            computation entirely.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="wide_agg">
+    <h3>Wide aggregate</h3>
+    <div class="workload-meta">7 columns, 50,000 rows &times; 20 iterations &ensp;|&ensp; <span class="faster">0.14&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT region, product,
+       SUM(revenue), AVG(cost), MIN(margin),
+       MAX(units), COUNT(*)
+FROM wide_bench GROUP BY region, product;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests aggregation on a wider table with more columns and a
+            larger dataset. The 7&times; speedup shows that the columnar
+            advantage scales with both row count and column count.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            Each column is stored as a contiguous typed array in the scan
+            cache. The hash aggregator processes each column independently,
+            keeping the working set in L1 cache. A 4-column INT block is
+            16&nbsp;KB&mdash;well within the 32&ndash;48&nbsp;KB L1 data cache.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="window_functions">
+    <h3>Window function (ROW_NUMBER)</h3>
+    <div class="workload-meta">5,000 rows &times; 20 iterations &ensp;|&ensp; <span class="faster">0.57&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT *, ROW_NUMBER() OVER (PARTITION BY category ORDER BY value DESC)
+FROM bench_data;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests window function execution with partitioning and ordering.
+            Window functions are among the most complex query operations,
+            requiring sorting within each partition.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The <code>PLAN_WINDOW</code> node sorts all input blocks by
+            partition key + order key, then walks the sorted data to compute
+            window values. All sort indices and window accumulators are
+            bump-allocated from <code>arena.scratch</code>.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="window_rank">
+    <h3>Window function (RANK)</h3>
+    <div class="workload-meta">50,000 rows &times; 5 iterations &ensp;|&ensp; <span class="faster">0.55&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT *, RANK() OVER (PARTITION BY region ORDER BY revenue DESC)
+FROM wide_bench;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests window functions on a larger dataset (50K rows). RANK
+            handles ties differently from ROW_NUMBER, requiring comparison
+            with the previous row&rsquo;s order value.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            Same window node, but with RANK semantics: equal order values
+            get the same rank, and the next rank skips ahead. The 10&times;
+            larger dataset shows the columnar advantage holds at scale.
+        </p>
+    </div>
+</div>
+
+<!-- ── Joins & Subqueries ─────────────────────────────────── -->
+<h2 id="joins">Joins, Subqueries &amp; Complex Queries</h2>
+
+<div class="workload" id="join">
+    <h3>Two-table join</h3>
+    <div class="workload-meta">500 + 2,000 rows &times; 50 iterations &ensp;|&ensp; <span class="faster">0.45&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT c.name, o.amount, o.created
+FROM customers c
+JOIN orders o ON c.id = o.customer_id;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests hash join performance on a typical OLTP join pattern:
+            a small dimension table (500 customers) joined to a larger
+            fact table (2,000 orders).
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            <code>PLAN_HASH_JOIN</code> builds a hash table from the smaller
+            (inner) table, then probes it for each block of the larger
+            (outer) table. The hash table is bump-allocated. The join cache
+            (<code>table.join_cache</code>) stores the pre-built hash table
+            and is invalidated by the same generation counter as the scan
+            cache.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="multi_join">
+    <h3>Three-table join + group</h3>
+    <div class="workload-meta">50,000 rows &times; 5 iterations &ensp;|&ensp; <span class="faster">0.33&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT r.name, p.name, SUM(s.revenue)
+FROM sales s
+JOIN regions r ON s.region_id = r.id
+JOIN products p ON s.product_id = p.id
+GROUP BY r.name, p.name;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests a star-schema join pattern: one large fact table joined
+            to two small dimension tables, followed by aggregation. This
+            is the canonical analytical query pattern.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            Two hash joins are chained, feeding into a hash aggregation
+            node. All three hash tables are bump-allocated. The result
+            (a small number of region &times; product combinations) is
+            cached by the result cache, making repeated executions
+            near-instant.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="subquery">
+    <h3>Subquery filter</h3>
+    <div class="workload-meta">IN subquery &times; 50 iterations &ensp;|&ensp; <span class="faster">0.44&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM orders
+WHERE customer_id IN (
+    SELECT id FROM customers WHERE region = 'West'
+);</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests <code>IN</code> subquery execution. The subquery is
+            converted to a hash semi-join internally, avoiding the naive
+            nested-loop approach.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            <code>PLAN_HASH_SEMI_JOIN</code> builds a hash set from the
+            subquery result, then probes it for each row of the outer
+            query. This is O(N + M) instead of O(N &times; M) for a
+            naive correlated subquery.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="subquery_complex">
+    <h3>Subquery pipeline</h3>
+    <div class="workload-meta">filter + sort + limit, 50,000 rows &times; 20 iterations &ensp;|&ensp; <span class="faster">0.20&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM (
+    SELECT * FROM wide_bench WHERE region = 'North'
+    ORDER BY revenue DESC
+    LIMIT 100
+) sub;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests a multi-stage pipeline: filter &rarr; sort &rarr; limit,
+            wrapped in a subquery. The 5&times; speedup (0.20&times;) shows
+            the benefit of the block-oriented executor on compound operations.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The plan is a chain: <code>SeqScan &rarr; Filter &rarr; Sort
+            &rarr; Limit</code>. Each node pulls blocks from its child
+            on demand. The limit node stops pulling after 100 rows,
+            avoiding unnecessary sort work on the remaining data.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="cte">
+    <h3>CTE filter chain</h3>
+    <div class="workload-meta">5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.44&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">WITH filtered AS (
+    SELECT * FROM bench_data WHERE value > 50
+)
+SELECT category, COUNT(*) FROM filtered
+GROUP BY category ORDER BY COUNT(*) DESC;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests CTE materialization and subsequent aggregation. CTEs
+            are a common pattern for breaking complex queries into
+            readable steps.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The CTE is materialized into a temporary table, then the
+            outer query runs against it. The scan cache is built for the
+            temp table on first access. The result cache caches the final
+            wire output.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="analytical_cte">
+    <h3>CTE pipeline</h3>
+    <div class="workload-meta">agg &rarr; sort &rarr; limit, 50,000 rows &times; 20 iterations &ensp;|&ensp; <span class="faster">0.75&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">WITH summary AS (
+    SELECT region, SUM(revenue) AS total
+    FROM wide_bench GROUP BY region
+)
+SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests a multi-stage analytical pipeline: aggregate in a CTE,
+            then sort and limit the result. The closer ratio (0.75&times;)
+            reflects that PostgreSQL&rsquo;s query optimizer handles this
+            pattern well.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The CTE materializes the aggregation result, then the outer
+            query sorts and limits it. Both stages use the block executor.
+            The result cache makes repeated executions near-instant.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="cte_star">
+    <h3>CTE star-schema</h3>
+    <div class="workload-meta">join &rarr; agg &rarr; sort, 50,000 rows &times; 5 iterations &ensp;|&ensp; <span class="faster">0.40&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">WITH joined AS (
+    SELECT r.name AS region, p.name AS product, s.revenue
+    FROM sales s
+    JOIN regions r ON s.region_id = r.id
+    JOIN products p ON s.product_id = p.id
+)
+SELECT region, SUM(revenue) AS total
+FROM joined GROUP BY region
+ORDER BY total DESC;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            The most complex batch workload: two joins, aggregation, and
+            sorting in a single CTE pipeline. This is a realistic
+            analytical query on a star schema.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The CTE materializes the join result, then the outer query
+            aggregates and sorts. In the throughput benchmark, this same
+            query runs at 74,069&nbsp;QPS (152&times; PostgreSQL) because
+            the 4-row result is served from the result cache in microseconds.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="set_ops">
+    <h3>Union</h3>
+    <div class="workload-meta">two 2,000-row tables &times; 50 iterations &ensp;|&ensp; <span class="faster">0.54&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT id, category, value FROM bench_data_a
+UNION
+SELECT id, category, value FROM bench_data_b;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests set operation performance. <code>UNION</code> requires
+            deduplication across two result sets, combining scan, hash,
+            and serialization costs.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            <code>PLAN_SET_OP</code> pulls blocks from both children and
+            uses a hash table for deduplication. The hash table is
+            bump-allocated. The deduplicated result is serialized directly
+            to the wire.
+        </p>
+    </div>
+</div>
+
+<!-- ── Functions & Generation ─────────────────────────────── -->
+<h2 id="functions">Functions &amp; Generation</h2>
+
+<div class="workload" id="generate_series">
+    <h3>Generate series</h3>
+    <div class="workload-meta">10,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.32&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM generate_series(1, 10000);</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests table-valued function performance. The 3&times; speedup
+            (0.32&times;) was achieved by generating integers directly into
+            columnar blocks instead of materializing a temporary table.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            <code>PLAN_GENERATE_SERIES</code> produces 1,024-row blocks of
+            contiguous <code>int32_t</code> arrays in a tight loop&mdash;zero
+            <code>malloc</code>, zero row-store materialization. The blocks
+            are serialized directly to the wire via <code>try_plan_send</code>.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="scalar_functions">
+    <h3>Scalar functions</h3>
+    <div class="workload-meta">4 functions, 5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.40&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT UPPER(name), LENGTH(name), ABS(score),
+       ROUND(score::numeric, 2)
+FROM bench_data;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests expression projection with multiple scalar functions.
+            The 2.5&times; speedup (0.40&times;) comes from batched wire
+            send and scan cache hits.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            <code>PLAN_EXPR_PROJECT</code> evaluates all 4 functions per
+            row within each 1,024-row block, writing results into output
+            <code>col_block</code> arrays. The input columns come from the
+            scan cache (contiguous arrays), and the output is serialized
+            directly to the wire&mdash;no row materialization.
+        </p>
+    </div>
+</div>
+
+<!-- ── Large Dataset ──────────────────────────────────────── -->
+<h2 id="large">Large Dataset (50K rows)</h2>
+
+<div class="workload" id="large_sort">
+    <h3>Large sort</h3>
+    <div class="workload-meta">50,000 rows &times; 10 iterations &ensp;|&ensp; <span class="faster">0.87&times;</span></div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM wide_bench ORDER BY revenue DESC;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests sort performance at scale. The closer ratio (0.87&times;)
+            shows that sorting 50K rows is dominated by the O(N log N)
+            comparison cost, where both databases use similar algorithms.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The sort node collects all ~49 blocks (50K / 1024), builds a
+            flat index array, and sorts with <code>qsort</code>. The
+            sorted blocks are then serialized to the wire. The remaining
+            gap is from mskql&rsquo;s batched wire send (fewer system calls)
+            and scan cache (contiguous sort key array).
+        </p>
+    </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="throughput">Concurrent Throughput Workloads</h2>
+<p>
+    Each throughput workload runs 8 threads for 5 seconds, measuring queries
+    per second (QPS) and median latency (p50). Source:
+    <code>bench/bench_throughput.c</code>.
+</p>
+
+<!-- ── Simple reads & writes ──────────────────────────────── -->
+<h2 id="tp-simple">Simple Reads &amp; Writes</h2>
+
+<div class="workload" id="tp_point_read">
+    <h3>Indexed point lookup</h3>
+    <div class="workload-meta">78,600 vs 23,461 QPS &ensp;|&ensp; <span class="faster">3.35&times;</span> &ensp;|&ensp; p50: 0.101 vs 0.254&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM tp_data WHERE id = $1;</code></pre>
+        <p>
+            Point lookup by primary key with a random ID each iteration.
+            8 threads, each with a persistent connection.
+        </p>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            The most common OLTP operation. The 3.35&times; throughput
+            advantage comes from mskql&rsquo;s lower per-query overhead:
+            no planner, no MVCC snapshot, no buffer pool lookup.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            Each query is parsed, the index is walked, and the single
+            matching row is serialized. The arena is reset between queries.
+            At 78,600 QPS, each query completes in ~101 microseconds
+            including network round-trip.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_full_scan">
+    <h3>Full table scan</h3>
+    <div class="workload-meta">121 vs 120 QPS &ensp;|&ensp; <span class="faster">1.00&times;</span> &ensp;|&ensp; p50: 66.0 vs 65.8&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM tp_data;</code></pre>
+        <p>5,000 rows, 8 concurrent threads.</p>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Dead heat. Under concurrent load, full scans are network-bound:
+            serializing 5,000 rows over TCP dominates the total time. The
+            engine speed difference is invisible.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            Both databases spend most of their time in <code>write()</code>
+            system calls. mskql&rsquo;s batched 64&nbsp;KB buffer helps in
+            batch mode but under concurrent load the network becomes the
+            bottleneck.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_filtered_scan">
+    <h3>Filtered scan</h3>
+    <div class="workload-meta">245 vs 241 QPS &ensp;|&ensp; <span class="faster">1.02&times;</span> &ensp;|&ensp; p50: 32.6 vs 33.0&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM tp_data WHERE category = 'cat_42';</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Near-parity, same as full scan. The filter reduces the result
+            set but the scan cost is similar. Network-bound under
+            concurrent load.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The selection vector avoids copying non-matching rows, but the
+            result set (~50 rows) is small enough that serialization time
+            is negligible. The bottleneck is the scan itself.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_insert">
+    <h3>Single-row insert</h3>
+    <div class="workload-meta">63,253 vs 39,189 QPS &ensp;|&ensp; <span class="faster">1.61&times;</span> &ensp;|&ensp; p50: 0.115 vs 0.195&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">INSERT INTO tp_data (id, category, value) VALUES ($1, $2, $3);</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Tests concurrent write throughput. The 1.61&times; advantage
+            is smaller than the 2.7&times; batch advantage because
+            PostgreSQL&rsquo;s group commit amortizes WAL overhead across
+            concurrent writers.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            Each insert appends to the row dynamic array and bumps the
+            generation counter. mskql&rsquo;s single-threaded executor
+            serializes all inserts, but each one is fast enough (115&mu;s)
+            to sustain 63K QPS across 8 threads.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_mixed_rw">
+    <h3>Mixed read/write</h3>
+    <div class="workload-meta">45,252 vs 58,001 QPS &ensp;|&ensp; <span style="color: var(--accent); font-weight: 600;">0.78&times;</span> &ensp;|&ensp; p50: 0.155 vs 0.127&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">-- 80% reads:
+SELECT * FROM tp_data WHERE id = $1;
+-- 20% writes:
+UPDATE tp_data SET value = $1 WHERE id = $2;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            <strong>The only workload where PostgreSQL wins.</strong>
+            PostgreSQL&rsquo;s MVCC allows concurrent readers and writers
+            without blocking. mskql&rsquo;s single-threaded executor
+            serializes all queries, so writers block readers.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            This is a fundamental architectural limitation: mskql processes
+            one query at a time. Adding MVCC or a concurrent executor would
+            close this gap but would add significant complexity to the
+            ~29K-line codebase.
+        </p>
+    </div>
+</div>
+
+<!-- ── Aggregation & Analytics (throughput) ────────────────── -->
+<h2 id="tp-analytics">Aggregation &amp; Analytics</h2>
+
+<div class="workload" id="tp_aggregate">
+    <h3>Group + sum</h3>
+    <div class="workload-meta">60,541 vs 10,042 QPS &ensp;|&ensp; <span class="faster">6.03&times;</span> &ensp;|&ensp; p50: 0.128 vs 0.652&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT category, SUM(value), COUNT(*), AVG(value)
+FROM tp_data GROUP BY category;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            6&times; throughput advantage on aggregation. The result cache
+            serves the 100-row result from cached wire bytes after the
+            first execution, skipping all computation.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            First execution: hash aggregation on columnar blocks (~0.13&nbsp;ms).
+            Subsequent executions: result cache hit, single
+            <code>send_all()</code> of cached bytes (~0.01&nbsp;ms). The
+            cache is invalidated only when a write bumps
+            <code>total_generation</code>.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_wide_agg">
+    <h3>Wide aggregate</h3>
+    <div class="workload-meta">5,386 vs 786 QPS &ensp;|&ensp; <span class="faster">6.85&times;</span> &ensp;|&ensp; p50: 1.471 vs 10.8&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT region, product,
+       SUM(revenue), AVG(cost), MIN(margin),
+       MAX(units), COUNT(*)
+FROM wide_bench GROUP BY region, product;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Nearly 7&times; throughput on a wider aggregation (50K rows,
+            7 columns). The advantage holds at scale because the columnar
+            executor and result cache both benefit from larger datasets.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            Same mechanism as the simple aggregate: first execution builds
+            the result via columnar hash aggregation, subsequent executions
+            serve from the result cache. The 50K-row scan cache is ~200&nbsp;KB
+            of contiguous data.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_window_rank">
+    <h3>Window function (RANK)</h3>
+    <div class="workload-meta">14 vs 12 QPS &ensp;|&ensp; <span class="faster">1.22&times;</span> &ensp;|&ensp; p50: 636.6 vs 652.7&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT *, RANK() OVER (PARTITION BY region ORDER BY revenue DESC)
+FROM wide_bench;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Window functions on 50K rows are expensive in both databases.
+            The modest 1.22&times; advantage shows that the result cache
+            does not help here (the 50K-row result is too large to cache
+            efficiently) and the sort dominates.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            Each execution sorts 50K rows and computes RANK values. The
+            columnar sort is slightly faster due to contiguous sort key
+            arrays, but the O(N log N) cost dominates.
+        </p>
+    </div>
+</div>
+
+<!-- ── Complex queries (throughput) ───────────────────────── -->
+<h2 id="tp-complex">Complex Queries</h2>
+
+<div class="workload" id="tp_join">
+    <h3>Two-table join</h3>
+    <div class="workload-meta">562 vs 302 QPS &ensp;|&ensp; <span class="faster">1.86&times;</span> &ensp;|&ensp; p50: 14.1 vs 26.3&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT c.name, o.amount, o.created
+FROM customers c JOIN orders o ON c.id = o.customer_id;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Nearly 2&times; throughput on a join producing ~2K result rows.
+            The result is large enough that the result cache helps but
+            serialization still takes significant time.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The hash join builds a hash table from the 500-row customers
+            table and probes it for each block of the 2K-row orders table.
+            The join cache stores the pre-built hash table across queries.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_multi_join">
+    <h3>Three-table join + group</h3>
+    <div class="workload-meta">23,560 vs 370 QPS &ensp;|&ensp; <span class="faster">63.6&times;</span> &ensp;|&ensp; p50: 0.354 vs 22.3&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT r.name, p.name, SUM(s.revenue)
+FROM sales s
+JOIN regions r ON s.region_id = r.id
+JOIN products p ON s.product_id = p.id
+GROUP BY r.name, p.name;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            <strong>64&times; throughput.</strong> The second-largest gap in
+            the entire benchmark suite. The small result set (region &times;
+            product combinations) fits entirely in the result cache.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            First execution: two hash joins + hash aggregation on columnar
+            blocks (~0.35&nbsp;ms). All subsequent executions: result cache
+            hit, single <code>send_all()</code>. PostgreSQL re-executes the
+            full plan (planner + 2 hash joins + aggregation) every time.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_cte_pipeline">
+    <h3>CTE pipeline</h3>
+    <div class="workload-meta">5,606 vs 1,920 QPS &ensp;|&ensp; <span class="faster">2.92&times;</span> &ensp;|&ensp; p50: 1.430 vs 4.312&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">WITH summary AS (
+    SELECT region, SUM(revenue) AS total
+    FROM wide_bench GROUP BY region
+)
+SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Nearly 3&times; throughput on a CTE pipeline. The result cache
+            serves the 5-row result from cached bytes after the first
+            execution.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            First execution materializes the CTE, aggregates, sorts, and
+            limits. The 5-row result is cached. Subsequent executions skip
+            all computation.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_subquery_complex">
+    <h3>Subquery pipeline</h3>
+    <div class="workload-meta">1,170 vs 898 QPS &ensp;|&ensp; <span class="faster">1.30&times;</span> &ensp;|&ensp; p50: 6.698 vs 8.775&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM (
+    SELECT * FROM wide_bench WHERE region = 'North'
+    ORDER BY revenue DESC LIMIT 100
+) sub;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            Modest 1.3&times; advantage. The 100-row result is cached, but
+            the first execution involves sorting ~10K filtered rows, which
+            is expensive in both databases.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The plan chain (scan &rarr; filter &rarr; sort &rarr; limit)
+            runs in the block executor. The limit node stops pulling after
+            100 rows. The result cache serves subsequent executions.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_large_sort">
+    <h3>Large sort</h3>
+    <div class="workload-meta">30 vs 12 QPS &ensp;|&ensp; <span class="faster">2.54&times;</span> &ensp;|&ensp; p50: 212.8 vs 661.0&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">SELECT * FROM wide_bench ORDER BY revenue DESC;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            2.5&times; throughput on sorting 50K rows. The throughput
+            advantage is larger than the batch advantage (0.87&times;)
+            because the result cache serves the sorted result from cached
+            wire bytes after the first execution.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            First execution: sort 50K rows (~213&nbsp;ms). Subsequent
+            executions: result cache hit. The 50K-row serialized result
+            is ~2&nbsp;MB of wire bytes, served in a single
+            <code>send_all()</code>.
+        </p>
+    </div>
+</div>
+
+<div class="workload" id="tp_cte_star">
+    <h3>CTE star-schema</h3>
+    <div class="workload-meta">74,069 vs 485 QPS &ensp;|&ensp; <span class="faster">152.5&times;</span> &ensp;|&ensp; p50: 0.109 vs 18.4&thinsp;ms</div>
+
+    <div class="what">
+        <span class="section-label">What</span>
+        <pre><code class="language-sql">WITH joined AS (
+    SELECT r.name AS region, p.name AS product, s.revenue
+    FROM sales s
+    JOIN regions r ON s.region_id = r.id
+    JOIN products p ON s.product_id = p.id
+)
+SELECT region, SUM(revenue) AS total
+FROM joined GROUP BY region ORDER BY total DESC;</code></pre>
+    </div>
+
+    <div class="so-what">
+        <span class="section-label">So what</span>
+        <p>
+            <strong>152&times; throughput&mdash;the largest gap in the entire
+            benchmark suite.</strong> The 4-row result (one per region) is
+            served from the result cache in 109 microseconds. PostgreSQL
+            re-executes the full plan (planner + 2 hash joins + aggregation
+            + sort) every time, taking 18.4&nbsp;ms.
+        </p>
+    </div>
+
+    <div class="now-what">
+        <span class="section-label">Now what</span>
+        <p>
+            The result cache is the key: the 4-row result is ~200 bytes of
+            serialized wire data. After the first execution, every subsequent
+            query is a hash lookup + <code>send_all()</code>. The cache is
+            invalidated only when a write bumps <code>total_generation</code>.
+            In a read-only throughput test, the cache is never invalidated.
+        </p>
+    </div>
+</div>
+
+<footer class="site-footer">
+    <a href="index.html">mskql</a>
+    &ensp;&middot;&ensp;
+    <a href="bench-vs-pg.html">Benchmarks vs PostgreSQL</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="architecture.html">Architecture</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

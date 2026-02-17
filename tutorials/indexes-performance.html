@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Tutorial: Indexes &amp; Query Performance</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        :root { --body-width: 55%; --fg: #111; --fg-dim: #555; --bg: #fffff8; --accent: #a00; --rule: #ccc; --code-bg: #f3f1eb; --nav-width: 180px; }
+        html { font-size: 15px; }
+        body { font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif; background: var(--bg); color: var(--fg); width: var(--body-width); margin-left: auto; margin-right: auto; padding: 3rem 0 5rem 0; }
+        .sidebar { float: left; width: var(--nav-width); margin-left: calc(-1 * var(--nav-width) - 40px); position: sticky; top: 2rem; }
+        .sidebar-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.3rem; }
+        .sidebar-title a { color: var(--fg); text-decoration: none; background: none; }
+        .sidebar-title a:hover { color: var(--accent); }
+        .sidebar-subtitle { font-size: 0.8rem; color: var(--fg-dim); font-style: italic; margin-bottom: 1.2rem; }
+        .sidebar-subtitle a { color: var(--fg-dim); text-decoration: none; background: none; }
+        .sidebar-subtitle a:hover { color: var(--accent); }
+        .sidebar nav ul { list-style: none; padding: 0; }
+        .sidebar nav li { margin-bottom: 0.15rem; }
+        .sidebar nav a { font-size: 0.82rem; color: var(--fg-dim); text-decoration: none; background: none; display: block; padding: 0.2rem 0.5rem; border-radius: 3px; line-height: 1.4; }
+        .sidebar nav a:hover { color: var(--accent); background: var(--code-bg); }
+        .sidebar nav a.active { color: var(--accent); font-weight: 600; background: var(--code-bg); }
+        .sidebar nav .nav-label { font-family: 'Menlo', 'Consolas', monospace; font-size: 0.6rem; font-weight: 700; color: var(--fg-dim); letter-spacing: 0.06em; text-transform: uppercase; padding: 0.6rem 0.5rem 0.2rem; }
+        p, ol, ul { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
+        li { margin-bottom: 0.3rem; }
+        ol, ul { padding-left: 1.6rem; }
+        a { color: var(--fg); text-decoration: none; background-image: linear-gradient(var(--accent), var(--accent)); background-size: 1px 1px; background-repeat: repeat-x; background-position: 0 1.15em; }
+        a:hover { color: var(--accent); }
+        strong { font-weight: 600; }
+        h1 { font-weight: 400; font-size: 2.2rem; line-height: 1.15; margin-bottom: 0.4rem; }
+        .subtitle { font-style: italic; font-size: 1.15rem; color: var(--fg-dim); display: block; margin-bottom: 0.6rem; line-height: 1.4; }
+        .byline { font-size: 0.95rem; color: var(--fg-dim); margin-bottom: 2rem; }
+        .title-rule { border: none; height: 3px; background: var(--accent); width: 60px; margin: 0 0 2rem 0; }
+        h2 { font-weight: 400; font-style: italic; font-size: 1.5rem; margin-top: 2.8rem; margin-bottom: 0.6rem; }
+        h3 { font-weight: 600; font-style: normal; font-size: 1.15rem; margin-top: 1.6rem; margin-bottom: 0.4rem; }
+        code { font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace; font-size: 0.82rem; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 2px; }
+        pre { background: var(--code-bg); border-left: 3px solid var(--accent); padding: 1rem 1.2rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.55; margin: 1rem 0 1.4rem 0; }
+        pre code { background: none; padding: 0; border-radius: 0; }
+        pre code.hljs { background: var(--code-bg); padding: 0; }
+        .hljs { background: var(--code-bg); }
+        .result-table { font-family: 'EB Garamond', Georgia, serif; font-size: 0.92rem; border-collapse: collapse; margin: 0.6rem 0 1.2rem 0; width: 100%; border-top: 2px solid var(--fg); border-bottom: 2px solid var(--fg); }
+        .result-table th { font-weight: 400; font-size: 0.78rem; font-variant: small-caps; text-transform: lowercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--fg); padding: 0.3rem 0.6rem 0.25rem; text-align: left; color: var(--fg); }
+        .result-table td { padding: 0.22rem 0.6rem; border: none; white-space: nowrap; }
+        .result-table .null-val { color: #999; font-style: italic; }
+        .result-table .num-val { text-align: right; font-variant-numeric: tabular-nums; }
+        .result-label { font-size: 0.8rem; font-style: italic; color: var(--fg-dim); margin: 0 0 0.3rem 0; }
+        .query-pair { display: flex; gap: 1.2rem; align-items: stretch; margin: 0.8rem 0 1.4rem 0; }
+        .query-pair pre { flex: 1 1 50%; min-width: 0; margin: 0; }
+        .query-pair .result-wrap { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+        .query-pair .result-table { margin: 0; }
+        .tutorial-nav { display: flex; justify-content: space-between; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.95rem; }
+        .tutorial-nav a { background: none; }
+        .tutorial-nav .prev::before { content: '\2190\00a0'; }
+        .tutorial-nav .next::after { content: '\00a0\2192'; }
+        footer.site-footer { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); font-size: 0.85rem; color: var(--fg-dim); }
+        footer.site-footer a { font-size: 0.85rem; }
+        hr { border: none; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+        @media (max-width: 1100px) { body { width: 80%; } .sidebar { float: none; margin-left: 0; width: auto; position: static; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--rule); } .sidebar nav ul { display: flex; flex-wrap: wrap; gap: 0.2rem 0.8rem; } .sidebar nav .nav-label { padding-top: 0.3rem; } }
+        @media (max-width: 700px) { body { width: 90%; padding: 2rem 0 3rem 0; } h1 { font-size: 2rem; } .query-pair { flex-direction: column; } }
+    </style>
+    <link rel="stylesheet" href="tutorial-interactive.css">
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-title"><a href="../index.html">mskql</a></div>
+    <div class="sidebar-subtitle"><a href="index.html">Tutorials</a></div>
+    <nav>
+        <ul>
+            <li><a href="task-tracker.html">1. Task Tracker</a></li>
+            <li><a href="reporting-dashboard.html">2. Reporting Dashboard</a></li>
+            <li><a href="time-series.html">3. Time-Series Analytics</a></li>
+            <li><a href="multi-table-joins.html">4. Multi-Table Joins</a></li>
+            <li><a href="schema-evolution.html">5. Schema Evolution</a></li>
+            <li><a href="recursive-ctes.html">6. Recursive CTEs</a></li>
+            <li><a href="set-operations.html">7. Set Operations</a></li>
+            <li><a href="string-math-functions.html">8. String &amp; Math</a></li>
+            <li><a href="indexes-performance.html" class="active">9. Indexes</a></li>
+            <li><a href="sequences-enums.html">10. Sequences &amp; Enums</a></li>
+        </ul>
+        <div class="nav-label">Reference</div>
+        <ul>
+            <li><a href="../grammar.html">SQL Grammar</a></li>
+            <li><a href="../bench-vs-pg.html">vs PostgreSQL</a></li>
+        </ul>
+    </nav>
+</aside>
+
+<h1>Indexes &amp; Query Performance</h1>
+<span class="subtitle">CREATE INDEX, EXPLAIN, and when indexes matter</span>
+<p class="byline">Tutorial 9 of 10</p>
+<hr class="title-rule">
+
+<p>
+    Without an index, every <code>WHERE</code> clause requires a full table
+    scan&mdash;reading every row to find matches. An index is a separate
+    data structure (a B-tree in mskql) that maps column values to row
+    positions, turning O(N) lookups into O(log N). This tutorial shows
+    when and how to use them.
+</p>
+
+<!-- ─── Schema ──────────────────────────────────────────────── -->
+
+<h2>1. Schema and seed data</h2>
+
+<p>
+    A user-events table with 20 rows. Small enough to see every row, large
+    enough to demonstrate index behavior.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE events (
+    id        SERIAL PRIMARY KEY,
+    user_id   INT NOT NULL,
+    action    TEXT NOT NULL,
+    amount    INT,
+    created   DATE NOT NULL
+);
+
+INSERT INTO events (user_id, action, amount, created) VALUES
+    (1, 'login',    NULL, '2025-01-01'),
+    (1, 'purchase', 50,   '2025-01-02'),
+    (1, 'purchase', 120,  '2025-01-05'),
+    (2, 'login',    NULL, '2025-01-01'),
+    (2, 'purchase', 30,   '2025-01-03'),
+    (2, 'login',    NULL, '2025-01-06'),
+    (3, 'login',    NULL, '2025-01-02'),
+    (3, 'purchase', 200,  '2025-01-04'),
+    (3, 'purchase', 75,   '2025-01-07'),
+    (3, 'refund',   -75,  '2025-01-08'),
+    (4, 'login',    NULL, '2025-01-01'),
+    (4, 'purchase', 90,   '2025-01-02'),
+    (4, 'purchase', 45,   '2025-01-05'),
+    (4, 'login',    NULL, '2025-01-09'),
+    (5, 'login',    NULL, '2025-01-03'),
+    (5, 'purchase', 300,  '2025-01-04'),
+    (5, 'refund',   -100, '2025-01-06'),
+    (5, 'purchase', 60,   '2025-01-08'),
+    (5, 'login',    NULL, '2025-01-10'),
+    (1, 'login',    NULL, '2025-01-10');</code></pre>
+
+<!-- ─── Query without index ────────────────────────────────── -->
+
+<h2>2. Query without an index</h2>
+
+<p>
+    Find all events for user 3. Without an index, the executor must scan
+    all 20 rows.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT id, action, amount, created
+FROM events
+WHERE user_id = 3
+ORDER BY created;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; 4 rows (scanned all 20)</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>action</th><th>amount</th><th>created</th></tr></thead>
+<tbody>
+<tr><td class="num-val">7</td><td>login</td><td class="null-val">NULL</td><td>2025-01-02</td></tr>
+<tr><td class="num-val">8</td><td>purchase</td><td class="num-val">200</td><td>2025-01-04</td></tr>
+<tr><td class="num-val">9</td><td>purchase</td><td class="num-val">75</td><td>2025-01-07</td></tr>
+<tr><td class="num-val">10</td><td>refund</td><td class="num-val">-75</td><td>2025-01-08</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── EXPLAIN ────────────────────────────────────────────── -->
+
+<h2>3. EXPLAIN &mdash; see the query plan</h2>
+
+<p>
+    <code>EXPLAIN</code> shows how the executor will run a query. Before
+    adding an index, it shows a sequential scan.
+</p>
+
+<pre><code class="language-sql">EXPLAIN SELECT * FROM events WHERE user_id = 3;</code></pre>
+
+<p>
+    The output shows a <code>SeqScan</code> (sequential scan) followed by a
+    <code>Filter</code> on <code>user_id = 3</code>. Every row is read, then
+    the filter discards non-matching rows.
+</p>
+
+<!-- ─── CREATE INDEX ───────────────────────────────────────── -->
+
+<h2>4. Create an index</h2>
+
+<p>
+    Add a B-tree index on <code>user_id</code>. The executor can now jump
+    directly to matching rows instead of scanning the entire table.
+</p>
+
+<pre><code class="language-sql">CREATE INDEX idx_events_user ON events (user_id);</code></pre>
+
+<p>
+    Now run <code>EXPLAIN</code> again:
+</p>
+
+<pre><code class="language-sql">EXPLAIN SELECT * FROM events WHERE user_id = 3;</code></pre>
+
+<p>
+    The plan now shows an <code>IndexScan</code> on <code>idx_events_user</code>.
+    Instead of reading 20 rows, it reads only the 4 matching rows directly.
+</p>
+
+<!-- ─── IF NOT EXISTS ──────────────────────────────────────── -->
+
+<h2>5. IF NOT EXISTS</h2>
+
+<p>
+    Use <code>IF NOT EXISTS</code> to make index creation idempotent&mdash;safe
+    to run in migrations that might execute more than once.
+</p>
+
+<pre><code class="language-sql">CREATE INDEX IF NOT EXISTS idx_events_user ON events (user_id);
+CREATE INDEX IF NOT EXISTS idx_events_action ON events (action);</code></pre>
+
+<p>
+    The first statement is a no-op (index already exists). The second creates
+    a new index on the <code>action</code> column.
+</p>
+
+<!-- ─── Using the action index ─────────────────────────────── -->
+
+<h2>6. Filter by indexed column</h2>
+
+<p>
+    With the <code>action</code> index in place, queries filtering on action
+    type use the index automatically.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT user_id,
+       SUM(amount) AS total
+FROM events
+WHERE action = 'purchase'
+GROUP BY user_id
+ORDER BY total DESC;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result</p>
+<table class="result-table">
+<thead><tr><th>user_id</th><th>total</th></tr></thead>
+<tbody>
+<tr><td class="num-val">5</td><td class="num-val">360</td></tr>
+<tr><td class="num-val">3</td><td class="num-val">275</td></tr>
+<tr><td class="num-val">1</td><td class="num-val">170</td></tr>
+<tr><td class="num-val">4</td><td class="num-val">135</td></tr>
+<tr><td class="num-val">2</td><td class="num-val">30</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Primary key index ──────────────────────────────────── -->
+
+<h2>7. Primary key lookups</h2>
+
+<p>
+    <code>PRIMARY KEY</code> automatically creates a unique index. Lookups
+    by primary key are always indexed&mdash;no extra <code>CREATE INDEX</code>
+    needed.
+</p>
+
+<div class="query-pair">
+<pre><code class="language-sql">SELECT id, user_id, action,
+       amount
+FROM events
+WHERE id = 8;</code></pre>
+<div class="result-wrap">
+<p class="result-label">Result &mdash; direct index lookup</p>
+<table class="result-table">
+<thead><tr><th>id</th><th>user_id</th><th>action</th><th>amount</th></tr></thead>
+<tbody>
+<tr><td class="num-val">8</td><td class="num-val">3</td><td>purchase</td><td class="num-val">200</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- ─── Drop index ─────────────────────────────────────────── -->
+
+<h2>8. Drop an index</h2>
+
+<p>
+    Remove an index when it is no longer needed. The table data is unaffected;
+    only the lookup structure is removed.
+</p>
+
+<pre><code class="language-sql">DROP INDEX idx_events_action;</code></pre>
+
+<p>
+    After dropping, queries on <code>action</code> fall back to sequential
+    scan. The <code>user_id</code> index remains.
+</p>
+
+<!-- ─── When to index ──────────────────────────────────────── -->
+
+<h2>9. When to create indexes</h2>
+
+<p>
+    Indexes are not free&mdash;they consume memory and slow down
+    <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> because the
+    index must be updated alongside the table. Use them when:
+</p>
+
+<ul>
+    <li><strong>High selectivity</strong>: the column has many distinct values
+        and your <code>WHERE</code> clause matches a small fraction of rows</li>
+    <li><strong>Frequent lookups</strong>: the column appears in
+        <code>WHERE</code> or <code>JOIN ON</code> clauses often</li>
+    <li><strong>Primary/foreign keys</strong>: always indexed (primary keys
+        automatically; foreign keys should be indexed manually)</li>
+</ul>
+
+<p>
+    Avoid indexes on columns with few distinct values (e.g., a boolean
+    <code>is_active</code> column) or on tables that are mostly written
+    and rarely queried.
+</p>
+
+<!-- ─── Wrap-up ─────────────────────────────────────────────── -->
+
+<h2>What you learned</h2>
+
+<p>
+    In this tutorial you created and used indexes on a 20-row events table:
+</p>
+
+<ul>
+    <li><strong><code>CREATE INDEX</code></strong> to build a B-tree lookup structure</li>
+    <li><strong><code>CREATE INDEX IF NOT EXISTS</code></strong> for idempotent migrations</li>
+    <li><strong><code>EXPLAIN</code></strong> to see whether a query uses a scan or an index</li>
+    <li><strong><code>DROP INDEX</code></strong> to remove an index</li>
+    <li><strong>Primary key indexes</strong> are created automatically</li>
+    <li><strong>When to index</strong>: high selectivity, frequent lookups, join keys</li>
+</ul>
+
+<div class="tutorial-nav">
+    <a class="prev" href="string-math-functions.html">String &amp; Math Functions</a>
+    <a class="next" href="sequences-enums.html">Sequences &amp; Enums</a>
+</div>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+<script src="../wasm/mskql-wasm.js"></script>
+<script src="tutorial-interactive.js"></script>
+</body>
+</html>
