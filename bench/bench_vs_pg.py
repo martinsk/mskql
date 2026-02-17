@@ -8,6 +8,8 @@ so the comparison with PostgreSQL is apples-to-apples.
 
 import argparse
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -52,6 +54,31 @@ def time_psql(host, port, user, db, sql_file):
     if rc != 0:
         return -1.0
     return elapsed
+
+
+def run_duckdb(duckdb_bin, db_path, sql_file):
+    """Run a SQL file through the DuckDB CLI. Returns (returncode, stdout)."""
+    with open(sql_file, "r", encoding="utf-8") as f:
+        r = subprocess.run(
+            [duckdb_bin, db_path],
+            stdin=f, capture_output=True, text=True, check=False,
+        )
+    return r.returncode, r.stdout
+
+
+def time_duckdb(duckdb_bin, db_path, sql_file):
+    """Time a DuckDB CLI invocation, return elapsed milliseconds."""
+    t0 = time.monotonic()
+    rc, _ = run_duckdb(duckdb_bin, db_path, sql_file)
+    elapsed = (time.monotonic() - t0) * 1000.0
+    if rc != 0:
+        return -1.0
+    return elapsed
+
+
+def duckdb_fixup(lines):
+    """Apply DuckDB SQL dialect fixups to a list of SQL lines."""
+    return [re.sub(r"::numeric", "::decimal", line, flags=re.IGNORECASE) for line in lines]
 
 
 # ── benchmark definitions ────────────────────────────────────────────────────
@@ -647,17 +674,25 @@ def main():
     p.add_argument("--pg-port", type=int, default=5432)
     p.add_argument("--pg-db", default="mskql_bench")
     p.add_argument("--pg-user", default=os.environ.get("USER", "postgres"))
+    p.add_argument("--duckdb-bin", default="duckdb", help="path to DuckDB CLI")
     p.add_argument("--filter", default=None, help="run only this benchmark")
     p.add_argument("--markdown", action="store_true", help="output markdown table")
     args = p.parse_args()
 
     host = "127.0.0.1"
 
-    print("=" * 78)
-    print("  mskql vs PostgreSQL benchmark")
-    print(f"  mskql  : {host}:{args.mskql_port}")
+    duckdb_bin = shutil.which(args.duckdb_bin)
+    if not duckdb_bin:
+        print(f"ERROR: DuckDB CLI not found (tried '{args.duckdb_bin}')")
+        print("       Install DuckDB or pass --duckdb-bin /path/to/duckdb")
+        sys.exit(1)
+
+    print("=" * 90)
+    print("  mskql vs PostgreSQL vs DuckDB benchmark")
+    print(f"  mskql   : {host}:{args.mskql_port}")
     print(f"  postgres: {host}:{args.pg_port} (db: {args.pg_db})")
-    print("=" * 78)
+    print(f"  duckdb  : {duckdb_bin} (file-backed, in-process — no client/server overhead)")
+    print("=" * 90)
     print()
 
     # ── verify connectivity ──
@@ -682,15 +717,16 @@ def main():
         run_psql_cmd(host, args.pg_port, args.pg_user, "postgres",
                      f"CREATE DATABASE {args.pg_db}")
 
-    # ── header ──
-    print(f"  {'BENCHMARK':<25s} {'mskql (ms)':>12s} {'pg (ms)':>12s} {'ratio':>10s}")
-    print(f"  {'-' * 63}")
-
     results = []
+    bench_count = sum(1 for n, _ in BENCHMARKS if not args.filter or args.filter == n)
 
+    bench_idx = 0
     for name, fn in BENCHMARKS:
         if args.filter and args.filter != name:
             continue
+        bench_idx += 1
+
+        print(f"  [{bench_idx}/{bench_count}] {name:<25s} ...", end="", flush=True)
 
         # Generate SQL
         setup_lines, bench_lines = fn()
@@ -707,8 +743,6 @@ def main():
         bench_file.write("\n".join(bench_lines) + "\n")
         bench_file.close()
 
-        print(f"  {name:<25s} ", end="", flush=True)
-
         # ── mskql ──
         run_psql(host, args.mskql_port, args.pg_user, "mskql", setup_file.name)
         mskql_ms = time_psql(host, args.mskql_port, args.pg_user, "mskql", bench_file.name)
@@ -717,49 +751,101 @@ def main():
         run_psql(host, args.pg_port, args.pg_user, args.pg_db, setup_file.name)
         pg_ms = time_psql(host, args.pg_port, args.pg_user, args.pg_db, bench_file.name)
 
+        # ── duckdb ──
+        duck_db = tempfile.mktemp(suffix=".duckdb", prefix=f"bench_{name}_")
+        duck_setup = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sql", prefix=f"duck_setup_{name}_", delete=False
+        )
+        duck_bench = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sql", prefix=f"duck_run_{name}_", delete=False
+        )
+        duck_setup.write("\n".join(duckdb_fixup(setup_lines)) + "\n")
+        duck_setup.close()
+        duck_bench.write("\n".join(duckdb_fixup(bench_lines)) + "\n")
+        duck_bench.close()
+        run_duckdb(duckdb_bin, duck_db, duck_setup.name)
+        duck_ms = time_duckdb(duckdb_bin, duck_db, duck_bench.name)
+        os.unlink(duck_setup.name)
+        os.unlink(duck_bench.name)
+        if os.path.exists(duck_db):
+            os.unlink(duck_db)
+
         # Cleanup
         os.unlink(setup_file.name)
         os.unlink(bench_file.name)
 
-        # Ratio
-        if pg_ms > 0 and mskql_ms >= 0:
-            ratio = mskql_ms / pg_ms
-            ratio_str = f"{ratio:.2f}x"
-        else:
-            ratio_str = "n/a"
+        results.append((name, mskql_ms, pg_ms, duck_ms))
+        tag = f" mskql={mskql_ms:.0f}ms" if mskql_ms >= 0 else " ERROR"
+        print(tag, flush=True)
 
-        if mskql_ms < 0:
-            mskql_str = "ERROR"
-        else:
-            mskql_str = f"{mskql_ms:.1f}"
+    # ── sort: mskql wins (fastest) first, losses last ──
+    def sort_key(r):
+        _name, m, p, d = r
+        best = min(t for t in (m, p, d) if t >= 0) if any(t >= 0 for t in (m, p, d)) else 0
+        if m >= 0 and m <= best:
+            return (0, m / max(best, 0.001))
+        return (1, m / max(best, 0.001) if m >= 0 else 999)
 
-        if pg_ms < 0:
-            pg_str = "ERROR"
-        else:
-            pg_str = f"{pg_ms:.1f}"
+    results.sort(key=sort_key)
 
-        print(f"{mskql_str:>12s} {pg_str:>12s} {ratio_str:>10s}")
+    # ── ANSI colors ──
+    GREEN = "\033[32m"
+    RED = "\033[31m"
+    YELLOW = "\033[33m"
+    RESET = "\033[0m"
 
-        results.append((name, mskql_ms, pg_ms))
-
-    print(f"  {'-' * 63}")
+    # ── print sorted results ──
     print()
-    print("  ratio = mskql / pg  (< 1.0 means mskql is faster)")
+    print(f"  {'BENCHMARK':<25s} {'mskql (ms)':>12s} {'pg (ms)':>12s} {'duck (ms)':>12s} {'ms/pg':>8s} {'ms/duck':>8s}  fastest")
+    print(f"  {'-' * 90}")
+
+    for name, mskql_ms, pg_ms, duck_ms in results:
+        mskql_str = f"{mskql_ms:.1f}" if mskql_ms >= 0 else "ERROR"
+        pg_str = f"{pg_ms:.1f}" if pg_ms >= 0 else "ERROR"
+        duck_str = f"{duck_ms:.1f}" if duck_ms >= 0 else "ERROR"
+        ms_pg_str = f"{mskql_ms / pg_ms:.2f}x" if pg_ms > 0 and mskql_ms >= 0 else "n/a"
+        ms_duck_str = f"{mskql_ms / duck_ms:.2f}x" if duck_ms > 0 and mskql_ms >= 0 else "n/a"
+
+        times = {"mskql": mskql_ms, "pg": pg_ms, "duck": duck_ms}
+        valid = {k: v for k, v in times.items() if v >= 0}
+        if valid:
+            winner = min(valid, key=valid.get)
+        else:
+            winner = "?"
+
+        if winner == "mskql":
+            tag = f"{GREEN}mskql{RESET}"
+        elif winner == "pg":
+            tag = f"{RED}pg{RESET}"
+        elif winner == "duck":
+            tag = f"{YELLOW}duck{RESET}"
+        else:
+            tag = "?"
+
+        print(f"  {name:<25s} {mskql_str:>12s} {pg_str:>12s} {duck_str:>12s} {ms_pg_str:>8s} {ms_duck_str:>8s}  {tag}")
+
+    print(f"  {'-' * 90}")
     print()
-    print(f"done. ({len(results)} benchmarks)")
+    print("  ratio = mskql / X  (< 1.0 means mskql is faster)")
+    print()
+    mskql_wins = sum(1 for _, m, p, d in results
+                     if m >= 0 and all(m <= t for t in (p, d) if t >= 0))
+    print(f"done. ({len(results)} benchmarks, mskql fastest in {mskql_wins})")
 
     if args.markdown and results:
         print()
-        print("| Benchmark | mskql (ms) | pg (ms) | ratio |")
-        print("|-----------|-----------|---------|-------|")
-        for name, m_ms, p_ms in results:
+        print("| Benchmark | mskql (ms) | pg (ms) | duck (ms) | ms/pg | ms/duck | fastest |")
+        print("|-----------|-----------|---------|-----------|-------|---------|---------|")
+        for name, m_ms, p_ms, d_ms in results:
             m_str = f"{m_ms:.1f}" if m_ms >= 0 else "ERROR"
             p_str = f"{p_ms:.1f}" if p_ms >= 0 else "ERROR"
-            if p_ms > 0 and m_ms >= 0:
-                r_str = f"{m_ms / p_ms:.2f}x"
-            else:
-                r_str = "n/a"
-            print(f"| {name} | {m_str} | {p_str} | {r_str} |")
+            d_str = f"{d_ms:.1f}" if d_ms >= 0 else "ERROR"
+            mp = f"{m_ms / p_ms:.2f}x" if p_ms > 0 and m_ms >= 0 else "n/a"
+            md = f"{m_ms / d_ms:.2f}x" if d_ms > 0 and m_ms >= 0 else "n/a"
+            times = {"mskql": m_ms, "pg": p_ms, "duck": d_ms}
+            valid = {k: v for k, v in times.items() if v >= 0}
+            winner = min(valid, key=valid.get) if valid else "?"
+            print(f"| {name} | {m_str} | {p_str} | {d_str} | {mp} | {md} | {winner} |")
 
 
 if __name__ == "__main__":
