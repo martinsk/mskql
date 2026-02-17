@@ -348,4 +348,32 @@ footer.site-footer a { font-size: 0.85rem; }
 @media (max-width: 700px) {
     body { width: 90%; padding: 2rem 0 3rem 0; }
     h1 { font-size: 2rem; }
+
+    /* ── Responsive tables ────────────────────────────── */
+    .table-scroll {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        margin: 1rem -0.5rem 1.4rem -0.5rem;
+        padding: 0 0.5rem;
+    }
+    .table-scroll table { margin: 0; }
+
+    table { font-size: 0.82rem; }
+    th, td { padding: 0.3rem 0.5rem; }
+    thead th { font-size: 0.75rem; }
+
+    .result-table { font-size: 0.82rem; }
+    .result-table th { font-size: 0.7rem; padding: 0.25rem 0.4rem; }
+    .result-table td { padding: 0.2rem 0.4rem; white-space: normal; }
+
+    .bench-detail { display: none; }
+    .bar-cell { display: none; }
+    th:last-child:empty { display: none; }
+}
+
+@media (max-width: 500px) {
+    body { width: 94%; }
+    table { font-size: 0.78rem; }
+    th, td { padding: 0.25rem 0.35rem; }
+    .result-table td { font-size: 0.78rem; }
 }
