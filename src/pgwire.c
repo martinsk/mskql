@@ -194,7 +194,8 @@ static int send_empty_query(int fd, struct msgbuf *m)
 static uint32_t column_type_to_oid(enum column_type t) { return pg_type_lookup(t)->oid; }
 
 /* push a cell value directly into a msgbuf as a pgwire text field (len + data) */
-static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c)
+static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c,
+                             struct database *db, struct table *t, uint16_t col_idx)
 {
     if (c->is_null) {
         msgbuf_push_u32(m, (uint32_t)-1);
@@ -249,14 +250,26 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c)
             txt = buf; len = strlen(buf);
             break;
         case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID:
             if (!c->value.as_text) {
                 msgbuf_push_u32(m, (uint32_t)-1);
                 return;
             }
             txt = c->value.as_text;
             len = strlen(txt);
+            break;
+        case COLUMN_TYPE_ENUM: {
+            const char *label = NULL;
+            if (t && col_idx < t->columns.count && t->columns.items[col_idx].enum_type_name && db) {
+                struct enum_type *et = db_find_type(db, t->columns.items[col_idx].enum_type_name);
+                if (et) label = enum_label(et, c->value.as_enum);
+            }
+            if (!label) { snprintf(buf, sizeof(buf), "%d", c->value.as_enum); label = buf; }
+            txt = label; len = strlen(txt);
+            break;
+        }
+        case COLUMN_TYPE_UUID:
+            uuid_format(&c->value.as_uuid, buf);
+            txt = buf; len = 36;
             break;
     }
     msgbuf_push_u32(m, (uint32_t)len);
@@ -741,7 +754,8 @@ static int send_row_description(int fd, struct database *db, struct query *q,
     return rc;
 }
 
-static int send_data_rows(int fd, struct rows *result)
+static int send_data_rows(int fd, struct rows *result,
+                          struct database *db, struct table *t)
 {
     struct msgbuf m;
     msgbuf_init(&m);
@@ -753,7 +767,7 @@ static int send_data_rows(int fd, struct rows *result)
         msgbuf_push_u16(&m, (uint16_t)r->cells.count);
 
         for (size_t j = 0; j < r->cells.count; j++)
-            msgbuf_push_cell(&m, &r->cells.items[j]);
+            msgbuf_push_cell(&m, &r->cells.items[j], db, t, (uint16_t)j);
 
         if (msg_send(fd, 'D', &m) != 0) {
             msgbuf_free(&m);
@@ -801,7 +815,8 @@ static inline size_t fast_i64_to_str(int64_t v, char *buf)
 }
 
 /* Push a col_block cell value directly into a msgbuf as a pgwire text field. */
-static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, uint16_t ri)
+static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, uint16_t ri,
+                                 struct database *db, struct table *t, uint16_t col_idx)
 {
     if (cb->nulls[ri]) {
         msgbuf_push_u32(m, (uint32_t)-1);
@@ -855,14 +870,26 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
         txt = buf; len = strlen(buf);
         break;
     case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
         if (!cb->data.str[ri]) {
             msgbuf_push_u32(m, (uint32_t)-1);
             return;
         }
         txt = cb->data.str[ri];
         len = strlen(txt);
+        break;
+    case COLUMN_TYPE_ENUM: {
+        const char *label = NULL;
+        if (t && col_idx < t->columns.count && t->columns.items[col_idx].enum_type_name && db) {
+            struct enum_type *et = db_find_type(db, t->columns.items[col_idx].enum_type_name);
+            if (et) label = enum_label(et, cb->data.i32[ri]);
+        }
+        if (!label) { snprintf(buf, sizeof(buf), "%d", cb->data.i32[ri]); label = buf; }
+        txt = label; len = strlen(txt);
+        break;
+    }
+    case COLUMN_TYPE_UUID:
+        uuid_format(&cb->data.uuid[ri], buf);
+        txt = buf; len = 36;
         break;
     }
     msgbuf_push_u32(m, (uint32_t)len);
@@ -1417,7 +1444,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
             wire.len += 5;
             msgbuf_push_u16(&wire, ncols);
             for (uint16_t c = 0; c < ncols; c++)
-                msgbuf_push_col_cell(&wire, &block.cols[c], ri);
+                msgbuf_push_col_cell(&wire, &block.cols[c], ri, db, t, c);
             wire.data[msg_start] = 'D';
             uint32_t body_len = (uint32_t)(wire.len - msg_start - 1);
             put_u32(wire.data + msg_start + 1, body_len);
@@ -1591,7 +1618,8 @@ static int handle_copy_to_stdout(int fd, struct database *db, struct query *q,
 static void build_command_tag(int fd, struct database *db, struct query *q,
                               struct rows *result, struct msgbuf *m,
                               int skip_row_desc, int rc,
-                              char *tag_buf, size_t tag_sz)
+                              char *tag_buf, size_t tag_sz,
+                              struct table *t)
 {
     switch (q->query_type) {
         case QUERY_TYPE_CREATE:
@@ -1608,14 +1636,14 @@ static void build_command_tag(int fd, struct database *db, struct query *q,
         case QUERY_TYPE_SELECT:
             if (!skip_row_desc)
                 send_row_description(fd, db, q, result);
-            send_data_rows(fd, result);
+            send_data_rows(fd, result, db, t);
             snprintf(tag_buf, tag_sz, "SELECT %zu", result->count);
             break;
         case QUERY_TYPE_INSERT:
             if (result->count > 0) {
                 if (!skip_row_desc)
                     send_row_description(fd, db, q, result);
-                send_data_rows(fd, result);
+                send_data_rows(fd, result, db, t);
             }
             {
                 size_t ins_count = q->insert.insert_rows_count;
@@ -1627,7 +1655,7 @@ static void build_command_tag(int fd, struct database *db, struct query *q,
             if (q->del.has_returning && result->count > 0) {
                 if (!skip_row_desc)
                     send_row_description(fd, db, q, result);
-                send_data_rows(fd, result);
+                send_data_rows(fd, result, db, t);
                 snprintf(tag_buf, tag_sz, "DELETE %zu", result->count);
             } else {
                 size_t del_count = 0;
@@ -1641,7 +1669,7 @@ static void build_command_tag(int fd, struct database *db, struct query *q,
             if (q->update.has_returning && result->count > 0) {
                 if (!skip_row_desc)
                     send_row_description(fd, db, q, result);
-                send_data_rows(fd, result);
+                send_data_rows(fd, result, db, t);
                 snprintf(tag_buf, tag_sz, "UPDATE %zu", result->count);
             } else {
                 size_t upd_count = 0;
@@ -1685,7 +1713,7 @@ static void build_command_tag(int fd, struct database *db, struct query *q,
             if (result->count > 0) {
                 if (!skip_row_desc)
                     send_row_description(fd, db, q, result);
-                send_data_rows(fd, result);
+                send_data_rows(fd, result, db, NULL);
             }
             snprintf(tag_buf, tag_sz, "EXPLAIN");
             break;
@@ -1722,7 +1750,7 @@ static void build_command_tag(int fd, struct database *db, struct query *q,
                 msgbuf_push_u16(m, 0);  /* format: text */
                 msg_send(fd, 'T', m);
             }
-            send_data_rows(fd, result);
+            send_data_rows(fd, result, db, NULL);
             snprintf(tag_buf, tag_sz, "SHOW");
             break;
     }
@@ -1880,7 +1908,13 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
 
     /* Build command tag, send result data, and complete */
     char tag[128];
-    build_command_tag(fd, db, &q, result, m, skip_row_desc, rc, tag, sizeof(tag));
+    /* Resolve table for ENUM label lookups in wire serialization */
+    struct table *t = NULL;
+    if (q.query_type == QUERY_TYPE_SELECT)       t = db_find_table_sv(db, q.select.table);
+    else if (q.query_type == QUERY_TYPE_INSERT)  t = db_find_table_sv(db, q.insert.table);
+    else if (q.query_type == QUERY_TYPE_UPDATE)  t = db_find_table_sv(db, q.update.table);
+    else if (q.query_type == QUERY_TYPE_DELETE)  t = db_find_table_sv(db, q.del.table);
+    build_command_tag(fd, db, &q, result, m, skip_row_desc, rc, tag, sizeof(tag), t);
     send_command_complete(fd, m, tag);
     arena_free_result_rows(conn_arena);
     return 0;

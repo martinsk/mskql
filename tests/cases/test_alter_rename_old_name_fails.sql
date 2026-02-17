@@ -6,5 +6,5 @@ ALTER TABLE t1 RENAME COLUMN old_name TO new_name;
 -- input:
 SELECT id, old_name FROM t1;
 -- expected output:
-1|
--- expected status: 0
+ERROR:  column "old_name" does not exist
+-- expected status: 1

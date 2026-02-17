@@ -27,9 +27,12 @@ static inline void cell_to_cb_at(struct col_block *cb, uint16_t i, const struct 
     case COLUMN_TYPE_FLOAT:     cb->data.f64[i] = cell->value.as_float; break;
     case COLUMN_TYPE_NUMERIC:   cb->data.f64[i] = cell->value.as_numeric; break;
     case COLUMN_TYPE_INTERVAL:  cb->data.iv[i] = cell->value.as_interval; break;
-    case COLUMN_TYPE_TEXT:  case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
+    case COLUMN_TYPE_TEXT:
         cb->data.str[i] = cell->value.as_text; break;
+    case COLUMN_TYPE_ENUM:
+        cb->data.i32[i] = cell->value.as_enum; break;
+    case COLUMN_TYPE_UUID:
+        cb->data.uuid[i] = cell->value.as_uuid; break;
     }
 }
 
@@ -50,9 +53,12 @@ static inline void cb_to_cell_at(const struct col_block *cb, uint16_t i, struct 
     case COLUMN_TYPE_FLOAT:     cell->value.as_float = cb->data.f64[i]; break;
     case COLUMN_TYPE_NUMERIC:   cell->value.as_numeric = cb->data.f64[i]; break;
     case COLUMN_TYPE_INTERVAL:  cell->value.as_interval = cb->data.iv[i]; break;
-    case COLUMN_TYPE_TEXT:  case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
+    case COLUMN_TYPE_TEXT:
         cell->value.as_text = cb->data.str[i]; break;
+    case COLUMN_TYPE_ENUM:
+        cell->value.as_enum = cb->data.i32[i]; break;
+    case COLUMN_TYPE_UUID:
+        cell->value.as_uuid = cb->data.uuid[i]; break;
     }
 }
 
@@ -71,9 +77,12 @@ static inline void cell_to_flat_at(void *data, size_t i, const struct cell *cell
     case COLUMN_TYPE_FLOAT:     ((double *)data)[i] = cell->value.as_float; break;
     case COLUMN_TYPE_NUMERIC:   ((double *)data)[i] = cell->value.as_numeric; break;
     case COLUMN_TYPE_INTERVAL:  ((struct interval *)data)[i] = cell->value.as_interval; break;
-    case COLUMN_TYPE_TEXT:  case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
+    case COLUMN_TYPE_TEXT:
         ((char **)data)[i] = cell->value.as_text; break;
+    case COLUMN_TYPE_ENUM:
+        ((int32_t *)data)[i] = cell->value.as_enum; break;
+    case COLUMN_TYPE_UUID:
+        ((struct uuid_val *)data)[i] = cell->value.as_uuid; break;
     }
 }
 
@@ -232,18 +241,34 @@ static void scan_cache_build(struct table *t)
             }
             break;
         }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID: {
+        case COLUMN_TYPE_TEXT: {
             char **dst = (char **)sc->col_data[c];
             for (size_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[r].cells.items[c];
                 if (cell->is_null || cell->type != ct
-                    || (column_type_is_text(cell->type) && !cell->value.as_text)) {
+                    || !cell->value.as_text) {
                     sc->col_nulls[c][r] = 1;
                 } else {
                     dst[r] = cell->value.as_text;
                 }
+            }
+            break;
+        }
+        case COLUMN_TYPE_ENUM: {
+            int32_t *dst = (int32_t *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != ct) { sc->col_nulls[c][r] = 1; }
+                else { dst[r] = cell->value.as_enum; }
+            }
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            struct uuid_val *dst = (struct uuid_val *)sc->col_data[c];
+            for (size_t r = 0; r < nrows; r++) {
+                struct cell *cell = &t->rows.items[r].cells.items[c];
+                if (cell->is_null || cell->type != ct) { sc->col_nulls[c][r] = 1; }
+                else { dst[r] = cell->value.as_uuid; }
             }
             break;
         }
@@ -319,9 +344,11 @@ static uint16_t scan_cache_read(struct scan_cache *sc, size_t *cursor,
         case COLUMN_TYPE_INTERVAL:
             memcpy(cb->data.iv, (struct interval *)sc->col_data[tc] + start, nrows * sizeof(struct interval)); break;
         case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID:
             memcpy(cb->data.str, (char **)sc->col_data[tc] + start, nrows * sizeof(char *)); break;
+        case COLUMN_TYPE_ENUM:
+            memcpy(cb->data.i32, (int32_t *)sc->col_data[tc] + start, nrows * sizeof(int32_t)); break;
+        case COLUMN_TYPE_UUID:
+            memcpy(cb->data.uuid, (struct uuid_val *)sc->col_data[tc] + start, nrows * sizeof(struct uuid_val)); break;
         }
     }
 
@@ -362,8 +389,8 @@ static inline double cb_to_double(const struct col_block *cb, uint16_t i)
     case COLUMN_TYPE_TIMESTAMPTZ:
         return (double)cb->data.i64[i];
     case COLUMN_TYPE_INTERVAL: return (double)interval_to_usec_approx(cb->data.iv[i]);
-    case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_TEXT:                return 0.0;
+    case COLUMN_TYPE_ENUM:     return (double)cb->data.i32[i];
     case COLUMN_TYPE_UUID:     return 0.0;
     }
     __builtin_unreachable();
@@ -814,13 +841,23 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
         }
         case COLUMN_TYPE_INTERVAL:
             break; /* BETWEEN on interval not meaningful */
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID: {
+        case COLUMN_TYPE_TEXT: {
             const char *lo = cmp_val->value.as_text ? cmp_val->value.as_text : "";
             const char *hi = between_high->value.as_text ? between_high->value.as_text : "";
             char * const *vals = cb->data.str;
             FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], lo) >= 0 && strcmp(vals[r], hi) <= 0);
+            break;
+        }
+        case COLUMN_TYPE_ENUM: {
+            int32_t lo = cmp_val->value.as_enum, hi = between_high->value.as_enum;
+            const int32_t *vals = cb->data.i32;
+            FLEAF_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            struct uuid_val lo = cmp_val->value.as_uuid, hi = between_high->value.as_uuid;
+            const struct uuid_val *vals = cb->data.uuid;
+            FLEAF_LOOP(!nulls[r] && uuid_compare(vals[r], lo) >= 0 && uuid_compare(vals[r], hi) <= 0);
             break;
         }
         }
@@ -887,9 +924,7 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
             }
             break;
         }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID: {
+        case COLUMN_TYPE_TEXT: {
             char * const *vals = cb->data.str;
             for (uint16_t _c = 0; _c < cand_count; _c++) {
                 uint16_t r = (uint16_t)cand[_c];
@@ -897,6 +932,27 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 for (uint32_t j = 0; j < in_count; j++)
                     if (!in_values[j].is_null && in_values[j].value.as_text &&
                         strcmp(vals[r], in_values[j].value.as_text) == 0) { sel[sel_count++] = r; break; }
+            }
+            break;
+        }
+        case COLUMN_TYPE_ENUM: {
+            const int32_t *vals = cb->data.i32;
+            for (uint16_t _c = 0; _c < cand_count; _c++) {
+                uint16_t r = (uint16_t)cand[_c];
+                if (nulls[r]) continue;
+                for (uint32_t j = 0; j < in_count; j++)
+                    if (!in_values[j].is_null && in_values[j].value.as_enum == vals[r]) { sel[sel_count++] = r; break; }
+            }
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            const struct uuid_val *vals = cb->data.uuid;
+            for (uint16_t _c = 0; _c < cand_count; _c++) {
+                uint16_t r = (uint16_t)cand[_c];
+                if (nulls[r]) continue;
+                for (uint32_t j = 0; j < in_count; j++)
+                    if (!in_values[j].is_null &&
+                        uuid_equal(vals[r], in_values[j].value.as_uuid)) { sel[sel_count++] = r; break; }
             }
             break;
         }
@@ -1059,9 +1115,7 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
             }
             break;
         }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID: {
+        case COLUMN_TYPE_TEXT: {
             const char *cv = cmp_val->value.as_text;
             if (!cv) cv = "";
             char * const *vals = cb->data.str;
@@ -1072,6 +1126,42 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 case CMP_GT: FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cv) >  0); break;
                 case CMP_LE: FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cv) <= 0); break;
                 case CMP_GE: FLEAF_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cv) >= 0); break;
+                case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
+            }
+            break;
+        }
+        case COLUMN_TYPE_ENUM: {
+            int32_t cv = cmp_val->value.as_enum;
+            const int32_t *vals = cb->data.i32;
+            switch (op) {
+                case CMP_EQ: FLEAF_LOOP(!nulls[r] && vals[r] == cv); break;
+                case CMP_NE: FLEAF_LOOP(!nulls[r] && vals[r] != cv); break;
+                case CMP_LT: FLEAF_LOOP(!nulls[r] && vals[r] <  cv); break;
+                case CMP_GT: FLEAF_LOOP(!nulls[r] && vals[r] >  cv); break;
+                case CMP_LE: FLEAF_LOOP(!nulls[r] && vals[r] <= cv); break;
+                case CMP_GE: FLEAF_LOOP(!nulls[r] && vals[r] >= cv); break;
+                case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
+            }
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            struct uuid_val cv = cmp_val->value.as_uuid;
+            const struct uuid_val *vals = cb->data.uuid;
+            switch (op) {
+                case CMP_EQ: FLEAF_LOOP(!nulls[r] && uuid_compare(vals[r], cv) == 0); break;
+                case CMP_NE: FLEAF_LOOP(!nulls[r] && uuid_compare(vals[r], cv) != 0); break;
+                case CMP_LT: FLEAF_LOOP(!nulls[r] && uuid_compare(vals[r], cv) <  0); break;
+                case CMP_GT: FLEAF_LOOP(!nulls[r] && uuid_compare(vals[r], cv) >  0); break;
+                case CMP_LE: FLEAF_LOOP(!nulls[r] && uuid_compare(vals[r], cv) <= 0); break;
+                case CMP_GE: FLEAF_LOOP(!nulls[r] && uuid_compare(vals[r], cv) >= 0); break;
                 case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                 case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                 case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
@@ -1241,6 +1331,57 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             coerce_cmp_to_temporal(&pn->filter.between_high, cb->type);
         }
 
+        /* Coerce TEXT comparison values to ENUM ordinal */
+        if (cb->type == COLUMN_TYPE_ENUM && pn->filter.cmp_val.type == COLUMN_TYPE_TEXT
+            && !pn->filter.cmp_val.is_null && pn->filter.cmp_val.value.as_text && ctx->db) {
+            /* Walk child chain to find the table for enum_type_name lookup */
+            struct table *et_tbl = NULL;
+            uint32_t ew = pn->left;
+            while (ew != IDX_NONE) {
+                struct plan_node *ewn = &PLAN_NODE(ctx->arena, ew);
+                if (ewn->op == PLAN_SEQ_SCAN) { et_tbl = ewn->seq_scan.table; break; }
+                if (ewn->op == PLAN_INDEX_SCAN) { et_tbl = ewn->index_scan.table; break; }
+                ew = ewn->left;
+            }
+            if (et_tbl && pn->filter.col_idx < (int)et_tbl->columns.count) {
+                const char *etn = et_tbl->columns.items[pn->filter.col_idx].enum_type_name;
+                if (etn) {
+                    struct enum_type *et = db_find_type(ctx->db, etn);
+                    if (et) {
+                        int ord = enum_ordinal(et, pn->filter.cmp_val.value.as_text);
+                        if (ord >= 0) {
+                            pn->filter.cmp_val.type = COLUMN_TYPE_ENUM;
+                            pn->filter.cmp_val.value.as_enum = ord;
+                        }
+                        /* Also coerce between_high if present */
+                        if (pn->filter.between_high.type == COLUMN_TYPE_TEXT
+                            && !pn->filter.between_high.is_null
+                            && pn->filter.between_high.value.as_text) {
+                            int ord2 = enum_ordinal(et, pn->filter.between_high.value.as_text);
+                            if (ord2 >= 0) {
+                                pn->filter.between_high.type = COLUMN_TYPE_ENUM;
+                                pn->filter.between_high.value.as_enum = ord2;
+                            }
+                        }
+                        /* Also coerce IN values if present */
+                        if (pn->filter.in_values && pn->filter.in_count > 0) {
+                            for (uint32_t iv = 0; iv < pn->filter.in_count; iv++) {
+                                if (pn->filter.in_values[iv].type == COLUMN_TYPE_TEXT
+                                    && !pn->filter.in_values[iv].is_null
+                                    && pn->filter.in_values[iv].value.as_text) {
+                                    int ov = enum_ordinal(et, pn->filter.in_values[iv].value.as_text);
+                                    if (ov >= 0) {
+                                        pn->filter.in_values[iv].type = COLUMN_TYPE_ENUM;
+                                        pn->filter.in_values[iv].value.as_enum = ov;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         /* Macro: iterate over candidate rows */
         #define FILTER_LOOP(COND) \
             for (uint16_t _c = 0; _c < cand_count; _c++) { \
@@ -1317,13 +1458,25 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             }
             case COLUMN_TYPE_INTERVAL:
                 break;
-            case COLUMN_TYPE_TEXT:
-            case COLUMN_TYPE_ENUM:
-            case COLUMN_TYPE_UUID: {
+            case COLUMN_TYPE_TEXT: {
                 const char *lo = pn->filter.cmp_val.value.as_text ? pn->filter.cmp_val.value.as_text : "";
                 const char *hi = pn->filter.between_high.value.as_text ? pn->filter.between_high.value.as_text : "";
                 char * const *vals = cb->data.str;
                 FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], lo) >= 0 && strcmp(vals[r], hi) <= 0);
+                break;
+            }
+            case COLUMN_TYPE_ENUM: {
+                int32_t lo = pn->filter.cmp_val.value.as_enum;
+                int32_t hi = pn->filter.between_high.value.as_enum;
+                const int32_t *vals = cb->data.i32;
+                FILTER_LOOP(!nulls[r] && vals[r] >= lo && vals[r] <= hi);
+                break;
+            }
+            case COLUMN_TYPE_UUID: {
+                struct uuid_val lo = pn->filter.cmp_val.value.as_uuid;
+                struct uuid_val hi = pn->filter.between_high.value.as_uuid;
+                const struct uuid_val *vals = cb->data.uuid;
+                FILTER_LOOP(!nulls[r] && uuid_compare(vals[r], lo) >= 0 && uuid_compare(vals[r], hi) <= 0);
                 break;
             }
             }
@@ -1437,9 +1590,7 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
                 break;
             }
-            case COLUMN_TYPE_TEXT:
-            case COLUMN_TYPE_ENUM:
-            case COLUMN_TYPE_UUID: {
+            case COLUMN_TYPE_TEXT: {
                 char * const *vals = cb->data.str;
                 for (uint16_t _c = 0; _c < cand_count; _c++) {
                     uint16_t r = (uint16_t)cand[_c];
@@ -1447,6 +1598,33 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     for (uint32_t j = 0; j < nv; j++) {
                         if (!inv[j].is_null && inv[j].value.as_text &&
                             strcmp(vals[r], inv[j].value.as_text) == 0) {
+                            sel[sel_count++] = r; break;
+                        }
+                    }
+                }
+                break;
+            }
+            case COLUMN_TYPE_ENUM: {
+                const int32_t *vals = cb->data.i32;
+                for (uint16_t _c = 0; _c < cand_count; _c++) {
+                    uint16_t r = (uint16_t)cand[_c];
+                    if (nulls[r]) continue;
+                    for (uint32_t j = 0; j < nv; j++) {
+                        if (!inv[j].is_null && inv[j].value.as_enum == vals[r]) {
+                            sel[sel_count++] = r; break;
+                        }
+                    }
+                }
+                break;
+            }
+            case COLUMN_TYPE_UUID: {
+                const struct uuid_val *vals = cb->data.uuid;
+                for (uint16_t _c = 0; _c < cand_count; _c++) {
+                    uint16_t r = (uint16_t)cand[_c];
+                    if (nulls[r]) continue;
+                    for (uint32_t j = 0; j < nv; j++) {
+                        if (!inv[j].is_null &&
+                            uuid_equal(vals[r], inv[j].value.as_uuid)) {
                             sel[sel_count++] = r; break;
                         }
                     }
@@ -1604,9 +1782,7 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             }
             case COLUMN_TYPE_INTERVAL:
                 goto fallback;
-            case COLUMN_TYPE_TEXT:
-            case COLUMN_TYPE_ENUM:
-            case COLUMN_TYPE_UUID: {
+            case COLUMN_TYPE_TEXT: {
                 const char *cmp_str = pn->filter.cmp_val.value.as_text;
                 char * const *vals = cb->data.str;
                 const uint8_t *nulls = cb->nulls;
@@ -1618,6 +1794,44 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     case CMP_GT: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) >  0); break;
                     case CMP_LE: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) <= 0); break;
                     case CMP_GE: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) >= 0); break;
+                    case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                    case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                    case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                    case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: goto fallback;
+                }
+                goto done;
+            }
+            case COLUMN_TYPE_ENUM: {
+                int32_t cv = pn->filter.cmp_val.value.as_enum;
+                const int32_t *vals = cb->data.i32;
+                const uint8_t *nulls = cb->nulls;
+                switch (op) {
+                    case CMP_EQ: FILTER_LOOP(!nulls[r] && vals[r] == cv); break;
+                    case CMP_NE: FILTER_LOOP(!nulls[r] && vals[r] != cv); break;
+                    case CMP_LT: FILTER_LOOP(!nulls[r] && vals[r] <  cv); break;
+                    case CMP_GT: FILTER_LOOP(!nulls[r] && vals[r] >  cv); break;
+                    case CMP_LE: FILTER_LOOP(!nulls[r] && vals[r] <= cv); break;
+                    case CMP_GE: FILTER_LOOP(!nulls[r] && vals[r] >= cv); break;
+                    case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                    case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                    case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                    case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: goto fallback;
+                }
+                goto done;
+            }
+            case COLUMN_TYPE_UUID: {
+                struct uuid_val cv = pn->filter.cmp_val.value.as_uuid;
+                const struct uuid_val *vals = cb->data.uuid;
+                const uint8_t *nulls = cb->nulls;
+                switch (op) {
+                    case CMP_EQ: FILTER_LOOP(!nulls[r] && uuid_compare(vals[r], cv) == 0); break;
+                    case CMP_NE: FILTER_LOOP(!nulls[r] && uuid_compare(vals[r], cv) != 0); break;
+                    case CMP_LT: FILTER_LOOP(!nulls[r] && uuid_compare(vals[r], cv) <  0); break;
+                    case CMP_GT: FILTER_LOOP(!nulls[r] && uuid_compare(vals[r], cv) >  0); break;
+                    case CMP_LE: FILTER_LOOP(!nulls[r] && uuid_compare(vals[r], cv) <= 0); break;
+                    case CMP_GE: FILTER_LOOP(!nulls[r] && uuid_compare(vals[r], cv) >= 0); break;
                     case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
                     case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
                     case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
@@ -1822,10 +2036,11 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     ocb->type = result.type;
                     cell_to_cb_at(ocb, r, &result);
                 } else {
-                    /* Text-like types */
-                    if (column_type_is_text(result.type) ||
-                        result.type == COLUMN_TYPE_UUID ||
-                        result.type == COLUMN_TYPE_ENUM) {
+                    /* UUID type */
+                    if (result.type == COLUMN_TYPE_UUID) {
+                        ocb->data.uuid[r] = result.value.as_uuid;
+                        ocb->type = result.type;
+                    } else if (column_type_is_text(result.type)) {
                         ocb->data.str[r] = result.value.as_text;
                         ocb->type = result.type;
                     } else {
@@ -1989,15 +2204,17 @@ static int flat_col_eq(const struct flat_col *a, uint32_t ai,
         struct interval ib = b->data.iv[bi];
         return ia.months == ib.months && ia.days == ib.days && ia.usec == ib.usec;
     }
-    case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID: {
+    case COLUMN_TYPE_TEXT: {
         const char *sa = ((const char **)a->data)[ai];
         const char *sb = b->data.str[bi];
         if (!sa && !sb) return 1;
         if (!sa || !sb) return 0;
         return strcmp(sa, sb) == 0;
     }
+    case COLUMN_TYPE_ENUM:
+        return ((int32_t *)a->data)[ai] == b->data.i32[bi];
+    case COLUMN_TYPE_UUID:
+        return uuid_equal(((const struct uuid_val *)a->data)[ai], b->data.uuid[bi]);
     case COLUMN_TYPE_INT:
     case COLUMN_TYPE_BOOLEAN:  return ((int32_t *)a->data)[ai] == b->data.i32[bi];
     }
@@ -2397,12 +2614,16 @@ static uint64_t distinct_hash_cell(struct col_block *cb, uint16_t ri)
             break;
         }
         case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID:
             if (cb->data.str[ri]) {
                 const char *s = cb->data.str[ri];
                 while (*s) { h ^= (uint64_t)(unsigned char)*s++; h *= 1099511628211ULL; }
             }
+            break;
+        case COLUMN_TYPE_ENUM:
+            h ^= (uint64_t)(uint32_t)cb->data.i32[ri]; break;
+        case COLUMN_TYPE_UUID:
+            h ^= cb->data.uuid[ri].hi; h *= 1099511628211ULL;
+            h ^= cb->data.uuid[ri].lo; h *= 1099511628211ULL;
             break;
     }
     h *= 1099511628211ULL;
@@ -2651,10 +2872,9 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 v = (double)cv.value.as_timestamp; break;
                             case COLUMN_TYPE_INTERVAL:
                                 v = (double)interval_to_usec_approx(cv.value.as_interval); break;
-                            case COLUMN_TYPE_TEXT:
-                            case COLUMN_TYPE_ENUM:
-                            case COLUMN_TYPE_UUID:
-                                break;
+                            case COLUMN_TYPE_TEXT:  break;
+                            case COLUMN_TYPE_ENUM:  break;
+                            case COLUMN_TYPE_UUID:  break;
                         }
                         st->sums[idx] += v;
                         if (!st->minmax_init[idx] || v < st->mins[idx])
@@ -2990,9 +3210,9 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 v = (double)cv.value.as_timestamp; break;
                             case COLUMN_TYPE_INTERVAL:
                                 v = (double)interval_to_usec_approx(cv.value.as_interval); break;
-                            case COLUMN_TYPE_TEXT:
-                            case COLUMN_TYPE_ENUM:
-                            case COLUMN_TYPE_UUID:     break;
+                            case COLUMN_TYPE_TEXT:  break;
+                            case COLUMN_TYPE_ENUM:  break;
+                            case COLUMN_TYPE_UUID:  break;
                         }
                         /* COUNT(DISTINCT expr): hash the result and deduplicate */
                         if (st->distinct_sets[a].cap > 0) {
@@ -3251,6 +3471,10 @@ static int sort_flat_cmp(const void *a, const void *b)
             int64_t va = interval_to_usec_approx(((const struct interval *)_bsort_ctx.flat_keys[k])[ia]);
             int64_t vb = interval_to_usec_approx(((const struct interval *)_bsort_ctx.flat_keys[k])[ib]);
             cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_UUID) {
+            struct uuid_val ua = ((const struct uuid_val *)_bsort_ctx.flat_keys[k])[ia];
+            struct uuid_val ub = ((const struct uuid_val *)_bsort_ctx.flat_keys[k])[ib];
+            cmp = uuid_compare(ua, ub);
         } else {
             const char *sa = ((const char **)_bsort_ctx.flat_keys[k])[ia];
             const char *sb = ((const char **)_bsort_ctx.flat_keys[k])[ib];
@@ -3453,12 +3677,22 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 ocb->data.f64[r] = s[idx[r]];
             break;
         }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID: {
+        case COLUMN_TYPE_TEXT: {
             char *const *s = (char *const *)src_data;
             for (uint16_t r = 0; r < out_count; r++)
                 ocb->data.str[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_ENUM: {
+            const int32_t *s = (const int32_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i32[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            const struct uuid_val *s = (const struct uuid_val *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.uuid[r] = s[idx[r]];
             break;
         }
         case COLUMN_TYPE_INTERVAL: {
@@ -4134,12 +4368,22 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 ocb->data.f64[r] = s[idx[r]];
             break;
         }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID: {
+        case COLUMN_TYPE_TEXT: {
             char *const *s = (char *const *)src_data;
             for (uint16_t r = 0; r < out_count; r++)
                 ocb->data.str[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_ENUM: {
+            const int32_t *s = (const int32_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i32[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            const struct uuid_val *s = (const struct uuid_val *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.uuid[r] = s[idx[r]];
             break;
         }
         case COLUMN_TYPE_INTERVAL: {
@@ -4218,9 +4462,14 @@ static inline uint32_t semi_hash_flat(enum column_type type, const void *data, u
             return h;
         }
         case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID:
             return block_hash_str(((const char **)data)[i]);
+        case COLUMN_TYPE_ENUM:
+            return block_hash_i32(((const int32_t *)data)[i]);
+        case COLUMN_TYPE_UUID: {
+            struct uuid_val u = ((const struct uuid_val *)data)[i];
+            uint64_t uh = uuid_hash(u);
+            return (uint32_t)(uh ^ (uh >> 32));
+        }
     }
     return 0;
 }
@@ -4252,14 +4501,16 @@ static inline int semi_eq_cb_flat(const struct col_block *cb, uint16_t oi,
             struct interval ib = ((const struct interval *)data)[fi];
             return ia.months == ib.months && ia.days == ib.days && ia.usec == ib.usec;
         }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID: {
+        case COLUMN_TYPE_TEXT: {
             const char *a = cb->data.str[oi];
             const char *b = ((const char **)data)[fi];
             if (!a || !b) return a == b;
             return strcmp(a, b) == 0;
         }
+        case COLUMN_TYPE_ENUM:
+            return cb->data.i32[oi] == ((const int32_t *)data)[fi];
+        case COLUMN_TYPE_UUID:
+            return uuid_equal(cb->data.uuid[oi], ((const struct uuid_val *)data)[fi]);
     }
     return 0;
 }
@@ -4286,9 +4537,11 @@ static size_t semi_elem_size(enum column_type type)
         case COLUMN_TYPE_INTERVAL:
             return sizeof(struct interval);
         case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID:
             return sizeof(char *);
+        case COLUMN_TYPE_ENUM:
+            return sizeof(int32_t);
+        case COLUMN_TYPE_UUID:
+            return sizeof(struct uuid_val);
     }
     return sizeof(char *);
 }
@@ -4375,9 +4628,13 @@ static void hash_semi_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
                     ((struct interval *)st->key_data)[di] = src_key->data.iv[ri];
                     break;
                 case COLUMN_TYPE_TEXT:
-                case COLUMN_TYPE_ENUM:
-                case COLUMN_TYPE_UUID:
                     ((char **)st->key_data)[di] = src_key->data.str[ri];
+                    break;
+                case COLUMN_TYPE_ENUM:
+                    ((int32_t *)st->key_data)[di] = src_key->data.i32[ri];
+                    break;
+                case COLUMN_TYPE_UUID:
+                    ((struct uuid_val *)st->key_data)[di] = src_key->data.uuid[ri];
                     break;
             }
             st->build_count++;
@@ -5127,11 +5384,15 @@ static int cell_value_to_str(const struct cell *c, char *buf, int buflen)
         return snprintf(buf, buflen, "'%s'", tmp);
     }
     case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
         if (c->value.as_text)
             return snprintf(buf, buflen, "'%s'", c->value.as_text);
         return snprintf(buf, buflen, "?");
+    case COLUMN_TYPE_ENUM:
+        return snprintf(buf, buflen, "enum(%d)", c->value.as_enum);
+    case COLUMN_TYPE_UUID: {
+        char ubuf[37]; uuid_format(&c->value.as_uuid, ubuf);
+        return snprintf(buf, buflen, "'%s'", ubuf);
+    }
     }
     __builtin_unreachable();
 }

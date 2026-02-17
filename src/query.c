@@ -154,8 +154,6 @@ static int cell_to_sql_literal(const struct cell *cv, char *buf, size_t bufsize)
         return 0;
     }
     case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
         if (!cv->value.as_text) return -1;
         {
             size_t pos = 0;
@@ -170,6 +168,14 @@ static int cell_to_sql_literal(const struct cell *cv, char *buf, size_t bufsize)
             buf[pos] = '\0';
         }
         return 0;
+    case COLUMN_TYPE_ENUM:
+        snprintf(buf, bufsize, "'enum(%d)'", cv->value.as_enum);
+        return 0;
+    case COLUMN_TYPE_UUID: {
+        char ubuf[37]; uuid_format(&cv->value.as_uuid, ubuf);
+        snprintf(buf, bufsize, "'%s'", ubuf);
+        return 0;
+    }
     }
     return -1;
 }
@@ -657,6 +663,23 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
             }
             /* SQL three-valued logic: any comparison with NULL → UNKNOWN */
             if (lhs_is_null) { cond_result = -1; goto cond_cleanup; }
+            /* Coerce TEXT RHS to ENUM ordinal when LHS is ENUM */
+            if (c->type == COLUMN_TYPE_ENUM && cond->value.type == COLUMN_TYPE_TEXT
+                && !cond->value.is_null && cond->value.value.as_text && t) {
+                int col_idx = -1;
+                if (cond->column.len > 0)
+                    col_idx = table_find_column_sv(t, cond->column);
+                if (col_idx >= 0 && t->columns.items[col_idx].enum_type_name && db) {
+                    struct enum_type *et = db_find_type(db, t->columns.items[col_idx].enum_type_name);
+                    if (et) {
+                        int ord = enum_ordinal(et, cond->value.value.as_text);
+                        if (ord >= 0) {
+                            cond->value.type = COLUMN_TYPE_ENUM;
+                            cond->value.value.as_enum = ord;
+                        }
+                    }
+                }
+            }
             {
                 int r = cell_compare(c, &cond->value);
                 if (r != -2)
@@ -1484,10 +1507,9 @@ static double cell_to_double_val(const struct cell *c)
     case COLUMN_TYPE_INTERVAL:
         return (double)interval_to_usec_approx(c->value.as_interval);
     case COLUMN_TYPE_BOOLEAN:
-    case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
-        break;
+    case COLUMN_TYPE_TEXT:  break;
+    case COLUMN_TYPE_ENUM:  return (double)c->value.as_enum;
+    case COLUMN_TYPE_UUID:  break;
     }
     return 0.0;
 }
@@ -1513,9 +1535,11 @@ static char *cell_to_text(const struct cell *c)
     case COLUMN_TYPE_TIMESTAMPTZ: timestamptz_to_str(c->value.as_timestamp, buf, sizeof(buf)); break;
     case COLUMN_TYPE_INTERVAL: interval_to_str(c->value.as_interval, buf, sizeof(buf)); break;
     case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
         buf[0] = '\0'; break;
+    case COLUMN_TYPE_ENUM:
+        snprintf(buf, sizeof(buf), "%d", c->value.as_enum); break;
+    case COLUMN_TYPE_UUID:
+        uuid_format(&c->value.as_uuid, buf); break;
     }
     return strdup(buf);
 }
@@ -1541,9 +1565,11 @@ static char *cell_to_text_rb(const struct cell *c, struct bump_alloc *rb)
     case COLUMN_TYPE_TIMESTAMPTZ: timestamptz_to_str(c->value.as_timestamp, buf, sizeof(buf)); break;
     case COLUMN_TYPE_INTERVAL: interval_to_str(c->value.as_interval, buf, sizeof(buf)); break;
     case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
         buf[0] = '\0'; break;
+    case COLUMN_TYPE_ENUM:
+        snprintf(buf, sizeof(buf), "%d", c->value.as_enum); break;
+    case COLUMN_TYPE_UUID:
+        uuid_format(&c->value.as_uuid, buf); break;
     }
     return bump_strdup(rb, buf);
 }
@@ -1947,19 +1973,18 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         /* generate a v4 UUID: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx */
         static int uuid_seeded = 0;
         if (!uuid_seeded) { srand((unsigned)time(NULL)); uuid_seeded = 1; }
-        #define UUID_STR_LEN 36
-        char buf[UUID_STR_LEN + 1];
-        const char *hex = "0123456789abcdef";
-        for (int i = 0; i < UUID_STR_LEN; i++) {
-            if (i == 8 || i == 13 || i == 18 || i == 23) buf[i] = '-';
-            else if (i == 14) buf[i] = '4'; /* version 4 */
-            else if (i == 19) buf[i] = hex[8 + (rand() & 3)]; /* variant 10xx */
-            else buf[i] = hex[rand() & 15];
-        }
-        buf[UUID_STR_LEN] = '\0';
+        struct uuid_val uv;
+        uv.hi = ((uint64_t)(rand() & 0xffff) << 48) | ((uint64_t)(rand() & 0xffff) << 32) |
+                ((uint64_t)(rand() & 0xffff) << 16) | (uint64_t)(rand() & 0xffff);
+        uv.lo = ((uint64_t)(rand() & 0xffff) << 48) | ((uint64_t)(rand() & 0xffff) << 32) |
+                ((uint64_t)(rand() & 0xffff) << 16) | (uint64_t)(rand() & 0xffff);
+        /* Set version 4: bits 12-15 of time_hi = 0100 */
+        uv.hi = (uv.hi & ~((uint64_t)0xf << 12)) | ((uint64_t)4 << 12);
+        /* Set variant 10xx: bits 62-63 of lo = 10 */
+        uv.lo = (uv.lo & ~((uint64_t)0x3 << 62)) | ((uint64_t)0x2 << 62);
         struct cell r = {0};
         r.type = COLUMN_TYPE_UUID;
-        r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+        r.value.as_uuid = uv;
         return r;
     }
 
@@ -2016,6 +2041,12 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
             result_v = timestamp_extract(src_c.value.as_timestamp, field);
         } else if (src_c.type == COLUMN_TYPE_TIME) {
             result_v = timestamp_extract(src_c.value.as_time, field);
+        } else {
+            arena_set_error(arena, "42883",
+                "function extract(%s, ...) does not exist for this type", field);
+            cell_release_rb(&field_c, rb);
+            cell_release_rb(&src_c, rb);
+            return cell_make_null();
         }
         cell_release_rb(&field_c, rb);
         cell_release_rb(&src_c, rb);
@@ -2044,7 +2075,11 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
             r.type = src_c.type;
             r.value.as_timestamp = timestamp_trunc_usec(src_c.value.as_timestamp, field);
         } else {
-            r = cell_make_null();
+            arena_set_error(arena, "42883",
+                "function date_trunc(text, ...) does not exist for this type");
+            cell_release_rb(&field_c, rb);
+            cell_release_rb(&src_c, rb);
+            return cell_make_null();
         }
         cell_release_rb(&field_c, rb);
         cell_release_rb(&src_c, rb);
@@ -3061,9 +3096,18 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
         if (!rb && txt) free(txt);
         break;
     case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
         r.value.as_text = txt;
+        break;
+    case COLUMN_TYPE_ENUM:
+        /* ENUM cells store ordinal; txt is discarded here — coercion happens at insert */
+        r.value.as_enum = 0;
+        if (!rb && txt) free(txt);
+        break;
+    case COLUMN_TYPE_UUID:
+        if (txt) {
+            uuid_parse(txt, &r.value.as_uuid);
+            if (!rb) free(txt);
+        }
         break;
     }
     return r;
@@ -3095,7 +3139,12 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         }
         if (idx < 0)
             idx = table_find_column_sv(t, col);
-        if (idx < 0) return cell_make_null();
+        if (idx < 0) {
+            arena_set_error(arena, "42703",
+                "column \"%.*s\" does not exist",
+                (int)col.len, col.data);
+            return cell_make_null();
+        }
         return cell_deep_copy_rb(&row->cells.items[idx], rb);
     }
 
@@ -3119,7 +3168,11 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             case COLUMN_TYPE_TIMESTAMPTZ:
             case COLUMN_TYPE_INTERVAL:
             case COLUMN_TYPE_UUID:
-                break;
+                arena_set_error(arena, "42883",
+                    "operator does not exist: - %s",
+                    column_type_name(operand.type));
+                cell_release_rb(&operand, rb);
+                return cell_make_null();
             }
             break;
         case OP_ADD:
@@ -3421,6 +3474,7 @@ static void emit_row(struct table *t, struct query_select *s, struct query_arena
                 struct cell c = eval_arith_expr(one, t, src);
                 da_push(&dst.cells, c);
             } else {
+                int found = 0;
                 for (size_t j = 0; j < t->columns.count; j++) {
                     if (sv_eq_cstr(one, t->columns.items[j].name)) {
                         struct cell c = src->cells.items[j];
@@ -3431,8 +3485,18 @@ static void emit_row(struct table *t, struct query_select *s, struct query_arena
                         else
                             copy.value = c.value;
                         da_push(&dst.cells, copy);
+                        found = 1;
                         break;
                     }
+                }
+                if (!found) {
+                    arena_set_error(arena, "42703",
+                        "column \"%.*s\" does not exist",
+                        (int)one.len, one.data);
+                    struct cell null_cell = {0};
+                    null_cell.type = COLUMN_TYPE_TEXT;
+                    null_cell.is_null = 1;
+                    da_push(&dst.cells, null_cell);
                 }
             }
 
@@ -3542,14 +3606,18 @@ static const char *cell_to_text_buf(const struct cell *cv, char *tmp, size_t tmp
         snprintf(tmp, tmp_size, "%d", (int)cv->value.as_smallint);
         return tmp;
     case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
     case COLUMN_TYPE_DATE:
     case COLUMN_TYPE_TIME:
     case COLUMN_TYPE_TIMESTAMP:
     case COLUMN_TYPE_TIMESTAMPTZ:
     case COLUMN_TYPE_INTERVAL:
-    case COLUMN_TYPE_UUID:
         return cv->value.as_text;
+    case COLUMN_TYPE_ENUM:
+        snprintf(tmp, tmp_size, "%d", cv->value.as_enum);
+        return tmp;
+    case COLUMN_TYPE_UUID:
+        uuid_format(&cv->value.as_uuid, tmp);
+        return tmp;
     }
     return NULL;
 }
@@ -6087,11 +6155,35 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
         for (uint32_t sc = 0; sc < nsc; sc++) {
             struct set_clause *scp = &arena->set_clauses.items[u->set_clauses_start + sc];
             col_idxs[sc] = table_find_column_sv(t, scp->column);
-            if (col_idxs[sc] < 0) { new_vals[sc] = (struct cell){0}; continue; }
+            if (col_idxs[sc] < 0) {
+                arena_set_error(arena, "42703",
+                    "column \"%.*s\" of relation \"%s\" does not exist",
+                    (int)scp->column.len, scp->column.data, t->name);
+                free(idx_row_ids);
+                return -1;
+            }
             if (scp->expr_idx != IDX_NONE) {
                 new_vals[sc] = eval_expr(scp->expr_idx, arena, t, &t->rows.items[i], db, NULL);
             } else {
                 cell_copy(&new_vals[sc], &scp->value);
+            }
+        }
+        /* coerce TEXT → ENUM ordinal for enum columns */
+        for (uint32_t sc = 0; sc < nsc; sc++) {
+            if (col_idxs[sc] < 0) continue;
+            int ci = col_idxs[sc];
+            if (t->columns.items[ci].type == COLUMN_TYPE_ENUM &&
+                new_vals[sc].type == COLUMN_TYPE_TEXT && !new_vals[sc].is_null &&
+                new_vals[sc].value.as_text) {
+                struct enum_type *et = db_find_type(db, t->columns.items[ci].enum_type_name);
+                if (et) {
+                    int ord = enum_ordinal(et, new_vals[sc].value.as_text);
+                    if (ord >= 0) {
+                        free(new_vals[sc].value.as_text);
+                        new_vals[sc].type = COLUMN_TYPE_ENUM;
+                        new_vals[sc].value.as_enum = ord;
+                    }
+                }
             }
         }
         /* enforce FK constraints before applying new values */
@@ -6451,7 +6543,13 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
             for (uint32_t vi = 0; vi < ins->insert_columns_count && vi < (uint32_t)src->cells.count; vi++) {
                 sv col_name = ASV(arena, ins->insert_columns_start + vi);
                 int ci = table_find_column_sv(t, col_name);
-                if (ci < 0) continue;
+                if (ci < 0) {
+                    arena_set_error(arena, "42703",
+                        "column \"%.*s\" of relation \"%s\" does not exist",
+                        (int)col_name.len, col_name.data, t->name);
+                    row_free(&copy);
+                    return -1;
+                }
                 cell_free_text(&copy.cells.items[ci]);
                 cell_copy(&copy.cells.items[ci], &src->cells.items[vi]);
             }
@@ -6512,12 +6610,30 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                     c->value.as_interval = v;
                     break;
                 }
-                case COLUMN_TYPE_UUID:
-                    c->type = ct;
+                case COLUMN_TYPE_UUID: {
+                    struct uuid_val uv;
+                    if (uuid_parse(s, &uv) == 0) {
+                        free((char *)s);
+                        c->type = ct;
+                        c->value.as_uuid = uv;
+                    }
                     break;
+                }
+                case COLUMN_TYPE_ENUM: {
+                    struct enum_type *et = db_find_type(db, t->columns.items[i].enum_type_name);
+                    if (et) {
+                        int ord = enum_ordinal(et, s);
+                        if (ord >= 0) {
+                            free((char *)s);
+                            c->type = ct;
+                            c->value.as_enum = ord;
+                        }
+                    }
+                    break;
+                }
                 case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_BIGINT:
                 case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_BOOLEAN:
-                case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM:
+                case COLUMN_TYPE_TEXT:
                     break;
                 }
             }

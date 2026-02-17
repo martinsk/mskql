@@ -6,6 +6,7 @@
 #include "dynamic_array.h"
 #include "column.h"
 #include "datetime.h"
+#include "uuid.h"
 
 struct bump_alloc; /* forward declaration — defined in arena.h */
 
@@ -21,7 +22,8 @@ union cell_value {
     int64_t as_timestamp;       /* microseconds since 2000-01-01 00:00:00 */
     int64_t as_time;            /* microseconds since midnight */
     struct interval as_interval;
-    char *as_uuid;              /* "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" */
+    struct uuid_val as_uuid;
+    int32_t as_enum;            /* 0-based ordinal into enum_type.values */
 };
 
 struct cell {

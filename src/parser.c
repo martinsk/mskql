@@ -801,7 +801,7 @@ static enum expr_func expr_func_from_name(sv name)
     if (sv_eq_ignorecase_cstr(name, "AVG"))   return FUNC_AGG_AVG;
     if (sv_eq_ignorecase_cstr(name, "MIN"))   return FUNC_AGG_MIN;
     if (sv_eq_ignorecase_cstr(name, "MAX"))   return FUNC_AGG_MAX;
-    return FUNC_COALESCE; /* fallback, should not happen */
+    __builtin_unreachable(); /* is_expr_func_keyword gates this call */
 }
 
 /* SQL structural keywords that terminate an expression — these must never be

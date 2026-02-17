@@ -5,6 +5,7 @@
 #include <string.h>
 #include "column.h"
 #include "datetime.h"
+#include "uuid.h"
 
 /* Block capacity: 1024 rows per block.
  * 1024 × 8 bytes = 8 KB per numeric column — fits L1 cache.
@@ -22,8 +23,9 @@ struct col_block {
         int32_t          i32[BLOCK_CAPACITY];         /* INT, BOOLEAN, DATE */
         int64_t          i64[BLOCK_CAPACITY];         /* BIGINT, TIMESTAMP, TIMESTAMPTZ, TIME */
         double           f64[BLOCK_CAPACITY];         /* FLOAT, NUMERIC */
-        char            *str[BLOCK_CAPACITY];         /* TEXT, ENUM, UUID — pointers into table or bump slab */
+        char            *str[BLOCK_CAPACITY];         /* TEXT, ENUM — pointers into table or bump slab */
         struct interval  iv[BLOCK_CAPACITY];           /* INTERVAL */
+        struct uuid_val  uuid[BLOCK_CAPACITY];          /* UUID — 16-byte binary */
     } data;
 };
 
@@ -60,11 +62,11 @@ static inline size_t col_type_elem_size(enum column_type ct)
     case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
     case COLUMN_TYPE_TIME:                              return sizeof(int64_t);
     case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:   return sizeof(double);
-    case COLUMN_TYPE_TEXT:  case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:                              return sizeof(char *);
+    case COLUMN_TYPE_TEXT:                              return sizeof(char *);
     case COLUMN_TYPE_INT:   case COLUMN_TYPE_BOOLEAN:
-    case COLUMN_TYPE_DATE:                              return sizeof(int32_t);
+    case COLUMN_TYPE_DATE:  case COLUMN_TYPE_ENUM:      return sizeof(int32_t);
     case COLUMN_TYPE_INTERVAL:                          return sizeof(struct interval);
+    case COLUMN_TYPE_UUID:                              return sizeof(struct uuid_val);
     }
     __builtin_unreachable();
 }
@@ -78,11 +80,11 @@ static inline void *cb_data_ptr(const struct col_block *cb, uint32_t i)
     case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
     case COLUMN_TYPE_TIME:                              return (void *)&cb->data.i64[i];
     case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:   return (void *)&cb->data.f64[i];
-    case COLUMN_TYPE_TEXT:  case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:                              return (void *)&cb->data.str[i];
+    case COLUMN_TYPE_TEXT:                              return (void *)&cb->data.str[i];
     case COLUMN_TYPE_INT:   case COLUMN_TYPE_BOOLEAN:
-    case COLUMN_TYPE_DATE:                              return (void *)&cb->data.i32[i];
+    case COLUMN_TYPE_DATE:  case COLUMN_TYPE_ENUM:      return (void *)&cb->data.i32[i];
     case COLUMN_TYPE_INTERVAL:                          return (void *)&cb->data.iv[i];
+    case COLUMN_TYPE_UUID:                              return (void *)&cb->data.uuid[i];
     }
     __builtin_unreachable();
 }
@@ -180,9 +182,13 @@ static inline uint32_t block_hash_cell(const struct col_block *cb, uint16_t i)
         case COLUMN_TYPE_NUMERIC:
             return block_hash_f64(cb->data.f64[i]);
         case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID:
             return block_hash_str(cb->data.str[i]);
+        case COLUMN_TYPE_ENUM:
+            return block_hash_i32(cb->data.i32[i]);
+        case COLUMN_TYPE_UUID: {
+            uint64_t uh = uuid_hash(cb->data.uuid[i]);
+            return (uint32_t)(uh ^ (uh >> 32));
+        }
         case COLUMN_TYPE_INTERVAL: {
             /* hash all 16 bytes of the interval struct */
             uint32_t h = FNV_OFFSET;
@@ -217,11 +223,13 @@ static inline int block_cell_eq(const struct col_block *a, uint16_t ai,
         case COLUMN_TYPE_NUMERIC:
             return a->data.f64[ai] == b->data.f64[bi];
         case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID:
             if (!a->data.str[ai] || !b->data.str[bi])
                 return a->data.str[ai] == b->data.str[bi];
             return strcmp(a->data.str[ai], b->data.str[bi]) == 0;
+        case COLUMN_TYPE_ENUM:
+            return a->data.i32[ai] == b->data.i32[bi];
+        case COLUMN_TYPE_UUID:
+            return uuid_equal(a->data.uuid[ai], b->data.uuid[bi]);
         case COLUMN_TYPE_INTERVAL:
             return a->data.iv[ai].months == b->data.iv[bi].months &&
                    a->data.iv[ai].days == b->data.iv[bi].days &&

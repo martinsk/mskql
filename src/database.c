@@ -259,31 +259,40 @@ static uint32_t cell_hash(const struct cell *c)
             case COLUMN_TYPE_FLOAT:
             case COLUMN_TYPE_NUMERIC:  dv = c->value.as_float; break;
             case COLUMN_TYPE_TEXT:
-            case COLUMN_TYPE_ENUM:
             case COLUMN_TYPE_DATE:
             case COLUMN_TYPE_TIME:
             case COLUMN_TYPE_TIMESTAMP:
             case COLUMN_TYPE_TIMESTAMPTZ:
-            case COLUMN_TYPE_INTERVAL:
-            case COLUMN_TYPE_UUID:     dv = 0.0; break;
+            case COLUMN_TYPE_INTERVAL:  dv = 0.0; break;
+            case COLUMN_TYPE_ENUM:      dv = (double)c->value.as_enum; break;
+            case COLUMN_TYPE_UUID:      dv = 0.0; break;
             }
             uint8_t *p = (uint8_t *)&dv;
             for (int i = 0; i < (int)sizeof(double); i++) { h ^= p[i]; h *= FNV_PRIME; }
             break;
         }
         case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
         case COLUMN_TYPE_DATE:
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_INTERVAL:
-        case COLUMN_TYPE_UUID:
             if (c->value.as_text) {
                 const char *s = c->value.as_text;
                 while (*s) { h ^= (uint8_t)*s++; h *= FNV_PRIME; }
             }
             break;
+        case COLUMN_TYPE_ENUM: {
+            uint8_t *p = (uint8_t *)&c->value.as_enum;
+            for (int i = 0; i < (int)sizeof(int32_t); i++) { h ^= p[i]; h *= FNV_PRIME; }
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            uint64_t uh = uuid_hash(c->value.as_uuid);
+            uint8_t *p = (uint8_t *)&uh;
+            for (int i = 0; i < (int)sizeof(uh); i++) { h ^= p[i]; h *= FNV_PRIME; }
+            break;
+        }
     }
     return h;
 }
@@ -2696,7 +2705,16 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                         for (uint32_t vi = 0; vi < ins->insert_columns_count && vi < (uint32_t)sel_rows.data[i].cells.count; vi++) {
                             sv col_name = ASV(&q->arena, ins->insert_columns_start + vi);
                             int ci = table_find_column_sv(t, col_name);
-                            if (ci < 0) continue;
+                            if (ci < 0) {
+                                arena_set_error(&q->arena, "42703",
+                                    "column \"%.*s\" of relation \"%s\" does not exist",
+                                    (int)col_name.len, col_name.data, t->name);
+                                row_free(&r);
+                                for (size_t ri = 0; ri < sel_rows.count; ri++)
+                                    row_free(&sel_rows.data[ri]);
+                                free(sel_rows.data);
+                                return -1;
+                            }
                             cell_free_text(&r.cells.items[ci]);
                             cell_copy(&r.cells.items[ci], &sel_rows.data[i].cells.items[vi]);
                         }
@@ -2818,7 +2836,14 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                 for (uint32_t sc = 0; sc < ins->conflict_set_count; sc++) {
                                     struct set_clause *scp = &q->arena.set_clauses.items[ins->conflict_set_start + sc];
                                     int ci = table_find_column_sv(t, scp->column);
-                                    if (ci < 0) continue;
+                                    if (ci < 0) {
+                                        arena_set_error(&q->arena, "42703",
+                                            "column \"%.*s\" of relation \"%s\" does not exist",
+                                            (int)scp->column.len, scp->column.data, t->name);
+                                        da_free(&merged_row.cells);
+                                        da_free(&merged_t.columns);
+                                        return -1;
+                                    }
                                     struct cell val;
                                     if (scp->expr_idx != IDX_NONE) {
                                         /* check if expression is EXCLUDED.col — resolve from new row */
@@ -3108,7 +3133,12 @@ skip_conflict_nothing:
                     for (uint32_t sc = 0; sc < nsc; sc++) {
                         struct set_clause *scp = &q->arena.set_clauses.items[u->set_clauses_start + sc];
                         col_idxs[sc] = table_find_column_sv(t, scp->column);
-                        if (col_idxs[sc] < 0) { new_vals[sc] = (struct cell){0}; continue; }
+                        if (col_idxs[sc] < 0) {
+                            arena_set_error(&q->arena, "42703",
+                                "column \"%.*s\" of relation \"%s\" does not exist",
+                                (int)scp->column.len, scp->column.data, t->name);
+                            return -1;
+                        }
                         if (scp->expr_idx != IDX_NONE) {
                             new_vals[sc] = eval_expr(scp->expr_idx, &q->arena, &merged_meta, &merged_row, db, NULL);
                         } else {
@@ -3325,6 +3355,12 @@ skip_conflict_nothing:
                 val = "on";
             else if (sv_eq_ignorecase_cstr(param, "DateStyle"))
                 val = "ISO, MDY";
+            else {
+                arena_set_error(&q->arena, "42704",
+                    "unrecognized configuration parameter \"%.*s\"",
+                    (int)param.len, param.data);
+                return -1;
+            }
             struct row r = {0};
             da_init(&r.cells);
             struct cell c = {0};

@@ -24,8 +24,7 @@ enum column_type {
 /* returns 1 if the column type stores its value as a heap-allocated char* */
 static inline int column_type_is_text(enum column_type t)
 {
-    return t == COLUMN_TYPE_TEXT || t == COLUMN_TYPE_ENUM ||
-           t == COLUMN_TYPE_UUID;
+    return t == COLUMN_TYPE_TEXT;
 }
 
 /* returns 1 if the column type is a temporal type stored as integer/struct */
@@ -66,7 +65,7 @@ static const struct pg_type_info pg_type_table[] = {
     /* [COLUMN_TYPE_INT]         */ { 23,   "int4",        "integer",                     4 },
     /* [COLUMN_TYPE_FLOAT]       */ { 701,  "float8",      "double precision",            8 },
     /* [COLUMN_TYPE_TEXT]        */ { 25,   "text",        "text",                       -1 },
-    /* [COLUMN_TYPE_ENUM]        */ { 25,   "text",        "USER-DEFINED",               -1 },
+    /* [COLUMN_TYPE_ENUM]        */ { 25,   "text",        "USER-DEFINED",                4 },
     /* [COLUMN_TYPE_BOOLEAN]     */ { 16,   "bool",        "boolean",                     1 },
     /* [COLUMN_TYPE_BIGINT]      */ { 20,   "int8",        "bigint",                      8 },
     /* [COLUMN_TYPE_NUMERIC]     */ { 1700, "numeric",     "numeric",                    -1 },
@@ -75,12 +74,17 @@ static const struct pg_type_info pg_type_table[] = {
     /* [COLUMN_TYPE_TIMESTAMP]   */ { 1114, "timestamp",   "timestamp without time zone", 8 },
     /* [COLUMN_TYPE_TIMESTAMPTZ] */ { 1184, "timestamptz", "timestamp with time zone",    8 },
     /* [COLUMN_TYPE_INTERVAL]    */ { 1186, "interval",    "interval",                   16 },
-    /* [COLUMN_TYPE_UUID]        */ { 2950, "uuid",        "uuid",                       -1 },
+    /* [COLUMN_TYPE_UUID]        */ { 2950, "uuid",        "uuid",                       16 },
 };
 
 static inline const struct pg_type_info *pg_type_lookup(enum column_type t)
 {
     return &pg_type_table[(int)t];
+}
+
+static inline const char *column_type_name(enum column_type t)
+{
+    return pg_type_table[(int)t].pg_name;
 }
 
 struct enum_type {
@@ -93,6 +97,8 @@ struct enum_type {
 
 void enum_type_free(struct enum_type *et);
 int  enum_type_valid(struct enum_type *et, const char *value);
+int  enum_ordinal(struct enum_type *et, const char *value);  /* -1 if not found */
+const char *enum_label(struct enum_type *et, int32_t ordinal); /* NULL if out of range */
 
 struct cell; /* forward declaration for default_value */
 

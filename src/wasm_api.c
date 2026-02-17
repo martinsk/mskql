@@ -229,9 +229,15 @@ static int format_cell(char *buf, int buf_len, int pos, struct cell *cell) {
         text = tmp;
         break;
     case COLUMN_TYPE_TEXT:
-    case COLUMN_TYPE_ENUM:
-    case COLUMN_TYPE_UUID:
         text = cell->value.as_text ? cell->value.as_text : "NULL";
+        break;
+    case COLUMN_TYPE_ENUM:
+        snprintf(tmp, sizeof(tmp), "%d", cell->value.as_enum);
+        text = tmp;
+        break;
+    case COLUMN_TYPE_UUID:
+        uuid_format(&cell->value.as_uuid, tmp);
+        text = tmp;
         break;
     }
     if (text) pos = buf_puts(buf, buf_len, pos, text);

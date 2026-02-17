@@ -30,3 +30,19 @@ int enum_type_valid(struct enum_type *et, const char *value)
     }
     return 0;
 }
+
+int enum_ordinal(struct enum_type *et, const char *value)
+{
+    for (size_t i = 0; i < et->values.count; i++) {
+        if (strcmp(et->values.items[i], value) == 0)
+            return (int)i;
+    }
+    return -1;
+}
+
+const char *enum_label(struct enum_type *et, int32_t ordinal)
+{
+    if (ordinal < 0 || (size_t)ordinal >= et->values.count)
+        return NULL;
+    return et->values.items[ordinal];
+}

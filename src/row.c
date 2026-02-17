@@ -70,7 +70,7 @@ int cell_compare(const struct cell *a, const struct cell *b)
         if (va > vb) return  1;
         return 0;
     }
-    /* allow cross-comparison between text-based types (TEXT, UUID, ENUM) */
+    /* allow cross-comparison between text-based types (TEXT, ENUM) */
     if (a->type != b->type) {
         if (column_type_is_text(a->type) && column_type_is_text(b->type)) {
             if (!a->value.as_text && !b->value.as_text) return 0;
@@ -180,13 +180,17 @@ int cell_compare(const struct cell *a, const struct cell *b)
         case COLUMN_TYPE_INTERVAL:
             return interval_compare(a->value.as_interval, b->value.as_interval);
         case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID:
             if (!a->value.as_text && !b->value.as_text) return 0;
             if (!a->value.as_text) return -1;
             if (!b->value.as_text) return  1;
             { int cmp = strcmp(a->value.as_text, b->value.as_text);
               return (cmp < 0) ? -1 : (cmp > 0) ? 1 : 0; }
+        case COLUMN_TYPE_ENUM:
+            if (a->value.as_enum < b->value.as_enum) return -1;
+            if (a->value.as_enum > b->value.as_enum) return  1;
+            return 0;
+        case COLUMN_TYPE_UUID:
+            return uuid_compare(a->value.as_uuid, b->value.as_uuid);
     }
     return -2;
 }
@@ -234,10 +238,12 @@ int cell_equal(const struct cell *a, const struct cell *b)
                    a->value.as_interval.days == b->value.as_interval.days &&
                    a->value.as_interval.usec == b->value.as_interval.usec;
         case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_UUID:
             if (!a->value.as_text || !b->value.as_text) return a->value.as_text == b->value.as_text;
             return strcmp(a->value.as_text, b->value.as_text) == 0;
+        case COLUMN_TYPE_ENUM:
+            return a->value.as_enum == b->value.as_enum;
+        case COLUMN_TYPE_UUID:
+            return uuid_equal(a->value.as_uuid, b->value.as_uuid);
     }
     return 0;
 }
