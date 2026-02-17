@@ -41,7 +41,14 @@ static uint32_t read_u32(const uint8_t *buf)
 
 /* ---- low-level send helpers ---- */
 
-static int send_all(int fd, const void *buf, size_t len)
+/* Write coalescing: when active_wbuf is set, send_all routes through it
+ * instead of calling write() directly. This batches many small messages
+ * into fewer, larger write() syscalls. */
+struct msgbuf;  /* forward decl */
+static struct msgbuf *active_wbuf = NULL;
+static int active_wbuf_fd = -1;
+
+static int send_all_raw(int fd, const void *buf, size_t len)
 {
     const uint8_t *p = buf;
     while (len > 0) {
@@ -96,6 +103,31 @@ static void msgbuf_ensure(struct msgbuf *m, size_t extra)
         m->data = tmp;
         m->cap  = newcap;
     }
+}
+
+/* send_all: routes through write coalescing buffer when active, else raw write */
+static int send_all(int fd, const void *buf, size_t len)
+{
+    if (active_wbuf && fd == active_wbuf_fd) {
+        /* Large writes bypass the buffer */
+        if (len > 262144) {
+            if (active_wbuf->len > 0) {
+                if (send_all_raw(fd, active_wbuf->data, active_wbuf->len) != 0) return -1;
+                active_wbuf->len = 0;
+            }
+            return send_all_raw(fd, buf, len);
+        }
+        msgbuf_ensure(active_wbuf, len);
+        memcpy(active_wbuf->data + active_wbuf->len, buf, len);
+        active_wbuf->len += len;
+        if (active_wbuf->len >= 262144) {
+            int rc = send_all_raw(fd, active_wbuf->data, active_wbuf->len);
+            active_wbuf->len = 0;
+            return rc;
+        }
+        return 0;
+    }
+    return send_all_raw(fd, buf, len);
 }
 
 static void msgbuf_push(struct msgbuf *m, const void *data, size_t len)
@@ -320,6 +352,8 @@ struct client_state {
     size_t recv_cap;
     struct query_arena arena;   /* connection-scoped arena, reset per request */
     struct txn_state txn;       /* per-connection transaction state */
+    /* Write coalescing buffer — reduces write() syscalls */
+    struct msgbuf wbuf;
     /* Extended Query Protocol state */
     struct prepared_stmt prepared[MAX_PREPARED];
     struct portal portals[MAX_PORTALS];
@@ -514,6 +548,7 @@ static void client_init(struct client_state *c, int fd)
     c->fd = fd;
     c->phase = PHASE_STARTUP;
     msgbuf_init(&c->send_buf);
+    msgbuf_init(&c->wbuf);
     c->recv_buf = NULL;
     c->recv_len = 0;
     c->recv_cap = 0;
@@ -530,6 +565,7 @@ static void client_free(struct client_state *c)
     if (c->fd >= 0) close(c->fd);
     c->fd = -1;
     msgbuf_free(&c->send_buf);
+    msgbuf_free(&c->wbuf);
     free(c->recv_buf);
     c->recv_buf = NULL;
     c->recv_len = 0;
@@ -896,6 +932,87 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
     msgbuf_push(m, txt, len);
 }
 
+/* Vectorized block serialization for numeric-only blocks.
+ * Writes all DataRow messages for a block directly into the wire buffer
+ * with a single msgbuf_ensure and no per-cell function calls.
+ * Returns number of rows written, or 0 if the block has non-numeric types. */
+static uint16_t serialize_numeric_block(struct msgbuf *wire,
+                                        const struct row_block *block,
+                                        uint16_t ncols)
+{
+    uint16_t active = block->sel ? block->sel_count : block->count;
+    if (active == 0) return 0;
+
+    /* Check all columns are numeric (INT/BIGINT/SMALLINT/BOOLEAN) */
+    for (uint16_t c = 0; c < ncols; c++) {
+        enum column_type ct = block->cols[c].type;
+        if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BIGINT &&
+            ct != COLUMN_TYPE_SMALLINT && ct != COLUMN_TYPE_BOOLEAN)
+            return 0;
+    }
+
+    /* Max row size: 'D'(1) + len(4) + ncols(2) + ncols*(fieldlen(4) + max_digits(21)) = 7 + 25*ncols */
+    size_t max_row = 7 + (size_t)ncols * 25;
+    msgbuf_ensure(wire, active * max_row);
+
+    uint8_t *dst = wire->data + wire->len;
+
+    for (uint16_t r = 0; r < active; r++) {
+        uint16_t ri = block->sel ? (uint16_t)block->sel[r] : r;
+        uint8_t *row_start = dst;
+        dst[0] = 'D';
+        dst += 5; /* skip header + length, fill later */
+        put_u16(dst, ncols);
+        dst += 2;
+
+        for (uint16_t c = 0; c < ncols; c++) {
+            const struct col_block *cb = &block->cols[c];
+            if (cb->nulls[ri]) {
+                put_u32(dst, (uint32_t)-1);
+                dst += 4;
+                continue;
+            }
+            char buf[24];
+            size_t len;
+            switch (cb->type) {
+            case COLUMN_TYPE_INT:
+                len = fast_i32_to_str(cb->data.i32[ri], buf);
+                break;
+            case COLUMN_TYPE_BIGINT:
+                len = fast_i64_to_str(cb->data.i64[ri], buf);
+                break;
+            case COLUMN_TYPE_SMALLINT:
+                len = fast_i32_to_str((int32_t)cb->data.i16[ri], buf);
+                break;
+            case COLUMN_TYPE_BOOLEAN:
+                buf[0] = cb->data.i32[ri] ? 't' : 'f';
+                len = 1;
+                break;
+            case COLUMN_TYPE_FLOAT:
+            case COLUMN_TYPE_NUMERIC:
+            case COLUMN_TYPE_TEXT:
+            case COLUMN_TYPE_ENUM:
+            case COLUMN_TYPE_DATE:
+            case COLUMN_TYPE_TIME:
+            case COLUMN_TYPE_TIMESTAMP:
+            case COLUMN_TYPE_TIMESTAMPTZ:
+            case COLUMN_TYPE_INTERVAL:
+            case COLUMN_TYPE_UUID:
+                __builtin_unreachable();
+            }
+            put_u32(dst, (uint32_t)len);
+            dst += 4;
+            memcpy(dst, buf, len);
+            dst += len;
+        }
+        uint32_t body_len = (uint32_t)(dst - row_start - 1);
+        put_u32(row_start + 1, body_len);
+    }
+
+    wire->len = (size_t)(dst - wire->data);
+    return active;
+}
+
 /* Send RowDescription using table metadata + plan column info.
  * ncols/col_types come from the plan's output columns.
  * join_tables/n_join_tables: optional array of joined tables for column name resolution. */
@@ -1087,7 +1204,7 @@ static int send_row_desc_plan(int fd, struct table *t, struct table **join_table
 /* ---- Result cache: replay cached wire bytes for identical SELECT queries ---- */
 
 #define RCACHE_SLOTS 8192
-#define RCACHE_MAX_BYTES (4 * 1024 * 1024) /* max cached wire data per entry */
+#define RCACHE_MAX_BYTES (16 * 1024 * 1024) /* max cached wire data per entry */
 
 struct rcache_entry {
     uint32_t sql_hash;
@@ -1418,7 +1535,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     /* Send data rows directly from blocks — batched into a large buffer */
     struct msgbuf wire;
     msgbuf_init(&wire);
-    msgbuf_ensure(&wire, 65536);
+    msgbuf_ensure(&wire, 262144);
 
     /* Accumulate all wire bytes for result cache */
     struct msgbuf cache_buf;
@@ -1434,26 +1551,40 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     msgbuf_free(&rd_buf);
 
     size_t total_rows = 0;
+    int cache_active = 1; /* lazy cache: stop copying after threshold */
 
     for (;;) {
-        uint16_t active = row_block_active_count(&block);
-        for (uint16_t r = 0; r < active; r++) {
-            uint16_t ri = row_block_row_idx(&block, r);
-            size_t msg_start = wire.len;
-            msgbuf_ensure(&wire, 5);
-            wire.len += 5;
-            msgbuf_push_u16(&wire, ncols);
-            for (uint16_t c = 0; c < ncols; c++)
-                msgbuf_push_col_cell(&wire, &block.cols[c], ri, db, t, c);
-            wire.data[msg_start] = 'D';
-            uint32_t body_len = (uint32_t)(wire.len - msg_start - 1);
-            put_u32(wire.data + msg_start + 1, body_len);
-            if (cache_buf.len < RCACHE_MAX_BYTES)
-                msgbuf_push(&cache_buf, wire.data + msg_start, wire.len - msg_start);
-            total_rows++;
+        /* Try vectorized numeric block serialization first */
+        size_t wire_before = wire.len;
+        uint16_t vec_rows = serialize_numeric_block(&wire, &block, ncols);
+        if (vec_rows > 0) {
+            if (cache_active && cache_buf.len < RCACHE_MAX_BYTES)
+                msgbuf_push(&cache_buf, wire.data + wire_before, wire.len - wire_before);
+            else
+                cache_active = 0;
+            total_rows += vec_rows;
+        } else {
+            /* Fallback: per-cell serialization for mixed-type blocks */
+            uint16_t active = row_block_active_count(&block);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = row_block_row_idx(&block, r);
+                size_t msg_start = wire.len;
+                msgbuf_ensure(&wire, 5);
+                wire.len += 5;
+                msgbuf_push_u16(&wire, ncols);
+                for (uint16_t c = 0; c < ncols; c++)
+                    msgbuf_push_col_cell(&wire, &block.cols[c], ri, db, t, c);
+                wire.data[msg_start] = 'D';
+                uint32_t body_len = (uint32_t)(wire.len - msg_start - 1);
+                put_u32(wire.data + msg_start + 1, body_len);
+                if (cache_active && cache_buf.len < RCACHE_MAX_BYTES)
+                    msgbuf_push(&cache_buf, wire.data + msg_start, wire.len - msg_start);
+                total_rows++;
+            }
+            if (cache_buf.len >= RCACHE_MAX_BYTES) cache_active = 0;
         }
 
-        if (wire.len >= 65536) {
+        if (wire.len >= 262144) {
             if (send_all(fd, wire.data, wire.len) != 0) {
                 msgbuf_free(&wire);
                 msgbuf_free(&cache_buf);
@@ -2600,15 +2731,37 @@ static int process_startup(struct client_state *c)
 
 static int process_messages(struct client_state *c, struct database *db)
 {
+    /* Activate write coalescing for this client */
+    active_wbuf = &c->wbuf;
+    active_wbuf_fd = c->fd;
+
     for (;;) {
         /* need at least 5 bytes: 1 type + 4 length */
-        if (c->recv_len < 5) return 0;
+        if (c->recv_len < 5) {
+            /* Flush coalesced writes before returning to poll */
+            int frc = 0;
+            if (c->wbuf.len > 0) frc = send_all_raw(c->fd, c->wbuf.data, c->wbuf.len);
+            c->wbuf.len = 0;
+            active_wbuf = NULL;
+            active_wbuf_fd = -1;
+            return frc;
+        }
         uint8_t msg_type = c->recv_buf[0];
         uint32_t msg_len = read_u32(c->recv_buf + 1);
-        if (msg_len < 4) return -1;
-        if (msg_len > 16 * 1024 * 1024) return -1; /* reject messages > 16 MB */
+        if (msg_len < 4 || msg_len > 16 * 1024 * 1024) {
+            active_wbuf = NULL; active_wbuf_fd = -1;
+            return -1;
+        }
         size_t total = 1 + msg_len; /* type byte + length-inclusive body */
-        if (c->recv_len < total) return 0; /* need more data */
+        if (c->recv_len < total) {
+            /* Flush coalesced writes before returning to poll */
+            int frc = 0;
+            if (c->wbuf.len > 0) frc = send_all_raw(c->fd, c->wbuf.data, c->wbuf.len);
+            c->wbuf.len = 0;
+            active_wbuf = NULL;
+            active_wbuf_fd = -1;
+            return frc;
+        }
 
         uint32_t body_len = msg_len - 4;
 
@@ -2716,7 +2869,10 @@ static int process_messages(struct client_state *c, struct database *db)
                 break;
             }
             case 'H': { /* Flush — send any pending output */
-                /* We write synchronously, so nothing to flush */
+                if (c->wbuf.len > 0) {
+                    send_all_raw(c->fd, c->wbuf.data, c->wbuf.len);
+                    c->wbuf.len = 0;
+                }
                 break;
             }
             case 'S': { /* Sync — end of extended query pipeline */
@@ -2732,6 +2888,7 @@ static int process_messages(struct client_state *c, struct database *db)
             }
 
             case 'X': /* Terminate */
+                active_wbuf = NULL; active_wbuf_fd = -1;
                 return -1;
             default:
                 /* ignore unknown messages (including 'd'/'c'/'f' when not in copy mode) */

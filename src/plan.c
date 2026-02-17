@@ -3407,7 +3407,6 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 /* ---- Sort ---- */
 
 struct block_sort_ctx {
-    struct col_block *all_cols;
     uint16_t          ncols;
     uint32_t          rows_per_block;
     int              *sort_cols;
@@ -3560,14 +3559,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         _bsort_ctx.sort_nulls_first = pn->sort.sort_nulls_first;
         _bsort_ctx.nsort_cols = pn->sort.nsort_cols;
 
-        _bsort_ctx.all_cols = (struct col_block *)bump_alloc(&ctx->arena->scratch,
-                                (st->nblocks ? st->nblocks : 1) * child_ncols * sizeof(struct col_block));
-        for (uint32_t b = 0; b < st->nblocks; b++)
-            memcpy(&_bsort_ctx.all_cols[b * child_ncols],
-                   st->collected[b].cols,
-                   child_ncols * sizeof(struct col_block));
-
-        /* Build flat arrays for ALL columns — used by both sort comparator and emit */
+        /* Build flat arrays for ALL columns — used by both sort comparator and emit.
+         * Flatten directly from collected blocks (no intermediate all_cols copy). */
         _bsort_ctx.flat_col_data = (void **)bump_alloc(&ctx->arena->scratch,
                                                         child_ncols * sizeof(void *));
         _bsort_ctx.flat_col_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch,
@@ -3589,7 +3582,7 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
             uint32_t fi = 0;
             for (uint32_t b = 0; b < st->nblocks; b++) {
-                struct col_block *src = &_bsort_ctx.all_cols[b * child_ncols + ci];
+                struct col_block *src = &st->collected[b].cols[ci];
                 uint16_t cnt = st->collected[b].count;
                 memcpy(_bsort_ctx.flat_col_nulls[ci] + fi, src->nulls, cnt);
                 memcpy((uint8_t *)_bsort_ctx.flat_col_data[ci] + fi * elem_sz,
