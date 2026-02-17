@@ -1,3 +1,4 @@
 build/
 tests/test-failures.log
 .DS_Store
+bench/__pycache__

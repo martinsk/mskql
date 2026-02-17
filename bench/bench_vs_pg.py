@@ -471,6 +471,137 @@ def bench_mixed_analytical():
     return setup, bench
 
 
+# ── worst-case benchmarks (scenarios where PostgreSQL is expected to win) ─────
+
+def bench_wc_large_dataset():
+    setup = [
+        "DROP TABLE IF EXISTS big;",
+        "CREATE TABLE big (id INT, a INT, b INT, c TEXT, d INT);",
+        "INSERT INTO big SELECT n, n % 1000, (n * 31337) % 100000, "
+        "'row_' || CAST(n % 5000 AS TEXT), (n * 7) % 10000 "
+        "FROM generate_series(0, 199999) AS g(n);",
+    ]
+    bench = [
+        "SELECT a, SUM(b), AVG(d) FROM big GROUP BY a ORDER BY a;",
+    ] * 5
+    return setup, bench
+
+
+def bench_wc_join_reorder():
+    setup = bootstrap_setup()
+    bench = [
+        "SELECT o.id, o.amount, c.name, c.region "
+        "FROM orders o "
+        "JOIN events e ON o.customer_id = e.user_id "
+        "JOIN customers c ON o.customer_id = c.id "
+        "WHERE c.tier = 'premium' AND e.event_type = 0 "
+        "ORDER BY o.amount DESC LIMIT 100;",
+    ] * 5
+    return setup, bench
+
+
+def bench_wc_correlated_subquery():
+    setup = [
+        "DROP TABLE IF EXISTS csq_detail;",
+        "DROP TABLE IF EXISTS csq_master;",
+        "CREATE TABLE csq_master (id INT, val INT);",
+        "CREATE TABLE csq_detail (id INT, ref_id INT, score INT);",
+        "INSERT INTO csq_master SELECT n, n * 3 "
+        "FROM generate_series(0, 1999) AS g(n);",
+        "INSERT INTO csq_detail SELECT n, n % 2000, (n * 17) % 1000 "
+        "FROM generate_series(0, 9999) AS g(n);",
+    ]
+    bench = [
+        "SELECT csq_master.id, csq_master.val, "
+        "(SELECT MAX(csq_detail.score) FROM csq_detail "
+        "WHERE csq_detail.ref_id = csq_master.id) AS max_score "
+        "FROM csq_master WHERE csq_master.val > 3000;",
+    ] * 10
+    return setup, bench
+
+
+def bench_wc_multi_index():
+    setup = [
+        "DROP TABLE IF EXISTS midx;",
+        "CREATE TABLE midx (id INT, status INT, category INT, "
+        "region INT, score INT, name TEXT);",
+        "INSERT INTO midx SELECT n, n % 5, n % 50, n % 4, "
+        "(n * 31337) % 10000, 'user_' || CAST(n AS TEXT) "
+        "FROM generate_series(0, 99999) AS g(n);",
+        "CREATE INDEX idx_midx_status ON midx (status);",
+        "CREATE INDEX idx_midx_category ON midx (category);",
+    ]
+    bench = [
+        "SELECT * FROM midx WHERE status = 2 AND category = 17 "
+        "AND score > 5000 ORDER BY score DESC LIMIT 50;",
+    ] * 50
+    return setup, bench
+
+
+def bench_wc_string_heavy():
+    setup = [
+        "DROP TABLE IF EXISTS strtbl;",
+        "CREATE TABLE strtbl (id INT, first_name TEXT, last_name TEXT, email TEXT);",
+        "INSERT INTO strtbl SELECT n, "
+        "'FirstName_' || CAST(n AS TEXT), "
+        "'LastName_' || CAST(n AS TEXT), "
+        "CONCAT('user_', CAST(n AS TEXT), '@example.com') "
+        "FROM generate_series(0, 9999) AS g(n);",
+    ]
+    bench = [
+        "SELECT id, "
+        "CONCAT(UPPER(first_name), ' ', UPPER(last_name)) AS full_name, "
+        "LENGTH(email), "
+        "REPLACE(email, 'example.com', 'test.org') "
+        "FROM strtbl WHERE first_name LIKE 'FirstName_1%' "
+        "ORDER BY id;",
+    ] * 20
+    return setup, bench
+
+
+def bench_wc_nested_cte():
+    setup = bootstrap_setup()
+    bench = [
+        "WITH "
+        "active_customers AS ("
+        "SELECT id, name, region FROM customers WHERE tier != 'basic'"
+        "), "
+        "customer_orders AS ("
+        "SELECT o.customer_id, COUNT(*) AS order_count, SUM(o.amount) AS total "
+        "FROM orders o "
+        "JOIN active_customers ac ON o.customer_id = ac.id "
+        "GROUP BY o.customer_id"
+        "), "
+        "ranked AS ("
+        "SELECT co.customer_id, co.order_count, co.total, "
+        "ac.name, ac.region "
+        "FROM customer_orders co "
+        "JOIN active_customers ac ON co.customer_id = ac.id "
+        "WHERE co.total > 500"
+        ") "
+        "SELECT region, COUNT(*) AS n, SUM(total) AS revenue, "
+        "AVG(order_count) AS avg_orders "
+        "FROM ranked GROUP BY region ORDER BY revenue DESC;",
+    ] * 5
+    return setup, bench
+
+
+def bench_wc_wide_output():
+    setup = [
+        "DROP TABLE IF EXISTS wide;",
+        "CREATE TABLE wide (c0 INT, c1 INT, c2 INT, c3 INT, c4 INT, "
+        "c5 INT, c6 INT, c7 INT, c8 INT, c9 INT);",
+        "INSERT INTO wide SELECT n, (n*3)%10000, (n*7)%10000, "
+        "(n*11)%10000, (n*13)%10000, (n*17)%10000, "
+        "(n*19)%10000, (n*23)%10000, (n*29)%10000, (n*31)%10000 "
+        "FROM generate_series(0, 49999) AS g(n);",
+    ]
+    bench = [
+        "SELECT * FROM wide ORDER BY c1 DESC;",
+    ] * 5
+    return setup, bench
+
+
 BENCHMARKS = [
     ("insert_bulk",        bench_insert_bulk),
     ("select_full_scan",   bench_select_full_scan),
@@ -498,6 +629,13 @@ BENCHMARKS = [
     ("subquery_complex",   bench_subquery_complex),
     ("window_rank",        bench_window_rank),
     ("mixed_analytical",   bench_mixed_analytical),
+    ("wc_large_dataset",   bench_wc_large_dataset),
+    ("wc_join_reorder",    bench_wc_join_reorder),
+    ("wc_correlated_subq", bench_wc_correlated_subquery),
+    ("wc_multi_index",     bench_wc_multi_index),
+    ("wc_string_heavy",    bench_wc_string_heavy),
+    ("wc_nested_cte",      bench_wc_nested_cte),
+    ("wc_wide_output",     bench_wc_wide_output),
 ]
 
 

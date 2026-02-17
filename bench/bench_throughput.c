@@ -857,6 +857,35 @@ static struct workload_def workload_mixed_analytical(void)
     };
 }
 
+/* --- wc_concurrent_read: many threads doing indexed point reads --- */
+
+static const char *g_wc_concurrent_read_q[200];
+static char        g_wc_concurrent_read_buf[200][64];
+
+static struct workload_def workload_wc_concurrent_read(void)
+{
+    setup_reset();
+    setup_add("DROP TABLE IF EXISTS wc_big");
+    setup_add("CREATE TABLE wc_big (id INT, val INT, payload TEXT)");
+    setup_add("INSERT INTO wc_big SELECT n, (n * 31337) % 100000, "
+              "'payload_' || CAST(n AS TEXT) "
+              "FROM generate_series(0, 49999) AS g(n)");
+    setup_add("CREATE INDEX idx_wc_big_id ON wc_big (id)");
+
+    for (int i = 0; i < 200; i++) {
+        int key = (i * 251) % 50000;
+        snprintf(g_wc_concurrent_read_buf[i],
+                 sizeof(g_wc_concurrent_read_buf[i]),
+                 "SELECT * FROM wc_big WHERE id = %d", key);
+        g_wc_concurrent_read_q[i] = g_wc_concurrent_read_buf[i];
+    }
+
+    return (struct workload_def){
+        .setup_sqls = g_setup_ptrs, .nsetup = g_setup_count,
+        .hot_sqls = g_wc_concurrent_read_q, .nhot = 200,
+    };
+}
+
 /* ------------------------------------------------------------------ */
 /*  Workload registry                                                  */
 /* ------------------------------------------------------------------ */
@@ -876,6 +905,7 @@ static struct workload_entry workloads[] = {
     { "subquery_complex",   workload_subquery_complex },
     { "window_rank",        workload_window_rank },
     { "mixed_analytical",   workload_mixed_analytical },
+    { "wc_concurrent_read", workload_wc_concurrent_read },
 };
 
 static int nworkloads = (int)(sizeof(workloads) / sizeof(workloads[0]));
