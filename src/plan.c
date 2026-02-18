@@ -743,11 +743,18 @@ static int index_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     st->cursor = 1;
 
     struct table *t = pn->index_scan.table;
-    struct condition *cond = &COND(ctx->arena, pn->index_scan.cond_idx);
+
+    /* build composite key from condition values */
+    struct cell composite[MAX_INDEX_COLS];
+    int nkeys = pn->index_scan.nkeys;
+    for (int c = 0; c < nkeys; c++) {
+        struct condition *cond = &COND(ctx->arena, pn->index_scan.cond_indices[c]);
+        composite[c] = cond->value;
+    }
 
     size_t *ids = NULL;
     size_t id_count = 0;
-    index_lookup(pn->index_scan.idx, &cond->value, &ids, &id_count);
+    index_lookup(pn->index_scan.idx, composite, &ids, &id_count);
     if (id_count == 0) return -1;
 
     /* Cap to BLOCK_CAPACITY (should rarely matter for point lookups) */
@@ -6180,13 +6187,20 @@ static int explain_index_scan(struct query_arena *arena, struct plan_node *pn,
                                char *buf, int buflen)
 {
     const char *tname = pn->index_scan.table ? pn->index_scan.table->name : "?";
-    if (pn->index_scan.cond_idx != IDX_NONE) {
-        struct condition *cond = &arena->conditions.items[pn->index_scan.cond_idx];
-        char vbuf[64] = "";
-        cell_value_to_str(&cond->value, vbuf, sizeof(vbuf));
-        return snprintf(buf, buflen, "Index Scan on %s (" SV_FMT " %s %s)\n",
-                        tname, (int)cond->column.len, cond->column.data,
-                        cmp_op_str(cond->op), vbuf);
+    int nkeys = pn->index_scan.nkeys;
+    if (nkeys > 0 && pn->index_scan.cond_indices[0] != IDX_NONE) {
+        int written = snprintf(buf, buflen, "Index Scan on %s (", tname);
+        for (int c = 0; c < nkeys && written < buflen; c++) {
+            struct condition *cond = &arena->conditions.items[pn->index_scan.cond_indices[c]];
+            char vbuf[64] = "";
+            cell_value_to_str(&cond->value, vbuf, sizeof(vbuf));
+            if (c > 0) written += snprintf(buf + written, buflen - written, " AND ");
+            written += snprintf(buf + written, buflen - written, SV_FMT " %s %s",
+                                (int)cond->column.len, cond->column.data,
+                                cmp_op_str(cond->op), vbuf);
+        }
+        written += snprintf(buf + written, buflen - written, ")\n");
+        return written;
     }
     return snprintf(buf, buflen, "Index Scan on %s\n", tname);
 }
@@ -8680,33 +8694,85 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
 
         /* --- All validation passed, now allocate plan nodes --- */
 
-        /* Try index scan for simple equality WHERE on an indexed column */
+        /* Try index scan for equality WHERE on indexed column(s) */
         int used_index = 0;
         if (compound_filter_cond != IDX_NONE) {
-            struct condition *cond = &COND(arena, compound_filter_cond);
-            if (cond->type == COND_COMPARE && cond->op == CMP_EQ &&
-                cond->subquery_sql == IDX_NONE) {
-                int fc = table_find_column_sv(t, cond->column);
-                if (fc >= 0) {
-                    uint16_t scan_ncols = (uint16_t)t->columns.count;
-                    int *col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
-                    for (uint16_t i = 0; i < scan_ncols; i++)
-                        col_map[i] = (int)i;
-                    for (size_t ix = 0; ix < t->indexes.count; ix++) {
-                        if (strcmp(t->indexes.items[ix].column_name,
-                                   t->columns.items[fc].name) == 0) {
-                            uint32_t idx_node = plan_alloc_node(arena, PLAN_INDEX_SCAN);
-                            PLAN_NODE(arena, idx_node).index_scan.table = t;
-                            PLAN_NODE(arena, idx_node).index_scan.idx = &t->indexes.items[ix];
-                            PLAN_NODE(arena, idx_node).index_scan.cond_idx = compound_filter_cond;
-                            PLAN_NODE(arena, idx_node).index_scan.ncols = scan_ncols;
-                            PLAN_NODE(arena, idx_node).index_scan.col_map = col_map;
-                            PLAN_NODE(arena, idx_node).est_rows = 1.0;
-                            current = idx_node;
-                            used_index = 1;
-                            compound_filter_cond = IDX_NONE; /* consumed by index scan */
-                            break;
+            /* Collect all CMP_EQ conditions from the WHERE tree */
+            uint32_t eq_cond_ids[MAX_INDEX_COLS];
+            int eq_col_ids[MAX_INDEX_COLS];
+            int neq = 0;
+
+            struct condition *root_cond = &COND(arena, compound_filter_cond);
+            if (root_cond->type == COND_COMPARE && root_cond->op == CMP_EQ &&
+                root_cond->subquery_sql == IDX_NONE) {
+                int fc = table_find_column_sv(t, root_cond->column);
+                if (fc >= 0 && neq < MAX_INDEX_COLS) {
+                    eq_cond_ids[neq] = compound_filter_cond;
+                    eq_col_ids[neq] = fc;
+                    neq++;
+                }
+            } else if (root_cond->type == COND_AND) {
+                /* Walk the COND_AND tree to collect CMP_EQ leaves (up to MAX_INDEX_COLS) */
+                uint32_t stack[16];
+                int sp = 0;
+                stack[sp++] = compound_filter_cond;
+                while (sp > 0 && neq < MAX_INDEX_COLS) {
+                    uint32_t ci = stack[--sp];
+                    if (ci == IDX_NONE) continue;
+                    struct condition *c = &COND(arena, ci);
+                    if (c->type == COND_COMPARE && c->op == CMP_EQ &&
+                        c->subquery_sql == IDX_NONE) {
+                        int fc = table_find_column_sv(t, c->column);
+                        if (fc >= 0) {
+                            eq_cond_ids[neq] = ci;
+                            eq_col_ids[neq] = fc;
+                            neq++;
                         }
+                    } else if (c->type == COND_AND && sp + 2 <= 16) {
+                        if (c->left != IDX_NONE) stack[sp++] = c->left;
+                        if (c->right != IDX_NONE) stack[sp++] = c->right;
+                    }
+                }
+            }
+
+            if (neq > 0) {
+                uint16_t scan_ncols = (uint16_t)t->columns.count;
+                int *col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
+                for (uint16_t i = 0; i < scan_ncols; i++)
+                    col_map[i] = (int)i;
+
+                for (size_t ix = 0; ix < t->indexes.count; ix++) {
+                    struct index *idx = &t->indexes.items[ix];
+                    /* check if all index columns have a matching CMP_EQ condition */
+                    uint32_t matched_conds[MAX_INDEX_COLS];
+                    int nmatched = 0;
+                    for (int c = 0; c < idx->ncols; c++) {
+                        int found = 0;
+                        for (int e = 0; e < neq; e++) {
+                            if (strcmp(idx->column_names[c], t->columns.items[eq_col_ids[e]].name) == 0) {
+                                matched_conds[c] = eq_cond_ids[e];
+                                found = 1;
+                                nmatched++;
+                                break;
+                            }
+                        }
+                        if (!found) break;
+                    }
+                    if (nmatched == idx->ncols) {
+                        uint32_t idx_node = plan_alloc_node(arena, PLAN_INDEX_SCAN);
+                        PLAN_NODE(arena, idx_node).index_scan.table = t;
+                        PLAN_NODE(arena, idx_node).index_scan.idx = idx;
+                        PLAN_NODE(arena, idx_node).index_scan.cond_idx = matched_conds[0];
+                        PLAN_NODE(arena, idx_node).index_scan.nkeys = idx->ncols;
+                        for (int c = 0; c < idx->ncols; c++)
+                            PLAN_NODE(arena, idx_node).index_scan.cond_indices[c] = matched_conds[c];
+                        PLAN_NODE(arena, idx_node).index_scan.ncols = scan_ncols;
+                        PLAN_NODE(arena, idx_node).index_scan.col_map = col_map;
+                        PLAN_NODE(arena, idx_node).est_rows = 1.0;
+                        current = idx_node;
+                        used_index = 1;
+                        compound_filter_cond = IDX_NONE; /* consumed by index scan */
+                        break;
                     }
                 }
             }

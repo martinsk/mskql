@@ -4585,6 +4585,10 @@ static int parse_create_table(struct lexer *l, struct query *out)
     struct query_create_table *crt = &out->create_table;
 
     crt->as_select_sql = IDX_NONE;
+    crt->pk_columns_start = 0;
+    crt->pk_columns_count = 0;
+    crt->unique_columns_start = 0;
+    crt->unique_columns_count = 0;
 
     /* table name */
     struct token tok = lexer_next(l);
@@ -4623,6 +4627,99 @@ static int parse_create_table(struct lexer *l, struct query *out)
     uint32_t col_start_idx = (uint32_t)out->arena.columns.count;
     uint32_t col_count = 0;
     for (;;) {
+        /* peek to detect table-level constraints */
+        struct token peek = lexer_peek(l);
+        if ((peek.type == TOK_KEYWORD || peek.type == TOK_IDENTIFIER) &&
+            (sv_eq_ignorecase_cstr(peek.value, "PRIMARY") ||
+             sv_eq_ignorecase_cstr(peek.value, "UNIQUE") ||
+             sv_eq_ignorecase_cstr(peek.value, "CONSTRAINT") ||
+             sv_eq_ignorecase_cstr(peek.value, "FOREIGN"))) {
+            /* table-level constraint */
+            tok = lexer_next(l); /* consume keyword */
+
+            /* CONSTRAINT name ... — consume the name, then re-read the constraint keyword */
+            if (sv_eq_ignorecase_cstr(tok.value, "CONSTRAINT")) {
+                lexer_next(l); /* consume constraint name */
+                tok = lexer_next(l); /* PRIMARY / UNIQUE / FOREIGN */
+            }
+
+            if (sv_eq_ignorecase_cstr(tok.value, "PRIMARY")) {
+                /* PRIMARY KEY (col1, col2, ...) */
+                struct token key_tok = lexer_peek(l);
+                if (key_tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(key_tok.value, "KEY"))
+                    lexer_next(l); /* consume KEY */
+                tok = lexer_next(l);
+                if (tok.type != TOK_LPAREN) {
+                    arena_set_error(&out->arena, "42601", "expected '(' after PRIMARY KEY");
+                    return -1;
+                }
+                crt->pk_columns_start = (uint32_t)out->arena.svs.count;
+                crt->pk_columns_count = 0;
+                for (;;) {
+                    tok = lexer_next(l);
+                    if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
+                        arena_set_error(&out->arena, "42601", "expected column name in PRIMARY KEY");
+                        return -1;
+                    }
+                    da_push(&out->arena.svs, tok.value);
+                    crt->pk_columns_count++;
+                    tok = lexer_next(l);
+                    if (tok.type == TOK_RPAREN) break;
+                    if (tok.type != TOK_COMMA) {
+                        arena_set_error(&out->arena, "42601", "expected ',' or ')' in PRIMARY KEY column list");
+                        return -1;
+                    }
+                }
+            } else if (sv_eq_ignorecase_cstr(tok.value, "UNIQUE")) {
+                /* UNIQUE (col1, col2, ...) */
+                tok = lexer_next(l);
+                if (tok.type != TOK_LPAREN) {
+                    arena_set_error(&out->arena, "42601", "expected '(' after UNIQUE");
+                    return -1;
+                }
+                crt->unique_columns_start = (uint32_t)out->arena.svs.count;
+                crt->unique_columns_count = 0;
+                for (;;) {
+                    tok = lexer_next(l);
+                    if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
+                        arena_set_error(&out->arena, "42601", "expected column name in UNIQUE");
+                        return -1;
+                    }
+                    da_push(&out->arena.svs, tok.value);
+                    crt->unique_columns_count++;
+                    tok = lexer_next(l);
+                    if (tok.type == TOK_RPAREN) break;
+                    if (tok.type != TOK_COMMA) {
+                        arena_set_error(&out->arena, "42601", "expected ',' or ')' in UNIQUE column list");
+                        return -1;
+                    }
+                }
+            } else {
+                /* FOREIGN KEY (...) REFERENCES ... — skip for now */
+                int depth = 0;
+                for (;;) {
+                    tok = lexer_next(l);
+                    if (tok.type == TOK_LPAREN) depth++;
+                    else if (tok.type == TOK_RPAREN) { if (--depth <= 0) break; }
+                    else if (tok.type == TOK_EOF) break;
+                }
+                /* skip REFERENCES table (col) and ON DELETE/UPDATE clauses */
+                for (;;) {
+                    struct token fp = lexer_peek(l);
+                    if (fp.type == TOK_COMMA || fp.type == TOK_RPAREN || fp.type == TOK_EOF) break;
+                    lexer_next(l);
+                }
+            }
+
+            tok = lexer_next(l);
+            if (tok.type == TOK_RPAREN) break;
+            if (tok.type != TOK_COMMA) {
+                arena_set_error(&out->arena, "42601", "expected ',' or ')' after table constraint");
+                return -1;
+            }
+            continue;
+        }
+
         /* column name */
         tok = lexer_next(l);
         if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
@@ -4968,16 +5065,25 @@ static int parse_create(struct lexer *l, struct query *out)
             return -1;
         }
 
-        tok = lexer_next(l);
-        if (tok.type != TOK_IDENTIFIER) {
-            arena_set_error(&out->arena, "42601", "expected column name in index");
-            return -1;
+        ci->index_columns_start = (uint32_t)out->arena.svs.count;
+        ci->index_columns_count = 0;
+        for (;;) {
+            tok = lexer_next(l);
+            if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
+                arena_set_error(&out->arena, "42601", "expected column name in index");
+                return -1;
+            }
+            da_push(&out->arena.svs, tok.value);
+            ci->index_columns_count++;
+            tok = lexer_next(l);
+            if (tok.type == TOK_RPAREN) break;
+            if (tok.type != TOK_COMMA) {
+                arena_set_error(&out->arena, "42601", "expected ',' or ')' in index column list");
+                return -1;
+            }
         }
-        ci->index_column = tok.value;
-
-        tok = lexer_next(l);
-        if (tok.type != TOK_RPAREN) {
-            arena_set_error(&out->arena, "42601", "expected ')' after column name");
+        if (ci->index_columns_count == 0) {
+            arena_set_error(&out->arena, "42601", "index must have at least one column");
             return -1;
         }
 

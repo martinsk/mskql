@@ -62,7 +62,9 @@ struct plan_node {
         struct {
             struct table *table;
             struct index *idx;
-            uint32_t     cond_idx;   /* condition index in arena */
+            uint32_t     cond_idx;   /* condition index in arena (single-col compat) */
+            uint32_t     cond_indices[MAX_INDEX_COLS]; /* one cond_idx per index column */
+            int          nkeys;      /* number of index columns matched */
             uint16_t     ncols;
             int         *col_map;
         } index_scan;

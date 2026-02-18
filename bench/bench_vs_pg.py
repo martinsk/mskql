@@ -83,7 +83,7 @@ def duckdb_fixup(lines):
 
 # ── no-cache variant helper ──────────────────────────────────────────────────
 # Benchmarks that are inherently write-heavy or already vary parameters per query.
-CACHE_RESISTANT = {"insert_bulk", "update", "delete", "transaction", "index_lookup"}
+CACHE_RESISTANT = {"insert_bulk", "update", "delete", "transaction", "index_lookup", "composite_index_lookup"}
 
 
 def nocache_lines(bench_lines):
@@ -205,6 +205,23 @@ def bench_index_lookup():
     bench = []
     for i in range(2000):
         bench.append(f"SELECT * FROM t WHERE id = {i % 10000};")
+    return setup, bench
+
+
+def bench_composite_index_lookup():
+    setup = [
+        "DROP TABLE IF EXISTS t;",
+        "CREATE TABLE t (a INT, b INT, val TEXT);",
+    ]
+    for i in range(10000):
+        setup.append(f"INSERT INTO t VALUES ({i % 100}, {i // 100}, 'value_{i}');")
+    setup.append("CREATE INDEX idx_ab ON t (a, b);")
+
+    bench = []
+    for i in range(2000):
+        a = i % 100
+        b = (i * 7) % 100
+        bench.append(f"SELECT * FROM t WHERE a = {a} AND b = {b};")
     return setup, bench
 
 
@@ -851,6 +868,7 @@ _BASE_BENCHMARKS = [
     ("join",               bench_join),
     ("update",             bench_update),
     ("index_lookup",       bench_index_lookup),
+    ("composite_index_lookup", bench_composite_index_lookup),
     ("delete",             bench_delete),
     ("transaction",        bench_transaction),
     ("window_functions",   bench_window_functions),

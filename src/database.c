@@ -2111,6 +2111,50 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             for (uint32_t i = 0; i < crt->columns_count; i++) {
                 table_add_column(&t, &q->arena.columns.items[crt->columns_start + i]);
             }
+            /* table-level PRIMARY KEY (col1, col2, ...) */
+            if (crt->pk_columns_count > 0) {
+                sv pk_col_names[MAX_INDEX_COLS];
+                int pk_col_indices[MAX_INDEX_COLS];
+                int pk_n = (int)crt->pk_columns_count;
+                if (pk_n > MAX_INDEX_COLS) pk_n = MAX_INDEX_COLS;
+                for (int c = 0; c < pk_n; c++) {
+                    pk_col_names[c] = q->arena.svs.items[crt->pk_columns_start + c];
+                    pk_col_indices[c] = table_find_column_sv(&t, pk_col_names[c]);
+                    if (pk_col_indices[c] >= 0) {
+                        t.columns.items[pk_col_indices[c]].is_primary_key = 1;
+                        t.columns.items[pk_col_indices[c]].not_null = 1;
+                        /* Only mark is_unique for single-column PK; composite PK
+                         * enforces uniqueness on the combination via the index */
+                        if (pk_n == 1)
+                            t.columns.items[pk_col_indices[c]].is_unique = 1;
+                    }
+                }
+                char idx_name[256];
+                snprintf(idx_name, sizeof(idx_name), "%.*s_pkey", (int)crt->table.len, crt->table.data);
+                struct index pk_idx;
+                index_init_sv(&pk_idx, (sv){idx_name, strlen(idx_name)}, pk_col_names, pk_col_indices, pk_n);
+                da_push(&t.indexes, pk_idx);
+            }
+            /* table-level UNIQUE (col1, col2, ...) */
+            if (crt->unique_columns_count > 0) {
+                sv uq_col_names[MAX_INDEX_COLS];
+                int uq_col_indices[MAX_INDEX_COLS];
+                int uq_n = (int)crt->unique_columns_count;
+                if (uq_n > MAX_INDEX_COLS) uq_n = MAX_INDEX_COLS;
+                for (int c = 0; c < uq_n; c++) {
+                    uq_col_names[c] = q->arena.svs.items[crt->unique_columns_start + c];
+                    uq_col_indices[c] = table_find_column_sv(&t, uq_col_names[c]);
+                    /* Only mark is_unique for single-column UNIQUE; composite UNIQUE
+                     * enforces uniqueness on the combination via the index */
+                    if (uq_col_indices[c] >= 0 && uq_n == 1)
+                        t.columns.items[uq_col_indices[c]].is_unique = 1;
+                }
+                char idx_name[256];
+                snprintf(idx_name, sizeof(idx_name), "%.*s_unique", (int)crt->table.len, crt->table.data);
+                struct index uq_idx;
+                index_init_sv(&uq_idx, (sv){idx_name, strlen(idx_name)}, uq_col_names, uq_col_indices, uq_n);
+                da_push(&t.indexes, uq_idx);
+            }
             da_push(&db->tables, t);
             return 0;
         }
@@ -2334,18 +2378,36 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                         return 0;
                 }
             }
-            int col_idx = table_find_column_sv(t, ci->index_column);
-            if (col_idx < 0) {
-                arena_set_error(&q->arena, "42703", "column '%.*s' not found in table '%.*s'", (int)ci->index_column.len, ci->index_column.data, (int)ci->table.len, ci->table.data);
+            int ncols = (int)ci->index_columns_count;
+            if (ncols < 1 || ncols > MAX_INDEX_COLS) {
+                arena_set_error(&q->arena, "42601", "index must have 1-%d columns", MAX_INDEX_COLS);
                 return -1;
             }
+            sv col_names[MAX_INDEX_COLS];
+            int col_indices[MAX_INDEX_COLS];
+            for (int c = 0; c < ncols; c++) {
+                col_names[c] = q->arena.svs.items[ci->index_columns_start + c];
+                col_indices[c] = table_find_column_sv(t, col_names[c]);
+                if (col_indices[c] < 0) {
+                    arena_set_error(&q->arena, "42703", "column '%.*s' not found in table '%.*s'",
+                                    (int)col_names[c].len, col_names[c].data,
+                                    (int)ci->table.len, ci->table.data);
+                    return -1;
+                }
+            }
             struct index idx;
-            index_init_sv(&idx, ci->index_name, ci->index_column, col_idx);
+            index_init_sv(&idx, ci->index_name, col_names, col_indices, ncols);
             /* backfill existing rows */
             for (size_t i = 0; i < t->rows.count; i++) {
-                if ((size_t)col_idx < t->rows.items[i].cells.count) {
-                    index_insert(&idx, &t->rows.items[i].cells.items[col_idx], i);
+                struct cell composite[MAX_INDEX_COLS];
+                int ok = 1;
+                for (int c = 0; c < ncols; c++) {
+                    if ((size_t)col_indices[c] < t->rows.items[i].cells.count)
+                        composite[c] = t->rows.items[i].cells.items[col_indices[c]];
+                    else
+                        ok = 0;
                 }
+                if (ok) index_insert(&idx, composite, i);
             }
             da_push(&t->indexes, idx);
             return 0;

@@ -49,6 +49,7 @@ void row_free(struct row *row);
 
 /* shared cell helpers — single canonical implementations */
 int  cell_compare(const struct cell *a, const struct cell *b);
+int  cells_compare(const struct cell *a, const struct cell *b, int ncols);
 int  cell_equal(const struct cell *a, const struct cell *b);
 int  cell_equal_nullsafe(const struct cell *a, const struct cell *b);
 void cell_copy(struct cell *dst, const struct cell *src);

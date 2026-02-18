@@ -2,7 +2,7 @@
 #include <string.h>
 #include <stdio.h>
 
-/* cell_compare → now shared from row.h */
+/* cell_compare / cells_compare → shared from row.h */
 
 static struct btree_node *node_alloc(int is_leaf)
 {
@@ -13,18 +13,18 @@ static struct btree_node *node_alloc(int is_leaf)
     return n;
 }
 
-/* cell_dup → use shared cell_copy from row.h */
-
-static void entry_free(struct btree_entry *e)
+static void entry_free(struct btree_entry *e, int ncols)
 {
-    if (column_type_is_text(e->key.type) && e->key.value.as_text)
-        free(e->key.value.as_text);
+    for (int c = 0; c < ncols; c++) {
+        if (column_type_is_text(e->keys[c].type) && e->keys[c].value.as_text)
+            free(e->keys[c].value.as_text);
+    }
     da_free(&e->row_ids);
 }
 
 /* ---- insert into a non-full node ---- */
 
-static void insert_nonfull(struct btree_node *node, const struct cell *key, size_t row_id);
+static void insert_nonfull(struct btree_node *node, const struct cell *keys, int ncols, size_t row_id);
 static void split_child(struct btree_node *parent, size_t idx);
 
 static void split_child(struct btree_node *parent, size_t idx)
@@ -54,16 +54,16 @@ static void split_child(struct btree_node *parent, size_t idx)
     full->count = mid;
 }
 
-static void insert_nonfull(struct btree_node *node, const struct cell *key, size_t row_id)
+static void insert_nonfull(struct btree_node *node, const struct cell *keys, int ncols, size_t row_id)
 {
     int i = (int)node->count - 1;
 
     if (node->is_leaf) {
         /* find position, check for duplicate key */
-        while (i >= 0 && cell_compare(key, &node->entries[i].key) < 0)
+        while (i >= 0 && cells_compare(keys, node->entries[i].keys, ncols) < 0)
             i--;
 
-        if (i >= 0 && cell_compare(key, &node->entries[i].key) == 0) {
+        if (i >= 0 && cells_compare(keys, node->entries[i].keys, ncols) == 0) {
             /* duplicate key — add row_id to existing entry */
             da_push(&node->entries[i].row_ids, row_id);
             return;
@@ -75,15 +75,16 @@ static void insert_nonfull(struct btree_node *node, const struct cell *key, size
             node->entries[j] = node->entries[j - 1];
 
         memset(&node->entries[i], 0, sizeof(node->entries[i]));
-        cell_copy(&node->entries[i].key, key);
+        for (int c = 0; c < ncols; c++)
+            cell_copy(&node->entries[i].keys[c], &keys[c]);
         da_init(&node->entries[i].row_ids);
         da_push(&node->entries[i].row_ids, row_id);
         node->count++;
     } else {
-        while (i >= 0 && cell_compare(key, &node->entries[i].key) < 0)
+        while (i >= 0 && cells_compare(keys, node->entries[i].keys, ncols) < 0)
             i--;
 
-        if (i >= 0 && cell_compare(key, &node->entries[i].key) == 0) {
+        if (i >= 0 && cells_compare(keys, node->entries[i].keys, ncols) == 0) {
             da_push(&node->entries[i].row_ids, row_id);
             return;
         }
@@ -91,69 +92,77 @@ static void insert_nonfull(struct btree_node *node, const struct cell *key, size
         i++;
         if (node->children[i]->count == BTREE_ORDER - 1) {
             split_child(node, (size_t)i);
-            if (cell_compare(key, &node->entries[i].key) == 0) {
+            if (cells_compare(keys, node->entries[i].keys, ncols) == 0) {
                 da_push(&node->entries[i].row_ids, row_id);
                 return;
             }
-            if (cell_compare(key, &node->entries[i].key) > 0)
+            if (cells_compare(keys, node->entries[i].keys, ncols) > 0)
                 i++;
         }
-        insert_nonfull(node->children[i], key, row_id);
+        insert_nonfull(node->children[i], keys, ncols, row_id);
     }
 }
 
 /* ---- lookup ---- */
 
-static struct btree_entry *node_lookup(struct btree_node *node, const struct cell *key)
+static struct btree_entry *node_lookup(struct btree_node *node, const struct cell *keys, int ncols)
 {
     if (!node) return NULL;
 
     size_t i = 0;
-    while (i < node->count && cell_compare(key, &node->entries[i].key) > 0)
+    while (i < node->count && cells_compare(keys, node->entries[i].keys, ncols) > 0)
         i++;
 
-    if (i < node->count && cell_compare(key, &node->entries[i].key) == 0)
+    if (i < node->count && cells_compare(keys, node->entries[i].keys, ncols) == 0)
         return &node->entries[i];
 
     if (node->is_leaf)
         return NULL;
 
-    return node_lookup(node->children[i], key);
+    return node_lookup(node->children[i], keys, ncols);
 }
 
 /* ---- free ---- */
 
-static void node_free(struct btree_node *node)
+static void node_free(struct btree_node *node, int ncols)
 {
     if (!node) return;
     for (size_t i = 0; i < node->count; i++)
-        entry_free(&node->entries[i]);
+        entry_free(&node->entries[i], ncols);
     if (!node->is_leaf) {
         for (size_t i = 0; i <= node->count; i++)
-            node_free(node->children[i]);
+            node_free(node->children[i], ncols);
     }
     free(node);
 }
 
 /* ---- public API ---- */
 
-void index_init(struct index *idx, const char *name, const char *col_name, int col_idx)
+void index_init(struct index *idx, const char *name,
+                const char *const *col_names, const int *col_indices, int ncols)
 {
     idx->name = strdup(name);
-    idx->column_name = strdup(col_name);
-    idx->column_idx = col_idx;
+    idx->ncols = ncols;
+    for (int i = 0; i < ncols; i++) {
+        idx->column_names[i] = strdup(col_names[i]);
+        idx->column_indices[i] = col_indices[i];
+    }
     idx->root = node_alloc(1);
 }
 
-void index_init_sv(struct index *idx, sv name, sv col_name, int col_idx)
+void index_init_sv(struct index *idx, sv name,
+                   const sv *col_names, const int *col_indices, int ncols)
 {
     idx->name = sv_to_cstr(name);
-    idx->column_name = sv_to_cstr(col_name);
-    idx->column_idx = col_idx;
+    idx->ncols = ncols;
+    for (int i = 0; i < ncols; i++) {
+        idx->column_names[i] = sv_to_cstr(col_names[i]);
+        idx->column_indices[i] = col_indices[i];
+    }
     idx->root = node_alloc(1);
 }
 
-void index_insert(struct index *idx, const struct cell *key, size_t row_id)
+void index_insert(struct index *idx, const struct cell *keys, size_t row_id)
 {
     if (idx->root->count == BTREE_ORDER - 1) {
         struct btree_node *old_root = idx->root;
@@ -162,13 +171,13 @@ void index_insert(struct index *idx, const struct cell *key, size_t row_id)
         split_child(new_root, 0);
         idx->root = new_root;
     }
-    insert_nonfull(idx->root, key, row_id);
+    insert_nonfull(idx->root, keys, idx->ncols, row_id);
 }
 
-int index_lookup(struct index *idx, const struct cell *key,
+int index_lookup(struct index *idx, const struct cell *keys,
                  size_t **out_ids, size_t *out_count)
 {
-    struct btree_entry *e = node_lookup(idx->root, key);
+    struct btree_entry *e = node_lookup(idx->root, keys, idx->ncols);
     if (!e) {
         *out_ids = NULL;
         *out_count = 0;
@@ -179,9 +188,9 @@ int index_lookup(struct index *idx, const struct cell *key,
     return 0;
 }
 
-void index_remove(struct index *idx, const struct cell *key, size_t row_id)
+void index_remove(struct index *idx, const struct cell *keys, size_t row_id)
 {
-    struct btree_entry *e = node_lookup(idx->root, key);
+    struct btree_entry *e = node_lookup(idx->root, keys, idx->ncols);
     if (!e) return;
     for (size_t i = 0; i < e->row_ids.count; i++) {
         if (e->row_ids.items[i] == row_id) {
@@ -194,14 +203,15 @@ void index_remove(struct index *idx, const struct cell *key, size_t row_id)
 
 void index_reset(struct index *idx)
 {
-    node_free(idx->root);
+    node_free(idx->root, idx->ncols);
     idx->root = node_alloc(1);
 }
 
 void index_free(struct index *idx)
 {
     free(idx->name);
-    free(idx->column_name);
-    node_free(idx->root);
+    for (int i = 0; i < idx->ncols; i++)
+        free(idx->column_names[i]);
+    node_free(idx->root, idx->ncols);
     idx->root = NULL;
 }

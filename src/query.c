@@ -5647,25 +5647,78 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
 
     int select_all = sv_eq_cstr(s->columns, "*");
 
-    /* try index lookup for simple equality WHERE on indexed column */
-    if (s->where.has_where && s->where.where_cond != IDX_NONE
-        && COND(arena, s->where.where_cond).type == COND_COMPARE
-        && COND(arena, s->where.where_cond).op == CMP_EQ && !s->has_order_by) {
-        int where_col = table_find_column_sv(t, COND(arena, s->where.where_cond).column);
-        if (where_col >= 0) {
-            for (size_t idx = 0; idx < t->indexes.count; idx++) {
-                if (strcmp(t->indexes.items[idx].column_name,
-                           t->columns.items[where_col].name) == 0) {
-                    size_t *ids = NULL;
-                    size_t id_count = 0;
-                    index_lookup(&t->indexes.items[idx], &COND(arena, s->where.where_cond).value,
-                                 &ids, &id_count);
-                    for (size_t k = 0; k < id_count; k++) {
-                        if (ids[k] < t->rows.count)
-                            emit_row(t, s, arena, &t->rows.items[ids[k]], result, select_all, db, rb);
+    /* try index lookup for simple equality WHERE on indexed column(s) */
+    if (s->where.has_where && s->where.where_cond != IDX_NONE && !s->has_order_by) {
+        for (size_t idx = 0; idx < t->indexes.count; idx++) {
+            struct index *ix = &t->indexes.items[idx];
+            struct cell composite[MAX_INDEX_COLS];
+            int matched = 0;
+            if (ix->ncols == 1) {
+                /* single-column: simple equality check */
+                struct condition *cond = &COND(arena, s->where.where_cond);
+                if (cond->type == COND_COMPARE && cond->op == CMP_EQ) {
+                    int wc = table_find_column_sv(t, cond->column);
+                    if (wc >= 0 && strcmp(ix->column_names[0], t->columns.items[wc].name) == 0) {
+                        composite[0] = cond->value;
+                        matched = 1;
                     }
-                    return 0;
                 }
+            } else {
+                /* multi-column: need COND_AND with CMP_EQ on all index columns */
+                struct condition *root = &COND(arena, s->where.where_cond);
+                if (root->type == COND_AND) {
+                    int found[MAX_INDEX_COLS] = {0};
+                    /* collect equality conditions from left and right */
+                    uint32_t cond_ids[2] = { root->left, root->right };
+                    for (int ci = 0; ci < 2; ci++) {
+                        if (cond_ids[ci] == IDX_NONE) continue;
+                        struct condition *sub = &COND(arena, cond_ids[ci]);
+                        if (sub->type == COND_COMPARE && sub->op == CMP_EQ) {
+                            int wc = table_find_column_sv(t, sub->column);
+                            if (wc >= 0) {
+                                for (int c = 0; c < ix->ncols; c++) {
+                                    if (strcmp(ix->column_names[c], t->columns.items[wc].name) == 0) {
+                                        composite[c] = sub->value;
+                                        found[c] = 1;
+                                    }
+                                }
+                            }
+                        }
+                        /* handle nested COND_AND on the left branch */
+                        if (sub->type == COND_AND) {
+                            uint32_t sub_ids[2] = { sub->left, sub->right };
+                            for (int si = 0; si < 2; si++) {
+                                if (sub_ids[si] == IDX_NONE) continue;
+                                struct condition *leaf = &COND(arena, sub_ids[si]);
+                                if (leaf->type == COND_COMPARE && leaf->op == CMP_EQ) {
+                                    int wc = table_find_column_sv(t, leaf->column);
+                                    if (wc >= 0) {
+                                        for (int c = 0; c < ix->ncols; c++) {
+                                            if (strcmp(ix->column_names[c], t->columns.items[wc].name) == 0) {
+                                                composite[c] = leaf->value;
+                                                found[c] = 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    matched = 1;
+                    for (int c = 0; c < ix->ncols; c++) {
+                        if (!found[c]) { matched = 0; break; }
+                    }
+                }
+            }
+            if (matched) {
+                size_t *ids = NULL;
+                size_t id_count = 0;
+                index_lookup(ix, composite, &ids, &id_count);
+                for (size_t k = 0; k < id_count; k++) {
+                    if (ids[k] < t->rows.count)
+                        emit_row(t, s, arena, &t->rows.items[ids[k]], result, select_all, db, rb);
+                }
+                return 0;
             }
         }
     }
@@ -5956,12 +6009,19 @@ static void rebuild_indexes(struct table *t)
 {
     for (size_t idx = 0; idx < t->indexes.count; idx++) {
         struct index *ix = &t->indexes.items[idx];
-        int col_idx = ix->column_idx;
         index_reset(ix);
         /* re-insert all rows */
         for (size_t r = 0; r < t->rows.count; r++) {
-            if ((size_t)col_idx < t->rows.items[r].cells.count)
-                index_insert(ix, &t->rows.items[r].cells.items[col_idx], r);
+            struct cell composite[MAX_INDEX_COLS];
+            int ok = 1;
+            for (int c = 0; c < ix->ncols; c++) {
+                int ci = ix->column_indices[c];
+                if ((size_t)ci < t->rows.items[r].cells.count)
+                    composite[c] = t->rows.items[r].cells.items[ci];
+                else
+                    ok = 0;
+            }
+            if (ok) index_insert(ix, composite, r);
         }
     }
 }
@@ -6129,9 +6189,11 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
             int wcol = table_find_column_sv(t, where_col);
             if (wcol >= 0) {
                 for (size_t ix = 0; ix < t->indexes.count; ix++) {
-                    if (t->indexes.items[ix].column_idx == wcol) {
-                        index_lookup(&t->indexes.items[ix], &where_val,
-                                     &idx_row_ids, &idx_row_count);
+                    struct index *idx = &t->indexes.items[ix];
+                    if (idx->ncols == 1 && idx->column_indices[0] == wcol) {
+                        struct cell composite[1];
+                        composite[0] = where_val;
+                        index_lookup(idx, composite, &idx_row_ids, &idx_row_count);
                         use_index_scan = 1;
                         break;
                     }
@@ -6218,15 +6280,34 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
         /* incremental index update: remove old keys, insert new keys */
         for (size_t ix = 0; ix < t->indexes.count; ix++) {
             struct index *idx = &t->indexes.items[ix];
-            int ic = idx->column_idx;
-            /* check if this indexed column is being updated */
-            for (uint32_t sc = 0; sc < nsc; sc++) {
-                if (col_idxs[sc] == ic) {
-                    index_remove(idx, &t->rows.items[i].cells.items[ic], i);
-                    index_insert(idx, &new_vals[sc], i);
-                    break;
+            /* check if any of this index's columns overlap with the SET columns */
+            int affected = 0;
+            for (int c = 0; c < idx->ncols && !affected; c++) {
+                for (uint32_t sc = 0; sc < nsc; sc++) {
+                    if (col_idxs[sc] == idx->column_indices[c]) { affected = 1; break; }
                 }
             }
+            if (!affected) continue;
+            /* build old composite key from current row */
+            struct cell old_key[MAX_INDEX_COLS];
+            for (int c = 0; c < idx->ncols; c++)
+                old_key[c] = t->rows.items[i].cells.items[idx->column_indices[c]];
+            index_remove(idx, old_key, i);
+            /* build new composite key: use new_vals where updated, old values otherwise */
+            struct cell new_key[MAX_INDEX_COLS];
+            for (int c = 0; c < idx->ncols; c++) {
+                int found = 0;
+                for (uint32_t sc = 0; sc < nsc; sc++) {
+                    if (col_idxs[sc] == idx->column_indices[c]) {
+                        new_key[c] = new_vals[sc];
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found)
+                    new_key[c] = t->rows.items[i].cells.items[idx->column_indices[c]];
+            }
+            index_insert(idx, new_key, i);
         }
         /* now apply all new values */
         for (size_t sc = 0; sc < nsc; sc++) {
@@ -6755,12 +6836,17 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
         /* update indexes */
         size_t new_row_id = t->rows.count - 1;
         for (size_t ix = 0; ix < t->indexes.count; ix++) {
-            int col_idx = t->indexes.items[ix].column_idx;
-            if (col_idx >= 0 && (size_t)col_idx < t->rows.items[new_row_id].cells.count) {
-                index_insert(&t->indexes.items[ix],
-                             &t->rows.items[new_row_id].cells.items[col_idx],
-                             new_row_id);
+            struct index *idx = &t->indexes.items[ix];
+            struct cell composite[MAX_INDEX_COLS];
+            int ok = 1;
+            for (int c = 0; c < idx->ncols; c++) {
+                int ci = idx->column_indices[c];
+                if (ci >= 0 && (size_t)ci < t->rows.items[new_row_id].cells.count)
+                    composite[c] = t->rows.items[new_row_id].cells.items[ci];
+                else
+                    ok = 0;
             }
+            if (ok) index_insert(idx, composite, new_row_id);
         }
 
         if (has_returning && result)

@@ -7,9 +7,10 @@
 #include <stdlib.h>
 
 #define BTREE_ORDER 64
+#define MAX_INDEX_COLS 8
 
 struct btree_entry {
-    struct cell key;
+    struct cell keys[MAX_INDEX_COLS];
     DYNAMIC_ARRAY(size_t) row_ids;
 };
 
@@ -21,21 +22,21 @@ struct btree_node {
 };
 
 struct index {
-    // TODO: STRINGVIEW OPPORTUNITY: name and column_name are char* that get strdup'd
-    // and freed repeatedly (e.g. rebuild_indexes does strdup → free → strdup cycle).
-    // Could be sv if the schema had a persistent backing store.
     char *name;
-    char *column_name;
-    int   column_idx;
+    int   ncols;
+    char *column_names[MAX_INDEX_COLS];
+    int   column_indices[MAX_INDEX_COLS];
     struct btree_node *root;
 };
 
-void index_init(struct index *idx, const char *name, const char *col_name, int col_idx);
-void index_init_sv(struct index *idx, sv name, sv col_name, int col_idx);
-void index_insert(struct index *idx, const struct cell *key, size_t row_id);
-int  index_lookup(struct index *idx, const struct cell *key,
+void index_init(struct index *idx, const char *name,
+                const char *const *col_names, const int *col_indices, int ncols);
+void index_init_sv(struct index *idx, sv name,
+                   const sv *col_names, const int *col_indices, int ncols);
+void index_insert(struct index *idx, const struct cell *keys, size_t row_id);
+int  index_lookup(struct index *idx, const struct cell *keys,
                   size_t **out_ids, size_t *out_count);
-void index_remove(struct index *idx, const struct cell *key, size_t row_id);
+void index_remove(struct index *idx, const struct cell *keys, size_t row_id);
 void index_reset(struct index *idx);
 void index_free(struct index *idx);
 

@@ -344,22 +344,28 @@ static void build_pg_index(struct database *db)
         int relid = (int)(16384 + i);
         for (size_t ix = 0; ix < ut->indexes.count; ix++) {
             struct index *idx = &ut->indexes.items[ix];
-            /* find column number */
-            int col_num = idx->column_idx + 1;
-            char key_buf[16];
-            snprintf(key_buf, sizeof(key_buf), "%d", col_num);
+            /* build space-separated indkey from all column indices */
+            char key_buf[128];
+            int kpos = 0;
+            for (int c = 0; c < idx->ncols; c++) {
+                if (c > 0) key_buf[kpos++] = ' ';
+                kpos += snprintf(key_buf + kpos, sizeof(key_buf) - kpos, "%d", idx->column_indices[c] + 1);
+            }
 
             /* check if this is a primary key or unique index */
             int is_pk = 0, is_unique = 0;
-            if ((size_t)idx->column_idx < ut->columns.count) {
-                is_pk = ut->columns.items[idx->column_idx].is_primary_key;
-                is_unique = ut->columns.items[idx->column_idx].is_unique || is_pk;
+            for (int c = 0; c < idx->ncols; c++) {
+                if ((size_t)idx->column_indices[c] < ut->columns.count) {
+                    if (ut->columns.items[idx->column_indices[c]].is_primary_key) is_pk = 1;
+                    if (ut->columns.items[idx->column_indices[c]].is_unique) is_unique = 1;
+                }
             }
+            if (is_pk) is_unique = 1;
 
             struct cell r[] = {
                 int_cell((int)(32768 + i * 100 + ix)),
                 int_cell(relid),
-                int_cell(1), /* indnatts */
+                int_cell(idx->ncols),
                 bool_cell(is_unique),
                 bool_cell(is_pk),
                 text_cell(key_buf),

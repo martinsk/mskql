@@ -573,6 +573,12 @@ struct query_create_table {
     uint32_t columns_count;
     int if_not_exists;
     uint32_t as_select_sql; /* index into arena.strings, or IDX_NONE — CREATE TABLE ... AS SELECT */
+    /* table-level PRIMARY KEY (col1, col2, ...) */
+    uint32_t pk_columns_start; /* index into arena.svs */
+    uint32_t pk_columns_count;
+    /* table-level UNIQUE (col1, col2, ...) */
+    uint32_t unique_columns_start; /* index into arena.svs */
+    uint32_t unique_columns_count;
 };
 
 struct query_drop_table {
@@ -591,7 +597,8 @@ struct query_alter {
 struct query_create_index {
     sv table;
     sv index_name;
-    sv index_column;
+    uint32_t index_columns_start; /* index into arena.svs (consecutive column names) */
+    uint32_t index_columns_count;
     int if_not_exists;
 };
 

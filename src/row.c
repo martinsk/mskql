@@ -195,6 +195,15 @@ int cell_compare(const struct cell *a, const struct cell *b)
     return -2;
 }
 
+int cells_compare(const struct cell *a, const struct cell *b, int ncols)
+{
+    for (int i = 0; i < ncols; i++) {
+        int cmp = cell_compare(&a[i], &b[i]);
+        if (cmp != 0) return cmp;
+    }
+    return 0;
+}
+
 int cell_equal(const struct cell *a, const struct cell *b)
 {
     /* SQL standard: NULL is never equal to anything, including NULL */
