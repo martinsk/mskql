@@ -28,6 +28,7 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <errno.h>
@@ -111,6 +112,8 @@ static int tcp_connect_port(int port)
         close(fd);
         return -1;
     }
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     return fd;
 }
 
@@ -156,32 +159,48 @@ static int pg_startup_params(int fd, const char *user, const char *database)
 }
 
 /* Send a simple query and drain all response messages until ReadyForQuery.
- * Returns 0 on success, -1 on error. */
+ * Returns 0 on success, -1 on error.
+ * Uses a stack buffer for send (single write) and a reusable drain buffer
+ * to avoid per-message malloc/free overhead. */
 static int pg_query(int fd, const char *sql)
 {
     size_t sql_len = strlen(sql) + 1;
-    uint32_t msg_len = 4 + (uint32_t)sql_len;
-    uint8_t hdr[5];
-    hdr[0] = 'Q';
-    put_u32(hdr + 1, msg_len);
-    if (send_all(fd, hdr, 5) != 0) return -1;
-    if (send_all(fd, sql, sql_len) != 0) return -1;
+    size_t total = 5 + sql_len;
+    uint8_t stack_send[512];
+    uint8_t *sendbuf = (total <= sizeof(stack_send)) ? stack_send : malloc(total);
+    sendbuf[0] = 'Q';
+    put_u32(sendbuf + 1, 4 + (uint32_t)sql_len);
+    memcpy(sendbuf + 5, sql, sql_len);
+    int rc = send_all(fd, sendbuf, total);
+    if (sendbuf != stack_send) free(sendbuf);
+    if (rc != 0) return -1;
+
+    /* Drain response — stack buffer avoids malloc for typical messages */
+    uint8_t drain_stack[65536];
+    uint8_t *drain_heap = NULL;
+    size_t drain_heap_cap = 0;
 
     for (;;) {
-        uint8_t type;
-        if (read_all(fd, &type, 1) != 0) return -1;
-        uint8_t lbuf[4];
-        if (read_all(fd, lbuf, 4) != 0) return -1;
-        uint32_t mlen = get_u32(lbuf);
-        if (mlen < 4) return -1;
-        uint32_t body_len = mlen - 4;
+        uint8_t hdr5[5];
+        if (read_all(fd, hdr5, 5) != 0) { free(drain_heap); return -1; }
+        uint32_t body_len = get_u32(hdr5 + 1);
+        if (body_len < 4) { free(drain_heap); return -1; }
+        body_len -= 4;
         if (body_len > 0) {
-            uint8_t *body = malloc(body_len);
-            if (read_all(fd, body, body_len) != 0) { free(body); return -1; }
-            free(body);
+            uint8_t *dst;
+            if (body_len <= sizeof(drain_stack)) {
+                dst = drain_stack;
+            } else {
+                if (body_len > drain_heap_cap) {
+                    free(drain_heap);
+                    drain_heap_cap = body_len;
+                    drain_heap = malloc(drain_heap_cap);
+                }
+                dst = drain_heap;
+            }
+            if (read_all(fd, dst, body_len) != 0) { free(drain_heap); return -1; }
         }
-        if (type == 'Z') return 0;
-        /* Don't treat ErrorResponse as fatal — caller may want to continue */
+        if (hdr5[0] == 'Z') { free(drain_heap); return 0; }
     }
 }
 

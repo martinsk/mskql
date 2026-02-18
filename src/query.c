@@ -6490,6 +6490,17 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
     int has_returning = (ins->returning_columns.len > 0);
     int return_all = has_returning && sv_eq_cstr(ins->returning_columns, "*");
 
+    /* Pre-grow rows DA to avoid per-row reallocation */
+    if (ins->insert_rows_count > 1) {
+        size_t needed = t->rows.count + ins->insert_rows_count;
+        if (needed > t->rows.capacity) {
+            size_t new_cap = t->rows.capacity ? t->rows.capacity : 8;
+            while (new_cap < needed) new_cap *= 2;
+            t->rows.items = realloc(t->rows.items, new_cap * sizeof(t->rows.items[0]));
+            t->rows.capacity = new_cap;
+        }
+    }
+
     for (uint32_t r = 0; r < ins->insert_rows_count; r++) {
         struct row *src = &arena->rows.items[ins->insert_rows_start + r];
 
@@ -6740,8 +6751,6 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
             return -1;
         }
         da_push(&t->rows, copy);
-        t->generation++;
-        db->total_generation++;
 
         /* update indexes */
         size_t new_row_id = t->rows.count - 1;
@@ -6756,6 +6765,12 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
 
         if (has_returning && result)
             emit_returning_row(t, &t->rows.items[t->rows.count - 1], ins->returning_columns, return_all, result, rb);
+    }
+
+    /* Batch generation bump — single increment after all rows inserted */
+    if (ins->insert_rows_count > 0) {
+        t->generation++;
+        db->total_generation++;
     }
 
     return 0;

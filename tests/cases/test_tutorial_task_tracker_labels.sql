@@ -14,9 +14,9 @@ SELECT t.title, l.name AS label FROM tasks t JOIN task_labels tl ON t.id = tl.ta
 Fix nav overflow|urgent
 Fix nav overflow|frontend
 Fix nav overflow|bug
-Rate limiting|backend
 Rate limiting|urgent
+Rate limiting|backend
 Add dark mode|feature
-Offline sync|feature
 Offline sync|backend
+Offline sync|feature
 -- expected status: 0

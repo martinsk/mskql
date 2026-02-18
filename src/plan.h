@@ -229,6 +229,10 @@ struct hash_agg_state {
     size_t   *grp_counts;  /* row count per group */
     int      *minmax_init;
     struct distinct_set *distinct_sets; /* bump: [agg_count * group_cap], only for DISTINCT aggs */
+    /* STRING_AGG / ARRAY_AGG accumulators */
+    char   **str_accum;    /* bump: [agg_count * group_cap] concatenated strings */
+    size_t  *str_accum_len; /* bump: [agg_count * group_cap] current length */
+    size_t  *str_accum_cap; /* bump: [agg_count * group_cap] allocated capacity */
     /* group key values stored in col_blocks */
     struct col_block *group_keys;
     uint32_t  ngroups;
