@@ -32,6 +32,7 @@ TESTCASE_DIR="$(cd "$SCRIPT_DIR/cases" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BASE_PORT=${MSKQL_TEST_BASE_PORT:-15433}
 NO_LEAK_CHECK=${MSKQL_NO_LEAK_CHECK:-0}
+FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 LSAN_SUPP="$SCRIPT_DIR/lsan_suppressions.txt"
 FAILURE_LOG="$SCRIPT_DIR/test-failures.log"
 
@@ -305,14 +306,15 @@ run_worker_batch() {
 
         # run setup SQL in a single psql session
         # (ensure each line ends with a semicolon so psql can parse them)
+        # Substitute @@FIXTURES@@ with absolute path to test fixtures directory
         if [ -n "$TC_SETUP" ]; then
-            echo "$TC_SETUP" | sed 's/;*$/;/' | psql_cmd "$port" >/dev/null 2>&1
+            echo "$TC_SETUP" | sed "s|@@FIXTURES@@|$FIXTURES_DIR|g" | sed 's/;*$/;/' | psql_cmd "$port" >/dev/null 2>&1
         fi
 
         # run input SQL in a single psql session
         local actual="" status=0
         if [ -n "$TC_INPUT" ]; then
-            actual=$(echo "$TC_INPUT" | sed 's/;*$/;/' | psql_cmd "$port" 2>&1) || status=$?
+            actual=$(echo "$TC_INPUT" | sed "s|@@FIXTURES@@|$FIXTURES_DIR|g" | sed 's/;*$/;/' | psql_cmd "$port" 2>&1) || status=$?
         fi
 
         # compare

@@ -6798,6 +6798,7 @@ int query_exec(struct table *t, struct query *q, struct rows *result, struct dat
         case QUERY_TYPE_COPY:
         case QUERY_TYPE_SET:
         case QUERY_TYPE_SHOW:
+        case QUERY_TYPE_CREATE_FOREIGN_TABLE:
             return -1;
         case QUERY_TYPE_SELECT:
             return query_select_exec(t, &q->select, &q->arena, result, db, rb);

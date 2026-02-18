@@ -2,6 +2,10 @@
 #include "query.h"
 #include "parser.h"
 #include "arena_helpers.h"
+#ifndef MSKQL_WASM
+#include "parquet.h"
+#include <carquet/carquet.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -451,6 +455,7 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
     case PLAN_WINDOW:         return pn->window.out_ncols;
     case PLAN_SET_OP:         return pn->set_op.ncols;
     case PLAN_GENERATE_SERIES: return 1;
+    case PLAN_PARQUET_SCAN:   return pn->parquet_scan.ncols;
     case PLAN_EXPR_PROJECT:   return pn->expr_project.ncols;
     case PLAN_SORT:
     case PLAN_HASH_SEMI_JOIN:
@@ -1345,6 +1350,7 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case PLAN_WINDOW:
             case PLAN_HASH_SEMI_JOIN:
             case PLAN_GENERATE_SERIES:
+            case PLAN_PARQUET_SCAN:
                 goto walk_done;
             }
         }
@@ -5599,6 +5605,267 @@ static int distinct_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* ---- Parquet Scan ---- */
+
+#ifndef MSKQL_WASM
+static int parquet_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                              struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct parquet_scan_state *st = (struct parquet_scan_state *)ctx->node_states[node_idx];
+    if (!st) {
+        st = (struct parquet_scan_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        ctx->node_states[node_idx] = st;
+    }
+
+    if (st->done) return 1;
+
+    /* Lazy init: open reader and batch reader on first call */
+    if (!st->reader) {
+        const char *path = pn->parquet_scan.table->parquet_path;
+        carquet_error_t err = CARQUET_ERROR_INIT;
+        carquet_reader_t *reader = carquet_reader_open(path, NULL, &err);
+        if (!reader) { st->done = 1; return 1; }
+        st->reader = reader;
+
+        carquet_batch_reader_config_t cfg;
+        carquet_batch_reader_config_init(&cfg);
+        cfg.batch_size = BLOCK_CAPACITY;
+
+        carquet_batch_reader_t *br = carquet_batch_reader_create(reader, &cfg, &err);
+        if (!br) {
+            carquet_reader_close(reader);
+            st->reader = NULL;
+            st->done = 1;
+            return 1;
+        }
+        st->batch_reader = br;
+    }
+
+    /* Read next batch */
+    carquet_row_batch_t *batch = NULL;
+    carquet_status_t status = carquet_batch_reader_next(
+        (carquet_batch_reader_t *)st->batch_reader, &batch);
+
+    if (status != CARQUET_OK || !batch) {
+        /* Clean up */
+        carquet_batch_reader_free((carquet_batch_reader_t *)st->batch_reader);
+        carquet_reader_close((carquet_reader_t *)st->reader);
+        st->batch_reader = NULL;
+        st->reader = NULL;
+        st->done = 1;
+        return 1;
+    }
+
+    int64_t nrows = carquet_row_batch_num_rows(batch);
+    if (nrows <= 0) {
+        carquet_row_batch_free(batch);
+        carquet_batch_reader_free((carquet_batch_reader_t *)st->batch_reader);
+        carquet_reader_close((carquet_reader_t *)st->reader);
+        st->batch_reader = NULL;
+        st->reader = NULL;
+        st->done = 1;
+        return 1;
+    }
+
+    uint16_t ncols = pn->parquet_scan.ncols;
+    uint16_t nrows_u16 = (uint16_t)(nrows > BLOCK_CAPACITY ? BLOCK_CAPACITY : nrows);
+    out->count = nrows_u16;
+
+    struct table *tbl = pn->parquet_scan.table;
+
+    for (uint16_t c = 0; c < ncols; c++) {
+        int parquet_col = pn->parquet_scan.col_map[c];
+        enum column_type ct = tbl->columns.items[c].type;
+        out->cols[c].type = ct;
+        out->cols[c].count = nrows_u16;
+        const void *data = NULL;
+        const uint8_t *null_bitmap = NULL;
+        int64_t num_values = 0;
+        (void)carquet_row_batch_column(batch, parquet_col, &data, &null_bitmap, &num_values);
+
+        /* Copy null bitmap: Carquet convention — bit set = NULL.
+         * All-zero bitmap (or NULL pointer) = all values valid. */
+        memset(out->cols[c].nulls, 0, nrows_u16);
+        if (null_bitmap) {
+            for (uint16_t r = 0; r < nrows_u16; r++) {
+                if (null_bitmap[r / 8] & (1 << (r % 8)))
+                    out->cols[c].nulls[r] = 1;
+            }
+        }
+
+        /* Check if this column has any nulls */
+        int has_nulls = 0;
+        if (null_bitmap) {
+            for (int bi = 0; bi < (nrows_u16 + 7) / 8; bi++) {
+                if (null_bitmap[bi]) { has_nulls = 1; break; }
+            }
+        }
+
+        /* Copy data based on type.
+         * Carquet compacts nullable columns: non-null values are packed
+         * contiguously in the data array.  Use a running data index (di)
+         * that only increments for non-null rows. */
+        switch (ct) {
+        case COLUMN_TYPE_BOOLEAN:
+            if (data) {
+                const uint8_t *src = (const uint8_t *)data;
+                uint16_t di = 0;
+                for (uint16_t r = 0; r < nrows_u16; r++) {
+                    if (out->cols[c].nulls[r]) continue;
+                    out->cols[c].data.i32[r] = src[di] ? 1 : 0;
+                    di++;
+                }
+            }
+            break;
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_SMALLINT:
+        case COLUMN_TYPE_ENUM:
+            if (data) {
+                const int32_t *src = (const int32_t *)data;
+                if (!has_nulls) {
+                    memcpy(out->cols[c].data.i32, src, nrows_u16 * sizeof(int32_t));
+                } else {
+                    uint16_t di = 0;
+                    for (uint16_t r = 0; r < nrows_u16; r++) {
+                        if (out->cols[c].nulls[r]) continue;
+                        out->cols[c].data.i32[r] = src[di++];
+                    }
+                }
+            }
+            break;
+        case COLUMN_TYPE_BIGINT:
+            if (data) {
+                const int64_t *src = (const int64_t *)data;
+                if (!has_nulls) {
+                    memcpy(out->cols[c].data.i64, src, nrows_u16 * sizeof(int64_t));
+                } else {
+                    uint16_t di = 0;
+                    for (uint16_t r = 0; r < nrows_u16; r++) {
+                        if (out->cols[c].nulls[r]) continue;
+                        out->cols[c].data.i64[r] = src[di++];
+                    }
+                }
+            }
+            break;
+        case COLUMN_TYPE_DATE:
+            if (data) {
+                const int32_t *src = (const int32_t *)data;
+                /* Parquet: days since 1970-01-01; mskql: days since 2000-01-01 */
+                uint16_t di = 0;
+                for (uint16_t r = 0; r < nrows_u16; r++) {
+                    if (has_nulls && out->cols[c].nulls[r]) continue;
+                    out->cols[c].data.i32[r] = src[di++] - 10957;
+                }
+            }
+            break;
+        case COLUMN_TYPE_TIME:
+            if (data) {
+                const int64_t *src = (const int64_t *)data;
+                if (!has_nulls) {
+                    memcpy(out->cols[c].data.i64, src, nrows_u16 * sizeof(int64_t));
+                } else {
+                    uint16_t di = 0;
+                    for (uint16_t r = 0; r < nrows_u16; r++) {
+                        if (out->cols[c].nulls[r]) continue;
+                        out->cols[c].data.i64[r] = src[di++];
+                    }
+                }
+            }
+            break;
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+            if (data) {
+                const int64_t *src = (const int64_t *)data;
+                /* Parquet: usec since 1970-01-01; mskql: usec since 2000-01-01 */
+                uint16_t di = 0;
+                for (uint16_t r = 0; r < nrows_u16; r++) {
+                    if (has_nulls && out->cols[c].nulls[r]) continue;
+                    out->cols[c].data.i64[r] = src[di++] - (10957LL * 86400LL * 1000000LL);
+                }
+            }
+            break;
+        case COLUMN_TYPE_INTERVAL:
+            if (data) {
+                const struct interval *src = (const struct interval *)data;
+                if (!has_nulls) {
+                    memcpy(out->cols[c].data.iv, src, nrows_u16 * sizeof(struct interval));
+                } else {
+                    uint16_t di = 0;
+                    for (uint16_t r = 0; r < nrows_u16; r++) {
+                        if (out->cols[c].nulls[r]) continue;
+                        out->cols[c].data.iv[r] = src[di++];
+                    }
+                }
+            }
+            break;
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC: {
+            if (data) {
+                const carquet_schema_t *schema = carquet_reader_schema(
+                    (carquet_reader_t *)st->reader);
+                int32_t num_elems = carquet_schema_num_elements(schema);
+                int leaf_idx = 0;
+                carquet_physical_type_t phys = CARQUET_PHYSICAL_DOUBLE;
+                for (int32_t ei = 0; ei < num_elems; ei++) {
+                    const carquet_schema_node_t *node = carquet_schema_get_element(schema, ei);
+                    if (!node || !carquet_schema_node_is_leaf(node)) continue;
+                    if (leaf_idx == parquet_col) {
+                        phys = carquet_schema_node_physical_type(node);
+                        break;
+                    }
+                    leaf_idx++;
+                }
+                if (phys == CARQUET_PHYSICAL_FLOAT) {
+                    const float *src = (const float *)data;
+                    uint16_t di = 0;
+                    for (uint16_t r = 0; r < nrows_u16; r++) {
+                        if (out->cols[c].nulls[r]) continue;
+                        out->cols[c].data.f64[r] = (double)src[di++];
+                    }
+                } else if (!has_nulls) {
+                    memcpy(out->cols[c].data.f64, data, nrows_u16 * sizeof(double));
+                } else {
+                    const double *src = (const double *)data;
+                    uint16_t di = 0;
+                    for (uint16_t r = 0; r < nrows_u16; r++) {
+                        if (out->cols[c].nulls[r]) continue;
+                        out->cols[c].data.f64[r] = src[di++];
+                    }
+                }
+            }
+            break;
+        }
+        case COLUMN_TYPE_TEXT:
+        case COLUMN_TYPE_UUID:
+            if (data) {
+                const carquet_byte_array_t *arr = (const carquet_byte_array_t *)data;
+                uint16_t di = 0;
+                for (uint16_t r = 0; r < nrows_u16; r++) {
+                    if (out->cols[c].nulls[r]) {
+                        out->cols[c].data.str[r] = NULL;
+                    } else {
+                        char *s = (char *)bump_alloc(&ctx->arena->scratch,
+                                                     arr[di].length + 1);
+                        memcpy(s, arr[di].data, arr[di].length);
+                        s[arr[di].length] = '\0';
+                        out->cols[c].data.str[r] = s;
+                        di++;
+                    }
+                }
+            } else {
+                for (uint16_t r = 0; r < nrows_u16; r++)
+                    out->cols[c].data.str[r] = NULL;
+            }
+            break;
+        }
+    }
+
+    carquet_row_batch_free(batch);
+    return 0;
+}
+#endif /* MSKQL_WASM */
+
 /* ---- Generate Series ---- */
 
 static int gen_series_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -5696,6 +5963,9 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     case PLAN_SET_OP:          return set_op_next(ctx, node_idx, out);
     case PLAN_DISTINCT:        return distinct_next(ctx, node_idx, out);
     case PLAN_GENERATE_SERIES: return gen_series_next(ctx, node_idx, out);
+#ifndef MSKQL_WASM
+    case PLAN_PARQUET_SCAN:    return parquet_scan_next(ctx, node_idx, out);
+#endif
     case PLAN_EXPR_PROJECT:    return expr_project_next(ctx, node_idx, out);
     case PLAN_SIMPLE_AGG:       return simple_agg_next(ctx, node_idx, out);
     case PLAN_NESTED_LOOP:
@@ -6014,6 +6284,11 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
         n = snprintf(buf + written, buflen - written, "Function Scan on generate_series\n");
         if (n > 0) written += n;
         break;
+    case PLAN_PARQUET_SCAN:
+        n = snprintf(buf + written, buflen - written, "Foreign Scan on %s\n",
+                     pn->parquet_scan.table ? pn->parquet_scan.table->name : "?");
+        if (n > 0) written += n;
+        break;
     case PLAN_NESTED_LOOP:
         n = explain_binary(arena, pn, "Nested Loop", buf + written, buflen - written, depth);
         if (n > 0) written += n;
@@ -6076,13 +6351,25 @@ static uint32_t append_project_node(uint32_t current, struct query_arena *arena,
     return proj_idx;
 }
 
-/* Create a PLAN_SEQ_SCAN node for a table with an identity column map.
- * Returns the new node index. */
+/* Create a PLAN_SEQ_SCAN (or PLAN_PARQUET_SCAN for foreign tables) node
+ * for a table with an identity column map.  Returns the new node index. */
 static uint32_t build_seq_scan(struct table *tbl, struct query_arena *arena)
 {
     uint16_t ncols = (uint16_t)tbl->columns.count;
     int *col_map = (int *)bump_alloc(&arena->scratch, ncols * sizeof(int));
     for (uint16_t i = 0; i < ncols; i++) col_map[i] = (int)i;
+
+#ifndef MSKQL_WASM
+    if (tbl->parquet_path) {
+        uint32_t scan_idx = plan_alloc_node(arena, PLAN_PARQUET_SCAN);
+        PLAN_NODE(arena, scan_idx).parquet_scan.table = tbl;
+        PLAN_NODE(arena, scan_idx).parquet_scan.ncols = ncols;
+        PLAN_NODE(arena, scan_idx).parquet_scan.col_map = col_map;
+        PLAN_NODE(arena, scan_idx).est_rows = 0; /* unknown without opening file */
+        return scan_idx;
+    }
+#endif
+
     uint32_t scan_idx = plan_alloc_node(arena, PLAN_SEQ_SCAN);
     PLAN_NODE(arena, scan_idx).seq_scan.table = tbl;
     PLAN_NODE(arena, scan_idx).seq_scan.ncols = ncols;

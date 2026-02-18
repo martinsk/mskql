@@ -25,6 +25,7 @@ enum plan_op {
     PLAN_HASH_SEMI_JOIN, /* hash semi-join for IN (SELECT ...) */
     PLAN_GENERATE_SERIES, /* virtual table: generate_series(start, stop, step) */
     PLAN_EXPR_PROJECT,   /* expression evaluation: UPPER(x), ABS(y), etc. */
+    PLAN_PARQUET_SCAN,   /* read Parquet file directly into col_blocks */
 };
 
 /* ---- Plan builder result ---- */
@@ -137,6 +138,11 @@ struct plan_node {
             struct table *table;      /* source table (for eval_expr column lookups) */
         } expr_project;
         struct {
+            struct table *table;      /* foreign table (has parquet_path) */
+            uint16_t     ncols;       /* number of columns to read */
+            int         *col_map;     /* bump-allocated: col_map[i] = parquet column index */
+        } parquet_scan;
+        struct {
             uint16_t out_ncols;       /* total output columns (passthrough + window) */
             uint16_t n_pass;          /* number of passthrough columns */
             int     *pass_cols;       /* bump: table column indices for passthrough */
@@ -168,6 +174,12 @@ struct scan_state {
 struct filter_state {
     /* stateless — operates on input block */
     int dummy;
+};
+
+struct parquet_scan_state {
+    void *reader;         /* carquet_reader_t* — opaque to avoid header dep */
+    void *batch_reader;   /* carquet_batch_reader_t* */
+    int   done;
 };
 
 /* Flat column storage for hash join build side — no BLOCK_CAPACITY limit.

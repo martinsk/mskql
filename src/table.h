@@ -40,6 +40,7 @@ struct table {
     // paths (db_exec CREATE TABLE). Could be sv if the schema had a persistent backing store.
     char *name;
     char *view_sql;  /* non-NULL if this is a view (stores the SELECT body) */
+    char *parquet_path; /* non-NULL if this is a Parquet foreign table (read-only) */
     DYNAMIC_ARRAY(struct column) columns;
     DYNAMIC_ARRAY(struct row) rows;
     DYNAMIC_ARRAY(struct index) indexes;

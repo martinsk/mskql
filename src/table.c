@@ -8,6 +8,7 @@ void table_init(struct table *t, const char *name)
 {
     t->name = strdup(name);
     t->view_sql = NULL;
+    t->parquet_path = NULL;
     da_init(&t->columns);
     da_init(&t->rows);
     da_init(&t->indexes);
@@ -20,6 +21,7 @@ void table_init_own(struct table *t, char *name)
 {
     t->name = name;
     t->view_sql = NULL;
+    t->parquet_path = NULL;
     da_init(&t->columns);
     da_init(&t->rows);
     da_init(&t->indexes);
@@ -63,6 +65,7 @@ void table_deep_copy(struct table *dst, const struct table *src)
 {
     dst->name = strdup(src->name);
     dst->view_sql = src->view_sql ? strdup(src->view_sql) : NULL;
+    dst->parquet_path = src->parquet_path ? strdup(src->parquet_path) : NULL;
     da_init(&dst->columns);
     da_init(&dst->rows);
     da_init(&dst->indexes);
@@ -195,6 +198,7 @@ void table_free(struct table *t)
 {
     free(t->name);
     free(t->view_sql);
+    free(t->parquet_path);
     for (size_t i = 0; i < t->columns.count; i++) {
         free(t->columns.items[i].name);
         free(t->columns.items[i].enum_type_name);

@@ -663,6 +663,7 @@ static int send_row_description(int fd, struct database *db, struct query *q,
     case QUERY_TYPE_COPY:
     case QUERY_TYPE_SET:
     case QUERY_TYPE_SHOW:
+    case QUERY_TYPE_CREATE_FOREIGN_TABLE:
         break;
     }
 
@@ -1883,6 +1884,9 @@ static void build_command_tag(int fd, struct database *db, struct query *q,
             }
             send_data_rows(fd, result, db, NULL);
             snprintf(tag_buf, tag_sz, "SHOW");
+            break;
+        case QUERY_TYPE_CREATE_FOREIGN_TABLE:
+            snprintf(tag_buf, tag_sz, "CREATE FOREIGN TABLE");
             break;
     }
 }

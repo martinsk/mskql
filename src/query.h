@@ -374,7 +374,8 @@ enum query_type {
     QUERY_TYPE_EXPLAIN,
     QUERY_TYPE_COPY,
     QUERY_TYPE_SET,
-    QUERY_TYPE_SHOW
+    QUERY_TYPE_SHOW,
+    QUERY_TYPE_CREATE_FOREIGN_TABLE
 };
 
 struct query_copy {
@@ -382,6 +383,11 @@ struct query_copy {
     int is_from;    /* 1 = COPY FROM, 0 = COPY TO */
     int is_csv;     /* WITH CSV */
     int has_header; /* WITH CSV HEADER */
+};
+
+struct query_create_foreign_table {
+    sv table_name;
+    sv filename;    /* path to Parquet file */
 };
 
 enum alter_action {
@@ -661,6 +667,7 @@ static inline int query_is_read_only(enum query_type qt)
     case QUERY_TYPE_DROP_VIEW:
     case QUERY_TYPE_TRUNCATE:
     case QUERY_TYPE_COPY:
+    case QUERY_TYPE_CREATE_FOREIGN_TABLE:
         return 0;
     }
     __builtin_unreachable();
@@ -688,6 +695,7 @@ struct query {
         struct query_explain explain;
         struct query_copy copy;
         struct query_show show;
+        struct query_create_foreign_table create_foreign_table;
     };
 };
 

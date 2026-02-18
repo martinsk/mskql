@@ -108,6 +108,7 @@ static int is_keyword(sv word)
         "SHOW", "RESET", "DISCARD", "DEALLOCATE",
         "OPERATOR", "COLLATE",
         "NULLS", "FIRST", "LAST", "FILTER",
+        "FOREIGN", "OPTIONS", "FILENAME",
         NULL
     };
     for (int i = 0; keywords[i]; i++) {
@@ -4801,6 +4802,53 @@ static int parse_create_table(struct lexer *l, struct query *out)
 static int parse_create(struct lexer *l, struct query *out)
 {
     struct token tok = lexer_next(l);
+
+    /* CREATE FOREIGN TABLE name OPTIONS (FILENAME 'path') */
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "FOREIGN")) {
+        tok = lexer_next(l);
+        if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "TABLE")) {
+            arena_set_error(&out->arena, "42601", "expected TABLE after FOREIGN");
+            return -1;
+        }
+        out->query_type = QUERY_TYPE_CREATE_FOREIGN_TABLE;
+        struct query_create_foreign_table *ft = &out->create_foreign_table;
+
+        tok = lexer_next(l);
+        if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
+            arena_set_error(&out->arena, "42601", "expected table name after FOREIGN TABLE");
+            return -1;
+        }
+        ft->table_name = tok.value;
+
+        tok = lexer_next(l);
+        if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "OPTIONS")) {
+            arena_set_error(&out->arena, "42601", "expected OPTIONS after table name");
+            return -1;
+        }
+        tok = lexer_next(l);
+        if (tok.type != TOK_LPAREN) {
+            arena_set_error(&out->arena, "42601", "expected '(' after OPTIONS");
+            return -1;
+        }
+        tok = lexer_next(l);
+        if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "FILENAME")) {
+            arena_set_error(&out->arena, "42601", "expected FILENAME in OPTIONS");
+            return -1;
+        }
+        tok = lexer_next(l);
+        if (tok.type != TOK_STRING) {
+            arena_set_error(&out->arena, "42601", "expected file path string after FILENAME");
+            return -1;
+        }
+        ft->filename = tok.value;
+
+        tok = lexer_next(l);
+        if (tok.type != TOK_RPAREN) {
+            arena_set_error(&out->arena, "42601", "expected ')' after filename");
+            return -1;
+        }
+        return 0;
+    }
 
     /* CREATE SEQUENCE name [START WITH n] [INCREMENT BY n] */
     if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "SEQUENCE"))

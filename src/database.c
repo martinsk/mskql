@@ -3,6 +3,7 @@
 #include "query.h"
 #include "plan.h"
 #include "catalog.h"
+#include "parquet.h"
 #include "stringview.h"
 #include <string.h>
 #include <strings.h>
@@ -76,12 +77,25 @@ int db_table_exec_query(struct database *db, sv table_name,
         arena_set_error(&q->arena, "42P01", "table '%.*s' not found", (int)table_name.len, table_name.data);
         return -1;
     }
+    /* Read-only enforcement for foreign tables */
+    if (t->parquet_path &&
+        (q->query_type == QUERY_TYPE_INSERT || q->query_type == QUERY_TYPE_UPDATE ||
+         q->query_type == QUERY_TYPE_DELETE || q->query_type == QUERY_TYPE_TRUNCATE)) {
+        arena_set_error(&q->arena, "42809",
+            "cannot modify foreign table \"%s\"", t->name);
+        return -1;
+    }
     /* COW trigger: save table state before first mutation in a transaction */
     if (db->active_txn && db->active_txn->in_transaction && db->active_txn->snapshot &&
         (q->query_type == QUERY_TYPE_INSERT || q->query_type == QUERY_TYPE_UPDATE ||
          q->query_type == QUERY_TYPE_DELETE)) {
         snapshot_cow_table(db->active_txn->snapshot, db, t->name);
     }
+#ifndef MSKQL_WASM
+    /* Materialize Parquet data for legacy executor fallback */
+    if (t->parquet_path && t->rows.count == 0)
+        parquet_materialize(t);
+#endif
     return query_exec(t, q, result, db, rb);
 }
 
@@ -3370,6 +3384,37 @@ skip_conflict_nothing:
             rows_push(result, r);
             return 0;
         }
+#ifndef MSKQL_WASM
+        case QUERY_TYPE_CREATE_FOREIGN_TABLE: {
+            struct query_create_foreign_table *ft = &q->create_foreign_table;
+            char *path = sv_to_cstr(ft->filename);
+
+            struct parquet_table_info info;
+            if (parquet_open_metadata(path, &info) != 0) {
+                arena_set_error(&q->arena, "58030",
+                    "could not open Parquet file: %.*s",
+                    (int)ft->filename.len, ft->filename.data);
+                free(path);
+                return -1;
+            }
+
+            struct table t;
+            table_init_own(&t, sv_to_cstr(ft->table_name));
+            t.parquet_path = path;
+
+            for (uint16_t i = 0; i < info.ncols; i++) {
+                struct column col = {0};
+                col.name = strdup(info.col_names[i]);
+                col.type = info.col_types[i];
+                da_push(&t.columns, col);
+            }
+            parquet_info_free(&info);
+
+            da_push(&db->tables, t);
+            db->total_generation++;
+            return 0;
+        }
+#endif
     }
     return -1;
 }

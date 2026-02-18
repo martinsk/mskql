@@ -629,6 +629,202 @@ def bench_wc_wide_output():
     return setup, bench
 
 
+# ── Parquet benchmarks (mskql foreign tables vs DuckDB native parquet) ────────
+# These return a dict: {"mskql": (setup, bench), "duck": (setup, bench), "pg": None}
+# pg=None means skip PostgreSQL (show "-").
+
+PARQUET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parquet_fixtures")
+
+
+def _pq(name):
+    return os.path.join(PARQUET_DIR, name)
+
+
+def _mskql_foreign(table_name, parquet_file):
+    return f"CREATE FOREIGN TABLE {table_name} OPTIONS (FILENAME '{_pq(parquet_file)}');"
+
+
+def _duck_from_pq(table_name, parquet_file):
+    return f"CREATE TABLE {table_name} AS SELECT * FROM read_parquet('{_pq(parquet_file)}');"
+
+
+def bench_pq_full_scan():
+    """Full scan of 50K-row Parquet file."""
+    mskql_setup = [_mskql_foreign("orders", "orders.parquet")]
+    duck_setup = [_duck_from_pq("orders", "orders.parquet")]
+    bench = ["SELECT * FROM orders;"] * 20
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
+def bench_pq_where():
+    """Filtered scan on 50K-row Parquet file."""
+    mskql_setup = [_mskql_foreign("events", "events.parquet")]
+    duck_setup = [_duck_from_pq("events", "events.parquet")]
+    bench = ["SELECT * FROM events WHERE amount > 500 AND score > 5000;"] * 50
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
+def bench_pq_aggregate():
+    """GROUP BY aggregate on 50K-row Parquet file."""
+    mskql_setup = [_mskql_foreign("events", "events.parquet")]
+    duck_setup = [_duck_from_pq("events", "events.parquet")]
+    bench = [
+        "SELECT event_type, COUNT(*), SUM(amount), AVG(score) "
+        "FROM events GROUP BY event_type;"
+    ] * 100
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
+def bench_pq_order_by():
+    """Sort 50K-row Parquet file."""
+    mskql_setup = [_mskql_foreign("events", "events.parquet")]
+    duck_setup = [_duck_from_pq("events", "events.parquet")]
+    bench = ["SELECT * FROM events ORDER BY score DESC;"] * 10
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
+def bench_pq_wide_agg():
+    """Wide aggregate on 50K-row 7-column Parquet file."""
+    mskql_setup = [_mskql_foreign("metrics", "metrics.parquet")]
+    duck_setup = [_duck_from_pq("metrics", "metrics.parquet")]
+    bench = [
+        "SELECT sensor_id, COUNT(*), AVG(v1), SUM(v2), MIN(v3), MAX(v4), AVG(v5) "
+        "FROM metrics GROUP BY sensor_id ORDER BY sensor_id;"
+    ] * 20
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
+def bench_pq_join_two():
+    """Join two Parquet files: orders (50K) x customers (2K)."""
+    mskql_setup = [
+        _mskql_foreign("pq_orders", "orders.parquet"),
+        _mskql_foreign("pq_customers", "customers.parquet"),
+    ]
+    duck_setup = [
+        _duck_from_pq("pq_orders", "orders.parquet"),
+        _duck_from_pq("pq_customers", "customers.parquet"),
+    ]
+    bench = [
+        "SELECT pq_customers.region, COUNT(*), SUM(pq_orders.amount) "
+        "FROM pq_orders "
+        "JOIN pq_customers ON pq_orders.customer_id = pq_customers.id "
+        "GROUP BY pq_customers.region ORDER BY pq_customers.region;"
+    ] * 10
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
+def bench_pq_join_three():
+    """Three-way join: orders x customers x products (all Parquet)."""
+    mskql_setup = [
+        _mskql_foreign("pq_orders", "orders.parquet"),
+        _mskql_foreign("pq_customers", "customers.parquet"),
+        _mskql_foreign("pq_products", "products.parquet"),
+    ]
+    duck_setup = [
+        _duck_from_pq("pq_orders", "orders.parquet"),
+        _duck_from_pq("pq_customers", "customers.parquet"),
+        _duck_from_pq("pq_products", "products.parquet"),
+    ]
+    bench = [
+        "SELECT pq_customers.region, pq_products.category, "
+        "SUM(pq_orders.quantity * pq_products.price) "
+        "FROM pq_orders "
+        "JOIN pq_customers ON pq_orders.customer_id = pq_customers.id "
+        "JOIN pq_products ON pq_orders.product_id = pq_products.id "
+        "GROUP BY pq_customers.region, pq_products.category "
+        "ORDER BY pq_customers.region, pq_products.category;"
+    ] * 5
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
+def bench_pq_mixed_join():
+    """Join Parquet file with a regular in-memory table."""
+    common_setup = [
+        "DROP TABLE IF EXISTS local_regions;",
+        "CREATE TABLE local_regions (id INT, region_name TEXT, tax_rate INT);",
+        "INSERT INTO local_regions VALUES (0, 'north', 10);",
+        "INSERT INTO local_regions VALUES (1, 'south', 8);",
+        "INSERT INTO local_regions VALUES (2, 'east', 12);",
+        "INSERT INTO local_regions VALUES (3, 'west', 9);",
+    ]
+    mskql_setup = common_setup + [_mskql_foreign("pq_sales", "sales.parquet")]
+    duck_setup = common_setup + [_duck_from_pq("pq_sales", "sales.parquet")]
+    bench = [
+        "SELECT lr.region_name, SUM(pq_sales.amount), "
+        "SUM(pq_sales.amount * lr.tax_rate / 100) "
+        "FROM pq_sales "
+        "JOIN local_regions lr ON pq_sales.region_id = lr.id "
+        "GROUP BY lr.region_name ORDER BY lr.region_name;"
+    ] * 20
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
+def bench_pq_subquery():
+    """Subquery: filter Parquet events by customers from another Parquet file."""
+    mskql_setup = [
+        _mskql_foreign("pq_events", "events.parquet"),
+        _mskql_foreign("pq_customers", "customers.parquet"),
+    ]
+    duck_setup = [
+        _duck_from_pq("pq_events", "events.parquet"),
+        _duck_from_pq("pq_customers", "customers.parquet"),
+    ]
+    bench = [
+        "SELECT * FROM pq_events "
+        "WHERE user_id IN (SELECT id FROM pq_customers WHERE tier = 'premium') "
+        "AND amount > 500 "
+        "ORDER BY score DESC LIMIT 100;"
+    ] * 20
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
+def bench_pq_lineitem_agg():
+    """Aggregate on 200K-row lineitem Parquet file."""
+    mskql_setup = [
+        _mskql_foreign("pq_lineitem", "lineitem.parquet"),
+        _mskql_foreign("pq_products", "products.parquet"),
+    ]
+    duck_setup = [
+        _duck_from_pq("pq_lineitem", "lineitem.parquet"),
+        _duck_from_pq("pq_products", "products.parquet"),
+    ]
+    bench = [
+        "SELECT pq_products.category, "
+        "COUNT(*), SUM(pq_lineitem.quantity * pq_lineitem.unit_price) "
+        "FROM pq_lineitem "
+        "JOIN pq_products ON pq_lineitem.product_id = pq_products.id "
+        "GROUP BY pq_products.category ORDER BY pq_products.category;"
+    ] * 5
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
+def bench_pq_analytical():
+    """CTE + join + aggregate across Parquet files."""
+    mskql_setup = [
+        _mskql_foreign("pq_orders", "orders.parquet"),
+        _mskql_foreign("pq_customers", "customers.parquet"),
+        _mskql_foreign("pq_products", "products.parquet"),
+    ]
+    duck_setup = [
+        _duck_from_pq("pq_orders", "orders.parquet"),
+        _duck_from_pq("pq_customers", "customers.parquet"),
+        _duck_from_pq("pq_products", "products.parquet"),
+    ]
+    bench = [
+        "WITH order_totals AS ("
+        "SELECT pq_orders.customer_id, "
+        "SUM(pq_orders.quantity * pq_products.price) AS total "
+        "FROM pq_orders "
+        "JOIN pq_products ON pq_orders.product_id = pq_products.id "
+        "GROUP BY pq_orders.customer_id"
+        ") SELECT pq_customers.region, COUNT(*), SUM(ot.total) "
+        "FROM order_totals ot "
+        "JOIN pq_customers ON ot.customer_id = pq_customers.id "
+        "GROUP BY pq_customers.region ORDER BY pq_customers.region;"
+    ] * 5
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
 BENCHMARKS = [
     ("insert_bulk",        bench_insert_bulk),
     ("select_full_scan",   bench_select_full_scan),
@@ -663,6 +859,18 @@ BENCHMARKS = [
     ("wc_string_heavy",    bench_wc_string_heavy),
     ("wc_nested_cte",      bench_wc_nested_cte),
     ("wc_wide_output",     bench_wc_wide_output),
+    # ── Parquet benchmarks (mskql vs DuckDB, no PostgreSQL) ──
+    ("pq_full_scan",       bench_pq_full_scan),
+    ("pq_where",           bench_pq_where),
+    ("pq_aggregate",       bench_pq_aggregate),
+    ("pq_order_by",        bench_pq_order_by),
+    ("pq_wide_agg",        bench_pq_wide_agg),
+    ("pq_join_two",        bench_pq_join_two),
+    ("pq_join_three",      bench_pq_join_three),
+    ("pq_mixed_join",      bench_pq_mixed_join),
+    ("pq_subquery",        bench_pq_subquery),
+    ("pq_lineitem_agg",    bench_pq_lineitem_agg),
+    ("pq_analytical",      bench_pq_analytical),
 ]
 
 
@@ -728,51 +936,77 @@ def main():
 
         print(f"  [{bench_idx}/{bench_count}] {name:<25s} ...", end="", flush=True)
 
-        # Generate SQL
-        setup_lines, bench_lines = fn()
-
-        # Write to temp files
-        setup_file = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".sql", prefix=f"bench_setup_{name}_", delete=False
-        )
-        bench_file = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".sql", prefix=f"bench_run_{name}_", delete=False
-        )
-        setup_file.write("\n".join(setup_lines) + "\n")
-        setup_file.close()
-        bench_file.write("\n".join(bench_lines) + "\n")
-        bench_file.close()
+        # Generate SQL — benchmark functions return either:
+        #   (setup_lines, bench_lines)  — shared SQL for all engines
+        #   {"mskql": (setup, bench), "duck": (setup, bench), "pg": None|(...)}
+        result = fn()
+        if isinstance(result, dict):
+            is_parquet = True
+            mskql_spec = result["mskql"]
+            duck_spec = result["duck"]
+            pg_spec = result.get("pg")
+        else:
+            is_parquet = False
+            setup_lines, bench_lines = result
+            mskql_spec = (setup_lines, bench_lines)
+            duck_spec = (setup_lines, bench_lines)
+            pg_spec = (setup_lines, bench_lines)
 
         # ── mskql ──
-        run_psql(host, args.mskql_port, args.pg_user, "mskql", setup_file.name)
-        mskql_ms = time_psql(host, args.mskql_port, args.pg_user, "mskql", bench_file.name)
+        m_setup_f = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sql", prefix=f"bench_setup_{name}_m_", delete=False
+        )
+        m_bench_f = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sql", prefix=f"bench_run_{name}_m_", delete=False
+        )
+        m_setup_f.write("\n".join(mskql_spec[0]) + "\n")
+        m_setup_f.close()
+        m_bench_f.write("\n".join(mskql_spec[1]) + "\n")
+        m_bench_f.close()
+        run_psql(host, args.mskql_port, args.pg_user, "mskql", m_setup_f.name)
+        mskql_ms = time_psql(host, args.mskql_port, args.pg_user, "mskql", m_bench_f.name)
+        os.unlink(m_setup_f.name)
+        os.unlink(m_bench_f.name)
 
         # ── postgres ──
-        run_psql(host, args.pg_port, args.pg_user, args.pg_db, setup_file.name)
-        pg_ms = time_psql(host, args.pg_port, args.pg_user, args.pg_db, bench_file.name)
+        if pg_spec is not None:
+            p_setup_f = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".sql", prefix=f"bench_setup_{name}_p_", delete=False
+            )
+            p_bench_f = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".sql", prefix=f"bench_run_{name}_p_", delete=False
+            )
+            p_setup_f.write("\n".join(pg_spec[0]) + "\n")
+            p_setup_f.close()
+            p_bench_f.write("\n".join(pg_spec[1]) + "\n")
+            p_bench_f.close()
+            run_psql(host, args.pg_port, args.pg_user, args.pg_db, p_setup_f.name)
+            pg_ms = time_psql(host, args.pg_port, args.pg_user, args.pg_db, p_bench_f.name)
+            os.unlink(p_setup_f.name)
+            os.unlink(p_bench_f.name)
+        else:
+            pg_ms = -2.0  # sentinel: not applicable
 
         # ── duckdb ──
         duck_db = tempfile.mktemp(suffix=".duckdb", prefix=f"bench_{name}_")
-        duck_setup = tempfile.NamedTemporaryFile(
+        d_setup_lines = duck_spec[0] if is_parquet else duckdb_fixup(duck_spec[0])
+        d_bench_lines = duck_spec[1] if is_parquet else duckdb_fixup(duck_spec[1])
+        d_setup_f = tempfile.NamedTemporaryFile(
             mode="w", suffix=".sql", prefix=f"duck_setup_{name}_", delete=False
         )
-        duck_bench = tempfile.NamedTemporaryFile(
+        d_bench_f = tempfile.NamedTemporaryFile(
             mode="w", suffix=".sql", prefix=f"duck_run_{name}_", delete=False
         )
-        duck_setup.write("\n".join(duckdb_fixup(setup_lines)) + "\n")
-        duck_setup.close()
-        duck_bench.write("\n".join(duckdb_fixup(bench_lines)) + "\n")
-        duck_bench.close()
-        run_duckdb(duckdb_bin, duck_db, duck_setup.name)
-        duck_ms = time_duckdb(duckdb_bin, duck_db, duck_bench.name)
-        os.unlink(duck_setup.name)
-        os.unlink(duck_bench.name)
+        d_setup_f.write("\n".join(d_setup_lines) + "\n")
+        d_setup_f.close()
+        d_bench_f.write("\n".join(d_bench_lines) + "\n")
+        d_bench_f.close()
+        run_duckdb(duckdb_bin, duck_db, d_setup_f.name)
+        duck_ms = time_duckdb(duckdb_bin, duck_db, d_bench_f.name)
+        os.unlink(d_setup_f.name)
+        os.unlink(d_bench_f.name)
         if os.path.exists(duck_db):
             os.unlink(duck_db)
-
-        # Cleanup
-        os.unlink(setup_file.name)
-        os.unlink(bench_file.name)
 
         results.append((name, mskql_ms, pg_ms, duck_ms))
         tag = f" mskql={mskql_ms:.0f}ms" if mskql_ms >= 0 else " ERROR"
@@ -801,12 +1035,14 @@ def main():
 
     for name, mskql_ms, pg_ms, duck_ms in results:
         mskql_str = f"{mskql_ms:.1f}" if mskql_ms >= 0 else "ERROR"
-        pg_str = f"{pg_ms:.1f}" if pg_ms >= 0 else "ERROR"
+        pg_str = "-" if pg_ms == -2.0 else (f"{pg_ms:.1f}" if pg_ms >= 0 else "ERROR")
         duck_str = f"{duck_ms:.1f}" if duck_ms >= 0 else "ERROR"
-        ms_pg_str = f"{mskql_ms / pg_ms:.2f}x" if pg_ms > 0 and mskql_ms >= 0 else "n/a"
+        ms_pg_str = f"{mskql_ms / pg_ms:.2f}x" if pg_ms > 0 and mskql_ms >= 0 else "-"
         ms_duck_str = f"{mskql_ms / duck_ms:.2f}x" if duck_ms > 0 and mskql_ms >= 0 else "n/a"
 
-        times = {"mskql": mskql_ms, "pg": pg_ms, "duck": duck_ms}
+        times = {"mskql": mskql_ms, "duck": duck_ms}
+        if pg_ms >= 0:
+            times["pg"] = pg_ms
         valid = {k: v for k, v in times.items() if v >= 0}
         if valid:
             winner = min(valid, key=valid.get)
@@ -838,11 +1074,13 @@ def main():
         print("|-----------|-----------|---------|-----------|-------|---------|---------|")
         for name, m_ms, p_ms, d_ms in results:
             m_str = f"{m_ms:.1f}" if m_ms >= 0 else "ERROR"
-            p_str = f"{p_ms:.1f}" if p_ms >= 0 else "ERROR"
+            p_str = "-" if p_ms == -2.0 else (f"{p_ms:.1f}" if p_ms >= 0 else "ERROR")
             d_str = f"{d_ms:.1f}" if d_ms >= 0 else "ERROR"
-            mp = f"{m_ms / p_ms:.2f}x" if p_ms > 0 and m_ms >= 0 else "n/a"
+            mp = f"{m_ms / p_ms:.2f}x" if p_ms > 0 and m_ms >= 0 else "-"
             md = f"{m_ms / d_ms:.2f}x" if d_ms > 0 and m_ms >= 0 else "n/a"
-            times = {"mskql": m_ms, "pg": p_ms, "duck": d_ms}
+            times = {"mskql": m_ms, "duck": d_ms}
+            if p_ms >= 0:
+                times["pg"] = p_ms
             valid = {k: v for k, v in times.items() if v >= 0}
             winner = min(valid, key=valid.get) if valid else "?"
             print(f"| {name} | {m_str} | {p_str} | {d_str} | {mp} | {md} | {winner} |")

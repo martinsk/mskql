@@ -1,4 +1,7 @@
 build/
+third_party/
 tests/test-failures.log
+tests/fixtures/
+bench/parquet_fixtures/
 .DS_Store
 bench/__pycache__
