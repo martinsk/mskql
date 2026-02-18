@@ -9,7 +9,7 @@ ifeq ($(origin CC),default)
     CC := $(HOMEBREW_CLANG)
   endif
 endif
-CFLAGS  ?= -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O1 -g -fsanitize=address -fno-omit-frame-pointer
+CFLAGS  ?= -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O1 -g -fsanitize=address -fno-omit-frame-pointer -MMD -MP
 BUILDDIR = ../build
 SRCS     = main.c database.c table.c query.c row.c parser.c pgwire.c index.c column.c plan.c catalog.c datetime.c parquet.c
 OBJS     = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
@@ -42,7 +42,7 @@ TARGET   = $(BUILDDIR)/mskql_debug
 BENCH    = $(BUILDDIR)/mskql_bench
 
 # ── Release flags (for benchmarks / production) ──────────────────
-RELEASE_CFLAGS = -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O3 -flto -DNDEBUG -g -I$(CARQUET_INC)
+RELEASE_CFLAGS = -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O3 -flto -DNDEBUG -g -MMD -MP -I$(CARQUET_INC)
 RELEASE_OBJS     = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(SRCS))
 RELEASE_LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(LIB_SRCS))
 
@@ -123,5 +123,8 @@ wasm-stubs: | $(BUILDDIR)
 
 $(WASM_TARGET): $(WASM_SRCS) | $(BUILDDIR)
 	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $(WASM_SRCS)
+
+-include $(OBJS:.o=.d)
+-include $(RELEASE_OBJS:.o=.d)
 
 .PHONY: all clean carquet-clean release bench bench-throughput wasm
