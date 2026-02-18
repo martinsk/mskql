@@ -35,6 +35,17 @@ struct join_cache {
     int       valid;
 };
 
+/* Cached columnar representation of a parquet foreign table.
+ * Built on first scan, reused for all subsequent queries. */
+struct parquet_cache {
+    uint16_t ncols;
+    size_t   nrows;
+    void   **col_data;           /* [ncols] heap-allocated typed arrays */
+    uint8_t **col_nulls;         /* [ncols] heap-allocated null bitmaps (1 byte per row) */
+    enum column_type *col_types; /* [ncols] */
+    int      valid;
+};
+
 struct table {
     // TODO: STRINGVIEW OPPORTUNITY: name is strdup'd from sv-originated strings in most
     // paths (db_exec CREATE TABLE). Could be sv if the schema had a persistent backing store.
@@ -47,6 +58,7 @@ struct table {
     uint64_t generation;  /* bumped on every INSERT/UPDATE/DELETE for scan cache invalidation */
     struct scan_cache scan_cache; /* cached columnar representation */
     struct join_cache join_cache; /* cached hash join build for inner table */
+    struct parquet_cache pq_cache; /* cached parquet columnar data */
 };
 
 void table_init(struct table *t, const char *name);

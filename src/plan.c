@@ -5608,6 +5608,323 @@ static int distinct_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 /* ---- Parquet Scan ---- */
 
 #ifndef MSKQL_WASM
+
+/* Parquet uses Unix epoch (1970-01-01), mskql uses PG epoch (2000-01-01). */
+#define PQ_DATE_OFFSET   10957
+#define PQ_USEC_OFFSET   (PQ_DATE_OFFSET * 86400LL * 1000000LL)
+
+/* Read a BLOCK_CAPACITY-sized slice from the parquet cache into a row_block.
+ * Returns number of rows copied (0 = end of data). */
+static uint16_t pq_cache_read(struct parquet_cache *pc, size_t *cursor,
+                               struct row_block *out, int *col_map, uint16_t ncols)
+{
+    size_t start = *cursor;
+    size_t end = pc->nrows;
+    if (end - start > BLOCK_CAPACITY)
+        end = start + BLOCK_CAPACITY;
+
+    uint16_t nrows = (uint16_t)(end - start);
+    if (nrows == 0) return 0;
+
+    out->count = nrows;
+
+    for (uint16_t c = 0; c < ncols; c++) {
+        int tc = col_map[c];
+        struct col_block *cb = &out->cols[c];
+        cb->type = pc->col_types[tc];
+        cb->count = nrows;
+
+        memcpy(cb->nulls, pc->col_nulls[tc] + start, nrows);
+
+        enum column_type ct = pc->col_types[tc];
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT:
+            memcpy(cb->data.i16, (int16_t *)pc->col_data[tc] + start, nrows * sizeof(int16_t)); break;
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_ENUM:
+            memcpy(cb->data.i32, (int32_t *)pc->col_data[tc] + start, nrows * sizeof(int32_t)); break;
+        case COLUMN_TYPE_BIGINT:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+            memcpy(cb->data.i64, (int64_t *)pc->col_data[tc] + start, nrows * sizeof(int64_t)); break;
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:
+            memcpy(cb->data.f64, (double *)pc->col_data[tc] + start, nrows * sizeof(double)); break;
+        case COLUMN_TYPE_TEXT:
+            memcpy(cb->data.str, (char **)pc->col_data[tc] + start, nrows * sizeof(char *)); break;
+        case COLUMN_TYPE_INTERVAL:
+            memcpy(cb->data.iv, (struct interval *)pc->col_data[tc] + start, nrows * sizeof(struct interval)); break;
+        case COLUMN_TYPE_UUID:
+            memcpy(cb->data.uuid, (struct uuid_val *)pc->col_data[tc] + start, nrows * sizeof(struct uuid_val)); break;
+        }
+    }
+
+    *cursor = end;
+    return nrows;
+}
+
+/* Build the parquet cache: read entire file into heap-allocated flat columnar arrays.
+ * All type conversions (epoch offsets, float→double, null expansion) happen here once. */
+static int pq_cache_build(struct table *tbl)
+{
+    struct parquet_cache *pc = &tbl->pq_cache;
+    if (pc->valid) return 0; /* already built */
+
+    const char *path = tbl->parquet_path;
+    if (!path) return -1;
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_options_t opts;
+    carquet_reader_options_init(&opts);
+    opts.use_mmap = true;
+    opts.verify_checksums = false;
+
+    carquet_reader_t *reader = carquet_reader_open(path, &opts, &err);
+    if (!reader) return -1;
+
+    /* Resolve physical types once for FLOAT/NUMERIC distinction */
+    const carquet_schema_t *schema = carquet_reader_schema(reader);
+    int32_t num_elements = carquet_schema_num_elements(schema);
+    uint16_t ncols = (uint16_t)tbl->columns.count;
+
+    carquet_physical_type_t *phys_types = (carquet_physical_type_t *)calloc(ncols, sizeof(carquet_physical_type_t));
+    {
+        int leaf = 0;
+        for (int32_t ei = 0; ei < num_elements && leaf < (int)ncols; ei++) {
+            const carquet_schema_node_t *node = carquet_schema_get_element(schema, ei);
+            if (!node || !carquet_schema_node_is_leaf(node)) continue;
+            phys_types[leaf] = carquet_schema_node_physical_type(node);
+            leaf++;
+        }
+    }
+
+    int64_t total_rows = carquet_reader_num_rows(reader);
+
+    /* Allocate flat arrays */
+    pc->ncols = ncols;
+    pc->nrows = 0;
+    pc->col_data = (void **)calloc(ncols, sizeof(void *));
+    pc->col_nulls = (uint8_t **)calloc(ncols, sizeof(uint8_t *));
+    pc->col_types = (enum column_type *)calloc(ncols, sizeof(enum column_type));
+
+    size_t alloc_rows = total_rows > 0 ? (size_t)total_rows : 1;
+    for (uint16_t c = 0; c < ncols; c++) {
+        enum column_type ct = tbl->columns.items[c].type;
+        pc->col_types[c] = ct;
+        size_t elem_sz = col_type_elem_size(ct);
+        pc->col_data[c] = calloc(alloc_rows, elem_sz);
+        pc->col_nulls[c] = (uint8_t *)calloc(alloc_rows, 1);
+    }
+
+    /* Read all batches with large batch size */
+    carquet_batch_reader_config_t cfg;
+    carquet_batch_reader_config_init(&cfg);
+    cfg.batch_size = 65536;
+
+    carquet_batch_reader_t *br = carquet_batch_reader_create(reader, &cfg, &err);
+    if (!br) {
+        free(phys_types);
+        carquet_reader_close(reader);
+        /* Clean up partially allocated cache */
+        for (uint16_t c = 0; c < ncols; c++) {
+            free(pc->col_data[c]);
+            free(pc->col_nulls[c]);
+        }
+        free(pc->col_data); free(pc->col_nulls); free(pc->col_types);
+        memset(pc, 0, sizeof(*pc));
+        return -1;
+    }
+
+    carquet_row_batch_t *batch = NULL;
+    while (carquet_batch_reader_next(br, &batch) == CARQUET_OK && batch) {
+        int64_t batch_rows = carquet_row_batch_num_rows(batch);
+        if (batch_rows <= 0) { carquet_row_batch_free(batch); batch = NULL; continue; }
+
+        size_t base = pc->nrows;
+
+        /* Grow arrays if needed (shouldn't happen if total_rows is accurate) */
+        if (base + (size_t)batch_rows > alloc_rows) {
+            alloc_rows = base + (size_t)batch_rows + 1024;
+            for (uint16_t c = 0; c < ncols; c++) {
+                size_t elem_sz = col_type_elem_size(pc->col_types[c]);
+                pc->col_data[c] = realloc(pc->col_data[c], alloc_rows * elem_sz);
+                pc->col_nulls[c] = (uint8_t *)realloc(pc->col_nulls[c], alloc_rows);
+            }
+        }
+
+        for (uint16_t c = 0; c < ncols; c++) {
+            const void *data = NULL;
+            const uint8_t *null_bitmap = NULL;
+            int64_t num_values = 0;
+            (void)carquet_row_batch_column(batch, c, &data, &null_bitmap, &num_values);
+
+            enum column_type ct = pc->col_types[c];
+            uint8_t *dst_nulls = pc->col_nulls[c] + base;
+            size_t br_count = (size_t)batch_rows;
+
+            /* Expand null bitmap: Carquet bit-packed → per-byte */
+            memset(dst_nulls, 0, br_count);
+            int has_nulls = 0;
+            if (null_bitmap) {
+                for (size_t r = 0; r < br_count; r++) {
+                    if (null_bitmap[r / 8] & (1 << (r % 8))) {
+                        dst_nulls[r] = 1;
+                        has_nulls = 1;
+                    }
+                }
+            }
+
+            if (!data) continue;
+
+            /* Copy data with null-compaction expansion and type conversion */
+            switch (ct) {
+            case COLUMN_TYPE_BOOLEAN: {
+                int32_t *dst = (int32_t *)pc->col_data[c] + base;
+                const uint8_t *src = (const uint8_t *)data;
+                size_t di = 0;
+                for (size_t r = 0; r < br_count; r++) {
+                    if (dst_nulls[r]) continue;
+                    dst[r] = src[di++] ? 1 : 0;
+                }
+                break;
+            }
+            case COLUMN_TYPE_INT:
+            case COLUMN_TYPE_SMALLINT:
+            case COLUMN_TYPE_ENUM: {
+                int32_t *dst = (int32_t *)pc->col_data[c] + base;
+                const int32_t *src = (const int32_t *)data;
+                if (!has_nulls) {
+                    memcpy(dst, src, br_count * sizeof(int32_t));
+                } else {
+                    size_t di = 0;
+                    for (size_t r = 0; r < br_count; r++) {
+                        if (dst_nulls[r]) continue;
+                        dst[r] = src[di++];
+                    }
+                }
+                break;
+            }
+            case COLUMN_TYPE_BIGINT: {
+                int64_t *dst = (int64_t *)pc->col_data[c] + base;
+                const int64_t *src = (const int64_t *)data;
+                if (!has_nulls) {
+                    memcpy(dst, src, br_count * sizeof(int64_t));
+                } else {
+                    size_t di = 0;
+                    for (size_t r = 0; r < br_count; r++) {
+                        if (dst_nulls[r]) continue;
+                        dst[r] = src[di++];
+                    }
+                }
+                break;
+            }
+            case COLUMN_TYPE_DATE: {
+                int32_t *dst = (int32_t *)pc->col_data[c] + base;
+                const int32_t *src = (const int32_t *)data;
+                size_t di = 0;
+                for (size_t r = 0; r < br_count; r++) {
+                    if (has_nulls && dst_nulls[r]) continue;
+                    dst[r] = src[di++] - PQ_DATE_OFFSET;
+                }
+                break;
+            }
+            case COLUMN_TYPE_TIME: {
+                int64_t *dst = (int64_t *)pc->col_data[c] + base;
+                const int64_t *src = (const int64_t *)data;
+                if (!has_nulls) {
+                    memcpy(dst, src, br_count * sizeof(int64_t));
+                } else {
+                    size_t di = 0;
+                    for (size_t r = 0; r < br_count; r++) {
+                        if (dst_nulls[r]) continue;
+                        dst[r] = src[di++];
+                    }
+                }
+                break;
+            }
+            case COLUMN_TYPE_TIMESTAMP:
+            case COLUMN_TYPE_TIMESTAMPTZ: {
+                int64_t *dst = (int64_t *)pc->col_data[c] + base;
+                const int64_t *src = (const int64_t *)data;
+                size_t di = 0;
+                for (size_t r = 0; r < br_count; r++) {
+                    if (has_nulls && dst_nulls[r]) continue;
+                    dst[r] = src[di++] - PQ_USEC_OFFSET;
+                }
+                break;
+            }
+            case COLUMN_TYPE_INTERVAL: {
+                struct interval *dst = (struct interval *)pc->col_data[c] + base;
+                const struct interval *src = (const struct interval *)data;
+                if (!has_nulls) {
+                    memcpy(dst, src, br_count * sizeof(struct interval));
+                } else {
+                    size_t di = 0;
+                    for (size_t r = 0; r < br_count; r++) {
+                        if (dst_nulls[r]) continue;
+                        dst[r] = src[di++];
+                    }
+                }
+                break;
+            }
+            case COLUMN_TYPE_FLOAT:
+            case COLUMN_TYPE_NUMERIC: {
+                double *dst = (double *)pc->col_data[c] + base;
+                if (phys_types[c] == CARQUET_PHYSICAL_FLOAT) {
+                    const float *src = (const float *)data;
+                    size_t di = 0;
+                    for (size_t r = 0; r < br_count; r++) {
+                        if (dst_nulls[r]) continue;
+                        dst[r] = (double)src[di++];
+                    }
+                } else if (!has_nulls) {
+                    memcpy(dst, data, br_count * sizeof(double));
+                } else {
+                    const double *src = (const double *)data;
+                    size_t di = 0;
+                    for (size_t r = 0; r < br_count; r++) {
+                        if (dst_nulls[r]) continue;
+                        dst[r] = src[di++];
+                    }
+                }
+                break;
+            }
+            case COLUMN_TYPE_TEXT:
+            case COLUMN_TYPE_UUID: {
+                char **dst = (char **)pc->col_data[c] + base;
+                const carquet_byte_array_t *arr = (const carquet_byte_array_t *)data;
+                size_t di = 0;
+                for (size_t r = 0; r < br_count; r++) {
+                    if (dst_nulls[r]) {
+                        dst[r] = NULL;
+                    } else {
+                        char *s = (char *)malloc(arr[di].length + 1);
+                        memcpy(s, arr[di].data, arr[di].length);
+                        s[arr[di].length] = '\0';
+                        dst[r] = s;
+                        di++;
+                    }
+                }
+                break;
+            }
+            }
+        }
+
+        pc->nrows += (size_t)batch_rows;
+        carquet_row_batch_free(batch);
+        batch = NULL;
+    }
+
+    free(phys_types);
+    carquet_batch_reader_free(br);
+    carquet_reader_close(reader);
+    pc->valid = 1;
+    return 0;
+}
+
 static int parquet_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                               struct row_block *out)
 {
@@ -5620,248 +5937,24 @@ static int parquet_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
     if (st->done) return 1;
 
-    /* Lazy init: open reader and batch reader on first call */
-    if (!st->reader) {
-        const char *path = pn->parquet_scan.table->parquet_path;
-        carquet_error_t err = CARQUET_ERROR_INIT;
-        carquet_reader_t *reader = carquet_reader_open(path, NULL, &err);
-        if (!reader) { st->done = 1; return 1; }
-        st->reader = reader;
+    struct table *tbl = pn->parquet_scan.table;
 
-        carquet_batch_reader_config_t cfg;
-        carquet_batch_reader_config_init(&cfg);
-        cfg.batch_size = BLOCK_CAPACITY;
-
-        carquet_batch_reader_t *br = carquet_batch_reader_create(reader, &cfg, &err);
-        if (!br) {
-            carquet_reader_close(reader);
-            st->reader = NULL;
+    /* Build cache on first access (or use existing cache) */
+    if (!tbl->pq_cache.valid) {
+        if (pq_cache_build(tbl) != 0) {
             st->done = 1;
             return 1;
         }
-        st->batch_reader = br;
     }
 
-    /* Read next batch */
-    carquet_row_batch_t *batch = NULL;
-    carquet_status_t status = carquet_batch_reader_next(
-        (carquet_batch_reader_t *)st->batch_reader, &batch);
-
-    if (status != CARQUET_OK || !batch) {
-        /* Clean up */
-        carquet_batch_reader_free((carquet_batch_reader_t *)st->batch_reader);
-        carquet_reader_close((carquet_reader_t *)st->reader);
-        st->batch_reader = NULL;
-        st->reader = NULL;
+    /* Serve from cache */
+    uint16_t n = pq_cache_read(&tbl->pq_cache, &st->cache_cursor,
+                                out, pn->parquet_scan.col_map,
+                                pn->parquet_scan.ncols);
+    if (n == 0) {
         st->done = 1;
-        return 1;
+        return -1;
     }
-
-    int64_t nrows = carquet_row_batch_num_rows(batch);
-    if (nrows <= 0) {
-        carquet_row_batch_free(batch);
-        carquet_batch_reader_free((carquet_batch_reader_t *)st->batch_reader);
-        carquet_reader_close((carquet_reader_t *)st->reader);
-        st->batch_reader = NULL;
-        st->reader = NULL;
-        st->done = 1;
-        return 1;
-    }
-
-    uint16_t ncols = pn->parquet_scan.ncols;
-    uint16_t nrows_u16 = (uint16_t)(nrows > BLOCK_CAPACITY ? BLOCK_CAPACITY : nrows);
-    out->count = nrows_u16;
-
-    struct table *tbl = pn->parquet_scan.table;
-
-    for (uint16_t c = 0; c < ncols; c++) {
-        int parquet_col = pn->parquet_scan.col_map[c];
-        enum column_type ct = tbl->columns.items[c].type;
-        out->cols[c].type = ct;
-        out->cols[c].count = nrows_u16;
-        const void *data = NULL;
-        const uint8_t *null_bitmap = NULL;
-        int64_t num_values = 0;
-        (void)carquet_row_batch_column(batch, parquet_col, &data, &null_bitmap, &num_values);
-
-        /* Copy null bitmap: Carquet convention — bit set = NULL.
-         * All-zero bitmap (or NULL pointer) = all values valid. */
-        memset(out->cols[c].nulls, 0, nrows_u16);
-        if (null_bitmap) {
-            for (uint16_t r = 0; r < nrows_u16; r++) {
-                if (null_bitmap[r / 8] & (1 << (r % 8)))
-                    out->cols[c].nulls[r] = 1;
-            }
-        }
-
-        /* Check if this column has any nulls */
-        int has_nulls = 0;
-        if (null_bitmap) {
-            for (int bi = 0; bi < (nrows_u16 + 7) / 8; bi++) {
-                if (null_bitmap[bi]) { has_nulls = 1; break; }
-            }
-        }
-
-        /* Copy data based on type.
-         * Carquet compacts nullable columns: non-null values are packed
-         * contiguously in the data array.  Use a running data index (di)
-         * that only increments for non-null rows. */
-        switch (ct) {
-        case COLUMN_TYPE_BOOLEAN:
-            if (data) {
-                const uint8_t *src = (const uint8_t *)data;
-                uint16_t di = 0;
-                for (uint16_t r = 0; r < nrows_u16; r++) {
-                    if (out->cols[c].nulls[r]) continue;
-                    out->cols[c].data.i32[r] = src[di] ? 1 : 0;
-                    di++;
-                }
-            }
-            break;
-        case COLUMN_TYPE_INT:
-        case COLUMN_TYPE_SMALLINT:
-        case COLUMN_TYPE_ENUM:
-            if (data) {
-                const int32_t *src = (const int32_t *)data;
-                if (!has_nulls) {
-                    memcpy(out->cols[c].data.i32, src, nrows_u16 * sizeof(int32_t));
-                } else {
-                    uint16_t di = 0;
-                    for (uint16_t r = 0; r < nrows_u16; r++) {
-                        if (out->cols[c].nulls[r]) continue;
-                        out->cols[c].data.i32[r] = src[di++];
-                    }
-                }
-            }
-            break;
-        case COLUMN_TYPE_BIGINT:
-            if (data) {
-                const int64_t *src = (const int64_t *)data;
-                if (!has_nulls) {
-                    memcpy(out->cols[c].data.i64, src, nrows_u16 * sizeof(int64_t));
-                } else {
-                    uint16_t di = 0;
-                    for (uint16_t r = 0; r < nrows_u16; r++) {
-                        if (out->cols[c].nulls[r]) continue;
-                        out->cols[c].data.i64[r] = src[di++];
-                    }
-                }
-            }
-            break;
-        case COLUMN_TYPE_DATE:
-            if (data) {
-                const int32_t *src = (const int32_t *)data;
-                /* Parquet: days since 1970-01-01; mskql: days since 2000-01-01 */
-                uint16_t di = 0;
-                for (uint16_t r = 0; r < nrows_u16; r++) {
-                    if (has_nulls && out->cols[c].nulls[r]) continue;
-                    out->cols[c].data.i32[r] = src[di++] - 10957;
-                }
-            }
-            break;
-        case COLUMN_TYPE_TIME:
-            if (data) {
-                const int64_t *src = (const int64_t *)data;
-                if (!has_nulls) {
-                    memcpy(out->cols[c].data.i64, src, nrows_u16 * sizeof(int64_t));
-                } else {
-                    uint16_t di = 0;
-                    for (uint16_t r = 0; r < nrows_u16; r++) {
-                        if (out->cols[c].nulls[r]) continue;
-                        out->cols[c].data.i64[r] = src[di++];
-                    }
-                }
-            }
-            break;
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ:
-            if (data) {
-                const int64_t *src = (const int64_t *)data;
-                /* Parquet: usec since 1970-01-01; mskql: usec since 2000-01-01 */
-                uint16_t di = 0;
-                for (uint16_t r = 0; r < nrows_u16; r++) {
-                    if (has_nulls && out->cols[c].nulls[r]) continue;
-                    out->cols[c].data.i64[r] = src[di++] - (10957LL * 86400LL * 1000000LL);
-                }
-            }
-            break;
-        case COLUMN_TYPE_INTERVAL:
-            if (data) {
-                const struct interval *src = (const struct interval *)data;
-                if (!has_nulls) {
-                    memcpy(out->cols[c].data.iv, src, nrows_u16 * sizeof(struct interval));
-                } else {
-                    uint16_t di = 0;
-                    for (uint16_t r = 0; r < nrows_u16; r++) {
-                        if (out->cols[c].nulls[r]) continue;
-                        out->cols[c].data.iv[r] = src[di++];
-                    }
-                }
-            }
-            break;
-        case COLUMN_TYPE_FLOAT:
-        case COLUMN_TYPE_NUMERIC: {
-            if (data) {
-                const carquet_schema_t *schema = carquet_reader_schema(
-                    (carquet_reader_t *)st->reader);
-                int32_t num_elems = carquet_schema_num_elements(schema);
-                int leaf_idx = 0;
-                carquet_physical_type_t phys = CARQUET_PHYSICAL_DOUBLE;
-                for (int32_t ei = 0; ei < num_elems; ei++) {
-                    const carquet_schema_node_t *node = carquet_schema_get_element(schema, ei);
-                    if (!node || !carquet_schema_node_is_leaf(node)) continue;
-                    if (leaf_idx == parquet_col) {
-                        phys = carquet_schema_node_physical_type(node);
-                        break;
-                    }
-                    leaf_idx++;
-                }
-                if (phys == CARQUET_PHYSICAL_FLOAT) {
-                    const float *src = (const float *)data;
-                    uint16_t di = 0;
-                    for (uint16_t r = 0; r < nrows_u16; r++) {
-                        if (out->cols[c].nulls[r]) continue;
-                        out->cols[c].data.f64[r] = (double)src[di++];
-                    }
-                } else if (!has_nulls) {
-                    memcpy(out->cols[c].data.f64, data, nrows_u16 * sizeof(double));
-                } else {
-                    const double *src = (const double *)data;
-                    uint16_t di = 0;
-                    for (uint16_t r = 0; r < nrows_u16; r++) {
-                        if (out->cols[c].nulls[r]) continue;
-                        out->cols[c].data.f64[r] = src[di++];
-                    }
-                }
-            }
-            break;
-        }
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_UUID:
-            if (data) {
-                const carquet_byte_array_t *arr = (const carquet_byte_array_t *)data;
-                uint16_t di = 0;
-                for (uint16_t r = 0; r < nrows_u16; r++) {
-                    if (out->cols[c].nulls[r]) {
-                        out->cols[c].data.str[r] = NULL;
-                    } else {
-                        char *s = (char *)bump_alloc(&ctx->arena->scratch,
-                                                     arr[di].length + 1);
-                        memcpy(s, arr[di].data, arr[di].length);
-                        s[arr[di].length] = '\0';
-                        out->cols[c].data.str[r] = s;
-                        di++;
-                    }
-                }
-            } else {
-                for (uint16_t r = 0; r < nrows_u16; r++)
-                    out->cols[c].data.str[r] = NULL;
-            }
-            break;
-        }
-    }
-
-    carquet_row_batch_free(batch);
     return 0;
 }
 #endif /* MSKQL_WASM */

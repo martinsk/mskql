@@ -15,6 +15,7 @@ void table_init(struct table *t, const char *name)
     t->generation = 0;
     memset(&t->scan_cache, 0, sizeof(t->scan_cache));
     memset(&t->join_cache, 0, sizeof(t->join_cache));
+    memset(&t->pq_cache, 0, sizeof(t->pq_cache));
 }
 
 void table_init_own(struct table *t, char *name)
@@ -28,6 +29,7 @@ void table_init_own(struct table *t, char *name)
     t->generation = 0;
     memset(&t->scan_cache, 0, sizeof(t->scan_cache));
     memset(&t->join_cache, 0, sizeof(t->join_cache));
+    memset(&t->pq_cache, 0, sizeof(t->pq_cache));
 }
 
 void table_add_column(struct table *t, struct column *col)
@@ -247,5 +249,22 @@ void table_free(struct table *t)
         free(t->join_cache.hashes);
         free(t->join_cache.nexts);
         free(t->join_cache.buckets);
+    }
+
+    /* free parquet cache */
+    if (t->pq_cache.valid) {
+        for (uint16_t i = 0; i < t->pq_cache.ncols; i++) {
+            if (t->pq_cache.col_types[i] == COLUMN_TYPE_TEXT ||
+                t->pq_cache.col_types[i] == COLUMN_TYPE_UUID) {
+                char **strs = (char **)t->pq_cache.col_data[i];
+                for (size_t r = 0; r < t->pq_cache.nrows; r++)
+                    free(strs[r]);
+            }
+            free(t->pq_cache.col_data[i]);
+            free(t->pq_cache.col_nulls[i]);
+        }
+        free(t->pq_cache.col_data);
+        free(t->pq_cache.col_nulls);
+        free(t->pq_cache.col_types);
     }
 }
