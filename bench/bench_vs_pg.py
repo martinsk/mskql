@@ -81,6 +81,23 @@ def duckdb_fixup(lines):
     return [re.sub(r"::numeric", "::decimal", line, flags=re.IGNORECASE) for line in lines]
 
 
+# ── no-cache variant helper ──────────────────────────────────────────────────
+# Benchmarks that are inherently write-heavy or already vary parameters per query.
+CACHE_RESISTANT = {"insert_bulk", "update", "delete", "transaction", "index_lookup"}
+
+
+def nocache_lines(bench_lines):
+    """Append a unique SQL comment to each line to bust the result cache."""
+    out = []
+    for i, line in enumerate(bench_lines):
+        stripped = line.rstrip()
+        if stripped.endswith(";"):
+            out.append(f"{stripped[:-1]} /* nc{i} */;")
+        else:
+            out.append(f"{stripped} /* nc{i} */")
+    return out
+
+
 # ── benchmark definitions ────────────────────────────────────────────────────
 # Each benchmark returns (setup_lines, bench_lines).
 
@@ -825,7 +842,7 @@ def bench_pq_analytical():
     return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
 
 
-BENCHMARKS = [
+_BASE_BENCHMARKS = [
     ("insert_bulk",        bench_insert_bulk),
     ("select_full_scan",   bench_select_full_scan),
     ("select_where",       bench_select_where),
@@ -872,6 +889,33 @@ BENCHMARKS = [
     ("pq_lineitem_agg",    bench_pq_lineitem_agg),
     ("pq_analytical",      bench_pq_analytical),
 ]
+
+
+def _make_nc_wrapper(fn):
+    """Create a no-cache wrapper for a benchmark function."""
+    def wrapper():
+        result = fn()
+        if isinstance(result, dict):
+            # Parquet-style: {"mskql": (setup, bench), "duck": (setup, bench), ...}
+            out = {}
+            for key, spec in result.items():
+                if spec is None:
+                    out[key] = None
+                else:
+                    out[key] = (spec[0], nocache_lines(spec[1]))
+            return out
+        else:
+            setup, bench = result
+            return setup, nocache_lines(bench)
+    return wrapper
+
+
+# Build final list: each cache-susceptible benchmark gets a _nc variant right after it.
+BENCHMARKS = []
+for _name, _fn in _BASE_BENCHMARKS:
+    BENCHMARKS.append((_name, _fn))
+    if _name not in CACHE_RESISTANT:
+        BENCHMARKS.append((_name + "_nc", _make_nc_wrapper(_fn)))
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
