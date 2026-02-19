@@ -91,7 +91,25 @@ static const char *resolve_col_name(struct query *q, struct database *db,
                 case FUNC_DATE_TRUNC: return "date_trunc";
                 case FUNC_AGE:        return "age";
                 case FUNC_TO_CHAR:    return "to_char";
-                default: break;
+                case FUNC_GREATEST: case FUNC_LEAST: case FUNC_NEXTVAL:
+                case FUNC_CURRVAL: case FUNC_GEN_RANDOM_UUID:
+                case FUNC_CURRENT_TIMESTAMP: case FUNC_CURRENT_DATE:
+                case FUNC_DATE_PART: case FUNC_SIGN: case FUNC_RANDOM:
+                case FUNC_REPLACE: case FUNC_LPAD: case FUNC_RPAD:
+                case FUNC_CONCAT: case FUNC_CONCAT_WS: case FUNC_POSITION:
+                case FUNC_SPLIT_PART: case FUNC_LEFT: case FUNC_RIGHT:
+                case FUNC_REPEAT: case FUNC_REVERSE: case FUNC_INITCAP:
+                case FUNC_PG_GET_USERBYID: case FUNC_PG_TABLE_IS_VISIBLE:
+                case FUNC_FORMAT_TYPE: case FUNC_PG_GET_EXPR:
+                case FUNC_OBJ_DESCRIPTION: case FUNC_COL_DESCRIPTION:
+                case FUNC_PG_ENCODING_TO_CHAR: case FUNC_SHOBJ_DESCRIPTION:
+                case FUNC_HAS_TABLE_PRIVILEGE: case FUNC_HAS_DATABASE_PRIVILEGE:
+                case FUNC_PG_GET_CONSTRAINTDEF: case FUNC_PG_GET_INDEXDEF:
+                case FUNC_ARRAY_TO_STRING: case FUNC_CURRENT_SCHEMA:
+                case FUNC_CURRENT_SCHEMAS: case FUNC_PG_IS_IN_RECOVERY:
+                case FUNC_AGG_SUM: case FUNC_AGG_COUNT: case FUNC_AGG_AVG:
+                case FUNC_AGG_MIN: case FUNC_AGG_MAX:
+                    break;
                 }
             }
         }
@@ -135,7 +153,6 @@ static const char *resolve_col_name(struct query *q, struct database *db,
             case WIN_SUM:          return "sum";
             case WIN_COUNT:        return "count";
             case WIN_AVG:          return "avg";
-            default: break;
             }
         }
         return "?";

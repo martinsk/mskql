@@ -56,17 +56,14 @@ struct block_hash_table {
 /* Element size for a column type's data storage. */
 static inline size_t col_type_elem_size(enum column_type ct)
 {
-    switch (ct) {
-    case COLUMN_TYPE_SMALLINT:                          return sizeof(int16_t);
-    case COLUMN_TYPE_BIGINT:
-    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_TIME:                              return sizeof(int64_t);
-    case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:   return sizeof(double);
-    case COLUMN_TYPE_TEXT:                              return sizeof(char *);
-    case COLUMN_TYPE_INT:   case COLUMN_TYPE_BOOLEAN:
-    case COLUMN_TYPE_DATE:  case COLUMN_TYPE_ENUM:      return sizeof(int32_t);
-    case COLUMN_TYPE_INTERVAL:                          return sizeof(struct interval);
-    case COLUMN_TYPE_UUID:                              return sizeof(struct uuid_val);
+    switch (column_type_storage(ct)) {
+    case STORE_I16:   return sizeof(int16_t);
+    case STORE_I32:   return sizeof(int32_t);
+    case STORE_I64:   return sizeof(int64_t);
+    case STORE_F64:   return sizeof(double);
+    case STORE_STR:   return sizeof(char *);
+    case STORE_IV:    return sizeof(struct interval);
+    case STORE_UUID:  return sizeof(struct uuid_val);
     }
     __builtin_unreachable();
 }
@@ -74,17 +71,14 @@ static inline size_t col_type_elem_size(enum column_type ct)
 /* Pointer to the data element at index i in a col_block (cast to void*). */
 static inline void *cb_data_ptr(const struct col_block *cb, uint32_t i)
 {
-    switch (cb->type) {
-    case COLUMN_TYPE_SMALLINT:                          return (void *)&cb->data.i16[i];
-    case COLUMN_TYPE_BIGINT:
-    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
-    case COLUMN_TYPE_TIME:                              return (void *)&cb->data.i64[i];
-    case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:   return (void *)&cb->data.f64[i];
-    case COLUMN_TYPE_TEXT:                              return (void *)&cb->data.str[i];
-    case COLUMN_TYPE_INT:   case COLUMN_TYPE_BOOLEAN:
-    case COLUMN_TYPE_DATE:  case COLUMN_TYPE_ENUM:      return (void *)&cb->data.i32[i];
-    case COLUMN_TYPE_INTERVAL:                          return (void *)&cb->data.iv[i];
-    case COLUMN_TYPE_UUID:                              return (void *)&cb->data.uuid[i];
+    switch (column_type_storage(cb->type)) {
+    case STORE_I16:   return (void *)&cb->data.i16[i];
+    case STORE_I32:   return (void *)&cb->data.i32[i];
+    case STORE_I64:   return (void *)&cb->data.i64[i];
+    case STORE_F64:   return (void *)&cb->data.f64[i];
+    case STORE_STR:   return (void *)&cb->data.str[i];
+    case STORE_IV:    return (void *)&cb->data.iv[i];
+    case STORE_UUID:  return (void *)&cb->data.uuid[i];
     }
     __builtin_unreachable();
 }

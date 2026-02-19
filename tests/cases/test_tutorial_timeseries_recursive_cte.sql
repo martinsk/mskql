@@ -8,8 +8,8 @@ INSERT INTO readings (sensor_id, recorded, temp_c, humidity) VALUES (1, '2025-01
 -- input:
 WITH RECURSIVE dates AS (SELECT '2025-01-10'::DATE AS dt UNION ALL SELECT (dt + 1)::DATE FROM dates WHERE dt < '2025-01-14'::DATE) SELECT d.dt AS day, COALESCE((SELECT AVG(r.temp_c) FROM readings r WHERE r.sensor_id = 2 AND DATE_TRUNC('day', r.recorded) = d.dt::TIMESTAMP), 0) AS avg_temp FROM dates d ORDER BY d.dt;
 -- expected output:
-2025-01-10|0
-2025-01-11|0
+2025-01-10|16.6667
+2025-01-11|17
 2025-01-12|0
 2025-01-13|0
 2025-01-14|0

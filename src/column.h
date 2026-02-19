@@ -51,6 +51,38 @@ static inline int column_type_is_temporal(enum column_type t)
     __builtin_unreachable();
 }
 
+/* Physical storage class — collapses 14 column_type variants into 7
+ * storage formats matching the col_block union members. Use this for
+ * dispatches that only care about the physical representation (elem size,
+ * data pointer, aggregate accumulation), NOT for semantic dispatches
+ * (text formatting, filter comparison value extraction). */
+enum storage_class {
+    STORE_I16,   /* SMALLINT */
+    STORE_I32,   /* INT, BOOLEAN, DATE, ENUM */
+    STORE_I64,   /* BIGINT, TIME, TIMESTAMP, TIMESTAMPTZ */
+    STORE_F64,   /* FLOAT, NUMERIC */
+    STORE_STR,   /* TEXT */
+    STORE_IV,    /* INTERVAL */
+    STORE_UUID   /* UUID */
+};
+
+static inline enum storage_class column_type_storage(enum column_type t)
+{
+    switch (t) {
+    case COLUMN_TYPE_SMALLINT:                          return STORE_I16;
+    case COLUMN_TYPE_INT:   case COLUMN_TYPE_BOOLEAN:
+    case COLUMN_TYPE_DATE:  case COLUMN_TYPE_ENUM:      return STORE_I32;
+    case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:                       return STORE_I64;
+    case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:   return STORE_F64;
+    case COLUMN_TYPE_TEXT:                               return STORE_STR;
+    case COLUMN_TYPE_INTERVAL:                          return STORE_IV;
+    case COLUMN_TYPE_UUID:                              return STORE_UUID;
+    }
+    __builtin_unreachable();
+}
+
 /* Unified PostgreSQL type metadata table — single source of truth for
  * OID, typname, display name, and storage length across catalog.c and pgwire.c. */
 struct pg_type_info {

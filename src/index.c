@@ -143,6 +143,7 @@ void index_init(struct index *idx, const char *name,
 {
     idx->name = strdup(name);
     idx->ncols = ncols;
+    idx->is_unique = 0;
     for (int i = 0; i < ncols; i++) {
         idx->column_names[i] = strdup(col_names[i]);
         idx->column_indices[i] = col_indices[i];
@@ -155,6 +156,7 @@ void index_init_sv(struct index *idx, sv name,
 {
     idx->name = sv_to_cstr(name);
     idx->ncols = ncols;
+    idx->is_unique = 0;
     for (int i = 0; i < ncols; i++) {
         idx->column_names[i] = sv_to_cstr(col_names[i]);
         idx->column_indices[i] = col_indices[i];

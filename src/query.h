@@ -30,6 +30,8 @@ struct agg_expr {
     uint32_t expr_idx; /* index into arena.exprs, or IDX_NONE — when set, evaluate expression instead of bare column */
     sv separator; /* STRING_AGG delimiter (empty for ARRAY_AGG) */
     uint32_t filter_cond; /* index into arena.conditions, or IDX_NONE — FILTER (WHERE ...) */
+    sv order_by_col; /* ORDER BY column inside aggregate (e.g. STRING_AGG(x, ',' ORDER BY y)) */
+    int order_by_desc; /* 1 if DESC */
 };
 
 enum win_func {
@@ -77,13 +79,14 @@ struct win_expr {
 
 enum select_expr_kind {
     SEL_COLUMN,
-    SEL_WINDOW
+    SEL_WINDOW,
+    SEL_EXPR_WIN  /* expression containing an embedded window function */
 };
 
 struct select_expr {
     enum select_expr_kind kind;
-    sv column;           /* for SEL_COLUMN */
-    struct win_expr win; /* for SEL_WINDOW */
+    sv column;           /* for SEL_COLUMN; for SEL_EXPR_WIN: raw expression text */
+    struct win_expr win; /* for SEL_WINDOW and SEL_EXPR_WIN */
     sv alias;            /* optional AS alias */
 };
 
@@ -179,7 +182,10 @@ enum expr_type {
     EXPR_SUBQUERY,      /* (SELECT ...) */
     EXPR_CAST,          /* CAST(expr AS type) or expr::type */
     EXPR_IS_NULL,       /* expr IS NULL / expr IS NOT NULL */
-    EXPR_EXISTS         /* EXISTS(SELECT ...) / NOT EXISTS(SELECT ...) */
+    EXPR_EXISTS,        /* EXISTS(SELECT ...) / NOT EXISTS(SELECT ...) */
+    EXPR_BETWEEN,       /* expr BETWEEN low AND high */
+    EXPR_IN_LIST,       /* expr IN (val1, val2, ...) */
+    EXPR_LIKE           /* expr LIKE pattern */
 };
 
 enum expr_op {
@@ -196,7 +202,11 @@ enum expr_op {
     OP_LT,              /* < */
     OP_GT,              /* > */
     OP_LE,              /* <= */
-    OP_GE               /* >= */
+    OP_GE,              /* >= */
+    OP_AND,             /* AND */
+    OP_OR,              /* OR */
+    OP_NOT,             /* NOT (unary) */
+    OP_LIKE             /* LIKE */
 };
 
 enum expr_func {
@@ -336,6 +346,30 @@ struct expr {
             uint32_t sql_idx;          /* index into arena.strings */
             int negate;                /* 1 for NOT EXISTS */
         } exists;
+
+        /* EXPR_BETWEEN */
+        struct {
+            uint32_t operand;          /* index into arena.exprs */
+            uint32_t low;              /* index into arena.exprs */
+            uint32_t high;             /* index into arena.exprs */
+            int negate;                /* 1 for NOT BETWEEN */
+        } between;
+
+        /* EXPR_IN_LIST */
+        struct {
+            uint32_t operand;          /* index into arena.exprs */
+            uint32_t values_start;     /* index into arena.arg_indices (consecutive) */
+            uint32_t values_count;
+            int negate;                /* 1 for NOT IN */
+        } in_list;
+
+        /* EXPR_LIKE */
+        struct {
+            uint32_t operand;          /* index into arena.exprs */
+            uint32_t pattern;          /* index into arena.exprs */
+            int negate;                /* 1 for NOT LIKE */
+            int case_insensitive;      /* 1 for ILIKE */
+        } like;
     };
 
     sv alias; /* optional AS alias */
@@ -395,7 +429,11 @@ enum alter_action {
     ALTER_DROP_COLUMN,
     ALTER_RENAME_COLUMN,
     ALTER_COLUMN_TYPE,
-    ALTER_RENAME_TABLE
+    ALTER_RENAME_TABLE,
+    ALTER_SET_DEFAULT,
+    ALTER_SET_NOT_NULL,
+    ALTER_DROP_DEFAULT,
+    ALTER_DROP_NOT_NULL
 };
 
 struct join_info {
@@ -411,12 +449,16 @@ struct join_info {
     int is_lateral;
     uint32_t lateral_subquery_sql; /* index into arena.strings, or IDX_NONE */
     uint32_t join_on_cond; /* full ON condition tree, or IDX_NONE */
+    uint32_t lateral_col_names_start; /* index into arena.svs for AS alias(col1, col2) */
+    uint32_t lateral_col_names_count;
 };
 
 struct cte_def {
     uint32_t name_idx;   /* index into arena.strings */
     uint32_t sql_idx;    /* index into arena.strings */
     int is_recursive;
+    uint32_t col_names_start; /* index into arena.svs for column list */
+    uint32_t col_names_count; /* number of column names (0 if no column list) */
 };
 
 struct order_by_item {
@@ -481,6 +523,7 @@ struct query_select {
     uint32_t aggregates_start; /* index into arena.aggregates (consecutive) */
     uint32_t aggregates_count;
     int agg_before_cols; /* 1 if aggregates listed before plain columns in SELECT */
+    int has_expr_aggs;   /* 1 if parsed_columns contain inline aggregate calls (FUNC_AGG_*) */
     uint32_t select_exprs_start; /* index into arena.select_exprs (consecutive) */
     uint32_t select_exprs_count;
     /* set operations: UNION / INTERSECT / EXCEPT */
@@ -709,6 +752,7 @@ struct query {
 int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db, struct bump_alloc *rb);
 int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb);
 int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb);
+void emit_returning_row(struct table *t, struct row *src, sv returning_columns, int return_all, struct rows *result, struct bump_alloc *rb);
 
 /* arena helpers that need complete type definitions — must come after all structs */
 #include "arena_helpers.h"

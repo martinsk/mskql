@@ -752,6 +752,24 @@ static void exec_lateral_join(struct database *db, struct table *t1, const char 
                 }
             }
             query_free(&lat_q);
+            /* apply column aliases from AS alias(col1, col2, ...) */
+            if (ji->lateral_col_names_count > 0) {
+                size_t lat_ncols = lat_rows.data[0].cells.count;
+                size_t lat_col_start = merged_t->columns.count - lat_ncols;
+                for (uint32_t cn = 0; cn < ji->lateral_col_names_count && cn < (uint32_t)lat_ncols; cn++) {
+                    sv col_name = a->svs.items[ji->lateral_col_names_start + cn];
+                    size_t idx = lat_col_start + cn;
+                    if (idx < merged_t->columns.count) {
+                        free(merged_t->columns.items[idx].name);
+                        char buf[256];
+                        if (lat_alias_buf[0])
+                            snprintf(buf, sizeof(buf), "%s.%.*s", lat_alias_buf, (int)col_name.len, col_name.data);
+                        else
+                            snprintf(buf, sizeof(buf), "%.*s", (int)col_name.len, col_name.data);
+                        merged_t->columns.items[idx].name = strdup(buf);
+                    }
+                }
+            }
             lat_cols_added = 1;
         }
 
@@ -1749,6 +1767,14 @@ static void materialize_ctes(struct database *db, struct query_select *s,
                 struct table *ct = materialize_subquery(db, base_sql, cd_name);
                 free(base_sql);
                 if (!ct) { free(rec_sql); continue; }
+                /* rename columns to match CTE column list */
+                if (cd->col_names_count > 0) {
+                    for (uint32_t cn = 0; cn < cd->col_names_count && cn < (uint32_t)ct->columns.count; cn++) {
+                        sv col_name = qa->svs.items[cd->col_names_start + cn];
+                        free(ct->columns.items[cn].name);
+                        ct->columns.items[cn].name = sv_to_cstr(col_name);
+                    }
+                }
                 cte_temps[(*n_cte_temps)++] = ct;
 
                 /* Collect all rows in an accumulator; the CTE table acts as
@@ -2133,6 +2159,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 snprintf(idx_name, sizeof(idx_name), "%.*s_pkey", (int)crt->table.len, crt->table.data);
                 struct index pk_idx;
                 index_init_sv(&pk_idx, (sv){idx_name, strlen(idx_name)}, pk_col_names, pk_col_indices, pk_n);
+                pk_idx.is_unique = 1;
                 da_push(&t.indexes, pk_idx);
             }
             /* table-level UNIQUE (col1, col2, ...) */
@@ -2153,6 +2180,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 snprintf(idx_name, sizeof(idx_name), "%.*s_unique", (int)crt->table.len, crt->table.data);
                 struct index uq_idx;
                 index_init_sv(&uq_idx, (sv){idx_name, strlen(idx_name)}, uq_col_names, uq_col_indices, uq_n);
+                uq_idx.is_unique = 1;
                 da_push(&t.indexes, uq_idx);
             }
             da_push(&db->tables, t);
@@ -2948,6 +2976,14 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                 }
                                 da_free(&merged_t.columns);
                                 da_free(&merged_row.cells);
+                                /* emit RETURNING row for the updated row */
+                                if (ins->has_returning && result) {
+                                    int ret_all = (ins->returning_columns.len == 1 &&
+                                                   ins->returning_columns.data[0] == '*');
+                                    emit_returning_row(t, &t->rows.items[conflict_row],
+                                                       ins->returning_columns, ret_all,
+                                                       result, rb);
+                                }
                                 /* remove this insert row — it was handled as update.
                                  * Cell text is bump-allocated, so only free the DA
                                  * backing array (not per-cell text). */
@@ -3396,6 +3432,66 @@ skip_conflict_nothing:
                         t->generation++;
                         db->total_generation++;
                     }
+                    return 0;
+                }
+                case ALTER_SET_DEFAULT: {
+                    int col_idx = table_find_column_sv(t, a->alter_column);
+                    if (col_idx < 0) {
+                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                        return -1;
+                    }
+                    struct column *col = &t->columns.items[col_idx];
+                    /* free old default if any */
+                    if (col->default_value) {
+                        if (column_type_is_text(col->default_value->type) && col->default_value->value.as_text)
+                            free(col->default_value->value.as_text);
+                        free(col->default_value);
+                    }
+                    col->has_default = 1;
+                    col->default_value = calloc(1, sizeof(struct cell));
+                    col->default_value->type = a->alter_new_col.default_value->type;
+                    col->default_value->is_null = a->alter_new_col.default_value->is_null;
+                    if (column_type_is_text(a->alter_new_col.default_value->type) && a->alter_new_col.default_value->value.as_text)
+                        col->default_value->value.as_text = strdup(a->alter_new_col.default_value->value.as_text);
+                    else
+                        col->default_value->value = a->alter_new_col.default_value->value;
+                    /* free parser's copy */
+                    free(a->alter_new_col.default_value);
+                    a->alter_new_col.default_value = NULL;
+                    return 0;
+                }
+                case ALTER_SET_NOT_NULL: {
+                    int col_idx = table_find_column_sv(t, a->alter_column);
+                    if (col_idx < 0) {
+                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                        return -1;
+                    }
+                    t->columns.items[col_idx].not_null = 1;
+                    return 0;
+                }
+                case ALTER_DROP_DEFAULT: {
+                    int col_idx = table_find_column_sv(t, a->alter_column);
+                    if (col_idx < 0) {
+                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                        return -1;
+                    }
+                    struct column *col = &t->columns.items[col_idx];
+                    if (col->default_value) {
+                        if (column_type_is_text(col->default_value->type) && col->default_value->value.as_text)
+                            free(col->default_value->value.as_text);
+                        free(col->default_value);
+                        col->default_value = NULL;
+                    }
+                    col->has_default = 0;
+                    return 0;
+                }
+                case ALTER_DROP_NOT_NULL: {
+                    int col_idx = table_find_column_sv(t, a->alter_column);
+                    if (col_idx < 0) {
+                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                        return -1;
+                    }
+                    t->columns.items[col_idx].not_null = 0;
                     return 0;
                 }
             }

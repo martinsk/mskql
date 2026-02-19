@@ -232,8 +232,7 @@ int parquet_materialize(struct table *t)
                     break;
                 }
                 case COLUMN_TYPE_TEXT:
-                case COLUMN_TYPE_UUID:
-                default: {
+                case COLUMN_TYPE_UUID: {
                     const carquet_byte_array_t *arr = (const carquet_byte_array_t *)col_data[c];
                     char *s = malloc(arr[d].length + 1);
                     memcpy(s, arr[d].data, arr[d].length);

@@ -24,6 +24,7 @@ struct btree_node {
 struct index {
     char *name;
     int   ncols;
+    int   is_unique;  /* 1 if created from PRIMARY KEY or UNIQUE constraint */
     char *column_names[MAX_INDEX_COLS];
     int   column_indices[MAX_INDEX_COLS];
     struct btree_node *root;

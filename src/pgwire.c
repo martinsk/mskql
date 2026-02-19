@@ -622,6 +622,22 @@ static int set_nonblocking(int fd)
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+/* Returns 1 if the query is SELECT * (including table.* patterns like t.*). */
+static int is_select_all(const struct query *q)
+{
+    if (sv_eq_cstr(q->select.columns, "*")) return 1;
+    if (q->select.parsed_columns_count == 1) {
+        struct select_column *sc0 = &q->arena.select_cols.items[q->select.parsed_columns_start];
+        if (sc0->expr_idx != IDX_NONE) {
+            struct expr *e0 = &EXPR(&q->arena, sc0->expr_idx);
+            if (e0->type == EXPR_COLUMN_REF && e0->column_ref.column.len == 1 &&
+                e0->column_ref.column.data[0] == '*')
+                return 1;
+        }
+    }
+    return 0;
+}
+
 /* ---- query result sending ---- */
 
 static int send_row_description(int fd, struct database *db, struct query *q,
@@ -1025,17 +1041,7 @@ static int send_row_desc_plan(int fd, struct table *t, struct table **join_table
     msgbuf_init(&m);
     msgbuf_push_u16(&m, ncols);
 
-    int select_all = sv_eq_cstr(q->select.columns, "*");
-    /* Detect table.* pattern (e.g. SELECT t.*) and treat as SELECT * */
-    if (!select_all && q->select.parsed_columns_count == 1) {
-        struct select_column *sc0 = &q->arena.select_cols.items[q->select.parsed_columns_start];
-        if (sc0->expr_idx != IDX_NONE) {
-            struct expr *e0 = &EXPR(&q->arena, sc0->expr_idx);
-            if (e0->type == EXPR_COLUMN_REF && e0->column_ref.column.len == 1 &&
-                e0->column_ref.column.data[0] == '*')
-                select_all = 1;
-        }
-    }
+    int select_all = is_select_all(q);
     /* Build cumulative column offset table for SELECT * resolution */
     uint16_t tbl_offsets[9] = {0};
     int tbl_count = 0;
@@ -1159,6 +1165,9 @@ static int send_row_desc_plan(int fd, struct table *t, struct table **join_table
                 case EXPR_SUBQUERY:
                 case EXPR_IS_NULL:
                 case EXPR_EXISTS:
+                case EXPR_BETWEEN:
+                case EXPR_IN_LIST:
+                case EXPR_LIKE:
                     break;
                 }
             }
@@ -1259,17 +1268,7 @@ static void build_row_desc_for_plan(struct msgbuf *rd_buf, struct query *q,
                                     uint16_t ncols, const enum column_type *col_types)
 {
     msgbuf_push_u16(rd_buf, ncols);
-    int select_all_rd = sv_eq_cstr(q->select.columns, "*");
-    /* Detect table.* pattern (e.g. SELECT t.*) and treat as SELECT * */
-    if (!select_all_rd && q->select.parsed_columns_count == 1) {
-        struct select_column *sc0 = &q->arena.select_cols.items[q->select.parsed_columns_start];
-        if (sc0->expr_idx != IDX_NONE) {
-            struct expr *e0 = &EXPR(&q->arena, sc0->expr_idx);
-            if (e0->type == EXPR_COLUMN_REF && e0->column_ref.column.len == 1 &&
-                e0->column_ref.column.data[0] == '*')
-                select_all_rd = 1;
-        }
-    }
+    int select_all_rd = is_select_all(q);
     /* Build cumulative column offset table for SELECT * resolution across N tables */
     uint16_t tbl_offsets[9] = {0}; /* [t] + up to 8 join tables */
     int tbl_count = 0;
@@ -1387,6 +1386,310 @@ static void rcache_store_plan_result(struct rcache_entry *rce, uint32_t rc_hash,
     }
 }
 
+/* ---- CTE inlining: build a single plan tree for simple CTE queries ---- */
+
+/* Detect and execute the pattern:
+ *   WITH <name> AS (<inner SQL>) SELECT * FROM <name> [ORDER BY ...] [LIMIT ...]
+ * by building one unified plan tree from the CTE inner query, appending the
+ * outer ORDER BY / LIMIT on top, and sending directly via the columnar wire
+ * path — no temp table materialization, no row-store round-trip.
+ * Returns row count on success, -1 if the query doesn't match or can't be inlined. */
+static int try_inline_cte(int fd, struct database *db, struct query *q,
+                          const char *sql, size_t sql_len)
+{
+    struct query_select *s = &q->select;
+
+    /* ---- Detection: single non-recursive CTE, trivial outer query ---- */
+    int has_single_cte = 0;
+    const char *cte_sql_str = NULL;
+    const char *cte_name_str = NULL;
+    uint32_t cte_col_names_start = 0;
+    uint32_t cte_col_names_count = 0;
+
+    if (s->ctes_count == 1 && !s->has_recursive_cte) {
+        struct cte_def *cd = &q->arena.ctes.items[s->ctes_start];
+        if (cd->is_recursive) return -1;
+        cte_sql_str = ASTRING(&q->arena, cd->sql_idx);
+        cte_name_str = ASTRING(&q->arena, cd->name_idx);
+        cte_col_names_start = cd->col_names_start;
+        cte_col_names_count = cd->col_names_count;
+        has_single_cte = 1;
+    } else if (s->ctes_count == 0 && s->cte_name != IDX_NONE &&
+               s->cte_sql != IDX_NONE && !s->has_recursive_cte) {
+        cte_sql_str = ASTRING(&q->arena, s->cte_sql);
+        cte_name_str = ASTRING(&q->arena, s->cte_name);
+        has_single_cte = 1;
+    }
+    if (!has_single_cte) return -1;
+
+    /* Outer query must be SELECT * FROM <cte_name> with no complex clauses */
+    if (!sv_eq_cstr(s->columns, "*")) return -1;
+    if (!sv_eq_cstr(s->table, cte_name_str)) return -1;
+    if (s->has_join || s->has_group_by || s->aggregates_count > 0 ||
+        s->has_set_op || s->has_distinct || s->has_distinct_on ||
+        s->select_exprs_count > 0 || s->where.has_where ||
+        s->from_subquery_sql != IDX_NONE || s->has_generate_series ||
+        s->has_expr_aggs || s->parsed_columns_count > 0 ||
+        s->insert_rows_count > 0)
+        return -1;
+
+    /* ---- Parse CTE inner SQL ---- */
+    struct query inner_q = {0};
+    if (query_parse(cte_sql_str, &inner_q) != 0) {
+        query_free(&inner_q);
+        return -1;
+    }
+    if (inner_q.query_type != QUERY_TYPE_SELECT) {
+        query_free(&inner_q);
+        return -1;
+    }
+
+    /* Find the source table for the inner query */
+    struct query_select *is = &inner_q.select;
+    struct table *src = NULL;
+    if (is->table.len > 0)
+        src = db_find_table_sv(db, is->table);
+    if (!src) { query_free(&inner_q); return -1; }
+
+    /* For aggregate HAVING (e.g. SUM(amount) > 500), the parser sets lhs_expr
+     * on the condition.  try_append_having_filter bails on lhs_expr != IDX_NONE,
+     * but the parser also sets a virtual column name ("sum", "count", etc.) that
+     * is sufficient for column-name matching.  Clear lhs_expr so the plan
+     * executor can handle the HAVING filter via the virtual name. */
+    if (is->has_having && is->having_cond != IDX_NONE) {
+        struct condition *hc = &COND(&inner_q.arena, is->having_cond);
+        if (hc->type == COND_COMPARE && hc->lhs_expr != IDX_NONE &&
+            hc->column.len > 0 && hc->scalar_subquery_sql == IDX_NONE &&
+            hc->subquery_sql == IDX_NONE && hc->rhs_column.len == 0)
+            hc->lhs_expr = IDX_NONE;
+    }
+
+    /* Build plan for the inner query (handles WHERE, GROUP BY, HAVING, etc.) */
+    struct plan_result pr = plan_build_select(src, is, &inner_q.arena, db);
+    if (pr.status != PLAN_OK) { query_free(&inner_q); return -1; }
+
+    uint32_t current = pr.node;
+
+    /* ---- Append outer ORDER BY ---- */
+    if (s->has_order_by && s->order_by_count > 0) {
+        /* Determine the inner query's output column layout for name resolution */
+        uint16_t ngrp = is->has_group_by ? (uint16_t)is->group_by_count : 0;
+        uint32_t agg_n = is->aggregates_count;
+        uint16_t agg_offset = is->agg_before_cols ? 0 : ngrp;
+        uint16_t grp_offset = is->agg_before_cols ? (uint16_t)agg_n : 0;
+
+        int sort_cols[32], sort_descs[32], sort_nf[32];
+        uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+        int sort_ok = 1;
+
+        for (uint16_t k = 0; k < sort_nord; k++) {
+            struct order_by_item *obi = &q->arena.order_items.items[s->order_by_start + k];
+            sort_cols[k] = -1;
+            sort_descs[k] = obi->desc;
+            sort_nf[k] = obi->nulls_first;
+
+            /* Try matching against GROUP BY column names */
+            for (uint32_t g = 0; g < is->group_by_count; g++) {
+                sv gcol = inner_q.arena.svs.items[is->group_by_start + g];
+                if (sv_eq_ignorecase(obi->column, gcol)) {
+                    sort_cols[k] = (int)(grp_offset + g);
+                    break;
+                }
+            }
+
+            /* Try matching against aggregate aliases */
+            if (sort_cols[k] < 0) {
+                for (uint32_t a = 0; a < agg_n; a++) {
+                    struct agg_expr *ae = &inner_q.arena.aggregates.items[is->aggregates_start + a];
+                    if (ae->alias.len > 0 && sv_eq_ignorecase(obi->column, ae->alias)) {
+                        sort_cols[k] = (int)(agg_offset + a);
+                        break;
+                    }
+                }
+            }
+
+            /* Try matching CTE column aliases (WITH x(col1, col2) AS ...) */
+            if (sort_cols[k] < 0 && cte_col_names_count > 0) {
+                for (uint32_t cn = 0; cn < cte_col_names_count; cn++) {
+                    sv col_name = q->arena.svs.items[cte_col_names_start + cn];
+                    if (sv_eq_ignorecase(obi->column, col_name)) {
+                        sort_cols[k] = (int)cn;
+                        break;
+                    }
+                }
+            }
+
+            /* Try matching against source table column names (for non-agg queries) */
+            if (sort_cols[k] < 0 && agg_n == 0 && ngrp == 0) {
+                int ci = table_find_column_sv(src, obi->column);
+                if (ci >= 0) sort_cols[k] = ci;
+            }
+
+            if (sort_cols[k] < 0) { sort_ok = 0; break; }
+        }
+
+        if (!sort_ok) { query_free(&inner_q); return -1; }
+
+        if (sort_nord > 0) {
+            int *sc = (int *)bump_alloc(&inner_q.arena.scratch, sort_nord * sizeof(int));
+            int *sd = (int *)bump_alloc(&inner_q.arena.scratch, sort_nord * sizeof(int));
+            int *snf = (int *)bump_alloc(&inner_q.arena.scratch, sort_nord * sizeof(int));
+            memcpy(sc, sort_cols, sort_nord * sizeof(int));
+            memcpy(sd, sort_descs, sort_nord * sizeof(int));
+            memcpy(snf, sort_nf, sort_nord * sizeof(int));
+            uint32_t sort_idx = plan_alloc_node(&inner_q.arena, PLAN_SORT);
+            PLAN_NODE(&inner_q.arena, sort_idx).left = current;
+            PLAN_NODE(&inner_q.arena, sort_idx).sort.sort_cols = sc;
+            PLAN_NODE(&inner_q.arena, sort_idx).sort.sort_descs = sd;
+            PLAN_NODE(&inner_q.arena, sort_idx).sort.sort_nulls_first = snf;
+            PLAN_NODE(&inner_q.arena, sort_idx).sort.nsort_cols = sort_nord;
+            current = sort_idx;
+        }
+    }
+
+    /* ---- Append outer LIMIT/OFFSET ---- */
+    if (s->has_limit || s->has_offset) {
+        uint32_t lim_idx = plan_alloc_node(&inner_q.arena, PLAN_LIMIT);
+        PLAN_NODE(&inner_q.arena, lim_idx).left = current;
+        PLAN_NODE(&inner_q.arena, lim_idx).limit.has_limit = s->has_limit;
+        PLAN_NODE(&inner_q.arena, lim_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
+        PLAN_NODE(&inner_q.arena, lim_idx).limit.has_offset = s->has_offset;
+        PLAN_NODE(&inner_q.arena, lim_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
+        current = lim_idx;
+    }
+
+    /* ---- Execute plan and send via columnar wire path ---- */
+    struct plan_exec_ctx ctx;
+    plan_exec_init(&ctx, &inner_q.arena, db, current);
+
+    uint16_t ncols = plan_node_ncols(&inner_q.arena, current);
+    if (ncols == 0) { query_free(&inner_q); return -1; }
+
+    struct row_block block;
+    row_block_alloc(&block, ncols, &inner_q.arena.scratch);
+
+    int rc = plan_next_block(&ctx, current, &block);
+    if (rc != 0) {
+        if (inner_q.arena.errmsg[0]) { query_free(&inner_q); return -1; }
+        /* No rows — send empty RowDescription */
+        enum column_type types[64];
+        for (uint16_t i = 0; i < ncols && i < 64; i++)
+            types[i] = (src && i < src->columns.count) ? src->columns.items[i].type : COLUMN_TYPE_INT;
+        /* Build RowDescription with CTE column names */
+        struct msgbuf rd_buf;
+        msgbuf_init(&rd_buf);
+        build_row_desc_for_plan(&rd_buf, &inner_q, src, NULL, 0, ncols, types);
+        if (msg_send(fd, 'T', &rd_buf) != 0) { msgbuf_free(&rd_buf); query_free(&inner_q); return -1; }
+        msgbuf_free(&rd_buf);
+        query_free(&inner_q);
+        return 0;
+    }
+
+    /* Determine column types from first block */
+    enum column_type col_types[64];
+    for (uint16_t i = 0; i < ncols && i < 64; i++)
+        col_types[i] = block.cols[i].type;
+
+    /* Build RowDescription using inner query metadata */
+    struct msgbuf rd_buf;
+    msgbuf_init(&rd_buf);
+    build_row_desc_for_plan(&rd_buf, &inner_q, src, NULL, 0, ncols, col_types);
+
+    if (msg_send(fd, 'T', &rd_buf) != 0) {
+        msgbuf_free(&rd_buf);
+        query_free(&inner_q);
+        return -1;
+    }
+
+    /* Result cache setup */
+    uint32_t rc_hash = rcache_hash_sql(sql, sql_len);
+    uint32_t rc_slot = rc_hash & (RCACHE_SLOTS - 1);
+    uint64_t rc_gen = db->total_generation;
+    struct rcache_entry *rce = &g_rcache[rc_slot];
+
+    struct msgbuf wire;
+    msgbuf_init(&wire);
+    msgbuf_ensure(&wire, 262144);
+
+    struct msgbuf cache_buf;
+    msgbuf_init(&cache_buf);
+    {
+        uint8_t hdr[5];
+        hdr[0] = 'T';
+        uint32_t rd_body_len = (uint32_t)(rd_buf.len + 4);
+        put_u32(hdr + 1, rd_body_len);
+        msgbuf_push(&cache_buf, hdr, 5);
+        msgbuf_push(&cache_buf, rd_buf.data, rd_buf.len);
+    }
+    msgbuf_free(&rd_buf);
+
+    size_t total_rows = 0;
+    int cache_active = 1;
+
+    for (;;) {
+        size_t wire_before = wire.len;
+        uint16_t vec_rows = serialize_numeric_block(&wire, &block, ncols);
+        if (vec_rows > 0) {
+            if (cache_active && cache_buf.len < RCACHE_MAX_BYTES)
+                msgbuf_push(&cache_buf, wire.data + wire_before, wire.len - wire_before);
+            else
+                cache_active = 0;
+            total_rows += vec_rows;
+        } else {
+            uint16_t active = row_block_active_count(&block);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = row_block_row_idx(&block, r);
+                size_t msg_start = wire.len;
+                msgbuf_ensure(&wire, 5);
+                wire.len += 5;
+                msgbuf_push_u16(&wire, ncols);
+                for (uint16_t c = 0; c < ncols; c++)
+                    msgbuf_push_col_cell(&wire, &block.cols[c], ri, db, src, c);
+                wire.data[msg_start] = 'D';
+                uint32_t body_len = (uint32_t)(wire.len - msg_start - 1);
+                put_u32(wire.data + msg_start + 1, body_len);
+                if (cache_active && cache_buf.len < RCACHE_MAX_BYTES)
+                    msgbuf_push(&cache_buf, wire.data + msg_start, wire.len - msg_start);
+                total_rows++;
+            }
+            if (cache_buf.len >= RCACHE_MAX_BYTES) cache_active = 0;
+        }
+
+        if (wire.len >= 262144) {
+            if (send_all(fd, wire.data, wire.len) != 0) {
+                msgbuf_free(&wire); msgbuf_free(&cache_buf);
+                query_free(&inner_q);
+                return -1;
+            }
+            wire.len = 0;
+        }
+
+        row_block_reset(&block);
+        if (plan_next_block(&ctx, current, &block) != 0) {
+            if (inner_q.arena.errmsg[0]) {
+                msgbuf_free(&wire); msgbuf_free(&cache_buf);
+                query_free(&inner_q);
+                return -1;
+            }
+            break;
+        }
+    }
+
+    if (wire.len > 0) {
+        if (send_all(fd, wire.data, wire.len) != 0) {
+            msgbuf_free(&wire); msgbuf_free(&cache_buf);
+            query_free(&inner_q);
+            return -1;
+        }
+    }
+    msgbuf_free(&wire);
+
+    rcache_store_plan_result(rce, rc_hash, rc_gen, (int)total_rows, &cache_buf);
+    msgbuf_free(&cache_buf);
+    query_free(&inner_q);
+    return (int)total_rows;
+}
+
 /* ---- try_plan_send orchestrator ---- */
 
 static int try_plan_send(int fd, struct database *db, struct query *q,
@@ -1404,6 +1707,12 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     if (rce->valid && rce->sql_hash == rc_hash && rce->generation == rc_gen) {
         if (send_all(fd, rce->wire_data, rce->wire_len) == 0)
             return rce->row_count;
+    }
+
+    /* ---- CTE inlining: try to build a single plan tree for simple CTEs ---- */
+    {
+        int inline_rc = try_inline_cte(fd, db, q, sql, sql_len);
+        if (inline_rc >= 0) return inline_rc;
     }
 
     struct query_select *s = &q->select;
@@ -2045,10 +2354,22 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     char tag[128];
     /* Resolve table for ENUM label lookups in wire serialization */
     struct table *t = NULL;
-    if (q.query_type == QUERY_TYPE_SELECT)       t = db_find_table_sv(db, q.select.table);
-    else if (q.query_type == QUERY_TYPE_INSERT)  t = db_find_table_sv(db, q.insert.table);
-    else if (q.query_type == QUERY_TYPE_UPDATE)  t = db_find_table_sv(db, q.update.table);
-    else if (q.query_type == QUERY_TYPE_DELETE)  t = db_find_table_sv(db, q.del.table);
+    switch (q.query_type) {
+    case QUERY_TYPE_SELECT:  t = db_find_table_sv(db, q.select.table); break;
+    case QUERY_TYPE_INSERT:  t = db_find_table_sv(db, q.insert.table); break;
+    case QUERY_TYPE_UPDATE:  t = db_find_table_sv(db, q.update.table); break;
+    case QUERY_TYPE_DELETE:  t = db_find_table_sv(db, q.del.table);    break;
+    case QUERY_TYPE_CREATE: case QUERY_TYPE_DROP: case QUERY_TYPE_CREATE_INDEX:
+    case QUERY_TYPE_DROP_INDEX: case QUERY_TYPE_CREATE_TYPE:
+    case QUERY_TYPE_DROP_TYPE: case QUERY_TYPE_ALTER: case QUERY_TYPE_BEGIN:
+    case QUERY_TYPE_COMMIT: case QUERY_TYPE_ROLLBACK:
+    case QUERY_TYPE_CREATE_SEQUENCE: case QUERY_TYPE_DROP_SEQUENCE:
+    case QUERY_TYPE_CREATE_VIEW: case QUERY_TYPE_DROP_VIEW:
+    case QUERY_TYPE_TRUNCATE: case QUERY_TYPE_EXPLAIN: case QUERY_TYPE_COPY:
+    case QUERY_TYPE_SET: case QUERY_TYPE_SHOW:
+    case QUERY_TYPE_CREATE_FOREIGN_TABLE:
+        break;
+    }
     build_command_tag(fd, db, &q, result, m, skip_row_desc, rc, tag, sizeof(tag), t);
     send_command_complete(fd, m, tag);
     arena_free_result_rows(conn_arena);
@@ -2477,7 +2798,7 @@ static int handle_describe(struct client_state *c, struct database *db,
 
                     if (t) {
                         /* build RowDescription from table metadata */
-                        int select_all = sv_eq_cstr(q.select.columns, "*");
+                        int select_all = is_select_all(&q);
                         struct msgbuf rm;
                         msgbuf_init(&rm);
                         uint16_t ncols;
@@ -2560,7 +2881,7 @@ static int handle_describe(struct client_state *c, struct database *db,
             if (q.select.table.len > 0)
                 t = db_find_table_sv(db, q.select.table);
             if (t) {
-                int select_all = sv_eq_cstr(q.select.columns, "*");
+                int select_all = is_select_all(&q);
                 struct msgbuf rm;
                 msgbuf_init(&rm);
                 uint16_t ncols;

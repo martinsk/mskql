@@ -413,29 +413,6 @@ static inline void cb_bulk_copy(struct col_block *dst,
     memcpy(cb_data_ptr(dst, 0), cb_data_ptr(src, 0), count * col_type_elem_size(src->type));
 }
 
-/* Helper: get a double value from a col_block at index i. */
-static inline double cb_to_double(const struct col_block *cb, uint16_t i)
-{
-    switch (cb->type) {
-    case COLUMN_TYPE_FLOAT:
-    case COLUMN_TYPE_NUMERIC:  return cb->data.f64[i];
-    case COLUMN_TYPE_BIGINT:   return (double)cb->data.i64[i];
-    case COLUMN_TYPE_SMALLINT: return (double)cb->data.i16[i];
-    case COLUMN_TYPE_INT:
-    case COLUMN_TYPE_BOOLEAN:  return (double)cb->data.i32[i];
-    case COLUMN_TYPE_DATE:     return (double)cb->data.i32[i];
-    case COLUMN_TYPE_TIME:
-    case COLUMN_TYPE_TIMESTAMP:
-    case COLUMN_TYPE_TIMESTAMPTZ:
-        return (double)cb->data.i64[i];
-    case COLUMN_TYPE_INTERVAL: return (double)interval_to_usec_approx(cb->data.iv[i]);
-    case COLUMN_TYPE_TEXT:                return 0.0;
-    case COLUMN_TYPE_ENUM:     return (double)cb->data.i32[i];
-    case COLUMN_TYPE_UUID:     return 0.0;
-    }
-    __builtin_unreachable();
-}
-
 /* Helper: get output column count for a plan node. */
 uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
 {
@@ -830,7 +807,11 @@ static uint16_t NAME(const CTYPE *vals, const uint8_t *nulls, \
     case CMP_GT: for (uint16_t i = 0; i < cand_count; i++) { uint16_t r = (uint16_t)cand[i]; mask[i] = !nulls[r] & (vals[r] >  cv); } break; \
     case CMP_LE: for (uint16_t i = 0; i < cand_count; i++) { uint16_t r = (uint16_t)cand[i]; mask[i] = !nulls[r] & (vals[r] <= cv); } break; \
     case CMP_GE: for (uint16_t i = 0; i < cand_count; i++) { uint16_t r = (uint16_t)cand[i]; mask[i] = !nulls[r] & (vals[r] >= cv); } break; \
-    default: return 0; \
+    case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN: \
+    case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT: \
+    case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS: \
+    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: \
+    case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: return 0; \
     } \
     uint16_t sc = 0; \
     for (uint16_t i = 0; i < cand_count; i++) \
@@ -855,7 +836,11 @@ static uint16_t vec_filter_f64(const double *vals, const uint8_t *nulls,
     case CMP_GT: for (uint16_t i = 0; i < cand_count; i++) { uint16_t r = (uint16_t)cand[i]; mask[i] = !nulls[r] & (vals[r] >  cv); } break;
     case CMP_LE: for (uint16_t i = 0; i < cand_count; i++) { uint16_t r = (uint16_t)cand[i]; mask[i] = !nulls[r] & (vals[r] <= cv); } break;
     case CMP_GE: for (uint16_t i = 0; i < cand_count; i++) { uint16_t r = (uint16_t)cand[i]; mask[i] = !nulls[r] & (vals[r] >= cv); } break;
-    default: return 0;
+    case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+    case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+    case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+    case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+    case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: return 0;
     }
     uint16_t sc = 0;
     for (uint16_t i = 0; i < cand_count; i++)
@@ -1912,6 +1897,12 @@ static int project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* Forward declaration — defined in "Shared aggregate helpers" section below */
+static inline void agg_reconstruct_row(struct col_block *cols, uint16_t ncols,
+                                        uint16_t ri, struct row *tmp_row,
+                                        int *tmp_row_inited,
+                                        struct bump_alloc *scratch);
+
 /* ---- Expression projection: evaluate arbitrary expressions per row ---- */
 
 static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -1948,22 +1939,13 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     out->sel_count = 0;
 
     /* Process each active row */
+    int tmp_inited = 1; /* cells already allocated above */
     for (uint16_t r = 0; r < active; r++) {
         uint16_t ri = row_block_row_idx(&input, r);
 
         /* Reconstruct row from col_blocks */
-        for (uint16_t c = 0; c < child_ncols; c++) {
-            struct col_block *cb = &input.cols[c];
-            struct cell *cell = &tmp_cells[c];
-            cell->type = cb->type;
-            if (cb->nulls[ri]) {
-                cell->is_null = 1;
-                memset(&cell->value, 0, sizeof(cell->value));
-            } else {
-                cell->is_null = 0;
-                cb_to_cell_at(cb, ri, cell);
-            }
-        }
+        agg_reconstruct_row(input.cols, child_ncols, ri,
+                            &tmp_row, &tmp_inited, &ctx->arena->scratch);
 
         /* Evaluate each output expression */
         for (uint16_t c = 0; c < out_ncols; c++) {
@@ -1981,81 +1963,45 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 ocb->nulls[r] = 1;
             } else {
                 ocb->nulls[r] = 0;
-                enum column_type ot = ocb->type;
-                if (ot == COLUMN_TYPE_SMALLINT) {
-                    if (result.type == COLUMN_TYPE_SMALLINT)
-                        ocb->data.i16[r] = result.value.as_smallint;
-                    else if (result.type == COLUMN_TYPE_INT)
-                        ocb->data.i16[r] = (int16_t)result.value.as_int;
-                    else if (result.type == COLUMN_TYPE_BIGINT)
-                        ocb->data.i16[r] = (int16_t)result.value.as_bigint;
-                    else if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
-                        ocb->data.i16[r] = (int16_t)result.value.as_float;
-                    else
-                        ocb->data.i16[r] = 0;
-                } else if (ot == COLUMN_TYPE_INT || ot == COLUMN_TYPE_BOOLEAN) {
-                    if (result.type == COLUMN_TYPE_SMALLINT)
-                        ocb->data.i32[r] = (int32_t)result.value.as_smallint;
-                    else if (result.type == COLUMN_TYPE_INT || result.type == COLUMN_TYPE_BOOLEAN)
-                        ocb->data.i32[r] = result.value.as_int;
-                    else if (result.type == COLUMN_TYPE_BIGINT)
-                        ocb->data.i32[r] = (int32_t)result.value.as_bigint;
-                    else if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
-                        ocb->data.i32[r] = (int32_t)result.value.as_float;
-                    else
-                        ocb->data.i32[r] = 0;
-                } else if (ot == COLUMN_TYPE_BIGINT) {
-                    if (result.type == COLUMN_TYPE_BIGINT)
-                        ocb->data.i64[r] = result.value.as_bigint;
-                    else if (result.type == COLUMN_TYPE_SMALLINT)
-                        ocb->data.i64[r] = result.value.as_smallint;
-                    else if (result.type == COLUMN_TYPE_INT)
-                        ocb->data.i64[r] = result.value.as_int;
-                    else if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
-                        ocb->data.i64[r] = (int64_t)result.value.as_float;
-                    else
-                        ocb->data.i64[r] = 0;
-                } else if (ot == COLUMN_TYPE_FLOAT || ot == COLUMN_TYPE_NUMERIC) {
-                    if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
-                        ocb->data.f64[r] = result.value.as_float;
-                    else if (result.type == COLUMN_TYPE_SMALLINT)
-                        ocb->data.f64[r] = result.value.as_smallint;
-                    else if (result.type == COLUMN_TYPE_INT)
-                        ocb->data.f64[r] = result.value.as_int;
-                    else if (result.type == COLUMN_TYPE_BIGINT)
-                        ocb->data.f64[r] = (double)result.value.as_bigint;
-                    else
-                        ocb->data.f64[r] = 0.0;
-                } else if (column_type_is_temporal(result.type)) {
-                    ocb->type = result.type;
+                /* If types match exactly, use cell_to_cb_at directly */
+                if (result.type == ocb->type) {
                     cell_to_cb_at(ocb, r, &result);
                 } else {
-                    /* UUID type */
-                    if (result.type == COLUMN_TYPE_UUID) {
-                        ocb->data.uuid[r] = result.value.as_uuid;
-                        ocb->type = result.type;
-                    } else if (column_type_is_text(result.type)) {
-                        ocb->data.str[r] = result.value.as_text;
-                        ocb->type = result.type;
-                    } else {
+                    /* Coerce result into the output column's storage class */
+                    double dv = 0.0;
+                    int have_numeric = 1;
+                    switch (column_type_storage(result.type)) {
+                    case STORE_I16: dv = (double)result.value.as_smallint; break;
+                    case STORE_I32: dv = (double)result.value.as_int; break;
+                    case STORE_I64: dv = (double)result.value.as_bigint; break;
+                    case STORE_F64: dv = result.value.as_float; break;
+                    case STORE_STR: case STORE_IV: case STORE_UUID:
+                        have_numeric = 0; break;
+                    }
+                    switch (column_type_storage(ocb->type)) {
+                    case STORE_I16: ocb->data.i16[r] = have_numeric ? (int16_t)dv : 0; break;
+                    case STORE_I32: ocb->data.i32[r] = have_numeric ? (int32_t)dv : 0; break;
+                    case STORE_I64: ocb->data.i64[r] = have_numeric ? (int64_t)dv : 0; break;
+                    case STORE_F64: ocb->data.f64[r] = have_numeric ? dv : 0.0; break;
+                    case STORE_STR: {
                         /* Numeric result but text output column — convert */
                         char buf[64];
-                        if (result.type == COLUMN_TYPE_SMALLINT)
-                            snprintf(buf, sizeof(buf), "%d", (int)result.value.as_smallint);
-                        else if (result.type == COLUMN_TYPE_INT)
-                            snprintf(buf, sizeof(buf), "%d", result.value.as_int);
-                        else if (result.type == COLUMN_TYPE_BIGINT)
-                            snprintf(buf, sizeof(buf), "%lld", result.value.as_bigint);
-                        else if (result.type == COLUMN_TYPE_FLOAT || result.type == COLUMN_TYPE_NUMERIC)
-                            snprintf(buf, sizeof(buf), "%g", result.value.as_float);
+                        if (have_numeric)
+                            snprintf(buf, sizeof(buf), "%g", dv);
                         else
                             buf[0] = '\0';
                         ocb->data.str[r] = bump_strdup(&ctx->arena->scratch, buf);
+                        break;
                     }
-                }
-                /* Update output type if first non-null row sets a more specific type */
-                if (r == 0 || (ocb->type == COLUMN_TYPE_TEXT && !column_type_is_text(result.type) && !result.is_null)) {
-                    /* Keep the type from first non-null result */
+                    case STORE_IV:
+                        ocb->type = result.type;
+                        cell_to_cb_at(ocb, r, &result);
+                        break;
+                    case STORE_UUID:
+                        ocb->type = result.type;
+                        cell_to_cb_at(ocb, r, &result);
+                        break;
+                    }
                 }
             }
             ocb->count = r + 1;
@@ -2624,6 +2570,155 @@ static uint64_t distinct_hash_cell(struct col_block *cb, uint16_t ri)
     return h;
 }
 
+/* ---- Shared aggregate helpers ---- */
+
+/* Reconstruct a row from col_blocks at row index ri into tmp_row.
+ * Lazily allocates tmp_row cells on first call (tmp_row_inited tracks this). */
+static inline void agg_reconstruct_row(struct col_block *cols, uint16_t ncols,
+                                        uint16_t ri, struct row *tmp_row,
+                                        int *tmp_row_inited,
+                                        struct bump_alloc *scratch)
+{
+    if (!*tmp_row_inited) {
+        tmp_row->cells.count = ncols;
+        tmp_row->cells.items = (struct cell *)bump_alloc(
+            scratch, ncols * sizeof(struct cell));
+        *tmp_row_inited = 1;
+    }
+    for (uint16_t c = 0; c < ncols; c++) {
+        struct col_block *cb = &cols[c];
+        struct cell *cell = &tmp_row->cells.items[c];
+        cell->type = cb->type;
+        if (cb->nulls[ri]) {
+            cell->is_null = 1;
+            memset(&cell->value, 0, sizeof(cell->value));
+        } else {
+            cell->is_null = 0;
+            cb_to_cell_at(cb, ri, cell);
+        }
+    }
+}
+
+/* Accumulate a non-null col_block value into aggregate accumulators.
+ * Dispatches on storage class (7 cases) instead of column_type (14 cases). */
+static inline void agg_accumulate_cb(const struct col_block *acb, uint16_t ri,
+                                      double *sums, double *mins, double *maxs,
+                                      const char **text_mins, const char **text_maxs,
+                                      int *minmax_init, size_t idx)
+{
+    switch (column_type_storage(acb->type)) {
+    case STORE_STR: {
+        const char *s = acb->data.str[ri];
+        if (s) {
+            if (!minmax_init[idx] || strcmp(s, text_mins[idx]) < 0)
+                text_mins[idx] = s;
+            if (!minmax_init[idx] || strcmp(s, text_maxs[idx]) > 0)
+                text_maxs[idx] = s;
+            minmax_init[idx] = 1;
+        }
+        break;
+    }
+    case STORE_I32: {
+        int32_t v = acb->data.i32[ri];
+        sums[idx] += (double)v;
+        if (!minmax_init[idx] || v < (int32_t)mins[idx]) mins[idx] = (double)v;
+        if (!minmax_init[idx] || v > (int32_t)maxs[idx]) maxs[idx] = (double)v;
+        minmax_init[idx] = 1;
+        break;
+    }
+    case STORE_I64: {
+        int64_t v = acb->data.i64[ri];
+        int64_t cur_min, cur_max;
+        memcpy(&cur_min, &mins[idx], sizeof(int64_t));
+        memcpy(&cur_max, &maxs[idx], sizeof(int64_t));
+        if (!minmax_init[idx] || v < cur_min) memcpy(&mins[idx], &v, sizeof(double));
+        if (!minmax_init[idx] || v > cur_max) memcpy(&maxs[idx], &v, sizeof(double));
+        minmax_init[idx] = 1;
+        break;
+    }
+    case STORE_IV: {
+        int64_t v = interval_to_usec_approx(acb->data.iv[ri]);
+        double dv = (double)v;
+        sums[idx] += dv;
+        if (!minmax_init[idx] || dv < mins[idx]) mins[idx] = dv;
+        if (!minmax_init[idx] || dv > maxs[idx]) maxs[idx] = dv;
+        minmax_init[idx] = 1;
+        break;
+    }
+    case STORE_I16: {
+        double v = (double)acb->data.i16[ri];
+        sums[idx] += v;
+        if (!minmax_init[idx] || v < mins[idx]) mins[idx] = v;
+        if (!minmax_init[idx] || v > maxs[idx]) maxs[idx] = v;
+        minmax_init[idx] = 1;
+        break;
+    }
+    case STORE_F64: {
+        double v = acb->data.f64[ri];
+        sums[idx] += v;
+        if (!minmax_init[idx] || v < mins[idx]) mins[idx] = v;
+        if (!minmax_init[idx] || v > maxs[idx]) maxs[idx] = v;
+        minmax_init[idx] = 1;
+        break;
+    }
+    case STORE_UUID:
+        break;
+    }
+}
+
+/* Emit a MIN or MAX result into a col_block at out_idx.
+ * Dispatches on storage class to reconstruct the correct value from the
+ * double accumulator slot. */
+static inline void agg_emit_minmax(struct col_block *dst, uint16_t out_idx,
+                                    enum column_type src_type, int is_min,
+                                    double *mins, double *maxs,
+                                    const char **text_mins, const char **text_maxs,
+                                    size_t *nonnull, size_t idx)
+{
+    if (nonnull[idx] == 0) {
+        dst->type = src_type;
+        dst->nulls[out_idx] = 1;
+        return;
+    }
+    dst->nulls[out_idx] = 0;
+    dst->type = src_type;
+    switch (column_type_storage(src_type)) {
+    case STORE_STR:
+        dst->data.str[out_idx] = (char *)(is_min ? text_mins[idx] : text_maxs[idx]);
+        break;
+    case STORE_I32: {
+        double mv = is_min ? mins[idx] : maxs[idx];
+        dst->data.i32[out_idx] = (int32_t)mv;
+        break;
+    }
+    case STORE_I64: {
+        int64_t mv;
+        memcpy(&mv, is_min ? &mins[idx] : &maxs[idx], sizeof(int64_t));
+        dst->data.i64[out_idx] = mv;
+        break;
+    }
+    case STORE_F64: {
+        dst->data.f64[out_idx] = is_min ? mins[idx] : maxs[idx];
+        break;
+    }
+    case STORE_I16: {
+        double mv = is_min ? mins[idx] : maxs[idx];
+        dst->data.i16[out_idx] = (int16_t)mv;
+        break;
+    }
+    case STORE_IV: {
+        /* Interval min/max stored as approx usec in double — can't reconstruct
+         * the original interval, so fall back to double representation */
+        dst->type = COLUMN_TYPE_FLOAT;
+        dst->data.f64[out_idx] = is_min ? mins[idx] : maxs[idx];
+        break;
+    }
+    case STORE_UUID:
+        dst->nulls[out_idx] = 1;
+        break;
+    }
+}
+
 /* ---- Hash aggregation ---- */
 
 static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -2801,24 +2896,9 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     /* FILTER (WHERE ...): evaluate per-aggregate filter condition */
                     struct agg_expr *ae_filt = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
                     if (ae_filt->filter_cond != IDX_NONE) {
-                        if (!st->tmp_row_inited) {
-                            st->tmp_row.cells.count = child_ncols;
-                            st->tmp_row.cells.items = (struct cell *)bump_alloc(
-                                &ctx->arena->scratch, child_ncols * sizeof(struct cell));
-                            st->tmp_row_inited = 1;
-                        }
-                        for (uint16_t c = 0; c < child_ncols; c++) {
-                            struct col_block *cb = &input.cols[c];
-                            struct cell *cell = &st->tmp_row.cells.items[c];
-                            cell->type = cb->type;
-                            if (cb->nulls[ri]) {
-                                cell->is_null = 1;
-                                memset(&cell->value, 0, sizeof(cell->value));
-                            } else {
-                                cell->is_null = 0;
-                                cb_to_cell_at(cb, ri, cell);
-                            }
-                        }
+                        agg_reconstruct_row(input.cols, child_ncols, ri,
+                                            &st->tmp_row, &st->tmp_row_inited,
+                                            &ctx->arena->scratch);
                         if (!eval_condition(ae_filt->filter_cond, ctx->arena,
                                             &st->tmp_row, pn->hash_agg.table, NULL))
                             continue;
@@ -2831,80 +2911,17 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         continue;
                     }
 
-                    if (ac == -2) {
-                        /* Expression-based aggregate: reconstruct temp row, eval expr */
-                        struct agg_expr *ae = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
-                        if (!st->tmp_row_inited) {
-                            st->tmp_row.cells.count = child_ncols;
-                            st->tmp_row.cells.items = (struct cell *)bump_alloc(
-                                &ctx->arena->scratch, child_ncols * sizeof(struct cell));
-                            st->tmp_row_inited = 1;
-                        }
-                        for (uint16_t c = 0; c < child_ncols; c++) {
-                            struct col_block *cb = &input.cols[c];
-                            struct cell *cell = &st->tmp_row.cells.items[c];
-                            cell->type = cb->type;
-                            if (cb->nulls[ri]) {
-                                cell->is_null = 1;
-                                memset(&cell->value, 0, sizeof(cell->value));
-                            } else {
-                                cell->is_null = 0;
-                                cb_to_cell_at(cb, ri, cell);
-                            }
-                        }
-                        struct cell cv = eval_expr(ae->expr_idx, ctx->arena,
-                                                   pn->hash_agg.table, &st->tmp_row,
-                                                   ctx->db, &ctx->arena->scratch);
-                        if (cv.is_null) continue;
-                        st->nonnull[idx]++;
-                        double v = 0.0;
-                        switch (cv.type) {
-                            case COLUMN_TYPE_SMALLINT: v = (double)cv.value.as_smallint; break;
-                            case COLUMN_TYPE_INT:      v = (double)cv.value.as_int; break;
-                            case COLUMN_TYPE_BIGINT:   v = (double)cv.value.as_bigint; break;
-                            case COLUMN_TYPE_FLOAT:
-                            case COLUMN_TYPE_NUMERIC:  v = cv.value.as_float; break;
-                            case COLUMN_TYPE_BOOLEAN:  v = (double)cv.value.as_bool; break;
-                            case COLUMN_TYPE_DATE:     v = (double)cv.value.as_date; break;
-                            case COLUMN_TYPE_TIME:
-                            case COLUMN_TYPE_TIMESTAMP:
-                            case COLUMN_TYPE_TIMESTAMPTZ:
-                                v = (double)cv.value.as_timestamp; break;
-                            case COLUMN_TYPE_INTERVAL:
-                                v = (double)interval_to_usec_approx(cv.value.as_interval); break;
-                            case COLUMN_TYPE_TEXT:  break;
-                            case COLUMN_TYPE_ENUM:  break;
-                            case COLUMN_TYPE_UUID:  break;
-                        }
-                        st->sums[idx] += v;
-                        if (!st->minmax_init[idx] || v < st->mins[idx])
-                            st->mins[idx] = v;
-                        if (!st->minmax_init[idx] || v > st->maxs[idx])
-                            st->maxs[idx] = v;
-                        st->minmax_init[idx] = 1;
-                        continue;
-                    }
-
-                    /* STRING_AGG / ARRAY_AGG: accumulate text values */
+                    /* STRING_AGG / ARRAY_AGG: accumulate text values (must be checked
+                     * before the generic expression handler which would skip this) */
                     struct agg_expr *ae_str = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
                     if (ae_str->func == AGG_STRING_AGG || ae_str->func == AGG_ARRAY_AGG) {
                         const char *val_str = NULL;
                         char numbuf[64];
                         if (ac == -2) {
                             /* expression-based: eval expr to get text */
-                            if (!st->tmp_row_inited) {
-                                st->tmp_row.cells.count = child_ncols;
-                                st->tmp_row.cells.items = (struct cell *)bump_alloc(
-                                    &ctx->arena->scratch, child_ncols * sizeof(struct cell));
-                                st->tmp_row_inited = 1;
-                            }
-                            for (uint16_t c = 0; c < child_ncols; c++) {
-                                struct col_block *cb = &input.cols[c];
-                                struct cell *cell = &st->tmp_row.cells.items[c];
-                                cell->type = cb->type;
-                                if (cb->nulls[ri]) { cell->is_null = 1; memset(&cell->value, 0, sizeof(cell->value)); }
-                                else { cell->is_null = 0; cb_to_cell_at(cb, ri, cell); }
-                            }
+                            agg_reconstruct_row(input.cols, child_ncols, ri,
+                                                &st->tmp_row, &st->tmp_row_inited,
+                                                &ctx->arena->scratch);
                             struct cell cv = eval_expr(ae_str->expr_idx, ctx->arena,
                                                        pn->hash_agg.table, &st->tmp_row,
                                                        ctx->db, &ctx->arena->scratch);
@@ -2974,6 +2991,45 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         continue;
                     }
 
+                    if (ac == -2) {
+                        /* Expression-based aggregate (non-STRING_AGG): reconstruct temp row, eval expr */
+                        struct agg_expr *ae = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
+                        agg_reconstruct_row(input.cols, child_ncols, ri,
+                                            &st->tmp_row, &st->tmp_row_inited,
+                                            &ctx->arena->scratch);
+                        struct cell cv = eval_expr(ae->expr_idx, ctx->arena,
+                                                   pn->hash_agg.table, &st->tmp_row,
+                                                   ctx->db, &ctx->arena->scratch);
+                        if (cv.is_null) continue;
+                        st->nonnull[idx]++;
+                        double v = 0.0;
+                        switch (cv.type) {
+                            case COLUMN_TYPE_SMALLINT: v = (double)cv.value.as_smallint; break;
+                            case COLUMN_TYPE_INT:      v = (double)cv.value.as_int; break;
+                            case COLUMN_TYPE_BIGINT:   v = (double)cv.value.as_bigint; break;
+                            case COLUMN_TYPE_FLOAT:
+                            case COLUMN_TYPE_NUMERIC:  v = cv.value.as_float; break;
+                            case COLUMN_TYPE_BOOLEAN:  v = (double)cv.value.as_bool; break;
+                            case COLUMN_TYPE_DATE:     v = (double)cv.value.as_date; break;
+                            case COLUMN_TYPE_TIME:
+                            case COLUMN_TYPE_TIMESTAMP:
+                            case COLUMN_TYPE_TIMESTAMPTZ:
+                                v = (double)cv.value.as_timestamp; break;
+                            case COLUMN_TYPE_INTERVAL:
+                                v = (double)interval_to_usec_approx(cv.value.as_interval); break;
+                            case COLUMN_TYPE_TEXT:  break;
+                            case COLUMN_TYPE_ENUM:  break;
+                            case COLUMN_TYPE_UUID:  break;
+                        }
+                        st->sums[idx] += v;
+                        if (!st->minmax_init[idx] || v < st->mins[idx])
+                            st->mins[idx] = v;
+                        if (!st->minmax_init[idx] || v > st->maxs[idx])
+                            st->maxs[idx] = v;
+                        st->minmax_init[idx] = 1;
+                        continue;
+                    }
+
                     struct col_block *acb = &input.cols[ac];
                     if (acb->nulls[ri]) continue;
 
@@ -2988,47 +3044,9 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             continue; /* duplicate — skip */
                     }
                     st->nonnull[idx]++;
-                    if (column_type_is_text(acb->type)) {
-                        const char *s = acb->data.str[ri];
-                        if (s) {
-                            if (!st->minmax_init[idx] || strcmp(s, st->text_mins[idx]) < 0)
-                                st->text_mins[idx] = s;
-                            if (!st->minmax_init[idx] || strcmp(s, st->text_maxs[idx]) > 0)
-                                st->text_maxs[idx] = s;
-                            st->minmax_init[idx] = 1;
-                        }
-                    } else if (acb->type == COLUMN_TYPE_DATE) {
-                        int32_t v = acb->data.i32[ri];
-                        st->sums[idx] += (double)v;
-                        if (!st->minmax_init[idx] || v < (int32_t)st->mins[idx]) st->mins[idx] = (double)v;
-                        if (!st->minmax_init[idx] || v > (int32_t)st->maxs[idx]) st->maxs[idx] = (double)v;
-                        st->minmax_init[idx] = 1;
-                    } else if (acb->type == COLUMN_TYPE_TIME ||
-                               acb->type == COLUMN_TYPE_TIMESTAMP ||
-                               acb->type == COLUMN_TYPE_TIMESTAMPTZ) {
-                        int64_t v = acb->data.i64[ri];
-                        int64_t cur_min, cur_max;
-                        memcpy(&cur_min, &st->mins[idx], sizeof(int64_t));
-                        memcpy(&cur_max, &st->maxs[idx], sizeof(int64_t));
-                        if (!st->minmax_init[idx] || v < cur_min) memcpy(&st->mins[idx], &v, sizeof(double));
-                        if (!st->minmax_init[idx] || v > cur_max) memcpy(&st->maxs[idx], &v, sizeof(double));
-                        st->minmax_init[idx] = 1;
-                    } else if (acb->type == COLUMN_TYPE_INTERVAL) {
-                        int64_t v = interval_to_usec_approx(acb->data.iv[ri]);
-                        double dv = (double)v;
-                        st->sums[idx] += dv;
-                        if (!st->minmax_init[idx] || dv < st->mins[idx]) st->mins[idx] = dv;
-                        if (!st->minmax_init[idx] || dv > st->maxs[idx]) st->maxs[idx] = dv;
-                        st->minmax_init[idx] = 1;
-                    } else {
-                        double v = cb_to_double(acb, ri);
-                        st->sums[idx] += v;
-                        if (!st->minmax_init[idx] || v < st->mins[idx])
-                            st->mins[idx] = v;
-                        if (!st->minmax_init[idx] || v > st->maxs[idx])
-                            st->maxs[idx] = v;
-                        st->minmax_init[idx] = 1;
-                    }
+                    agg_accumulate_cb(acb, ri, st->sums, st->mins, st->maxs,
+                                      st->text_mins, st->text_maxs,
+                                      st->minmax_init, idx);
                 }
             }
             row_block_reset(&input);
@@ -3118,39 +3136,11 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     enum column_type src_type_mm = COLUMN_TYPE_INT;
                     if (src_col_mm >= 0 && pn->hash_agg.table)
                         src_type_mm = pn->hash_agg.table->columns.items[src_col_mm].type;
-                    if (st->nonnull[idx] == 0) {
-                        dst->type = src_type_mm;
-                        dst->nulls[out_count] = 1;
-                    } else if (column_type_is_text(src_type_mm)) {
-                        dst->type = COLUMN_TYPE_TEXT;
-                        dst->nulls[out_count] = 0;
-                        dst->data.str[out_count] = (char *)(ae->func == AGG_MIN
-                            ? st->text_mins[idx] : st->text_maxs[idx]);
-                    } else if (src_type_mm == COLUMN_TYPE_FLOAT || src_type_mm == COLUMN_TYPE_NUMERIC) {
-                        double mv = ae->func == AGG_MIN ? st->mins[idx] : st->maxs[idx];
-                        dst->type = COLUMN_TYPE_FLOAT;
-                        dst->nulls[out_count] = 0;
-                        dst->data.f64[out_count] = mv;
-                    } else if (src_type_mm == COLUMN_TYPE_BIGINT ||
-                               src_type_mm == COLUMN_TYPE_TIME ||
-                               src_type_mm == COLUMN_TYPE_TIMESTAMP ||
-                               src_type_mm == COLUMN_TYPE_TIMESTAMPTZ) {
-                        int64_t mv;
-                        memcpy(&mv, ae->func == AGG_MIN ? &st->mins[idx] : &st->maxs[idx], sizeof(int64_t));
-                        dst->type = src_type_mm;
-                        dst->nulls[out_count] = 0;
-                        dst->data.i64[out_count] = mv;
-                    } else if (src_type_mm == COLUMN_TYPE_DATE) {
-                        double mv = ae->func == AGG_MIN ? st->mins[idx] : st->maxs[idx];
-                        dst->type = COLUMN_TYPE_DATE;
-                        dst->nulls[out_count] = 0;
-                        dst->data.i32[out_count] = (int32_t)mv;
-                    } else {
-                        double mv = ae->func == AGG_MIN ? st->mins[idx] : st->maxs[idx];
-                        dst->type = COLUMN_TYPE_INT;
-                        dst->nulls[out_count] = 0;
-                        dst->data.i32[out_count] = (int32_t)mv;
-                    }
+                    agg_emit_minmax(dst, out_count, src_type_mm,
+                                    ae->func == AGG_MIN,
+                                    st->mins, st->maxs,
+                                    st->text_mins, st->text_maxs,
+                                    st->nonnull, idx);
                     break;
                 }
                 case AGG_STRING_AGG:
@@ -3245,24 +3235,9 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     /* FILTER (WHERE ...): evaluate per-aggregate filter condition */
                     struct agg_expr *ae_filt = &ctx->arena->aggregates.items[pn->simple_agg.agg_start + a];
                     if (ae_filt->filter_cond != IDX_NONE) {
-                        if (!st->tmp_row_inited) {
-                            st->tmp_row.cells.count = child_ncols;
-                            st->tmp_row.cells.items = (struct cell *)bump_alloc(
-                                &ctx->arena->scratch, child_ncols * sizeof(struct cell));
-                            st->tmp_row_inited = 1;
-                        }
-                        for (uint16_t c = 0; c < child_ncols; c++) {
-                            struct col_block *cb = &input.cols[c];
-                            struct cell *cell = &st->tmp_row.cells.items[c];
-                            cell->type = cb->type;
-                            if (cb->nulls[ri]) {
-                                cell->is_null = 1;
-                                memset(&cell->value, 0, sizeof(cell->value));
-                            } else {
-                                cell->is_null = 0;
-                                cb_to_cell_at(cb, ri, cell);
-                            }
-                        }
+                        agg_reconstruct_row(input.cols, child_ncols, ri,
+                                            &st->tmp_row, &st->tmp_row_inited,
+                                            &ctx->arena->scratch);
                         if (!eval_condition(ae_filt->filter_cond, ctx->arena,
                                             &st->tmp_row, pn->simple_agg.table, NULL))
                             continue;
@@ -3278,24 +3253,9 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (ac == -2) {
                         /* Expression-based aggregate */
                         struct agg_expr *ae = &ctx->arena->aggregates.items[pn->simple_agg.agg_start + a];
-                        if (!st->tmp_row_inited) {
-                            st->tmp_row.cells.count = child_ncols;
-                            st->tmp_row.cells.items = (struct cell *)bump_alloc(
-                                &ctx->arena->scratch, child_ncols * sizeof(struct cell));
-                            st->tmp_row_inited = 1;
-                        }
-                        for (uint16_t c = 0; c < child_ncols; c++) {
-                            struct col_block *cb = &input.cols[c];
-                            struct cell *cell = &st->tmp_row.cells.items[c];
-                            cell->type = cb->type;
-                            if (cb->nulls[ri]) {
-                                cell->is_null = 1;
-                                memset(&cell->value, 0, sizeof(cell->value));
-                            } else {
-                                cell->is_null = 0;
-                                cb_to_cell_at(cb, ri, cell);
-                            }
-                        }
+                        agg_reconstruct_row(input.cols, child_ncols, ri,
+                                            &st->tmp_row, &st->tmp_row_inited,
+                                            &ctx->arena->scratch);
                         struct cell cv = eval_expr(ae->expr_idx, ctx->arena,
                                                    pn->simple_agg.table, &st->tmp_row,
                                                    ctx->db, &ctx->arena->scratch);
@@ -3346,48 +3306,9 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             continue; /* duplicate — skip */
                     }
                     st->nonnull[a]++;
-                    if (column_type_is_text(acb->type)) {
-                        const char *s = acb->data.str[ri];
-                        if (s) {
-                            if (!st->minmax_init[a] || strcmp(s, st->text_mins[a]) < 0)
-                                st->text_mins[a] = s;
-                            if (!st->minmax_init[a] || strcmp(s, st->text_maxs[a]) > 0)
-                                st->text_maxs[a] = s;
-                            st->minmax_init[a] = 1;
-                        }
-                    } else if (acb->type == COLUMN_TYPE_DATE) {
-                        int32_t v = acb->data.i32[ri];
-                        st->sums[a] += (double)v;
-                        if (!st->minmax_init[a] || v < (int32_t)st->mins[a]) st->mins[a] = (double)v;
-                        if (!st->minmax_init[a] || v > (int32_t)st->maxs[a]) st->maxs[a] = (double)v;
-                        st->minmax_init[a] = 1;
-                    } else if (acb->type == COLUMN_TYPE_TIME ||
-                               acb->type == COLUMN_TYPE_TIMESTAMP ||
-                               acb->type == COLUMN_TYPE_TIMESTAMPTZ) {
-                        int64_t v = acb->data.i64[ri];
-                        st->nonnull[a]--; /* undo the increment above; we handle nonnull here */
-                        st->nonnull[a]++;
-                        /* Store as int64 bits in the double slot */
-                        int64_t cur_min, cur_max;
-                        memcpy(&cur_min, &st->mins[a], sizeof(int64_t));
-                        memcpy(&cur_max, &st->maxs[a], sizeof(int64_t));
-                        if (!st->minmax_init[a] || v < cur_min) memcpy(&st->mins[a], &v, sizeof(double));
-                        if (!st->minmax_init[a] || v > cur_max) memcpy(&st->maxs[a], &v, sizeof(double));
-                        st->minmax_init[a] = 1;
-                    } else if (acb->type == COLUMN_TYPE_INTERVAL) {
-                        int64_t v = interval_to_usec_approx(acb->data.iv[ri]);
-                        double dv = (double)v;
-                        st->sums[a] += dv;
-                        if (!st->minmax_init[a] || dv < st->mins[a]) st->mins[a] = dv;
-                        if (!st->minmax_init[a] || dv > st->maxs[a]) st->maxs[a] = dv;
-                        st->minmax_init[a] = 1;
-                    } else {
-                        double v = cb_to_double(acb, ri);
-                        st->sums[a] += v;
-                        if (!st->minmax_init[a] || v < st->mins[a]) st->mins[a] = v;
-                        if (!st->minmax_init[a] || v > st->maxs[a]) st->maxs[a] = v;
-                        st->minmax_init[a] = 1;
-                    }
+                    agg_accumulate_cb(acb, ri, st->sums, st->mins, st->maxs,
+                                      st->text_mins, st->text_maxs,
+                                      st->minmax_init, a);
                 }
             }
             row_block_reset(&input);
@@ -3458,39 +3379,11 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 enum column_type src_type_mm = COLUMN_TYPE_INT;
                 if (src_col_mm >= 0 && pn->simple_agg.table)
                     src_type_mm = pn->simple_agg.table->columns.items[src_col_mm].type;
-                if (st->nonnull[a] == 0) {
-                    dst->type = src_type_mm;
-                    dst->nulls[0] = 1;
-                } else if (column_type_is_text(src_type_mm)) {
-                    dst->type = COLUMN_TYPE_TEXT;
-                    dst->nulls[0] = 0;
-                    dst->data.str[0] = (char *)(ae->func == AGG_MIN
-                        ? st->text_mins[a] : st->text_maxs[a]);
-                } else if (src_type_mm == COLUMN_TYPE_FLOAT || src_type_mm == COLUMN_TYPE_NUMERIC) {
-                    double mv = ae->func == AGG_MIN ? st->mins[a] : st->maxs[a];
-                    dst->type = COLUMN_TYPE_FLOAT;
-                    dst->nulls[0] = 0;
-                    dst->data.f64[0] = mv;
-                } else if (src_type_mm == COLUMN_TYPE_BIGINT ||
-                           src_type_mm == COLUMN_TYPE_TIME ||
-                           src_type_mm == COLUMN_TYPE_TIMESTAMP ||
-                           src_type_mm == COLUMN_TYPE_TIMESTAMPTZ) {
-                    int64_t mv;
-                    memcpy(&mv, ae->func == AGG_MIN ? &st->mins[a] : &st->maxs[a], sizeof(int64_t));
-                    dst->type = src_type_mm;
-                    dst->nulls[0] = 0;
-                    dst->data.i64[0] = mv;
-                } else if (src_type_mm == COLUMN_TYPE_DATE) {
-                    double mv = ae->func == AGG_MIN ? st->mins[a] : st->maxs[a];
-                    dst->type = COLUMN_TYPE_DATE;
-                    dst->nulls[0] = 0;
-                    dst->data.i32[0] = (int32_t)mv;
-                } else {
-                    double mv = ae->func == AGG_MIN ? st->mins[a] : st->maxs[a];
-                    dst->type = COLUMN_TYPE_INT;
-                    dst->nulls[0] = 0;
-                    dst->data.i32[0] = (int32_t)mv;
-                }
+                agg_emit_minmax(dst, 0, src_type_mm,
+                                ae->func == AGG_MIN,
+                                st->mins, st->maxs,
+                                st->text_mins, st->text_maxs,
+                                st->nonnull, a);
                 break;
             }
             case AGG_STRING_AGG:
@@ -7129,6 +7022,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     if (s->has_recursive_cte)   return PLAN_RES_NOTIMPL;
     if (s->has_distinct_on)     return PLAN_RES_NOTIMPL;
     if (s->insert_rows_count > 0) return PLAN_RES_NOTIMPL;
+    if (s->has_expr_aggs)       return PLAN_RES_NOTIMPL; /* COALESCE(SUM(...),0) etc. */
     /* HAVING without GROUP BY is handled in build_simple_agg */
     if (s->group_by_rollup || s->group_by_cube) return PLAN_RES_NOTIMPL;
 
@@ -7774,6 +7668,7 @@ static struct plan_result build_window(struct table *t, struct query_select *s,
     uint16_t n_pass = 0, n_win = 0;
     for (size_t e = 0; e < nexprs; e++) {
         struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
+        if (se->kind == SEL_EXPR_WIN) return PLAN_RES_NOTIMPL; /* expression with embedded window */
         if (se->kind == SEL_COLUMN) n_pass++;
         else n_win++;
     }
@@ -8121,6 +8016,8 @@ static enum plan_status validate_agg_columns(struct table *t, struct query_selec
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
         if (ae->func == AGG_NONE)
             return PLAN_NOTIMPL;
+        if (ae->order_by_col.len > 0)
+            return PLAN_NOTIMPL; /* STRING_AGG ORDER BY — fall to legacy path */
         if (ae->expr_idx != IDX_NONE) {
             agg_col_idxs[a] = -2; /* expression-based aggregate */
         } else if (sv_eq_cstr(ae->column, "*")) {
@@ -8538,6 +8435,19 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
     uint32_t *expr_proj_indices = NULL;
     uint16_t proj_ncols = 0;
 
+    /* Bail if any parsed_column is a * wildcard mixed with other columns (SELECT *, expr) */
+    if (!select_all && s->parsed_columns_count > 1) {
+        for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+            struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
+            if (sc->expr_idx != IDX_NONE) {
+                struct expr *e = &EXPR(arena, sc->expr_idx);
+                if (e->type == EXPR_COLUMN_REF && e->column_ref.column.len == 1 &&
+                    e->column_ref.column.data[0] == '*')
+                    return PLAN_RES_NOTIMPL;
+            }
+        }
+    }
+
     if (select_all) {
         /* No projection needed — return all columns */
     } else if (s->parsed_columns_count > 0) {
@@ -8935,6 +8845,10 @@ struct plan_result plan_build_select(struct table *t, struct query_select *s,
         struct plan_result agg_pr = build_aggregate(t, s, arena);
         if (agg_pr.status == PLAN_OK) return agg_pr;
     }
+
+    /* ---- Inline aggregate expressions (e.g. SUM(val) + 1) ---- */
+    if (s->has_expr_aggs)
+        return PLAN_RES_NOTIMPL;
 
     /* ---- Single-table path ---- */
     return build_single_table(t, s, arena, db);

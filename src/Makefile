@@ -60,8 +60,13 @@ $(CARQUET_LIB): $(CARQUET_DIR)/CMakeLists.txt | $(BUILDDIR)
 		>/dev/null 2>&1
 	@$(MAKE) -C $(CARQUET_BUILD) --no-print-directory -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu) >/dev/null 2>&1
 
+OMP_LDFLAGS =
+ifeq ($(UNAME_S),Darwin)
+  OMP_LDFLAGS = -L/opt/homebrew/opt/llvm/lib -lomp
+endif
+
 $(TARGET): $(OBJS) $(CARQUET_LIB)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(CARQUET_LIB) -lm $(CARQUET_LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(CARQUET_LIB) -lm $(CARQUET_LDFLAGS) $(OMP_LDFLAGS)
 
 RELEASE_TARGET = $(BUILDDIR)/mskql
 
