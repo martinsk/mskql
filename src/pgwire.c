@@ -1696,6 +1696,508 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
     return (int)total_rows;
 }
 
+/* ---- Correlated subquery decorrelation ---- */
+
+/* Detect the pattern:
+ *   SELECT outer_cols..., (SELECT AGG(inner.col) FROM inner WHERE inner.ref = outer.key)
+ *   FROM outer [WHERE ...]
+ * Decorrelate by materializing:
+ *   SELECT ref, AGG(col) FROM inner GROUP BY ref
+ * as a temp table, then building a LEFT HASH JOIN plan.
+ *
+ * Returns row count on success, -1 if pattern doesn't match or can't be decorrelated. */
+static int try_decorrelate_subquery(int fd, struct database *db, struct query *q,
+                                     const char *sql, size_t sql_len)
+{
+    struct query_select *s = &q->select;
+    struct query_arena *qa = &q->arena;
+
+    /* Must be a single-table SELECT with parsed columns */
+    if (s->has_join || s->has_set_op || s->has_group_by || s->aggregates_count > 0 ||
+        s->ctes_count > 0 || s->cte_sql != IDX_NONE || s->from_subquery_sql != IDX_NONE ||
+        s->has_recursive_cte || s->select_exprs_count > 0 || s->has_distinct ||
+        s->parsed_columns_count == 0 || s->has_generate_series)
+        return -1;
+
+    struct table *outer_t = NULL;
+    if (s->table.len > 0)
+        outer_t = db_find_table_sv(db, s->table);
+    if (!outer_t || outer_t->view_sql) return -1;
+
+    /* Scan parsed columns for exactly one EXPR_SUBQUERY */
+    int subq_col_idx = -1;
+    uint32_t subq_expr_idx = IDX_NONE;
+    int n_subq = 0;
+    for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+        struct select_column *sc = &qa->select_cols.items[s->parsed_columns_start + i];
+        if (sc->expr_idx == IDX_NONE) continue;
+        struct expr *e = &EXPR(qa, sc->expr_idx);
+        if (e->type == EXPR_SUBQUERY) {
+            subq_col_idx = (int)i;
+            subq_expr_idx = sc->expr_idx;
+            n_subq++;
+        }
+    }
+    if (n_subq != 1 || subq_col_idx < 0) return -1;
+
+    /* Get the subquery SQL */
+    struct expr *sq_expr = &EXPR(qa, subq_expr_idx);
+    const char *sq_sql = ASTRING(qa, sq_expr->subquery.sql_idx);
+    if (!sq_sql || !*sq_sql) return -1;
+
+    /* Parse the subquery SQL to detect the pattern:
+     *   SELECT AGG(inner.col) FROM inner WHERE inner.ref = outer.key
+     * We do lightweight string parsing since the subquery is stored as raw SQL. */
+
+    /* Find aggregate function: MAX, MIN, SUM, AVG, COUNT */
+    const char *agg_name = NULL;
+    const char *agg_start = NULL;
+    static const char *agg_names[] = {"MAX(", "MIN(", "SUM(", "AVG(", "COUNT(", NULL};
+    char sq_upper[2048];
+    size_t sq_len = strlen(sq_sql);
+    if (sq_len >= sizeof(sq_upper)) return -1;
+    for (size_t i = 0; i < sq_len; i++)
+        sq_upper[i] = (char)toupper((unsigned char)sq_sql[i]);
+    sq_upper[sq_len] = '\0';
+
+    for (int a = 0; agg_names[a]; a++) {
+        const char *found = strstr(sq_upper, agg_names[a]);
+        if (found) {
+            agg_name = agg_names[a];
+            agg_start = sq_sql + (found - sq_upper);
+            break;
+        }
+    }
+    if (!agg_name) return -1;
+
+    /* Extract the aggregate argument (column name inside the parens) */
+    const char *arg_begin = agg_start + strlen(agg_name);
+    const char *arg_end = strchr(arg_begin, ')');
+    if (!arg_end || arg_end - arg_begin > 200) return -1;
+    char agg_arg[256];
+    size_t arg_len = (size_t)(arg_end - arg_begin);
+    memcpy(agg_arg, arg_begin, arg_len);
+    agg_arg[arg_len] = '\0';
+    /* Strip table prefix from agg arg (e.g. "csq_detail.score" → "score") */
+    char *dot = strchr(agg_arg, '.');
+    const char *agg_col_name = dot ? dot + 1 : agg_arg;
+    /* Trim whitespace */
+    while (*agg_col_name == ' ') agg_col_name++;
+
+    /* Find FROM clause to get inner table name */
+    const char *from_pos = strstr(sq_upper, "FROM ");
+    if (!from_pos) return -1;
+    const char *tbl_start = sq_sql + (from_pos - sq_upper) + 5;
+    while (*tbl_start == ' ') tbl_start++;
+    const char *tbl_end = tbl_start;
+    while (*tbl_end && *tbl_end != ' ' && *tbl_end != '\n' && *tbl_end != '\t') tbl_end++;
+    if (tbl_end <= tbl_start || tbl_end - tbl_start > 200) return -1;
+    char inner_tbl_name[256];
+    memcpy(inner_tbl_name, tbl_start, (size_t)(tbl_end - tbl_start));
+    inner_tbl_name[tbl_end - tbl_start] = '\0';
+
+    struct table *inner_t = db_find_table(db, inner_tbl_name);
+    if (!inner_t || inner_t->view_sql) return -1;
+
+    /* Find WHERE clause to extract correlation: inner.ref = outer.key */
+    const char *where_pos = strstr(sq_upper, "WHERE ");
+    if (!where_pos) return -1;
+    const char *cond_start = sq_sql + (where_pos - sq_upper) + 6;
+    while (*cond_start == ' ') cond_start++;
+
+    /* Parse "inner.ref_col = outer.key_col" or "outer.key_col = inner.ref_col" */
+    const char *eq_pos = strchr(cond_start, '=');
+    if (!eq_pos) return -1;
+
+    /* Extract LHS and RHS of the = */
+    char lhs[256], rhs[256];
+    {
+        const char *l = cond_start;
+        while (*l == ' ') l++;
+        const char *le = eq_pos;
+        while (le > l && le[-1] == ' ') le--;
+        if (le <= l || (size_t)(le - l) >= sizeof(lhs)) return -1;
+        memcpy(lhs, l, (size_t)(le - l));
+        lhs[le - l] = '\0';
+    }
+    {
+        const char *r = eq_pos + 1;
+        while (*r == ' ') r++;
+        const char *re = r;
+        while (*re && *re != ' ' && *re != ')' && *re != '\n' && *re != ';') re++;
+        if (re <= r || (size_t)(re - r) >= sizeof(rhs)) return -1;
+        memcpy(rhs, r, (size_t)(re - r));
+        rhs[re - r] = '\0';
+    }
+
+    /* Determine which side is the inner table ref and which is the outer table ref.
+     * Pattern: "inner_table.col = outer_table.col" or vice versa */
+    char inner_ref_col[128] = {0}, outer_ref_col[128] = {0};
+    size_t inner_name_len = strlen(inner_tbl_name);
+    size_t outer_name_len = strlen(outer_t->name);
+
+    /* Check LHS */
+    if (strncasecmp(lhs, inner_tbl_name, inner_name_len) == 0 && lhs[inner_name_len] == '.') {
+        strncpy(inner_ref_col, lhs + inner_name_len + 1, sizeof(inner_ref_col) - 1);
+    } else if (strncasecmp(lhs, outer_t->name, outer_name_len) == 0 && lhs[outer_name_len] == '.') {
+        strncpy(outer_ref_col, lhs + outer_name_len + 1, sizeof(outer_ref_col) - 1);
+    } else {
+        /* Try without table prefix — check if it's a column in inner or outer */
+        dot = strchr(lhs, '.');
+        if (dot) {
+            /* Has a prefix but doesn't match either table — could be an alias */
+            const char *col_part = dot + 1;
+            if (table_find_column(inner_t, col_part) >= 0)
+                strncpy(inner_ref_col, col_part, sizeof(inner_ref_col) - 1);
+            else if (table_find_column(outer_t, col_part) >= 0)
+                strncpy(outer_ref_col, col_part, sizeof(outer_ref_col) - 1);
+            else return -1;
+        } else {
+            if (table_find_column(inner_t, lhs) >= 0)
+                strncpy(inner_ref_col, lhs, sizeof(inner_ref_col) - 1);
+            else if (table_find_column(outer_t, lhs) >= 0)
+                strncpy(outer_ref_col, lhs, sizeof(outer_ref_col) - 1);
+            else return -1;
+        }
+    }
+
+    /* Check RHS */
+    if (strncasecmp(rhs, inner_tbl_name, inner_name_len) == 0 && rhs[inner_name_len] == '.') {
+        if (inner_ref_col[0]) return -1; /* both sides are inner? */
+        strncpy(inner_ref_col, rhs + inner_name_len + 1, sizeof(inner_ref_col) - 1);
+    } else if (strncasecmp(rhs, outer_t->name, outer_name_len) == 0 && rhs[outer_name_len] == '.') {
+        if (outer_ref_col[0]) return -1; /* both sides are outer? */
+        strncpy(outer_ref_col, rhs + outer_name_len + 1, sizeof(outer_ref_col) - 1);
+    } else {
+        dot = strchr(rhs, '.');
+        if (dot) {
+            const char *col_part = dot + 1;
+            if (!inner_ref_col[0] && table_find_column(inner_t, col_part) >= 0)
+                strncpy(inner_ref_col, col_part, sizeof(inner_ref_col) - 1);
+            else if (!outer_ref_col[0] && table_find_column(outer_t, col_part) >= 0)
+                strncpy(outer_ref_col, col_part, sizeof(outer_ref_col) - 1);
+            else return -1;
+        } else {
+            if (!inner_ref_col[0] && table_find_column(inner_t, rhs) >= 0)
+                strncpy(inner_ref_col, rhs, sizeof(inner_ref_col) - 1);
+            else if (!outer_ref_col[0] && table_find_column(outer_t, rhs) >= 0)
+                strncpy(outer_ref_col, rhs, sizeof(outer_ref_col) - 1);
+            else return -1;
+        }
+    }
+
+    if (!inner_ref_col[0] || !outer_ref_col[0]) return -1;
+
+    /* Validate columns exist */
+    int inner_ref_ci = table_find_column(inner_t, inner_ref_col);
+    int inner_agg_ci = table_find_column(inner_t, agg_col_name);
+    int outer_key_ci = table_find_column(outer_t, outer_ref_col);
+    if (inner_ref_ci < 0 || inner_agg_ci < 0 || outer_key_ci < 0) return -1;
+
+    /* Build the aggregate SQL: SELECT ref_col, AGG(agg_col) FROM inner GROUP BY ref_col */
+    char agg_func[16];
+    size_t agg_name_len = strlen(agg_name) - 1; /* strip trailing '(' */
+    memcpy(agg_func, agg_name, agg_name_len);
+    agg_func[agg_name_len] = '\0';
+
+    char mat_sql[1024];
+    snprintf(mat_sql, sizeof(mat_sql),
+             "SELECT %s, %s(%s) FROM %s GROUP BY %s",
+             inner_ref_col, agg_func, agg_col_name, inner_tbl_name, inner_ref_col);
+
+    struct table *agg_temp = materialize_subquery(db, mat_sql, "__csq_agg_temp");
+    if (!agg_temp) return -1;
+    if (agg_temp->columns.count < 2) {
+        remove_temp_table(db, agg_temp);
+        return -1;
+    }
+
+    /* Now build a plan: outer_scan → LEFT HASH JOIN with agg_temp → PROJECT */
+    uint16_t outer_ncols = (uint16_t)outer_t->columns.count;
+    uint16_t agg_ncols = (uint16_t)agg_temp->columns.count; /* 2: ref_col, agg_result */
+
+    /* Build outer scan */
+    int *outer_col_map = (int *)bump_alloc(&qa->scratch, outer_ncols * sizeof(int));
+    for (uint16_t i = 0; i < outer_ncols; i++) outer_col_map[i] = (int)i;
+    uint32_t outer_scan = plan_alloc_node(qa, PLAN_SEQ_SCAN);
+    PLAN_NODE(qa, outer_scan).seq_scan.table = outer_t;
+    PLAN_NODE(qa, outer_scan).seq_scan.ncols = outer_ncols;
+    PLAN_NODE(qa, outer_scan).seq_scan.col_map = outer_col_map;
+
+    /* Add WHERE filter if present */
+    uint32_t outer_current = outer_scan;
+    /* We'll handle the WHERE by building the plan normally for the outer table
+     * and then replacing the subquery column. But since plan_build_select
+     * doesn't know about our join, we build the filter manually. */
+
+    /* Build inner (agg_temp) scan */
+    int *inner_col_map = (int *)bump_alloc(&qa->scratch, agg_ncols * sizeof(int));
+    for (uint16_t i = 0; i < agg_ncols; i++) inner_col_map[i] = (int)i;
+    uint32_t inner_scan = plan_alloc_node(qa, PLAN_SEQ_SCAN);
+    PLAN_NODE(qa, inner_scan).seq_scan.table = agg_temp;
+    PLAN_NODE(qa, inner_scan).seq_scan.ncols = agg_ncols;
+    PLAN_NODE(qa, inner_scan).seq_scan.col_map = inner_col_map;
+
+    /* Build LEFT HASH JOIN */
+    uint32_t join_idx = plan_alloc_node(qa, PLAN_HASH_JOIN);
+    PLAN_NODE(qa, join_idx).left = outer_current;
+    PLAN_NODE(qa, join_idx).right = inner_scan;
+    PLAN_NODE(qa, join_idx).hash_join.outer_key_col = outer_key_ci;
+    PLAN_NODE(qa, join_idx).hash_join.inner_key_col = 0; /* ref_col is column 0 in agg_temp */
+    PLAN_NODE(qa, join_idx).hash_join.join_type = 1; /* LEFT */
+
+    /* Build PROJECT to select the right columns:
+     * For each parsed column: if it's a column ref → map to outer col index,
+     * if it's the subquery → map to the agg result column (outer_ncols + 1) */
+    uint16_t proj_ncols = (uint16_t)s->parsed_columns_count;
+    int *proj_map = (int *)bump_alloc(&qa->scratch, proj_ncols * sizeof(int));
+    for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+        if ((int)i == subq_col_idx) {
+            proj_map[i] = (int)(outer_ncols + 1); /* agg result is column 1 in agg_temp */
+        } else {
+            struct select_column *sc = &qa->select_cols.items[s->parsed_columns_start + i];
+            if (sc->expr_idx == IDX_NONE) { remove_temp_table(db, agg_temp); return -1; }
+            struct expr *e = &EXPR(qa, sc->expr_idx);
+            if (e->type != EXPR_COLUMN_REF) { remove_temp_table(db, agg_temp); return -1; }
+            int ci = table_find_column_sv(outer_t, e->column_ref.column);
+            if (ci < 0) { remove_temp_table(db, agg_temp); return -1; }
+            proj_map[i] = ci;
+        }
+    }
+
+    uint32_t proj_idx = plan_alloc_node(qa, PLAN_PROJECT);
+    PLAN_NODE(qa, proj_idx).left = join_idx;
+    PLAN_NODE(qa, proj_idx).project.ncols = proj_ncols;
+    PLAN_NODE(qa, proj_idx).project.col_map = proj_map;
+
+    uint32_t current = proj_idx;
+
+    /* Add WHERE filter on the outer table if present.
+     * We need to add it BEFORE the join (on the outer scan).
+     * Re-check: actually, we should add the filter on the outer scan node. */
+    if (s->where.has_where && s->where.where_cond != IDX_NONE) {
+        /* Build a simple filter on the outer scan.
+         * We need to insert the filter between outer_scan and the join. */
+        struct condition *cond = &COND(qa, s->where.where_cond);
+        if (cond->type == COND_COMPARE && cond->op <= CMP_GE &&
+            cond->rhs_column.len == 0 && cond->subquery_sql == IDX_NONE &&
+            cond->scalar_subquery_sql == IDX_NONE) {
+            int fc = table_find_column_sv(outer_t, cond->column);
+            if (fc >= 0) {
+                uint32_t filt_idx = plan_alloc_node(qa, PLAN_FILTER);
+                PLAN_NODE(qa, filt_idx).left = outer_scan;
+                PLAN_NODE(qa, filt_idx).filter.cond_idx = s->where.where_cond;
+                PLAN_NODE(qa, filt_idx).filter.col_idx = fc;
+                PLAN_NODE(qa, filt_idx).filter.cmp_op = (int)cond->op;
+                PLAN_NODE(qa, filt_idx).filter.cmp_val = cond->value;
+                /* Rewire the join to use the filter as left child */
+                PLAN_NODE(qa, join_idx).left = filt_idx;
+            }
+        }
+    }
+
+    /* Add SORT if ORDER BY present */
+    if (s->has_order_by && s->order_by_count > 0) {
+        /* ORDER BY columns reference the projected output */
+        uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+        int *sc_arr = (int *)bump_alloc(&qa->scratch, sort_nord * sizeof(int));
+        int *sd_arr = (int *)bump_alloc(&qa->scratch, sort_nord * sizeof(int));
+        int *snf_arr = (int *)bump_alloc(&qa->scratch, sort_nord * sizeof(int));
+        int sort_ok = 1;
+        for (uint16_t k = 0; k < sort_nord; k++) {
+            struct order_by_item *obi = &qa->order_items.items[s->order_by_start + k];
+            sd_arr[k] = obi->desc;
+            snf_arr[k] = obi->nulls_first;
+            /* Find the column in the projected output */
+            int found = -1;
+            for (uint32_t pi = 0; pi < s->parsed_columns_count; pi++) {
+                struct select_column *psc = &qa->select_cols.items[s->parsed_columns_start + pi];
+                if (psc->alias.len > 0 && sv_eq_ignorecase(obi->column, psc->alias)) {
+                    found = (int)pi; break;
+                }
+                if (psc->expr_idx != IDX_NONE) {
+                    struct expr *pe = &EXPR(qa, psc->expr_idx);
+                    if (pe->type == EXPR_COLUMN_REF && sv_eq_ignorecase(obi->column, pe->column_ref.column)) {
+                        found = (int)pi; break;
+                    }
+                }
+            }
+            if (found < 0) {
+                /* Try direct table column lookup in projected map */
+                int tci = table_find_column_sv(outer_t, obi->column);
+                if (tci >= 0) {
+                    for (uint32_t pi = 0; pi < s->parsed_columns_count; pi++) {
+                        if (proj_map[pi] == tci) { found = (int)pi; break; }
+                    }
+                }
+            }
+            if (found < 0) { sort_ok = 0; break; }
+            sc_arr[k] = found;
+        }
+        if (sort_ok) {
+            uint32_t sort_idx = plan_alloc_node(qa, PLAN_SORT);
+            PLAN_NODE(qa, sort_idx).left = current;
+            PLAN_NODE(qa, sort_idx).sort.sort_cols = sc_arr;
+            PLAN_NODE(qa, sort_idx).sort.sort_descs = sd_arr;
+            PLAN_NODE(qa, sort_idx).sort.sort_nulls_first = snf_arr;
+            PLAN_NODE(qa, sort_idx).sort.nsort_cols = sort_nord;
+            current = sort_idx;
+        }
+    }
+
+    /* Add LIMIT/OFFSET */
+    if (s->has_limit || s->has_offset) {
+        uint32_t lim_idx = plan_alloc_node(qa, PLAN_LIMIT);
+        PLAN_NODE(qa, lim_idx).left = current;
+        PLAN_NODE(qa, lim_idx).limit.has_limit = s->has_limit;
+        PLAN_NODE(qa, lim_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
+        PLAN_NODE(qa, lim_idx).limit.has_offset = s->has_offset;
+        PLAN_NODE(qa, lim_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
+        current = lim_idx;
+    }
+
+    /* Execute the plan and send results */
+    struct plan_exec_ctx ctx;
+    plan_exec_init(&ctx, qa, db, current);
+
+    uint16_t ncols = plan_node_ncols(qa, current);
+    if (ncols == 0) { remove_temp_table(db, agg_temp); return -1; }
+
+    struct row_block block;
+    row_block_alloc(&block, ncols, &qa->scratch);
+
+    int rc = plan_next_block(&ctx, current, &block);
+    if (rc != 0) {
+        if (qa->errmsg[0]) { remove_temp_table(db, agg_temp); return -1; }
+        /* No rows — send empty result */
+        enum column_type types[64];
+        for (uint16_t i = 0; i < ncols && i < 64; i++)
+            types[i] = COLUMN_TYPE_INT;
+        /* Build column types from projection */
+        for (uint32_t i = 0; i < s->parsed_columns_count && i < 64; i++) {
+            if ((int)i == subq_col_idx) {
+                types[i] = agg_temp->columns.count > 1 ? agg_temp->columns.items[1].type : COLUMN_TYPE_INT;
+            } else {
+                struct select_column *sc = &qa->select_cols.items[s->parsed_columns_start + i];
+                if (sc->expr_idx != IDX_NONE) {
+                    struct expr *e = &EXPR(qa, sc->expr_idx);
+                    if (e->type == EXPR_COLUMN_REF) {
+                        int ci = table_find_column_sv(outer_t, e->column_ref.column);
+                        if (ci >= 0) types[i] = outer_t->columns.items[ci].type;
+                    }
+                }
+            }
+        }
+        send_row_desc_plan(fd, outer_t, NULL, 0, q, ncols, types);
+        remove_temp_table(db, agg_temp);
+        return 0;
+    }
+
+    /* Determine column types from first block */
+    enum column_type col_types[64];
+    for (uint16_t i = 0; i < ncols && i < 64; i++)
+        col_types[i] = block.cols[i].type;
+
+    /* Build and send RowDescription */
+    struct msgbuf rd_buf;
+    msgbuf_init(&rd_buf);
+    build_row_desc_for_plan(&rd_buf, q, outer_t, NULL, 0, ncols, col_types);
+
+    if (msg_send(fd, 'T', &rd_buf) != 0) {
+        msgbuf_free(&rd_buf);
+        remove_temp_table(db, agg_temp);
+        return -1;
+    }
+
+    /* Send data rows */
+    struct msgbuf wire;
+    msgbuf_init(&wire);
+    msgbuf_ensure(&wire, 262144);
+
+    /* Result cache */
+    uint32_t rc_hash = rcache_hash_sql(sql, sql_len);
+    uint32_t rc_slot = rc_hash & (RCACHE_SLOTS - 1);
+    uint64_t rc_gen = db->total_generation;
+    struct rcache_entry *rce = &g_rcache[rc_slot];
+
+    struct msgbuf cache_buf;
+    msgbuf_init(&cache_buf);
+    {
+        uint8_t hdr[5];
+        hdr[0] = 'T';
+        uint32_t rd_body_len = (uint32_t)(rd_buf.len + 4);
+        put_u32(hdr + 1, rd_body_len);
+        msgbuf_push(&cache_buf, hdr, 5);
+        msgbuf_push(&cache_buf, rd_buf.data, rd_buf.len);
+    }
+    msgbuf_free(&rd_buf);
+
+    size_t total_rows = 0;
+    int cache_active = 1;
+
+    for (;;) {
+        size_t wire_before = wire.len;
+        uint16_t vec_rows = serialize_numeric_block(&wire, &block, ncols);
+        if (vec_rows > 0) {
+            if (cache_active && cache_buf.len < RCACHE_MAX_BYTES)
+                msgbuf_push(&cache_buf, wire.data + wire_before, wire.len - wire_before);
+            else cache_active = 0;
+            total_rows += vec_rows;
+        } else {
+            uint16_t active = row_block_active_count(&block);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = row_block_row_idx(&block, r);
+                size_t msg_start = wire.len;
+                msgbuf_ensure(&wire, 5);
+                wire.len += 5;
+                msgbuf_push_u16(&wire, ncols);
+                for (uint16_t c = 0; c < ncols; c++)
+                    msgbuf_push_col_cell(&wire, &block.cols[c], ri, db, outer_t, c < outer_ncols ? c : 0);
+                wire.data[msg_start] = 'D';
+                uint32_t body_len = (uint32_t)(wire.len - msg_start - 1);
+                put_u32(wire.data + msg_start + 1, body_len);
+                if (cache_active && cache_buf.len < RCACHE_MAX_BYTES)
+                    msgbuf_push(&cache_buf, wire.data + msg_start, wire.len - msg_start);
+                total_rows++;
+            }
+            if (cache_buf.len >= RCACHE_MAX_BYTES) cache_active = 0;
+        }
+
+        if (wire.len >= 262144) {
+            if (send_all(fd, wire.data, wire.len) != 0) {
+                msgbuf_free(&wire); msgbuf_free(&cache_buf);
+                remove_temp_table(db, agg_temp);
+                return -1;
+            }
+            wire.len = 0;
+        }
+
+        row_block_reset(&block);
+        if (plan_next_block(&ctx, current, &block) != 0) {
+            if (qa->errmsg[0]) {
+                msgbuf_free(&wire); msgbuf_free(&cache_buf);
+                remove_temp_table(db, agg_temp);
+                return -1;
+            }
+            break;
+        }
+    }
+
+    if (wire.len > 0) {
+        if (send_all(fd, wire.data, wire.len) != 0) {
+            msgbuf_free(&wire); msgbuf_free(&cache_buf);
+            remove_temp_table(db, agg_temp);
+            return -1;
+        }
+    }
+    msgbuf_free(&wire);
+
+    rcache_store_plan_result(rce, rc_hash, rc_gen, (int)total_rows, &cache_buf);
+    msgbuf_free(&cache_buf);
+    remove_temp_table(db, agg_temp);
+    return (int)total_rows;
+}
+
 /* ---- try_plan_send orchestrator ---- */
 
 static int try_plan_send(int fd, struct database *db, struct query *q,
@@ -1719,6 +2221,12 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     {
         int inline_rc = try_inline_cte(fd, db, q, sql, sql_len);
         if (inline_rc >= 0) return inline_rc;
+    }
+
+    /* ---- Correlated subquery decorrelation ---- */
+    {
+        int dec_rc = try_decorrelate_subquery(fd, db, q, sql, sql_len);
+        if (dec_rc >= 0) return dec_rc;
     }
 
     struct query_select *s = &q->select;

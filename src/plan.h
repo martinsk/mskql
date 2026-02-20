@@ -27,6 +27,7 @@ enum plan_op {
     PLAN_EXPR_PROJECT,   /* expression evaluation: UPPER(x), ABS(y), etc. */
     PLAN_PARQUET_SCAN,   /* read Parquet file directly into col_blocks */
     PLAN_VEC_PROJECT,    /* vectorized columnar expression eval (no per-row overhead) */
+    PLAN_TOP_N,          /* fused SORT + LIMIT: heap-based top-N selection */
 };
 
 /* ---- Plan builder result ---- */
@@ -51,6 +52,14 @@ enum vec_op_kind {
     VEC_PASSTHROUGH,   /* copy input column directly */
     VEC_COL_OP_LIT,    /* col OP literal */
     VEC_COL_OP_COL,    /* col OP col */
+    VEC_FUNC_UPPER,    /* UPPER(col) → TEXT */
+    VEC_FUNC_LOWER,    /* LOWER(col) → TEXT */
+    VEC_FUNC_LENGTH,   /* LENGTH(col) → INT */
+    VEC_FUNC_ABS_I32,  /* ABS(col) → INT */
+    VEC_FUNC_ABS_I64,  /* ABS(col) → BIGINT */
+    VEC_FUNC_ABS_F64,  /* ABS(col) → FLOAT/NUMERIC */
+    VEC_FUNC_ROUND,    /* ROUND(col, N) → NUMERIC */
+    VEC_FUNC_CAST_INT_TO_F64, /* col::numeric / col::float → NUMERIC */
 };
 
 struct vec_project_op {
@@ -61,6 +70,7 @@ struct vec_project_op {
     int64_t  lit_i64;          /* literal value for integer ops */
     double   lit_f64;          /* literal value for float ops */
     enum column_type out_type; /* output column type */
+    int      func_precision;   /* decimal places for VEC_FUNC_ROUND */
 };
 
 /* Plan node: arena-allocated in query_arena.plan_nodes DA.
@@ -166,6 +176,14 @@ struct plan_node {
             uint16_t ncols;           /* number of output columns */
             struct vec_project_op *ops; /* bump-allocated: [ncols] */
         } vec_project;
+        struct {
+            int     *sort_cols;        /* bump: column indices to sort by */
+            int     *sort_descs;       /* bump: 1=DESC, 0=ASC per column */
+            int     *sort_nulls_first; /* bump: -1=default, 0=NULLS LAST, 1=NULLS FIRST */
+            uint16_t nsort_cols;
+            size_t   limit;            /* N = number of rows to keep */
+            size_t   offset;           /* skip first M rows from sorted result */
+        } top_n;
         struct {
             uint16_t out_ncols;       /* total output columns (passthrough + window) */
             uint16_t n_pass;          /* number of passthrough columns */
@@ -352,6 +370,23 @@ struct set_op_state {
 struct limit_state {
     size_t emitted;
     size_t skipped;
+};
+
+struct top_n_state {
+    int       input_done;
+    uint32_t  emit_cursor;
+    /* flat columnar arrays for all collected rows */
+    void    **flat_data;       /* bump: [ncols] typed arrays */
+    uint8_t **flat_nulls;      /* bump: [ncols] null bitmaps */
+    enum column_type *flat_types; /* bump: [ncols] */
+    uint16_t  ncols;
+    uint32_t  heap_size;       /* current entries in heap */
+    uint32_t  heap_cap;        /* = limit + offset */
+    uint32_t *heap;            /* bump: indices into flat arrays, heap-ordered */
+    uint32_t  total_rows;      /* total rows appended to flat arrays */
+    uint32_t  flat_cap;        /* capacity of flat arrays */
+    uint32_t *sorted;          /* bump: final sorted indices for emit */
+    uint32_t  sorted_count;    /* number of entries to emit (after offset) */
 };
 
 struct gen_series_state {

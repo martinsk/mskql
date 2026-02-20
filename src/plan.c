@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <math.h>
+#include <ctype.h>
 
 #define MAX_SORT_KEYS 32
 
@@ -436,6 +438,7 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
     case PLAN_EXPR_PROJECT:   return pn->expr_project.ncols;
     case PLAN_VEC_PROJECT:    return pn->vec_project.ncols;
     case PLAN_SORT:
+    case PLAN_TOP_N:
     case PLAN_HASH_SEMI_JOIN:
     case PLAN_DISTINCT:
     case PLAN_FILTER:
@@ -1329,6 +1332,7 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case PLAN_FILTER:
             case PLAN_PROJECT:
             case PLAN_SORT:
+            case PLAN_TOP_N:
             case PLAN_LIMIT:
             case PLAN_DISTINCT:
             case PLAN_EXPR_PROJECT:
@@ -2148,7 +2152,7 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
                 break;
             }
-        } else { /* VEC_COL_OP_COL */
+        } else if (vop->kind == VEC_COL_OP_COL) {
             struct col_block *rcb = &input.cols[vop->right_col];
             switch (vop->out_type) {
             case COLUMN_TYPE_INT: {
@@ -2210,6 +2214,87 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
             case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
                 break;
+            }
+        } else if (vop->kind == VEC_FUNC_UPPER || vop->kind == VEC_FUNC_LOWER) {
+            int is_upper = (vop->kind == VEC_FUNC_UPPER);
+            memcpy(ocb->nulls, lcb->nulls, count);
+            for (uint16_t i = 0; i < count; i++) {
+                if (lcb->nulls[i] || !lcb->data.str[i]) {
+                    ocb->data.str[i] = NULL;
+                    continue;
+                }
+                const char *src = lcb->data.str[i];
+                size_t slen = strlen(src);
+                char *dst = (char *)bump_alloc(&ctx->arena->scratch, slen + 1);
+                for (size_t j = 0; j < slen; j++)
+                    dst[j] = is_upper ? (char)toupper((unsigned char)src[j])
+                                      : (char)tolower((unsigned char)src[j]);
+                dst[slen] = '\0';
+                ocb->data.str[i] = dst;
+            }
+        } else if (vop->kind == VEC_FUNC_LENGTH) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            for (uint16_t i = 0; i < count; i++) {
+                if (lcb->nulls[i]) { ocb->data.i32[i] = 0; ocb->nulls[i] = 1; continue; }
+                ocb->data.i32[i] = lcb->data.str[i] ? (int32_t)strlen(lcb->data.str[i]) : 0;
+            }
+        } else if (vop->kind == VEC_FUNC_ABS_I32) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const int32_t *src = lcb->data.i32;
+            int32_t *dst = ocb->data.i32;
+            for (uint16_t i = 0; i < count; i++)
+                dst[i] = src[i] < 0 ? -src[i] : src[i];
+        } else if (vop->kind == VEC_FUNC_ABS_I64) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const int64_t *src = lcb->data.i64;
+            int64_t *dst = ocb->data.i64;
+            for (uint16_t i = 0; i < count; i++)
+                dst[i] = src[i] < 0 ? -src[i] : src[i];
+        } else if (vop->kind == VEC_FUNC_ABS_F64) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const double *src = lcb->data.f64;
+            double *dst = ocb->data.f64;
+            for (uint16_t i = 0; i < count; i++)
+                dst[i] = fabs(src[i]);
+        } else if (vop->kind == VEC_FUNC_ROUND) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            double *dst = ocb->data.f64;
+            double pow10 = 1.0;
+            for (int p = 0; p < vop->func_precision; p++) pow10 *= 10.0;
+            enum column_type src_ct = lcb->type;
+            if (src_ct == COLUMN_TYPE_INT || src_ct == COLUMN_TYPE_BOOLEAN || src_ct == COLUMN_TYPE_DATE) {
+                const int32_t *isrc = lcb->data.i32;
+                for (uint16_t i = 0; i < count; i++)
+                    dst[i] = round((double)isrc[i] * pow10) / pow10;
+            } else if (src_ct == COLUMN_TYPE_BIGINT) {
+                const int64_t *isrc = lcb->data.i64;
+                for (uint16_t i = 0; i < count; i++)
+                    dst[i] = round((double)isrc[i] * pow10) / pow10;
+            } else if (src_ct == COLUMN_TYPE_SMALLINT) {
+                const int16_t *isrc = lcb->data.i16;
+                for (uint16_t i = 0; i < count; i++)
+                    dst[i] = round((double)isrc[i] * pow10) / pow10;
+            } else {
+                const double *fsrc = lcb->data.f64;
+                for (uint16_t i = 0; i < count; i++)
+                    dst[i] = round(fsrc[i] * pow10) / pow10;
+            }
+        } else if (vop->kind == VEC_FUNC_CAST_INT_TO_F64) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            enum column_type src_type = lcb->type;
+            double *dst = ocb->data.f64;
+            if (src_type == COLUMN_TYPE_INT || src_type == COLUMN_TYPE_BOOLEAN ||
+                src_type == COLUMN_TYPE_DATE) {
+                const int32_t *src = lcb->data.i32;
+                for (uint16_t i = 0; i < count; i++) dst[i] = (double)src[i];
+            } else if (src_type == COLUMN_TYPE_BIGINT) {
+                const int64_t *src = lcb->data.i64;
+                for (uint16_t i = 0; i < count; i++) dst[i] = (double)src[i];
+            } else if (src_type == COLUMN_TYPE_SMALLINT) {
+                const int16_t *src = lcb->data.i16;
+                for (uint16_t i = 0; i < count; i++) dst[i] = (double)src[i];
+            } else {
+                memcpy(dst, lcb->data.f64, count * sizeof(double));
             }
         }
     }
@@ -4261,6 +4346,371 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* ---- Top-N Sort (fused SORT + LIMIT via binary heap) ---- */
+
+/* Thread-local context for top_n comparator — reuses _bsort_ctx */
+static int top_n_cmp_indices(uint32_t ia, uint32_t ib,
+                              const struct top_n_state *st,
+                              const struct plan_node *pn)
+{
+    for (uint16_t k = 0; k < pn->top_n.nsort_cols; k++) {
+        int sci = pn->top_n.sort_cols[k];
+        uint8_t na = st->flat_nulls[sci][ia];
+        uint8_t nb = st->flat_nulls[sci][ib];
+        if (na && nb) continue;
+        if (na || nb) {
+            int nf = pn->top_n.sort_nulls_first ? pn->top_n.sort_nulls_first[k] : -1;
+            int nulls_go_first = (nf == 1) || (nf == -1 && pn->top_n.sort_descs[k]);
+            if (na) return nulls_go_first ? -1 : 1;
+            else    return nulls_go_first ? 1 : -1;
+        }
+        int cmp = 0;
+        enum column_type kt = st->flat_types[sci];
+        if (kt == COLUMN_TYPE_SMALLINT) {
+            int16_t va = ((const int16_t *)st->flat_data[sci])[ia];
+            int16_t vb = ((const int16_t *)st->flat_data[sci])[ib];
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN ||
+                   kt == COLUMN_TYPE_ENUM || kt == COLUMN_TYPE_DATE) {
+            int32_t va = ((const int32_t *)st->flat_data[sci])[ia];
+            int32_t vb = ((const int32_t *)st->flat_data[sci])[ib];
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_BIGINT || kt == COLUMN_TYPE_TIME ||
+                   kt == COLUMN_TYPE_TIMESTAMP || kt == COLUMN_TYPE_TIMESTAMPTZ) {
+            int64_t va = ((const int64_t *)st->flat_data[sci])[ia];
+            int64_t vb = ((const int64_t *)st->flat_data[sci])[ib];
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC) {
+            double va = ((const double *)st->flat_data[sci])[ia];
+            double vb = ((const double *)st->flat_data[sci])[ib];
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_INTERVAL) {
+            int64_t va = interval_to_usec_approx(((const struct interval *)st->flat_data[sci])[ia]);
+            int64_t vb = interval_to_usec_approx(((const struct interval *)st->flat_data[sci])[ib]);
+            cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        } else if (kt == COLUMN_TYPE_UUID) {
+            struct uuid_val ua = ((const struct uuid_val *)st->flat_data[sci])[ia];
+            struct uuid_val ub = ((const struct uuid_val *)st->flat_data[sci])[ib];
+            cmp = uuid_compare(ua, ub);
+        } else {
+            const char *sa = ((const char **)st->flat_data[sci])[ia];
+            const char *sb = ((const char **)st->flat_data[sci])[ib];
+            if (!sa && !sb) continue;
+            if (!sa) cmp = -1;
+            else if (!sb) cmp = 1;
+            else cmp = strcmp(sa, sb);
+        }
+        if (pn->top_n.sort_descs[k]) cmp = -cmp;
+        if (cmp != 0) return cmp;
+    }
+    return 0;
+}
+
+/* Max-heap: parent is "worse" (larger in sort order) than children.
+ * We keep the N best rows; the root is the worst of the best,
+ * so new rows that are better than root can replace it. */
+static void top_n_sift_up(struct top_n_state *st, const struct plan_node *pn,
+                            uint32_t pos)
+{
+    while (pos > 0) {
+        uint32_t parent = (pos - 1) / 2;
+        /* parent should be >= child in sort order (max-heap of sort order) */
+        if (top_n_cmp_indices(st->heap[parent], st->heap[pos], st, pn) >= 0)
+            break;
+        uint32_t tmp = st->heap[parent];
+        st->heap[parent] = st->heap[pos];
+        st->heap[pos] = tmp;
+        pos = parent;
+    }
+}
+
+static void top_n_sift_down(struct top_n_state *st, const struct plan_node *pn,
+                              uint32_t pos)
+{
+    for (;;) {
+        uint32_t largest = pos;
+        uint32_t left = 2 * pos + 1;
+        uint32_t right = 2 * pos + 2;
+        if (left < st->heap_size &&
+            top_n_cmp_indices(st->heap[left], st->heap[largest], st, pn) > 0)
+            largest = left;
+        if (right < st->heap_size &&
+            top_n_cmp_indices(st->heap[right], st->heap[largest], st, pn) > 0)
+            largest = right;
+        if (largest == pos) break;
+        uint32_t tmp = st->heap[pos];
+        st->heap[pos] = st->heap[largest];
+        st->heap[largest] = tmp;
+        pos = largest;
+    }
+}
+
+static void top_n_grow_flat(struct top_n_state *st, uint32_t new_cap,
+                             struct bump_alloc *scratch)
+{
+    for (uint16_t c = 0; c < st->ncols; c++) {
+        size_t elem_sz = col_type_elem_size(st->flat_types[c]);
+        void *new_data = bump_alloc(scratch, new_cap * elem_sz);
+        uint8_t *new_nulls = (uint8_t *)bump_alloc(scratch, new_cap);
+        if (st->total_rows > 0) {
+            memcpy(new_data, st->flat_data[c], st->total_rows * elem_sz);
+            memcpy(new_nulls, st->flat_nulls[c], st->total_rows);
+        }
+        st->flat_data[c] = new_data;
+        st->flat_nulls[c] = new_nulls;
+    }
+    st->flat_cap = new_cap;
+}
+
+static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                       struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct top_n_state *st = (struct top_n_state *)ctx->node_states[node_idx];
+    if (!st) {
+        st = (struct top_n_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        ctx->node_states[node_idx] = st;
+        st->heap_cap = (uint32_t)(pn->top_n.limit + pn->top_n.offset);
+        if (st->heap_cap == 0) st->heap_cap = 1;
+        st->heap = (uint32_t *)bump_alloc(&ctx->arena->scratch,
+                                           st->heap_cap * sizeof(uint32_t));
+    }
+
+    if (!st->input_done) {
+        uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
+        if (child_ncols == 0) return -1;
+        st->ncols = child_ncols;
+
+        /* Initialize flat column arrays */
+        st->flat_data = (void **)bump_alloc(&ctx->arena->scratch,
+                                             child_ncols * sizeof(void *));
+        st->flat_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch,
+                                                  child_ncols * sizeof(uint8_t *));
+        st->flat_types = (enum column_type *)bump_alloc(&ctx->arena->scratch,
+                                                         child_ncols * sizeof(enum column_type));
+        /* Types will be set from first block */
+        int types_set = 0;
+
+        /* Initial capacity: 2x heap_cap to reduce reallocs */
+        uint32_t init_cap = st->heap_cap * 2;
+        if (init_cap < 256) init_cap = 256;
+
+        /* Collection phase: pull all blocks, maintain heap of best N */
+        struct row_block input;
+        row_block_alloc(&input, child_ncols, &ctx->arena->scratch);
+
+        while (plan_next_block(ctx, pn->left, &input) == 0) {
+            uint16_t count = row_block_active_count(&input);
+            if (count == 0) continue;
+
+            /* Compact selection vector if present */
+            if (input.sel && input.sel_count > 0) {
+                struct row_block compact;
+                row_block_alloc(&compact, child_ncols, &ctx->arena->scratch);
+                compact.count = count;
+                for (uint16_t c = 0; c < child_ncols; c++) {
+                    compact.cols[c].type = input.cols[c].type;
+                    compact.cols[c].count = count;
+                    for (uint16_t i = 0; i < count; i++) {
+                        uint16_t ri = (uint16_t)input.sel[i];
+                        cb_copy_value(&compact.cols[c], i, &input.cols[c], ri);
+                    }
+                }
+                input = compact;
+            }
+
+            /* Set types from first block */
+            if (!types_set) {
+                for (uint16_t c = 0; c < child_ncols; c++)
+                    st->flat_types[c] = input.cols[c].type;
+                /* Now allocate flat arrays */
+                for (uint16_t c = 0; c < child_ncols; c++) {
+                    size_t elem_sz = col_type_elem_size(st->flat_types[c]);
+                    st->flat_data[c] = bump_alloc(&ctx->arena->scratch, init_cap * elem_sz);
+                    st->flat_nulls[c] = (uint8_t *)bump_alloc(&ctx->arena->scratch, init_cap);
+                }
+                st->flat_cap = init_cap;
+                types_set = 1;
+            }
+
+            /* Append rows to flat arrays and maintain heap */
+            for (uint16_t r = 0; r < count; r++) {
+                if (st->heap_size < st->heap_cap) {
+                    /* Heap not full yet — append row and sift up */
+                    uint32_t fi = st->total_rows;
+                    if (fi >= st->flat_cap)
+                        top_n_grow_flat(st, st->flat_cap * 2, &ctx->arena->scratch);
+
+                    for (uint16_t c = 0; c < child_ncols; c++) {
+                        size_t elem_sz = col_type_elem_size(st->flat_types[c]);
+                        memcpy((uint8_t *)st->flat_data[c] + fi * elem_sz,
+                               (uint8_t *)cb_data_ptr(&input.cols[c], 0) + r * elem_sz,
+                               elem_sz);
+                        st->flat_nulls[c][fi] = input.cols[c].nulls[r];
+                    }
+                    st->total_rows++;
+                    st->heap[st->heap_size] = fi;
+                    st->heap_size++;
+                    top_n_sift_up(st, pn, st->heap_size - 1);
+                } else {
+                    /* Heap full — compare new row against root (worst of best N).
+                     * We need to temporarily store the new row to compare. */
+                    uint32_t fi = st->total_rows;
+                    if (fi >= st->flat_cap)
+                        top_n_grow_flat(st, st->flat_cap * 2, &ctx->arena->scratch);
+
+                    for (uint16_t c = 0; c < child_ncols; c++) {
+                        size_t elem_sz = col_type_elem_size(st->flat_types[c]);
+                        memcpy((uint8_t *)st->flat_data[c] + fi * elem_sz,
+                               (uint8_t *)cb_data_ptr(&input.cols[c], 0) + r * elem_sz,
+                               elem_sz);
+                        st->flat_nulls[c][fi] = input.cols[c].nulls[r];
+                    }
+                    st->total_rows++;
+
+                    /* Compare new row (fi) against heap root (worst of best N) */
+                    int cmp = top_n_cmp_indices(fi, st->heap[0], st, pn);
+                    if (cmp < 0) {
+                        /* New row is better (smaller in sort order) — replace root */
+                        st->heap[0] = fi;
+                        top_n_sift_down(st, pn, 0);
+                    }
+                    /* else: new row is worse, discard (it stays in flat arrays but not in heap) */
+                }
+            }
+
+            row_block_alloc(&input, child_ncols, &ctx->arena->scratch);
+        }
+
+        if (!types_set || st->heap_size == 0) {
+            st->input_done = 1;
+            return -1;
+        }
+
+        /* Sort the heap entries in proper sort order for emit.
+         * Use the global _bsort_ctx + pdqsort since we need a qsort comparator. */
+        uint32_t n = st->heap_size;
+        st->sorted = (uint32_t *)bump_alloc(&ctx->arena->scratch, n * sizeof(uint32_t));
+        memcpy(st->sorted, st->heap, n * sizeof(uint32_t));
+
+        /* Set up _bsort_ctx for the final sort of heap entries */
+        _bsort_ctx.ncols = child_ncols;
+        _bsort_ctx.sort_cols = pn->top_n.sort_cols;
+        _bsort_ctx.sort_descs = pn->top_n.sort_descs;
+        _bsort_ctx.sort_nulls_first = pn->top_n.sort_nulls_first;
+        _bsort_ctx.nsort_cols = pn->top_n.nsort_cols;
+        _bsort_ctx.flat_col_data = st->flat_data;
+        _bsort_ctx.flat_col_nulls = st->flat_nulls;
+        _bsort_ctx.flat_col_types = st->flat_types;
+
+        uint16_t nsk = pn->top_n.nsort_cols;
+        _bsort_ctx.flat_keys = (void **)bump_alloc(&ctx->arena->scratch,
+                                                     nsk * sizeof(void *));
+        _bsort_ctx.flat_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch,
+                                                         nsk * sizeof(uint8_t *));
+        _bsort_ctx.key_types = (enum column_type *)bump_alloc(&ctx->arena->scratch,
+                                                               nsk * sizeof(enum column_type));
+        for (uint16_t k = 0; k < nsk; k++) {
+            int sci = pn->top_n.sort_cols[k];
+            _bsort_ctx.flat_keys[k] = st->flat_data[sci];
+            _bsort_ctx.flat_nulls[k] = st->flat_nulls[sci];
+            _bsort_ctx.key_types[k] = st->flat_types[sci];
+        }
+
+        if (n > 1)
+            pdqsort(st->sorted, n, sizeof(uint32_t), sort_flat_cmp);
+
+        /* Apply offset: skip first 'offset' entries */
+        uint32_t offset = (uint32_t)pn->top_n.offset;
+        if (offset >= n) {
+            st->input_done = 1;
+            st->sorted_count = 0;
+            return -1;
+        }
+        st->sorted = st->sorted + offset;
+        st->sorted_count = n - offset;
+        /* Cap at limit */
+        if (st->sorted_count > (uint32_t)pn->top_n.limit)
+            st->sorted_count = (uint32_t)pn->top_n.limit;
+
+        st->input_done = 1;
+        st->emit_cursor = 0;
+    }
+
+    /* Emit phase */
+    if (st->emit_cursor >= st->sorted_count) return -1;
+
+    row_block_reset(out);
+    uint32_t remain = st->sorted_count - st->emit_cursor;
+    uint16_t out_count = (remain < BLOCK_CAPACITY) ? (uint16_t)remain : BLOCK_CAPACITY;
+    const uint32_t *idx = st->sorted + st->emit_cursor;
+
+    for (uint16_t c = 0; c < st->ncols; c++) {
+        struct col_block *ocb = &out->cols[c];
+        enum column_type ct = st->flat_types[c];
+        const uint8_t *src_nulls = st->flat_nulls[c];
+        const void *src_data = st->flat_data[c];
+        ocb->type = ct;
+        ocb->count = out_count;
+
+        for (uint16_t r = 0; r < out_count; r++)
+            ocb->nulls[r] = src_nulls[idx[r]];
+
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT: {
+            const int16_t *s = (const int16_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.i16[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_DATE: {
+            const int32_t *s = (const int32_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.i32[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_BIGINT:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            const int64_t *s = (const int64_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.i64[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC: {
+            const double *s = (const double *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.f64[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_TEXT: {
+            char *const *s = (char *const *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.str[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_ENUM: {
+            const int32_t *s = (const int32_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.i32[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            const struct uuid_val *s = (const struct uuid_val *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.uuid[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_INTERVAL: {
+            const struct interval *s = (const struct interval *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.iv[r] = s[idx[r]];
+            break;
+        }
+        }
+    }
+
+    st->emit_cursor += out_count;
+    out->count = out_count;
+    return 0;
+}
+
 /* ---- Window function executor ---- */
 
 /* qsort comparator for window: sort by (partition_col, order_col) in flat arrays */
@@ -6259,6 +6709,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     case PLAN_HASH_JOIN:       return hash_join_next(ctx, node_idx, out);
     case PLAN_HASH_AGG:        return hash_agg_next(ctx, node_idx, out);
     case PLAN_SORT:            return sort_next(ctx, node_idx, out);
+    case PLAN_TOP_N:           return top_n_next(ctx, node_idx, out);
     case PLAN_WINDOW:          return window_next(ctx, node_idx, out);
     case PLAN_HASH_SEMI_JOIN:  return hash_semi_join_next(ctx, node_idx, out);
     case PLAN_SET_OP:          return set_op_next(ctx, node_idx, out);
@@ -6555,6 +7006,13 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
         n = explain_sort(arena, pn, buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
+    case PLAN_TOP_N: {
+        char label[64];
+        snprintf(label, sizeof(label), "Top-N Sort (limit=%zu)", pn->top_n.limit);
+        n = explain_unary(arena, pn, label, buf + written, buflen - written, depth);
+        if (n > 0) written += n;
+        break;
+    }
     case PLAN_HASH_JOIN:
         n = explain_binary(arena, pn, "Hash Join", buf + written, buflen - written, depth);
         if (n > 0) written += n;
@@ -6629,6 +7087,23 @@ static uint32_t build_limit(uint32_t current, struct query_select *s,
                              struct query_arena *arena)
 {
     if (!s->has_limit && !s->has_offset) return current;
+
+    /* Fuse SORT + LIMIT → PLAN_TOP_N when we have a concrete LIMIT.
+     * This replaces the full sort with a heap-based top-N selection. */
+    if (s->has_limit && PLAN_NODE(arena, current).op == PLAN_SORT) {
+        struct plan_node *sort_pn = &PLAN_NODE(arena, current);
+        uint32_t tn_idx = plan_alloc_node(arena, PLAN_TOP_N);
+        struct plan_node *tn = &PLAN_NODE(arena, tn_idx);
+        tn->left = sort_pn->left; /* bypass the SORT, take its child */
+        tn->top_n.sort_cols = sort_pn->sort.sort_cols;
+        tn->top_n.sort_descs = sort_pn->sort.sort_descs;
+        tn->top_n.sort_nulls_first = sort_pn->sort.sort_nulls_first;
+        tn->top_n.nsort_cols = sort_pn->sort.nsort_cols;
+        tn->top_n.limit = (size_t)s->limit_count;
+        tn->top_n.offset = s->has_offset ? (size_t)s->offset_count : 0;
+        return tn_idx;
+    }
+
     uint32_t limit_idx = plan_alloc_node(arena, PLAN_LIMIT);
     PLAN_NODE(arena, limit_idx).left = current;
     PLAN_NODE(arena, limit_idx).limit.has_limit = s->has_limit;
@@ -9144,6 +9619,120 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                         vops[i].lit_f64 = lit_f2;
                     else
                         vops[i].lit_i64 = lit_i2;
+                } else {
+                    vec_ok = 0; break;
+                }
+            } else if (e->type == EXPR_FUNC_CALL) {
+                enum expr_func fn = e->func_call.func;
+                uint32_t nargs = e->func_call.args_count;
+
+                if ((fn == FUNC_UPPER || fn == FUNC_LOWER) && nargs == 1) {
+                    uint32_t arg_idx = arena->arg_indices.items[e->func_call.args_start];
+                    struct expr *ae = &EXPR(arena, arg_idx);
+                    if (ae->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                    int ci = table_find_column_sv(t, ae->column_ref.column);
+                    if (ci < 0 || !column_type_is_text(t->columns.items[ci].type)) { vec_ok = 0; break; }
+                    vops[i].kind = (fn == FUNC_UPPER) ? VEC_FUNC_UPPER : VEC_FUNC_LOWER;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = COLUMN_TYPE_TEXT;
+                } else if (fn == FUNC_LENGTH && nargs == 1) {
+                    uint32_t arg_idx = arena->arg_indices.items[e->func_call.args_start];
+                    struct expr *ae = &EXPR(arena, arg_idx);
+                    if (ae->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                    int ci = table_find_column_sv(t, ae->column_ref.column);
+                    if (ci < 0 || !column_type_is_text(t->columns.items[ci].type)) { vec_ok = 0; break; }
+                    vops[i].kind = VEC_FUNC_LENGTH;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = COLUMN_TYPE_INT;
+                } else if (fn == FUNC_ABS && nargs == 1) {
+                    uint32_t arg_idx = arena->arg_indices.items[e->func_call.args_start];
+                    struct expr *ae = &EXPR(arena, arg_idx);
+                    if (ae->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                    int ci = table_find_column_sv(t, ae->column_ref.column);
+                    if (ci < 0) { vec_ok = 0; break; }
+                    enum column_type ct = t->columns.items[ci].type;
+                    if (ct == COLUMN_TYPE_INT) {
+                        vops[i].kind = VEC_FUNC_ABS_I32;
+                        vops[i].out_type = COLUMN_TYPE_INT;
+                    } else if (ct == COLUMN_TYPE_BIGINT) {
+                        vops[i].kind = VEC_FUNC_ABS_I64;
+                        vops[i].out_type = COLUMN_TYPE_BIGINT;
+                    } else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) {
+                        vops[i].kind = VEC_FUNC_ABS_F64;
+                        vops[i].out_type = ct;
+                    } else { vec_ok = 0; break; }
+                    vops[i].left_col = (uint16_t)ci;
+                } else if (fn == FUNC_ROUND && nargs == 2) {
+                    /* ROUND(expr, precision) — expr must resolve to a f64 column */
+                    uint32_t arg0_idx = arena->arg_indices.items[e->func_call.args_start];
+                    uint32_t arg1_idx = arena->arg_indices.items[e->func_call.args_start + 1];
+                    struct expr *a0 = &EXPR(arena, arg0_idx);
+                    struct expr *a1 = &EXPR(arena, arg1_idx);
+                    /* arg1 must be an integer literal (precision) */
+                    if (a1->type != EXPR_LITERAL) { vec_ok = 0; break; }
+                    int precision = 0;
+                    if (a1->literal.type == COLUMN_TYPE_INT) precision = a1->literal.value.as_int;
+                    else if (a1->literal.type == COLUMN_TYPE_BIGINT) precision = (int)a1->literal.value.as_bigint;
+                    else { vec_ok = 0; break; }
+                    /* arg0: column ref or CAST(col AS numeric) */
+                    int src_col = -1;
+                    int need_cast = 0;
+                    if (a0->type == EXPR_COLUMN_REF) {
+                        src_col = table_find_column_sv(t, a0->column_ref.column);
+                        if (src_col < 0) { vec_ok = 0; break; }
+                        enum column_type ct = t->columns.items[src_col].type;
+                        if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) {
+                            /* already f64 */
+                        } else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BIGINT || ct == COLUMN_TYPE_SMALLINT) {
+                            need_cast = 1;
+                        } else { vec_ok = 0; break; }
+                    } else if (a0->type == EXPR_CAST) {
+                        struct expr *inner = &EXPR(arena, a0->cast.operand);
+                        if (inner->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                        src_col = table_find_column_sv(t, inner->column_ref.column);
+                        if (src_col < 0) { vec_ok = 0; break; }
+                        enum column_type ct = t->columns.items[src_col].type;
+                        if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) {
+                            /* already f64, cast is a no-op */
+                        } else if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BIGINT || ct == COLUMN_TYPE_SMALLINT) {
+                            need_cast = 1;
+                        } else { vec_ok = 0; break; }
+                    } else { vec_ok = 0; break; }
+                    if (need_cast) {
+                        /* Insert a CAST op before ROUND — use two vops slots.
+                         * Too complex for single-pass; bail to EXPR_PROJECT for now
+                         * unless we handle it inline in the ROUND executor. */
+                        /* Actually, handle it inline: ROUND executor reads from int col
+                         * and converts to double before rounding. Use FUNC_ROUND with
+                         * left_col pointing to the source column. The executor will
+                         * read from the correct storage type. */
+                    }
+                    vops[i].kind = VEC_FUNC_ROUND;
+                    vops[i].left_col = (uint16_t)src_col;
+                    vops[i].out_type = COLUMN_TYPE_NUMERIC;
+                    vops[i].func_precision = precision;
+                } else {
+                    vec_ok = 0; break;
+                }
+            } else if (e->type == EXPR_CAST) {
+                struct expr *inner = &EXPR(arena, e->cast.operand);
+                if (inner->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                int ci = table_find_column_sv(t, inner->column_ref.column);
+                if (ci < 0) { vec_ok = 0; break; }
+                enum column_type src_ct = t->columns.items[ci].type;
+                enum column_type dst_ct = e->cast.target;
+                /* Only handle int→float/numeric casts vectorized */
+                if ((dst_ct == COLUMN_TYPE_FLOAT || dst_ct == COLUMN_TYPE_NUMERIC) &&
+                    (src_ct == COLUMN_TYPE_INT || src_ct == COLUMN_TYPE_BIGINT ||
+                     src_ct == COLUMN_TYPE_SMALLINT)) {
+                    vops[i].kind = VEC_FUNC_CAST_INT_TO_F64;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = dst_ct;
+                } else if (src_ct == dst_ct || (column_type_storage(src_ct) == column_type_storage(dst_ct))) {
+                    /* Identity cast or same-storage cast — passthrough */
+                    vops[i].kind = VEC_PASSTHROUGH;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = dst_ct;
                 } else {
                     vec_ok = 0; break;
                 }
