@@ -434,6 +434,7 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
     case PLAN_GENERATE_SERIES: return 1;
     case PLAN_PARQUET_SCAN:   return pn->parquet_scan.ncols;
     case PLAN_EXPR_PROJECT:   return pn->expr_project.ncols;
+    case PLAN_VEC_PROJECT:    return pn->vec_project.ncols;
     case PLAN_SORT:
     case PLAN_HASH_SEMI_JOIN:
     case PLAN_DISTINCT:
@@ -1331,6 +1332,7 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case PLAN_LIMIT:
             case PLAN_DISTINCT:
             case PLAN_EXPR_PROJECT:
+            case PLAN_VEC_PROJECT:
                 walk = wn->left;
                 break;
             case PLAN_INDEX_SCAN:
@@ -2011,6 +2013,210 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* ---- Vectorized projection: evaluate simple expressions on columnar arrays ---- */
+
+static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                            struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    uint16_t out_ncols = pn->vec_project.ncols;
+    struct vec_project_op *ops = pn->vec_project.ops;
+
+    uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
+    if (child_ncols == 0) return -1;
+
+    struct row_block input;
+    row_block_alloc(&input, child_ncols, &ctx->arena->scratch);
+    int rc = plan_next_block(ctx, pn->left, &input);
+    if (rc != 0) return rc;
+
+    uint16_t count = row_block_active_count(&input);
+    if (count == 0) return -1;
+
+    /* If the child returned a selection vector (e.g. from a filter), allocate
+     * a compacted copy of the input so tight arithmetic loops use 0..count-1. */
+    if (input.sel && input.sel_count > 0) {
+        struct row_block compact;
+        row_block_alloc(&compact, child_ncols, &ctx->arena->scratch);
+        compact.count = count;
+        compact.sel = NULL;
+        compact.sel_count = 0;
+        for (uint16_t col = 0; col < child_ncols; col++) {
+            struct col_block *src = &input.cols[col];
+            struct col_block *dst = &compact.cols[col];
+            dst->type = src->type;
+            dst->count = count;
+            for (uint16_t i = 0; i < count; i++) {
+                uint16_t ri = input.sel[i];
+                dst->nulls[i] = src->nulls[ri];
+            }
+            switch (column_type_storage(src->type)) {
+            case STORE_I32: for (uint16_t i = 0; i < count; i++) dst->data.i32[i] = src->data.i32[input.sel[i]]; break;
+            case STORE_I64: for (uint16_t i = 0; i < count; i++) dst->data.i64[i] = src->data.i64[input.sel[i]]; break;
+            case STORE_F64: for (uint16_t i = 0; i < count; i++) dst->data.f64[i] = src->data.f64[input.sel[i]]; break;
+            case STORE_I16: for (uint16_t i = 0; i < count; i++) dst->data.i16[i] = src->data.i16[input.sel[i]]; break;
+            case STORE_STR: for (uint16_t i = 0; i < count; i++) dst->data.str[i] = src->data.str[input.sel[i]]; break;
+            case STORE_IV:  for (uint16_t i = 0; i < count; i++) dst->data.iv[i]  = src->data.iv[input.sel[i]]; break;
+            case STORE_UUID: for (uint16_t i = 0; i < count; i++) memcpy(dst->data.uuid + i * 16, src->data.uuid + input.sel[i] * 16, 16); break;
+            }
+        }
+        input = compact;
+    }
+
+    out->count = count;
+    out->sel = NULL;
+    out->sel_count = 0;
+
+    for (uint16_t c = 0; c < out_ncols; c++) {
+        struct vec_project_op *vop = &ops[c];
+        struct col_block *ocb = &out->cols[c];
+        ocb->type = vop->out_type;
+        ocb->count = count;
+
+        if (vop->kind == VEC_PASSTHROUGH) {
+            struct col_block *icb = &input.cols[vop->left_col];
+            memcpy(ocb->nulls, icb->nulls, count * sizeof(uint8_t));
+            switch (column_type_storage(vop->out_type)) {
+            case STORE_I32: memcpy(ocb->data.i32, icb->data.i32, count * sizeof(int32_t)); break;
+            case STORE_I64: memcpy(ocb->data.i64, icb->data.i64, count * sizeof(int64_t)); break;
+            case STORE_F64: memcpy(ocb->data.f64, icb->data.f64, count * sizeof(double)); break;
+            case STORE_I16: memcpy(ocb->data.i16, icb->data.i16, count * sizeof(int16_t)); break;
+            case STORE_STR: memcpy(ocb->data.str, icb->data.str, count * sizeof(char *)); break;
+            case STORE_IV:  memcpy(ocb->data.iv, icb->data.iv, count * sizeof(struct interval)); break;
+            case STORE_UUID: memcpy(ocb->data.uuid, icb->data.uuid, count * 16); break;
+            }
+            continue;
+        }
+
+        struct col_block *lcb = &input.cols[vop->left_col];
+
+        if (vop->kind == VEC_COL_OP_LIT) {
+            switch (vop->out_type) {
+            case COLUMN_TYPE_INT: {
+                const int32_t *src = lcb->data.i32;
+                int32_t lit = (int32_t)vop->lit_i64;
+                int32_t *dst = ocb->data.i32;
+                switch (vop->op) {
+                case OP_ADD: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] + lit; break;
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] - lit; break;
+                case OP_MUL: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] * lit; break;
+                case OP_DIV:
+                    if (lit == 0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                    for (uint16_t i = 0; i < count; i++) dst[i] = src[i] / lit;
+                    break;
+                default: break;
+                }
+                memcpy(ocb->nulls, lcb->nulls, count);
+                break;
+            }
+            case COLUMN_TYPE_BIGINT: {
+                const int64_t *src = lcb->data.i64;
+                int64_t lit = vop->lit_i64;
+                int64_t *dst = ocb->data.i64;
+                switch (vop->op) {
+                case OP_ADD: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] + lit; break;
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] - lit; break;
+                case OP_MUL: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] * lit; break;
+                case OP_DIV:
+                    if (lit == 0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                    for (uint16_t i = 0; i < count; i++) dst[i] = src[i] / lit;
+                    break;
+                default: break;
+                }
+                memcpy(ocb->nulls, lcb->nulls, count);
+                break;
+            }
+            case COLUMN_TYPE_FLOAT:
+            case COLUMN_TYPE_NUMERIC: {
+                const double *src = lcb->data.f64;
+                double lit = vop->lit_f64;
+                double *dst = ocb->data.f64;
+                switch (vop->op) {
+                case OP_ADD: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] + lit; break;
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] - lit; break;
+                case OP_MUL: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] * lit; break;
+                case OP_DIV: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] / lit; break;
+                default: break;
+                }
+                memcpy(ocb->nulls, lcb->nulls, count);
+                break;
+            }
+            case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_BOOLEAN:
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_DATE:
+            case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
+            case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
+            case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+                break;
+            }
+        } else { /* VEC_COL_OP_COL */
+            struct col_block *rcb = &input.cols[vop->right_col];
+            switch (vop->out_type) {
+            case COLUMN_TYPE_INT: {
+                const int32_t *ls = lcb->data.i32;
+                const int32_t *rs = rcb->data.i32;
+                int32_t *dst = ocb->data.i32;
+                switch (vop->op) {
+                case OP_ADD: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] + rs[i]; break;
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] - rs[i]; break;
+                case OP_MUL: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] * rs[i]; break;
+                case OP_DIV:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (rs[i] == 0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = rs[i] ? ls[i] / rs[i] : 0;
+                    }
+                    break;
+                default: break;
+                }
+                for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
+                break;
+            }
+            case COLUMN_TYPE_BIGINT: {
+                const int64_t *ls = lcb->data.i64;
+                const int64_t *rs = rcb->data.i64;
+                int64_t *dst = ocb->data.i64;
+                switch (vop->op) {
+                case OP_ADD: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] + rs[i]; break;
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] - rs[i]; break;
+                case OP_MUL: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] * rs[i]; break;
+                case OP_DIV:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (rs[i] == 0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = rs[i] ? ls[i] / rs[i] : 0;
+                    }
+                    break;
+                default: break;
+                }
+                for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
+                break;
+            }
+            case COLUMN_TYPE_FLOAT:
+            case COLUMN_TYPE_NUMERIC: {
+                const double *ls = lcb->data.f64;
+                const double *rs = rcb->data.f64;
+                double *dst = ocb->data.f64;
+                switch (vop->op) {
+                case OP_ADD: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] + rs[i]; break;
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] - rs[i]; break;
+                case OP_MUL: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] * rs[i]; break;
+                case OP_DIV: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] / rs[i]; break;
+                default: break;
+                }
+                for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
+                break;
+            }
+            case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_BOOLEAN:
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_DATE:
+            case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
+            case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
+            case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+                break;
+            }
+        }
+    }
+
+    return 0;
+}
+
 static int limit_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                       struct row_block *out)
 {
@@ -2602,7 +2808,8 @@ static inline void agg_reconstruct_row(struct col_block *cols, uint16_t ncols,
 /* Accumulate a non-null col_block value into aggregate accumulators.
  * Dispatches on storage class (7 cases) instead of column_type (14 cases). */
 static inline void agg_accumulate_cb(const struct col_block *acb, uint16_t ri,
-                                      double *sums, double *mins, double *maxs,
+                                      double *sums, int64_t *i64_sums,
+                                      double *mins, double *maxs,
                                       const char **text_mins, const char **text_maxs,
                                       int *minmax_init, size_t idx)
 {
@@ -2620,7 +2827,7 @@ static inline void agg_accumulate_cb(const struct col_block *acb, uint16_t ri,
     }
     case STORE_I32: {
         int32_t v = acb->data.i32[ri];
-        sums[idx] += (double)v;
+        i64_sums[idx] += (int64_t)v;
         if (!minmax_init[idx] || v < (int32_t)mins[idx]) mins[idx] = (double)v;
         if (!minmax_init[idx] || v > (int32_t)maxs[idx]) maxs[idx] = (double)v;
         minmax_init[idx] = 1;
@@ -2628,6 +2835,7 @@ static inline void agg_accumulate_cb(const struct col_block *acb, uint16_t ri,
     }
     case STORE_I64: {
         int64_t v = acb->data.i64[ri];
+        i64_sums[idx] += v;
         int64_t cur_min, cur_max;
         memcpy(&cur_min, &mins[idx], sizeof(int64_t));
         memcpy(&cur_max, &maxs[idx], sizeof(int64_t));
@@ -2646,10 +2854,10 @@ static inline void agg_accumulate_cb(const struct col_block *acb, uint16_t ri,
         break;
     }
     case STORE_I16: {
-        double v = (double)acb->data.i16[ri];
-        sums[idx] += v;
-        if (!minmax_init[idx] || v < mins[idx]) mins[idx] = v;
-        if (!minmax_init[idx] || v > maxs[idx]) maxs[idx] = v;
+        int16_t v = acb->data.i16[ri];
+        i64_sums[idx] += (int64_t)v;
+        if (!minmax_init[idx] || (double)v < mins[idx]) mins[idx] = (double)v;
+        if (!minmax_init[idx] || (double)v > maxs[idx]) maxs[idx] = (double)v;
         minmax_init[idx] = 1;
         break;
     }
@@ -2740,6 +2948,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         uint32_t agg_n = pn->hash_agg.agg_count;
         uint32_t max_groups = st->group_cap;
         st->sums = (double *)bump_calloc(&ctx->arena->scratch, agg_n * max_groups, sizeof(double));
+        st->i64_sums = (int64_t *)bump_calloc(&ctx->arena->scratch, agg_n * max_groups, sizeof(int64_t));
         st->mins = (double *)bump_calloc(&ctx->arena->scratch, agg_n * max_groups, sizeof(double));
         st->maxs = (double *)bump_calloc(&ctx->arena->scratch, agg_n * max_groups, sizeof(double));
         st->text_mins = (const char **)bump_calloc(&ctx->arena->scratch, agg_n * max_groups, sizeof(const char *));
@@ -2822,6 +3031,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             st->field = _new; \
                         } while(0)
                         GROW_ARR(double, sums);
+                        GROW_ARR(int64_t, i64_sums);
                         GROW_ARR(double, mins);
                         GROW_ARR(double, maxs);
                         GROW_ARR(const char *, text_mins);
@@ -3002,30 +3212,38 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                                    ctx->db, &ctx->arena->scratch);
                         if (cv.is_null) continue;
                         st->nonnull[idx]++;
-                        double v = 0.0;
-                        switch (cv.type) {
-                            case COLUMN_TYPE_SMALLINT: v = (double)cv.value.as_smallint; break;
-                            case COLUMN_TYPE_INT:      v = (double)cv.value.as_int; break;
-                            case COLUMN_TYPE_BIGINT:   v = (double)cv.value.as_bigint; break;
-                            case COLUMN_TYPE_FLOAT:
-                            case COLUMN_TYPE_NUMERIC:  v = cv.value.as_float; break;
-                            case COLUMN_TYPE_BOOLEAN:  v = (double)cv.value.as_bool; break;
-                            case COLUMN_TYPE_DATE:     v = (double)cv.value.as_date; break;
-                            case COLUMN_TYPE_TIME:
-                            case COLUMN_TYPE_TIMESTAMP:
-                            case COLUMN_TYPE_TIMESTAMPTZ:
-                                v = (double)cv.value.as_timestamp; break;
-                            case COLUMN_TYPE_INTERVAL:
-                                v = (double)interval_to_usec_approx(cv.value.as_interval); break;
-                            case COLUMN_TYPE_TEXT:  break;
-                            case COLUMN_TYPE_ENUM:  break;
-                            case COLUMN_TYPE_UUID:  break;
+                        if (cv.type == COLUMN_TYPE_FLOAT || cv.type == COLUMN_TYPE_NUMERIC) {
+                            double v = cv.value.as_float;
+                            st->sums[idx] += v;
+                            if (!st->minmax_init[idx] || v < st->mins[idx])
+                                st->mins[idx] = v;
+                            if (!st->minmax_init[idx] || v > st->maxs[idx])
+                                st->maxs[idx] = v;
+                        } else {
+                            long long iv = 0;
+                            switch (cv.type) {
+                                case COLUMN_TYPE_SMALLINT: iv = cv.value.as_smallint; break;
+                                case COLUMN_TYPE_INT:      iv = cv.value.as_int; break;
+                                case COLUMN_TYPE_BIGINT:   iv = cv.value.as_bigint; break;
+                                case COLUMN_TYPE_BOOLEAN:  iv = cv.value.as_bool; break;
+                                case COLUMN_TYPE_DATE:     iv = cv.value.as_date; break;
+                                case COLUMN_TYPE_TIME:
+                                case COLUMN_TYPE_TIMESTAMP:
+                                case COLUMN_TYPE_TIMESTAMPTZ:
+                                    iv = cv.value.as_timestamp; break;
+                                case COLUMN_TYPE_INTERVAL:
+                                    iv = interval_to_usec_approx(cv.value.as_interval); break;
+                                case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
+                                case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM:
+                                case COLUMN_TYPE_UUID: break;
+                            }
+                            st->i64_sums[idx] += iv;
+                            double v = (double)iv;
+                            if (!st->minmax_init[idx] || v < st->mins[idx])
+                                st->mins[idx] = v;
+                            if (!st->minmax_init[idx] || v > st->maxs[idx])
+                                st->maxs[idx] = v;
                         }
-                        st->sums[idx] += v;
-                        if (!st->minmax_init[idx] || v < st->mins[idx])
-                            st->mins[idx] = v;
-                        if (!st->minmax_init[idx] || v > st->maxs[idx])
-                            st->maxs[idx] = v;
                         st->minmax_init[idx] = 1;
                         continue;
                     }
@@ -3044,7 +3262,8 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             continue; /* duplicate — skip */
                     }
                     st->nonnull[idx]++;
-                    agg_accumulate_cb(acb, ri, st->sums, st->mins, st->maxs,
+                    agg_accumulate_cb(acb, ri, st->sums, st->i64_sums,
+                                      st->mins, st->maxs,
                                       st->text_mins, st->text_maxs,
                                       st->minmax_init, idx);
                 }
@@ -3099,9 +3318,9 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
                             src_is_float = 1;
                     }
-                    /* Use consistent type across all groups: BIGINT for int sums,
-                     * FLOAT for float sums. Mixing INT/BIGINT across groups in the
-                     * same col_block causes misreads. */
+                    /* Expression aggregates: detect float if sums[] was used */
+                    if (src_col == -2 && st->sums[idx] != 0.0)
+                        src_is_float = 1;
                     if (src_is_float) {
                         dst->type = COLUMN_TYPE_FLOAT;
                         if (st->nonnull[idx] == 0) {
@@ -3116,7 +3335,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             dst->nulls[out_count] = 1;
                         } else {
                             dst->nulls[out_count] = 0;
-                            dst->data.i64[out_count] = (int64_t)st->sums[idx];
+                            dst->data.i64[out_count] = st->i64_sums[idx];
                         }
                     }
                     break;
@@ -3126,8 +3345,20 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (st->nonnull[idx] == 0) {
                         dst->nulls[out_count] = 1;
                     } else {
+                        int src_col_avg = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
+                        int avg_is_float = 0;
+                        if (src_col_avg >= 0 && pn->hash_agg.table) {
+                            enum column_type sct = pn->hash_agg.table->columns.items[src_col_avg].type;
+                            if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
+                                avg_is_float = 1;
+                        }
+                        if (src_col_avg == -2 && st->sums[idx] != 0.0)
+                            avg_is_float = 1;
                         dst->nulls[out_count] = 0;
-                        dst->data.f64[out_count] = st->sums[idx] / (double)st->nonnull[idx];
+                        if (avg_is_float)
+                            dst->data.f64[out_count] = st->sums[idx] / (double)st->nonnull[idx];
+                        else
+                            dst->data.f64[out_count] = (double)st->i64_sums[idx] / (double)st->nonnull[idx];
                     }
                     break;
                 case AGG_MIN:
@@ -3202,6 +3433,7 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         st = (struct simple_agg_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
         ctx->node_states[node_idx] = st;
         st->sums      = (double *)bump_calloc(&ctx->arena->scratch, agg_n, sizeof(double));
+        st->i64_sums  = (int64_t *)bump_calloc(&ctx->arena->scratch, agg_n, sizeof(int64_t));
         st->mins      = (double *)bump_calloc(&ctx->arena->scratch, agg_n, sizeof(double));
         st->maxs      = (double *)bump_calloc(&ctx->arena->scratch, agg_n, sizeof(double));
         st->text_mins = (const char **)bump_calloc(&ctx->arena->scratch, agg_n, sizeof(const char *));
@@ -3260,39 +3492,53 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                                    pn->simple_agg.table, &st->tmp_row,
                                                    ctx->db, &ctx->arena->scratch);
                         if (cv.is_null) continue;
-                        double v = 0.0;
-                        switch (cv.type) {
-                            case COLUMN_TYPE_SMALLINT: v = (double)cv.value.as_smallint; break;
-                            case COLUMN_TYPE_INT:      v = (double)cv.value.as_int; break;
-                            case COLUMN_TYPE_BIGINT:   v = (double)cv.value.as_bigint; break;
-                            case COLUMN_TYPE_FLOAT:
-                            case COLUMN_TYPE_NUMERIC:  v = cv.value.as_float; break;
-                            case COLUMN_TYPE_BOOLEAN:  v = (double)cv.value.as_bool; break;
-                            case COLUMN_TYPE_DATE:     v = (double)cv.value.as_date; break;
-                            case COLUMN_TYPE_TIME:
-                            case COLUMN_TYPE_TIMESTAMP:
-                            case COLUMN_TYPE_TIMESTAMPTZ:
-                                v = (double)cv.value.as_timestamp; break;
-                            case COLUMN_TYPE_INTERVAL:
-                                v = (double)interval_to_usec_approx(cv.value.as_interval); break;
-                            case COLUMN_TYPE_TEXT:  break;
-                            case COLUMN_TYPE_ENUM:  break;
-                            case COLUMN_TYPE_UUID:  break;
-                        }
                         /* COUNT(DISTINCT expr): hash the result and deduplicate */
                         if (st->distinct_sets[a].cap > 0) {
                             uint64_t dh = 14695981039346656037ULL;
-                            uint64_t bits;
-                            memcpy(&bits, &v, sizeof(bits));
+                            uint64_t bits = 0;
+                            if (cv.type == COLUMN_TYPE_FLOAT || cv.type == COLUMN_TYPE_NUMERIC)
+                                memcpy(&bits, &cv.value.as_float, sizeof(bits));
+                            else {
+                                long long tmp = 0;
+                                if (cv.type == COLUMN_TYPE_INT) tmp = cv.value.as_int;
+                                else if (cv.type == COLUMN_TYPE_BIGINT) tmp = cv.value.as_bigint;
+                                else if (cv.type == COLUMN_TYPE_SMALLINT) tmp = cv.value.as_smallint;
+                                memcpy(&bits, &tmp, sizeof(bits));
+                            }
                             dh ^= bits;
                             dh *= 1099511628211ULL;
                             if (!distinct_set_insert(&st->distinct_sets[a], dh, &ctx->arena->scratch))
                                 continue; /* duplicate — skip */
                         }
                         st->nonnull[a]++;
-                        st->sums[a] += v;
-                        if (!st->minmax_init[a] || v < st->mins[a]) st->mins[a] = v;
-                        if (!st->minmax_init[a] || v > st->maxs[a]) st->maxs[a] = v;
+                        if (cv.type == COLUMN_TYPE_FLOAT || cv.type == COLUMN_TYPE_NUMERIC) {
+                            double v = cv.value.as_float;
+                            st->sums[a] += v;
+                            if (!st->minmax_init[a] || v < st->mins[a]) st->mins[a] = v;
+                            if (!st->minmax_init[a] || v > st->maxs[a]) st->maxs[a] = v;
+                        } else {
+                            long long iv = 0;
+                            switch (cv.type) {
+                                case COLUMN_TYPE_SMALLINT: iv = cv.value.as_smallint; break;
+                                case COLUMN_TYPE_INT:      iv = cv.value.as_int; break;
+                                case COLUMN_TYPE_BIGINT:   iv = cv.value.as_bigint; break;
+                                case COLUMN_TYPE_BOOLEAN:  iv = cv.value.as_bool; break;
+                                case COLUMN_TYPE_DATE:     iv = cv.value.as_date; break;
+                                case COLUMN_TYPE_TIME:
+                                case COLUMN_TYPE_TIMESTAMP:
+                                case COLUMN_TYPE_TIMESTAMPTZ:
+                                    iv = cv.value.as_timestamp; break;
+                                case COLUMN_TYPE_INTERVAL:
+                                    iv = interval_to_usec_approx(cv.value.as_interval); break;
+                                case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
+                                case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM:
+                                case COLUMN_TYPE_UUID: break;
+                            }
+                            st->i64_sums[a] += iv;
+                            double v = (double)iv;
+                            if (!st->minmax_init[a] || v < st->mins[a]) st->mins[a] = v;
+                            if (!st->minmax_init[a] || v > st->maxs[a]) st->maxs[a] = v;
+                        }
                         st->minmax_init[a] = 1;
                         continue;
                     }
@@ -3306,7 +3552,8 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             continue; /* duplicate — skip */
                     }
                     st->nonnull[a]++;
-                    agg_accumulate_cb(acb, ri, st->sums, st->mins, st->maxs,
+                    agg_accumulate_cb(acb, ri, st->sums, st->i64_sums,
+                                      st->mins, st->maxs,
                                       st->text_mins, st->text_maxs,
                                       st->minmax_init, a);
                 }
@@ -3319,7 +3566,6 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     /* Phase 2: emit exactly one row */
     if (st->emit_done) return -1;
     st->emit_done = 1;
-
     row_block_reset(out);
     for (uint32_t a = 0; a < agg_n; a++) {
         struct agg_expr *ae = &ctx->arena->aggregates.items[pn->simple_agg.agg_start + a];
@@ -3343,6 +3589,8 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
                         src_is_float = 1;
                 }
+                if (src_col == -2 && st->sums[a] != 0.0)
+                    src_is_float = 1;
                 if (st->nonnull[a] == 0) {
                     dst->type = src_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_BIGINT;
                     dst->nulls[0] = 1;
@@ -3351,15 +3599,15 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     dst->nulls[0] = 0;
                     dst->data.f64[0] = st->sums[a];
                 } else {
-                    double sv = st->sums[a];
-                    if (sv == (double)(int32_t)sv && sv >= -2147483648.0 && sv <= 2147483647.0) {
+                    int64_t sv = st->i64_sums[a];
+                    if (sv >= INT32_MIN && sv <= INT32_MAX) {
                         dst->type = COLUMN_TYPE_INT;
                         dst->nulls[0] = 0;
                         dst->data.i32[0] = (int32_t)sv;
                     } else {
                         dst->type = COLUMN_TYPE_BIGINT;
                         dst->nulls[0] = 0;
-                        dst->data.i64[0] = (int64_t)sv;
+                        dst->data.i64[0] = sv;
                     }
                 }
                 break;
@@ -3369,8 +3617,20 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 if (st->nonnull[a] == 0) {
                     dst->nulls[0] = 1;
                 } else {
+                    int src_col_avg = pn->simple_agg.agg_col_indices[a];
+                    int avg_is_float = 0;
+                    if (src_col_avg >= 0 && pn->simple_agg.table) {
+                        enum column_type sct = pn->simple_agg.table->columns.items[src_col_avg].type;
+                        if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
+                            avg_is_float = 1;
+                    }
+                    if (src_col_avg == -2 && st->sums[a] != 0.0)
+                        avg_is_float = 1;
                     dst->nulls[0] = 0;
-                    dst->data.f64[0] = st->sums[a] / (double)st->nonnull[a];
+                    if (avg_is_float)
+                        dst->data.f64[0] = st->sums[a] / (double)st->nonnull[a];
+                    else
+                        dst->data.f64[0] = (double)st->i64_sums[a] / (double)st->nonnull[a];
                 }
                 break;
             case AGG_MIN:
@@ -3720,7 +3980,7 @@ static int sort_flat_cmp(const void *a, const void *b)
             int16_t va = ((const int16_t *)_bsort_ctx.flat_keys[k])[ia];
             int16_t vb = ((const int16_t *)_bsort_ctx.flat_keys[k])[ib];
             cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
-        } else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN) {
+        } else if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN || kt == COLUMN_TYPE_ENUM) {
             int32_t va = ((const int32_t *)_bsort_ctx.flat_keys[k])[ia];
             int32_t vb = ((const int32_t *)_bsort_ctx.flat_keys[k])[ib];
             cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
@@ -4110,6 +4370,15 @@ static inline double flat_col_to_double(void *data, uint8_t *nulls, enum column_
     return 0.0;
 }
 
+static inline int64_t flat_col_to_i64(void *data, uint8_t *nulls, enum column_type ct, uint32_t idx)
+{
+    if (nulls[idx]) return 0;
+    if (ct == COLUMN_TYPE_SMALLINT) return (int64_t)((int16_t *)data)[idx];
+    if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN) return (int64_t)((int32_t *)data)[idx];
+    if (ct == COLUMN_TYPE_BIGINT) return ((int64_t *)data)[idx];
+    return 0;
+}
+
 static inline int flat_col_ord_cmp(void *data, enum column_type ct, uint8_t *nulls, uint32_t a, uint32_t b)
 {
     int an = nulls[a], bn = nulls[b];
@@ -4270,9 +4539,11 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         /* Compute window values */
         uint16_t nw = pn->window.n_win;
         st->win_i32 = (int32_t *)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(int32_t));
+        st->win_i64 = (int64_t *)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(int64_t));
         st->win_f64 = (double *)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(double));
         st->win_null = (uint8_t *)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(uint8_t));
         st->win_is_dbl = (int *)bump_calloc(&ctx->arena->scratch, nw, sizeof(int));
+        st->win_is_i64 = (int *)bump_calloc(&ctx->arena->scratch, nw, sizeof(int));
         st->win_str = (char **)bump_calloc(&ctx->arena->scratch, nw * total, sizeof(char *));
         st->win_is_str = (int *)bump_calloc(&ctx->arena->scratch, nw, sizeof(int));
 
@@ -4421,7 +4692,12 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 st->win_is_dbl[w] = 1;
                             }
                         } else {
-                            st->win_null[oi * nw + w] = 1;
+                            if (pn->window.win_has_default && pn->window.win_has_default[w]) {
+                                st->win_f64[oi * nw + w] = pn->window.win_default_dbl[w];
+                                st->win_is_dbl[w] = 1;
+                            } else {
+                                st->win_null[oi * nw + w] = 1;
+                            }
                         }
                     }
                     break;
@@ -4444,7 +4720,12 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 st->win_is_dbl[w] = 1;
                             }
                         } else {
-                            st->win_null[oi * nw + w] = 1;
+                            if (pn->window.win_has_default && pn->window.win_has_default[w]) {
+                                st->win_f64[oi * nw + w] = pn->window.win_default_dbl[w];
+                                st->win_is_dbl[w] = 1;
+                            } else {
+                                st->win_null[oi * nw + w] = 1;
+                            }
                         }
                     }
                     break;
@@ -4474,15 +4755,20 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 case WIN_SUM:
                 case WIN_COUNT:
                 case WIN_AVG: {
+                    int src_is_flt = (ac >= 0 && (st->flat_types[ac] == COLUMN_TYPE_FLOAT || st->flat_types[ac] == COLUMN_TYPE_NUMERIC));
                     if (!pn->window.win_has_frame[w] && oc < 0) {
                         /* no frame, no ORDER BY: partition total */
-                        double part_sum = 0.0;
+                        double part_sum_f = 0.0;
+                        int64_t part_sum_i = 0;
                         int part_nn = 0;
                         for (uint32_t i = ps; i < pe; i++) {
                             if (ac >= 0) {
                                 uint32_t si = st->sorted[i];
                                 if (!st->flat_nulls[ac][si]) {
-                                    part_sum += flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                    if (src_is_flt)
+                                        part_sum_f += flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                    else
+                                        part_sum_i += flat_col_to_i64(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
                                     part_nn++;
                                 }
                             }
@@ -4490,45 +4776,53 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         for (uint32_t i = ps; i < pe; i++) {
                             uint32_t oi = st->sorted[i];
                             if (wf == WIN_SUM) {
-                                if (ac >= 0 && (st->flat_types[ac] == COLUMN_TYPE_FLOAT || st->flat_types[ac] == COLUMN_TYPE_NUMERIC)) {
+                                if (src_is_flt) {
                                     st->win_is_dbl[w] = 1;
-                                    st->win_f64[oi * nw + w] = part_sum;
+                                    st->win_f64[oi * nw + w] = part_sum_f;
                                 } else {
-                                    st->win_i32[oi * nw + w] = (int32_t)part_sum;
+                                    st->win_is_i64[w] = 1;
+                                    st->win_i64[oi * nw + w] = part_sum_i;
                                 }
                             } else if (wf == WIN_COUNT) {
                                 st->win_i32[oi * nw + w] = (ac >= 0) ? part_nn : (int32_t)psize;
                             } else {
                                 st->win_is_dbl[w] = 1;
-                                if (part_nn > 0) st->win_f64[oi * nw + w] = part_sum / (double)part_nn;
+                                double avg_sum = src_is_flt ? part_sum_f : (double)part_sum_i;
+                                if (part_nn > 0) st->win_f64[oi * nw + w] = avg_sum / (double)part_nn;
                                 else st->win_null[oi * nw + w] = 1;
                             }
                         }
                     } else if (!pn->window.win_has_frame[w] && oc >= 0) {
                         /* ORDER BY without explicit frame: implicit UNBOUNDED PRECEDING TO CURRENT ROW */
-                        double running_sum = 0.0;
+                        double running_sum_f = 0.0;
+                        int64_t running_sum_i = 0;
                         int running_nn = 0;
                         int running_count = 0;
                         for (uint32_t i = ps; i < pe; i++) {
                             uint32_t si = st->sorted[i];
                             if (ac >= 0 && !st->flat_nulls[ac][si]) {
-                                running_sum += flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                if (src_is_flt)
+                                    running_sum_f += flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                else
+                                    running_sum_i += flat_col_to_i64(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
                                 running_nn++;
                             }
                             running_count++;
                             uint32_t oi = st->sorted[i];
                             if (wf == WIN_SUM) {
-                                if (ac >= 0 && (st->flat_types[ac] == COLUMN_TYPE_FLOAT || st->flat_types[ac] == COLUMN_TYPE_NUMERIC)) {
+                                if (src_is_flt) {
                                     st->win_is_dbl[w] = 1;
-                                    st->win_f64[oi * nw + w] = running_sum;
+                                    st->win_f64[oi * nw + w] = running_sum_f;
                                 } else {
-                                    st->win_i32[oi * nw + w] = (int32_t)running_sum;
+                                    st->win_is_i64[w] = 1;
+                                    st->win_i64[oi * nw + w] = running_sum_i;
                                 }
                             } else if (wf == WIN_COUNT) {
                                 st->win_i32[oi * nw + w] = (ac >= 0) ? running_nn : running_count;
                             } else {
                                 st->win_is_dbl[w] = 1;
-                                if (running_nn > 0) st->win_f64[oi * nw + w] = running_sum / (double)running_nn;
+                                double avg_sum = src_is_flt ? running_sum_f : (double)running_sum_i;
+                                if (running_nn > 0) st->win_f64[oi * nw + w] = avg_sum / (double)running_nn;
                                 else st->win_null[oi * nw + w] = 1;
                             }
                         }
@@ -4551,26 +4845,33 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 case FRAME_UNBOUNDED_PRECEDING: fe = 0; break;
                             }
                             if (fs > psize) fs = psize;
-                            double frame_sum = 0.0;
+                            double frame_sum_f = 0.0;
+                            int64_t frame_sum_i = 0;
                             int frame_nn = 0, frame_count = 0;
                             for (uint32_t fi = fs; fi < fe; fi++) {
                                 uint32_t si = st->sorted[ps + fi];
                                 frame_count++;
                                 if (ac >= 0 && !st->flat_nulls[ac][si]) {
-                                    frame_sum += flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                    if (src_is_flt)
+                                        frame_sum_f += flat_col_to_double(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
+                                    else
+                                        frame_sum_i += flat_col_to_i64(st->flat_data[ac], st->flat_nulls[ac], st->flat_types[ac], si);
                                     frame_nn++;
                                 }
                             }
                             uint32_t oi = st->sorted[i];
                             if (wf == WIN_SUM) {
-                                if (ac >= 0 && (st->flat_types[ac] == COLUMN_TYPE_FLOAT || st->flat_types[ac] == COLUMN_TYPE_NUMERIC)) {
-                                    st->win_is_dbl[w] = 1; st->win_f64[oi * nw + w] = frame_sum;
-                                } else st->win_i32[oi * nw + w] = (int32_t)frame_sum;
+                                if (src_is_flt) {
+                                    st->win_is_dbl[w] = 1; st->win_f64[oi * nw + w] = frame_sum_f;
+                                } else {
+                                    st->win_is_i64[w] = 1; st->win_i64[oi * nw + w] = frame_sum_i;
+                                }
                             } else if (wf == WIN_COUNT) {
                                 st->win_i32[oi * nw + w] = (ac >= 0) ? frame_nn : frame_count;
                             } else {
                                 st->win_is_dbl[w] = 1;
-                                if (frame_nn > 0) st->win_f64[oi * nw + w] = frame_sum / (double)frame_nn;
+                                double avg_sum = src_is_flt ? frame_sum_f : (double)frame_sum_i;
+                                if (frame_nn > 0) st->win_f64[oi * nw + w] = avg_sum / (double)frame_nn;
                                 else st->win_null[oi * nw + w] = 1;
                             }
                         }
@@ -4692,6 +4993,7 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         struct col_block *ocb = &out->cols[oc];
         ocb->type = st->win_is_str[w] ? COLUMN_TYPE_TEXT
                   : st->win_is_dbl[w] ? COLUMN_TYPE_FLOAT
+                  : st->win_is_i64[w] ? COLUMN_TYPE_BIGINT
                   : COLUMN_TYPE_INT;
         ocb->count = out_count;
 
@@ -4706,6 +5008,12 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 uint32_t fi = idx[r];
                 ocb->nulls[r] = st->win_null[fi * nw + w];
                 ocb->data.f64[r] = st->win_f64[fi * nw + w];
+            }
+        } else if (st->win_is_i64[w]) {
+            for (uint16_t r = 0; r < out_count; r++) {
+                uint32_t fi = idx[r];
+                ocb->nulls[r] = st->win_null[fi * nw + w];
+                ocb->data.i64[r] = st->win_i64[fi * nw + w];
             }
         } else {
             for (uint16_t r = 0; r < out_count; r++) {
@@ -5960,6 +6268,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     case PLAN_PARQUET_SCAN:    return parquet_scan_next(ctx, node_idx, out);
 #endif
     case PLAN_EXPR_PROJECT:    return expr_project_next(ctx, node_idx, out);
+    case PLAN_VEC_PROJECT:     return vec_project_next(ctx, node_idx, out);
     case PLAN_SIMPLE_AGG:       return simple_agg_next(ctx, node_idx, out);
     case PLAN_NESTED_LOOP:
         /* not yet implemented */
@@ -6236,6 +6545,10 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
         break;
     case PLAN_EXPR_PROJECT:
         n = explain_unary(arena, pn, "Project (expressions)", buf + written, buflen - written, depth);
+        if (n > 0) written += n;
+        break;
+    case PLAN_VEC_PROJECT:
+        n = explain_unary(arena, pn, "Vec Project", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
     case PLAN_SORT:
@@ -7682,6 +7995,8 @@ static struct plan_result build_window(struct table *t, struct query_select *s,
     int *wac = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
     int *wfn = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
     int *woff = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    int *whd = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
+    double *wdd = (double *)bump_alloc(&arena->scratch, n_win * sizeof(double));
     int *whf = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
     int *wfs = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
     int *wfe = (int *)bump_alloc(&arena->scratch, n_win * sizeof(int));
@@ -7720,6 +8035,17 @@ static struct plan_result build_window(struct table *t, struct query_select *s,
             wac[wi] = ac;
             wfn[wi] = (int)se->win.func;
             woff[wi] = se->win.offset;
+            whd[wi] = se->win.has_default;
+            if (se->win.has_default) {
+                struct cell *dv = &se->win.default_val;
+                if (dv->type == COLUMN_TYPE_INT) wdd[wi] = (double)dv->value.as_int;
+                else if (dv->type == COLUMN_TYPE_BIGINT) wdd[wi] = (double)dv->value.as_bigint;
+                else if (dv->type == COLUMN_TYPE_FLOAT || dv->type == COLUMN_TYPE_NUMERIC) wdd[wi] = dv->value.as_float;
+                else if (dv->type == COLUMN_TYPE_SMALLINT) wdd[wi] = (double)dv->value.as_smallint;
+                else wdd[wi] = 0.0;
+            } else {
+                wdd[wi] = 0.0;
+            }
             whf[wi] = se->win.has_frame;
             wfs[wi] = (int)se->win.frame_start;
             wfe[wi] = (int)se->win.frame_end;
@@ -7753,6 +8079,8 @@ static struct plan_result build_window(struct table *t, struct query_select *s,
     PLAN_NODE(arena, win_idx).window.win_arg_col = wac;
     PLAN_NODE(arena, win_idx).window.win_func = wfn;
     PLAN_NODE(arena, win_idx).window.win_offset = woff;
+    PLAN_NODE(arena, win_idx).window.win_has_default = whd;
+    PLAN_NODE(arena, win_idx).window.win_default_dbl = wdd;
     PLAN_NODE(arena, win_idx).window.win_has_frame = whf;
     PLAN_NODE(arena, win_idx).window.win_frame_start = wfs;
     PLAN_NODE(arena, win_idx).window.win_frame_end = wfe;
@@ -8714,14 +9042,130 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
     if (need_project)
         current = append_project_node(current, arena, proj_ncols, proj_map);
 
-    /* Add expression projection node for computed columns */
+    /* Add expression projection node for computed columns.
+     * Try vectorized path first for simple col OP col / col OP lit expressions. */
     if (need_expr_project) {
-        uint32_t eproj_idx = plan_alloc_node(arena, PLAN_EXPR_PROJECT);
-        PLAN_NODE(arena, eproj_idx).left = current;
-        PLAN_NODE(arena, eproj_idx).expr_project.ncols = proj_ncols;
-        PLAN_NODE(arena, eproj_idx).expr_project.expr_indices = expr_proj_indices;
-        PLAN_NODE(arena, eproj_idx).expr_project.table = t;
-        current = eproj_idx;
+        int vec_ok = 1;
+        struct vec_project_op *vops = (struct vec_project_op *)bump_alloc(
+            &arena->scratch, proj_ncols * sizeof(struct vec_project_op));
+        memset(vops, 0, proj_ncols * sizeof(struct vec_project_op));
+
+        for (uint16_t i = 0; i < proj_ncols && vec_ok; i++) {
+            struct expr *e = &EXPR(arena, expr_proj_indices[i]);
+
+            if (e->type == EXPR_COLUMN_REF) {
+                int ci = table_find_column_sv(t, e->column_ref.column);
+                if (ci < 0) { vec_ok = 0; break; }
+                vops[i].kind = VEC_PASSTHROUGH;
+                vops[i].left_col = (uint16_t)ci;
+                vops[i].out_type = t->columns.items[ci].type;
+            } else if (e->type == EXPR_BINARY_OP) {
+                enum expr_op op = e->binary.op;
+                if (op != OP_ADD && op != OP_SUB && op != OP_MUL && op != OP_DIV) {
+                    vec_ok = 0; break;
+                }
+                struct expr *le = &EXPR(arena, e->binary.left);
+                struct expr *re = &EXPR(arena, e->binary.right);
+
+                if (le->type == EXPR_COLUMN_REF && re->type == EXPR_COLUMN_REF) {
+                    int lci = table_find_column_sv(t, le->column_ref.column);
+                    int rci = table_find_column_sv(t, re->column_ref.column);
+                    if (lci < 0 || rci < 0) { vec_ok = 0; break; }
+                    enum column_type lt = t->columns.items[lci].type;
+                    enum column_type rt = t->columns.items[rci].type;
+                    if (lt != rt) { vec_ok = 0; break; }
+                    if (lt != COLUMN_TYPE_INT && lt != COLUMN_TYPE_BIGINT &&
+                        lt != COLUMN_TYPE_FLOAT && lt != COLUMN_TYPE_NUMERIC) {
+                        vec_ok = 0; break;
+                    }
+                    vops[i].kind = VEC_COL_OP_COL;
+                    vops[i].left_col = (uint16_t)lci;
+                    vops[i].right_col = (uint16_t)rci;
+                    vops[i].op = op;
+                    vops[i].out_type = lt;
+                } else if (le->type == EXPR_COLUMN_REF && re->type == EXPR_LITERAL) {
+                    int lci = table_find_column_sv(t, le->column_ref.column);
+                    if (lci < 0) { vec_ok = 0; break; }
+                    enum column_type lt = t->columns.items[lci].type;
+                    if (lt != COLUMN_TYPE_INT && lt != COLUMN_TYPE_BIGINT &&
+                        lt != COLUMN_TYPE_FLOAT && lt != COLUMN_TYPE_NUMERIC) {
+                        vec_ok = 0; break;
+                    }
+                    /* Extract literal value, coercing to column type */
+                    enum column_type lit_t = re->literal.type;
+                    double lit_f = 0.0;
+                    int64_t lit_i = 0;
+                    if (lit_t == COLUMN_TYPE_FLOAT || lit_t == COLUMN_TYPE_NUMERIC)
+                        lit_f = re->literal.value.as_float;
+                    else if (lit_t == COLUMN_TYPE_BIGINT)
+                        { lit_i = re->literal.value.as_bigint; lit_f = (double)lit_i; }
+                    else if (lit_t == COLUMN_TYPE_INT)
+                        { lit_i = (int64_t)re->literal.value.as_int; lit_f = (double)lit_i; }
+                    else if (lit_t == COLUMN_TYPE_SMALLINT)
+                        { lit_i = (int64_t)re->literal.value.as_smallint; lit_f = (double)lit_i; }
+                    else { vec_ok = 0; break; }
+                    vops[i].kind = VEC_COL_OP_LIT;
+                    vops[i].left_col = (uint16_t)lci;
+                    vops[i].op = op;
+                    vops[i].out_type = lt;
+                    if (lt == COLUMN_TYPE_FLOAT || lt == COLUMN_TYPE_NUMERIC)
+                        vops[i].lit_f64 = lit_f;
+                    else
+                        vops[i].lit_i64 = lit_i;
+                } else if (le->type == EXPR_LITERAL && re->type == EXPR_COLUMN_REF) {
+                    int rci = table_find_column_sv(t, re->column_ref.column);
+                    if (rci < 0) { vec_ok = 0; break; }
+                    enum column_type rt = t->columns.items[rci].type;
+                    if (rt != COLUMN_TYPE_INT && rt != COLUMN_TYPE_BIGINT &&
+                        rt != COLUMN_TYPE_FLOAT && rt != COLUMN_TYPE_NUMERIC) {
+                        vec_ok = 0; break;
+                    }
+                    /* Rewrite lit OP col as col OP lit for commutative ops,
+                     * bail for non-commutative (SUB, DIV) */
+                    if (op == OP_SUB || op == OP_DIV) { vec_ok = 0; break; }
+                    /* Extract literal value, coercing to column type */
+                    enum column_type lit_t2 = le->literal.type;
+                    double lit_f2 = 0.0;
+                    int64_t lit_i2 = 0;
+                    if (lit_t2 == COLUMN_TYPE_FLOAT || lit_t2 == COLUMN_TYPE_NUMERIC)
+                        lit_f2 = le->literal.value.as_float;
+                    else if (lit_t2 == COLUMN_TYPE_BIGINT)
+                        { lit_i2 = le->literal.value.as_bigint; lit_f2 = (double)lit_i2; }
+                    else if (lit_t2 == COLUMN_TYPE_INT)
+                        { lit_i2 = (int64_t)le->literal.value.as_int; lit_f2 = (double)lit_i2; }
+                    else if (lit_t2 == COLUMN_TYPE_SMALLINT)
+                        { lit_i2 = (int64_t)le->literal.value.as_smallint; lit_f2 = (double)lit_i2; }
+                    else { vec_ok = 0; break; }
+                    vops[i].kind = VEC_COL_OP_LIT;
+                    vops[i].left_col = (uint16_t)rci;
+                    vops[i].op = op;
+                    vops[i].out_type = rt;
+                    if (rt == COLUMN_TYPE_FLOAT || rt == COLUMN_TYPE_NUMERIC)
+                        vops[i].lit_f64 = lit_f2;
+                    else
+                        vops[i].lit_i64 = lit_i2;
+                } else {
+                    vec_ok = 0; break;
+                }
+            } else {
+                vec_ok = 0; break;
+            }
+        }
+
+        if (vec_ok) {
+            uint32_t vp_idx = plan_alloc_node(arena, PLAN_VEC_PROJECT);
+            PLAN_NODE(arena, vp_idx).left = current;
+            PLAN_NODE(arena, vp_idx).vec_project.ncols = proj_ncols;
+            PLAN_NODE(arena, vp_idx).vec_project.ops = vops;
+            current = vp_idx;
+        } else {
+            uint32_t eproj_idx = plan_alloc_node(arena, PLAN_EXPR_PROJECT);
+            PLAN_NODE(arena, eproj_idx).left = current;
+            PLAN_NODE(arena, eproj_idx).expr_project.ncols = proj_ncols;
+            PLAN_NODE(arena, eproj_idx).expr_project.expr_indices = expr_proj_indices;
+            PLAN_NODE(arena, eproj_idx).expr_project.table = t;
+            current = eproj_idx;
+        }
     }
 
     /* Add DISTINCT node if present (after sort+project, before limit) */
@@ -8830,7 +9274,8 @@ struct plan_result plan_build_select(struct table *t, struct query_select *s,
         !s->has_set_op && s->ctes_count == 0 && s->cte_sql == IDX_NONE &&
         s->from_subquery_sql == IDX_NONE && !s->has_recursive_cte &&
         s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
-        !s->has_distinct && !s->has_distinct_on) {
+        !s->has_distinct && !s->has_distinct_on &&
+        (s->parsed_columns_count == 0 || s->parsed_columns_count == s->aggregates_count)) {
         struct plan_result sa_pr = build_simple_agg(t, s, arena);
         if (sa_pr.status == PLAN_OK) return sa_pr;
     }

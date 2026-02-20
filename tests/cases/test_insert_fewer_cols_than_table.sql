@@ -1,9 +1,8 @@
--- INSERT with fewer values than columns should pad with NULL
+-- INSERT with fewer values than columns should error (PostgreSQL behavior)
 -- setup:
 CREATE TABLE t1 (id INT, name TEXT, age INT);
-INSERT INTO t1 VALUES (1, 'alice');
 -- input:
-SELECT id, name, age FROM t1;
+INSERT INTO t1 VALUES (1, 'alice');
 -- expected output:
-1|alice|
+ERROR:  INSERT has fewer expressions than target columns
 -- expected status: 0

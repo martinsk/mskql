@@ -69,6 +69,8 @@ struct win_expr {
     sv order_col;
     int order_desc; /* 1 = DESC, 0 = ASC (default) */
     int offset;     /* for LAG/LEAD (default 1), NTH_VALUE (n), NTILE (buckets) */
+    int has_default;     /* LAG/LEAD: 1 if a default value was provided */
+    struct cell default_val; /* LAG/LEAD: default value when out of range */
     /* window frame */
     int has_frame;
     enum frame_bound frame_start;

@@ -14,6 +14,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
+#include <math.h>
 
 /* ---- helpers: write big-endian integers ---- */
 
@@ -246,7 +247,12 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c,
             txt = buf;
             break;
         case COLUMN_TYPE_FLOAT:
-            len = (size_t)snprintf(buf, sizeof(buf), "%g", c->value.as_float);
+            if (isinf(c->value.as_float))
+                len = (size_t)snprintf(buf, sizeof(buf), "%s", c->value.as_float > 0 ? "Infinity" : "-Infinity");
+            else if (isnan(c->value.as_float))
+                len = (size_t)snprintf(buf, sizeof(buf), "NaN");
+            else
+                len = (size_t)snprintf(buf, sizeof(buf), "%g", c->value.as_float);
             txt = buf;
             break;
         case COLUMN_TYPE_BOOLEAN:
@@ -1790,6 +1796,12 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         if (from_sub_temp) { s->from_subquery_sql = saved_from_sub_sql; remove_temp_table(db, from_sub_temp); }
         goto cte_restore_bail;
     }
+    /* Views are stored as tables with 0 columns and view_sql set —
+     * bail to legacy path which handles view expansion. */
+    if (t && t->view_sql) {
+        if (from_sub_temp) { s->from_subquery_sql = saved_from_sub_sql; remove_temp_table(db, from_sub_temp); }
+        goto cte_restore_bail;
+    }
 
     struct table *join_tables[8] = {0};
     int n_join_tables = 0;
@@ -2028,7 +2040,12 @@ static int handle_copy_to_stdout(int fd, struct database *db, struct query *q,
                     vlen = (size_t)snprintf(buf, sizeof(buf), "%lld", cell->value.as_bigint);
                     val = buf;
                 } else if (cell->type == COLUMN_TYPE_FLOAT || cell->type == COLUMN_TYPE_NUMERIC) {
-                    vlen = (size_t)snprintf(buf, sizeof(buf), "%g", cell->value.as_float);
+                    if (isinf(cell->value.as_float))
+                        vlen = (size_t)snprintf(buf, sizeof(buf), "%s", cell->value.as_float > 0 ? "Infinity" : "-Infinity");
+                    else if (isnan(cell->value.as_float))
+                        vlen = (size_t)snprintf(buf, sizeof(buf), "NaN");
+                    else
+                        vlen = (size_t)snprintf(buf, sizeof(buf), "%g", cell->value.as_float);
                     val = buf;
                 } else if (cell->type == COLUMN_TYPE_BOOLEAN) {
                     val = cell->value.as_bool ? "t" : "f";

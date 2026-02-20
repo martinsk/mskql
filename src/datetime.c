@@ -355,6 +355,16 @@ void interval_to_str(struct interval iv, char *buf, size_t len)
     int32_t days = iv.days;
     int64_t usec = iv.usec;
 
+    /* Normalize: borrow between days and usec when signs differ.
+     * E.g. 2 days -12h → 1 day 12h;  -2 days 12h → -1 day -12h */
+    if (days > 0 && usec < 0) {
+        days--;
+        usec += USEC_PER_DAY;
+    } else if (days < 0 && usec > 0) {
+        days++;
+        usec -= USEC_PER_DAY;
+    }
+
     /* handle negative usec */
     if (usec < 0) {
         neg_time = 1;
@@ -426,7 +436,7 @@ double date_extract(int32_t days, const char *field)
     if (strcasecmp(field, "month") == 0) return (double)m;
     if (strcasecmp(field, "day") == 0) return (double)d;
     if (strcasecmp(field, "quarter") == 0) return (double)((m - 1) / 3 + 1);
-    if (strcasecmp(field, "epoch") == 0) return (double)days * 86400.0;
+    if (strcasecmp(field, "epoch") == 0) return (double)days * 86400.0 + (double)PG_EPOCH_UNIX;
 
     if (strcasecmp(field, "dow") == 0) {
         /* PG epoch 2000-01-01 is a Saturday (dow=6) */
@@ -465,7 +475,7 @@ double timestamp_extract(int64_t usec, const char *field)
     if (strcasecmp(field, "second") == 0)
         return (double)((time_usec % USEC_PER_MIN) / USEC_PER_SEC);
     if (strcasecmp(field, "epoch") == 0)
-        return (double)usec / (double)USEC_PER_SEC;
+        return (double)usec / (double)USEC_PER_SEC + (double)PG_EPOCH_UNIX;
 
     /* delegate date-level fields */
     return date_extract(days, field);

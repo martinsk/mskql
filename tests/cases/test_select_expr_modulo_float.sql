@@ -5,5 +5,5 @@ INSERT INTO t1 (id, val) VALUES (1, 7.5);
 -- input:
 SELECT id, val % 3 FROM t1;
 -- expected output:
-1|1
+1|1.5
 -- expected status: 0

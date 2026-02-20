@@ -1464,6 +1464,13 @@ static struct cell cell_make_float(double v)
     return c;
 }
 
+static struct cell cell_make_bigint(long long v)
+{
+    struct cell c = {0};
+    c.type = COLUMN_TYPE_BIGINT;
+    c.value.as_bigint = v;
+    return c;
+}
 
 /* Deep-copy a cell, strdup'ing any text.  Caller owns the copy and must
  * either push it into a result row or call cell_release(). */
@@ -1571,26 +1578,34 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
                                   struct table *t, struct row *row,
                                   struct database *db, struct bump_alloc *rb)
 {
-    /* AND/OR: short-circuit evaluation */
+    /* AND/OR: three-valued logic (NULL = UNKNOWN) */
     if (e->binary.op == OP_AND) {
         struct cell lhs = eval_expr(e->binary.left, arena, t, row, db, rb);
-        int lb = cell_is_null(&lhs) ? 0 : (lhs.type == COLUMN_TYPE_BOOLEAN ? lhs.value.as_bool : (cell_to_double_val(&lhs) != 0));
+        int l_null = cell_is_null(&lhs);
+        int lb = l_null ? 0 : (lhs.type == COLUMN_TYPE_BOOLEAN ? lhs.value.as_bool : (cell_to_double_val(&lhs) != 0));
         cell_release_rb(&lhs, rb);
-        if (!lb) return cell_make_bool(0);
+        if (!l_null && !lb) return cell_make_bool(0); /* FALSE AND x = FALSE */
         struct cell rhs = eval_expr(e->binary.right, arena, t, row, db, rb);
-        int rb2 = cell_is_null(&rhs) ? 0 : (rhs.type == COLUMN_TYPE_BOOLEAN ? rhs.value.as_bool : (cell_to_double_val(&rhs) != 0));
+        int r_null = cell_is_null(&rhs);
+        int rb2 = r_null ? 0 : (rhs.type == COLUMN_TYPE_BOOLEAN ? rhs.value.as_bool : (cell_to_double_val(&rhs) != 0));
         cell_release_rb(&rhs, rb);
-        return cell_make_bool(rb2);
+        if (!r_null && !rb2) return cell_make_bool(0); /* x AND FALSE = FALSE */
+        if (l_null || r_null) return cell_make_null(); /* UNKNOWN AND TRUE = UNKNOWN */
+        return cell_make_bool(1);
     }
     if (e->binary.op == OP_OR) {
         struct cell lhs = eval_expr(e->binary.left, arena, t, row, db, rb);
-        int lb = cell_is_null(&lhs) ? 0 : (lhs.type == COLUMN_TYPE_BOOLEAN ? lhs.value.as_bool : (cell_to_double_val(&lhs) != 0));
+        int l_null = cell_is_null(&lhs);
+        int lb = l_null ? 0 : (lhs.type == COLUMN_TYPE_BOOLEAN ? lhs.value.as_bool : (cell_to_double_val(&lhs) != 0));
         cell_release_rb(&lhs, rb);
-        if (lb) return cell_make_bool(1);
+        if (!l_null && lb) return cell_make_bool(1); /* TRUE OR x = TRUE */
         struct cell rhs = eval_expr(e->binary.right, arena, t, row, db, rb);
-        int rb2 = cell_is_null(&rhs) ? 0 : (rhs.type == COLUMN_TYPE_BOOLEAN ? rhs.value.as_bool : (cell_to_double_val(&rhs) != 0));
+        int r_null = cell_is_null(&rhs);
+        int rb2 = r_null ? 0 : (rhs.type == COLUMN_TYPE_BOOLEAN ? rhs.value.as_bool : (cell_to_double_val(&rhs) != 0));
         cell_release_rb(&rhs, rb);
-        return cell_make_bool(rb2);
+        if (!r_null && rb2) return cell_make_bool(1); /* x OR TRUE = TRUE */
+        if (l_null || r_null) return cell_make_null(); /* UNKNOWN OR FALSE = UNKNOWN */
+        return cell_make_bool(0);
     }
 
     struct cell lhs = eval_expr(e->binary.left, arena, t, row, db, rb);
@@ -1771,9 +1786,27 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
                        (long long)rhs.value.as_smallint;
         long long res = 0;
         switch (e->binary.op) {
-        case OP_ADD: res = la + ra; break;
-        case OP_SUB: res = la - ra; break;
-        case OP_MUL: res = la * ra; break;
+        case OP_ADD:
+            if (__builtin_saddll_overflow(la, ra, &res)) {
+                cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+                arena_set_error(arena, "22003", "bigint out of range");
+                return cell_make_null();
+            }
+            break;
+        case OP_SUB:
+            if (__builtin_ssubll_overflow(la, ra, &res)) {
+                cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+                arena_set_error(arena, "22003", "bigint out of range");
+                return cell_make_null();
+            }
+            break;
+        case OP_MUL:
+            if (__builtin_smulll_overflow(la, ra, &res)) {
+                cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+                arena_set_error(arena, "22003", "bigint out of range");
+                return cell_make_null();
+            }
+            break;
         case OP_DIV:
             if (ra == 0) {
                 cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
@@ -1801,55 +1834,72 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         case OP_CONCAT: case OP_NEG: case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE: break;
         }
         cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
-        struct cell c = {0};
-        c.type = COLUMN_TYPE_BIGINT;
-        c.value.as_bigint = res;
-        return c;
+        return cell_make_bigint(res);
     }
 
+    /* INT/SMALLINT/BOOLEAN native arithmetic — no double conversion */
+    if (!use_float) {
+        long long la = (lhs.type == COLUMN_TYPE_INT) ? (long long)lhs.value.as_int
+                     : (lhs.type == COLUMN_TYPE_SMALLINT) ? (long long)lhs.value.as_smallint
+                     : (long long)lhs.value.as_bool;
+        long long ra = (rhs.type == COLUMN_TYPE_INT) ? (long long)rhs.value.as_int
+                     : (rhs.type == COLUMN_TYPE_SMALLINT) ? (long long)rhs.value.as_smallint
+                     : (long long)rhs.value.as_bool;
+        cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+        long long res = 0;
+        switch (e->binary.op) {
+        case OP_ADD: res = la + ra; break;
+        case OP_SUB: res = la - ra; break;
+        case OP_MUL: res = la * ra; break;
+        case OP_DIV:
+            if (ra == 0) {
+                arena_set_error(arena, "22012", "division by zero");
+                return cell_make_null();
+            }
+            res = la / ra; break;
+        case OP_MOD:
+            if (ra == 0) {
+                arena_set_error(arena, "22012", "division by zero");
+                return cell_make_null();
+            }
+            res = la % ra; break;
+        case OP_EXP: return cell_make_float(pow((double)la, (double)ra));
+        case OP_EQ: return cell_make_bool(la == ra);
+        case OP_NE: return cell_make_bool(la != ra);
+        case OP_LT: return cell_make_bool(la < ra);
+        case OP_GT: return cell_make_bool(la > ra);
+        case OP_LE: return cell_make_bool(la <= ra);
+        case OP_GE: return cell_make_bool(la >= ra);
+        case OP_CONCAT: case OP_NEG: case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE: break;
+        }
+        if (res >= INT32_MIN && res <= INT32_MAX)
+            return cell_make_int((int)res);
+        return cell_make_bigint(res);
+    }
+
+    /* FLOAT/NUMERIC arithmetic — double is correct here */
     double lv = cell_to_double_val(&lhs);
     double rv = cell_to_double_val(&rhs);
+    cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
     double result_v = 0.0;
     switch (e->binary.op) {
         case OP_ADD: result_v = lv + rv; break;
         case OP_SUB: result_v = lv - rv; break;
         case OP_MUL: result_v = lv * rv; break;
-        case OP_DIV:
-            if (rv == 0.0 && !use_float) {
-                cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
-                arena_set_error(arena, "22012", "division by zero");
-                return cell_make_null();
-            }
-            if (!use_float)
-                result_v = (double)((long long)lv / (long long)rv);
-            else
-                result_v = lv / rv;
-            break;
-        case OP_MOD:
-            if (rv == 0.0) {
-                cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
-                arena_set_error(arena, "22012", "division by zero");
-                return cell_make_null();
-            }
-            result_v = (double)((long long)lv % (long long)rv);
-            break;
-        case OP_EXP: result_v = pow(lv, rv); use_float = 1; break;
-        case OP_CONCAT: break; /* handled above */
-        case OP_NEG: break;    /* not a binary op */
-        case OP_EQ: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(lv == rv); }
-        case OP_NE: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(lv != rv); }
-        case OP_LT: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(lv < rv); }
-        case OP_GT: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(lv > rv); }
-        case OP_LE: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(lv <= rv); }
-        case OP_GE: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(lv >= rv); }
+        case OP_DIV: result_v = lv / rv; break;
+        case OP_MOD: result_v = fmod(lv, rv); break;
+        case OP_EXP: result_v = pow(lv, rv); break;
+        case OP_CONCAT: break;
+        case OP_NEG: break;
+        case OP_EQ: return cell_make_bool(lv == rv);
+        case OP_NE: return cell_make_bool(lv != rv);
+        case OP_LT: return cell_make_bool(lv < rv);
+        case OP_GT: return cell_make_bool(lv > rv);
+        case OP_LE: return cell_make_bool(lv <= rv);
+        case OP_GE: return cell_make_bool(lv >= rv);
         case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE: break;
     }
-    cell_release_rb(&lhs, rb);
-    cell_release_rb(&rhs, rb);
-
-    if (use_float || result_v != (double)(int)result_v)
-        return cell_make_float(result_v);
-    return cell_make_int((int)result_v);
+    return cell_make_float(result_v);
 }
 
 static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t args_start,
@@ -2100,8 +2150,18 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
             cell_release_rb(&src_c, rb);
             return cell_make_null();
         }
+        /* epoch returns an integer for date/timestamp sources */
+        int is_epoch = (strcasecmp(field, "epoch") == 0);
+        enum column_type src_type = src_c.type;
         cell_release_rb(&field_c, rb);
         cell_release_rb(&src_c, rb);
+        if (is_epoch && (src_type == COLUMN_TYPE_DATE ||
+                         src_type == COLUMN_TYPE_TIMESTAMP ||
+                         src_type == COLUMN_TYPE_TIMESTAMPTZ)) {
+            long long iv = (long long)result_v;
+            if ((double)iv == result_v)
+                return cell_make_bigint(iv);
+        }
         struct cell r = {0};
         r.type = COLUMN_TYPE_FLOAT;
         r.value.as_float = result_v;
@@ -2872,8 +2932,8 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         }
         if (fn == FUNC_AGG_SUM) {
             if (nonnull == 0) return cell_make_null();
-            if (sum != (double)(int)sum || sum > 2147483647.0 || sum < -2147483648.0)
-                return cell_make_float(sum);
+            if (sum > 2147483647.0 || sum < -2147483648.0)
+                return cell_make_bigint((long long)sum);
             return cell_make_int((int)sum);
         } else if (fn == FUNC_AGG_COUNT) {
             return cell_make_int((int)nonnull);
@@ -2980,6 +3040,21 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
          target == COLUMN_TYPE_FLOAT || target == COLUMN_TYPE_NUMERIC) &&
         column_type_is_text(src.type) && src.value.as_text) {
         const char *s = src.value.as_text;
+        /* handle special float values: infinity, -infinity, NaN */
+        if ((target == COLUMN_TYPE_FLOAT || target == COLUMN_TYPE_NUMERIC) &&
+            (strcasecmp(s, "infinity") == 0 || strcasecmp(s, "-infinity") == 0 ||
+             strcasecmp(s, "inf") == 0 || strcasecmp(s, "-inf") == 0 ||
+             strcasecmp(s, "nan") == 0)) {
+            double v = 0.0;
+            if (strcasecmp(s, "nan") == 0) v = 0.0 / 0.0;
+            else if (s[0] == '-') v = -1.0 / 0.0;
+            else v = 1.0 / 0.0;
+            cell_release_rb(&src, rb);
+            struct cell r = {0};
+            r.type = target;
+            r.value.as_float = v;
+            return r;
+        }
         /* validate: skip leading whitespace, optional sign, require at least one digit */
         const char *p = s;
         while (*p == ' ' || *p == '\t') p++;
@@ -3047,7 +3122,30 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
         struct cell r = {0};
         r.type = target;
         switch (target) {
-        case COLUMN_TYPE_DATE:        r.value.as_date = date_from_str(s); break;
+        case COLUMN_TYPE_DATE: {
+            int32_t d = date_from_str(s);
+            if (d == DATE_INVALID) {
+                arena_set_error(arena, "22007", "invalid input syntax for type date: \"%s\"", s);
+                cell_release_rb(&src, rb);
+                return cell_make_null();
+            }
+            /* validate day-of-month: re-derive y/m/d and check round-trip */
+            {
+                int y, mo, dy;
+                days_to_ymd(d, &y, &mo, &dy);
+                /* parse original y/m/d from string */
+                int oy = 0, om = 0, od = 0;
+                if (sscanf(s, "%d-%d-%d", &oy, &om, &od) == 3) {
+                    if (od != dy || om != mo) {
+                        arena_set_error(arena, "22008", "date/time field value out of range: \"%s\"", s);
+                        cell_release_rb(&src, rb);
+                        return cell_make_null();
+                    }
+                }
+            }
+            r.value.as_date = d;
+            break;
+        }
         case COLUMN_TYPE_TIME:        r.value.as_time = time_from_str(s); break;
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ: r.value.as_timestamp = timestamp_from_str(s); break;
@@ -3296,6 +3394,16 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         if (query_parse(sql_buf, &sub_q) == 0) {
             struct rows sub_rows = {0};
             int sub_rc = db_exec(db, &sub_q, &sub_rows, NULL);
+            if (sub_rc == 0 && sub_rows.count > 1) {
+                /* scalar subquery must return at most one row */
+                for (size_t ri = 0; ri < sub_rows.count; ri++)
+                    row_free(&sub_rows.data[ri]);
+                free(sub_rows.data);
+                query_free(&sub_q);
+                arena_set_error(arena, "21000",
+                    "more than one row returned by a subquery used as an expression");
+                return cell_make_null();
+            }
             if (sub_rc == 0 && sub_rows.count > 0
                 && sub_rows.data[0].cells.count > 0) {
                 struct cell result = cell_deep_copy_rb(&sub_rows.data[0].cells.items[0], rb);
@@ -4127,6 +4235,33 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
         }
     }
 
+    /* If parsed_columns exist, rebuild the row to include non-aggregate
+     * columns (e.g. SELECT 1 AS marker, SUM(val) FROM t).  Aggregate
+     * placeholders (expr_idx == IDX_NONE) map sequentially to the
+     * aggregate cells we just built. */
+    if (s->parsed_columns_count > 0 && s->parsed_columns_count != naggs &&
+        s->group_by_count == 0) {
+        struct cell *saved_agg = bump_alloc(&arena->scratch, naggs * sizeof(struct cell));
+        for (uint32_t a = 0; a < naggs; a++)
+            saved_agg[a] = dst.cells.items[a];
+        da_free(&dst.cells);
+        dst = (struct row){0};
+        da_init(&dst.cells);
+        uint32_t agg_placeholder = 0;
+        for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+            struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
+            if (sc->expr_idx != IDX_NONE) {
+                struct cell c = eval_expr(sc->expr_idx, arena, t, NULL, NULL, rb);
+                da_push(&dst.cells, c);
+            } else if (agg_placeholder < naggs) {
+                da_push(&dst.cells, saved_agg[agg_placeholder++]);
+            } else {
+                struct cell nc = { .type = COLUMN_TYPE_TEXT, .is_null = 1 };
+                da_push(&dst.cells, nc);
+            }
+        }
+    }
+
     rows_push(result, dst);
 
     return 0;
@@ -4548,7 +4683,16 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                                 win_is_dbl[e] = 1;
                             }
                         } else {
-                            win_is_null[sorted_idx[i] * nexprs + e] = 1;
+                            if (se->win.has_default) {
+                                win_dbl_vals[sorted_idx[i] * nexprs + e] = cell_to_double(&se->win.default_val);
+                                win_is_dbl[e] = 1;
+                                if (column_type_is_text(se->win.default_val.type))
+                                    win_int_vals[sorted_idx[i] * nexprs + e] = se->win.default_val.value.as_int;
+                                else
+                                    win_int_vals[sorted_idx[i] * nexprs + e] = (int64_t)cell_to_double(&se->win.default_val);
+                            } else {
+                                win_is_null[sorted_idx[i] * nexprs + e] = 1;
+                            }
                         }
                     }
                     break;
@@ -6837,6 +6981,30 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
         }
     }
 
+    /* Validate column count vs value count */
+    if (ins->insert_rows_count > 0 && !ins->is_default_values) {
+        struct row *first = &arena->rows.items[ins->insert_rows_start];
+        size_t nvals = first->cells.count;
+        if (ins->insert_columns_count > 0) {
+            /* column list provided: values must not exceed specified columns */
+            if (nvals > ins->insert_columns_count) {
+                arena_set_error(arena, "42601", "INSERT has more expressions than target columns");
+                return -1;
+            }
+        } else {
+            /* no column list: error if more values than columns */
+            if (nvals > t->columns.count) {
+                arena_set_error(arena, "42601", "INSERT has more expressions than target columns");
+                return -1;
+            }
+            /* error if fewer values than columns */
+            if (nvals < t->columns.count) {
+                arena_set_error(arena, "42601", "INSERT has fewer expressions than target columns");
+                return -1;
+            }
+        }
+    }
+
     for (uint32_t r = 0; r < ins->insert_rows_count; r++) {
         struct row *src = &arena->rows.items[ins->insert_rows_start + r];
 
@@ -6974,6 +7142,15 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                             free((char *)s);
                             c->type = ct;
                             c->value.as_enum = ord;
+                        } else {
+                            arena_set_error(arena, "22P02",
+                                "invalid input value for enum %s: \"%s\"",
+                                t->columns.items[i].enum_type_name, s);
+                            free((char *)s);
+                            c->type = ct;
+                            c->is_null = 1;
+                            row_free(&copy);
+                            return -1;
                         }
                     }
                     break;

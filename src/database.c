@@ -833,6 +833,42 @@ static int exec_first_join(struct database *db, struct table *t1, const char **a
         return -1;
     }
     if (sq_temp) remove_temp_table(db, sq_temp);
+
+    /* NATURAL JOIN / USING: remove the duplicate right-side join column */
+    if ((ji->is_natural || ji->has_using) && ji->join_right_col.len > 0 && ji->join_type != 4) {
+        /* find the right-side join column in the merged metadata (right portion).
+         * Merged names may be aliased (e.g. "t2.id"), so match the bare part after '.'. */
+        int skip_idx = -1;
+        size_t ncols1 = t1->columns.count;
+        for (size_t c = ncols1; c < merged_t->columns.count; c++) {
+            const char *mname = merged_t->columns.items[c].name;
+            const char *dot = strrchr(mname, '.');
+            const char *bare = dot ? dot + 1 : mname;
+            if (strncasecmp(bare, ji->join_right_col.data, ji->join_right_col.len) == 0 &&
+                bare[ji->join_right_col.len] == '\0') {
+                skip_idx = (int)c;
+                break;
+            }
+        }
+        if (skip_idx >= 0) {
+            /* remove column from metadata */
+            column_free(&merged_t->columns.items[skip_idx]);
+            for (size_t c = (size_t)skip_idx; c + 1 < merged_t->columns.count; c++)
+                merged_t->columns.items[c] = merged_t->columns.items[c + 1];
+            merged_t->columns.count--;
+            /* remove cell from every row */
+            for (size_t r = 0; r < merged->count; r++) {
+                struct row *row = &merged->data[r];
+                if ((size_t)skip_idx < row->cells.count) {
+                    cell_free_text(&row->cells.items[skip_idx]);
+                    for (size_t c = (size_t)skip_idx; c + 1 < row->cells.count; c++)
+                        row->cells.items[c] = row->cells.items[c + 1];
+                    row->cells.count--;
+                }
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -1792,7 +1828,7 @@ static void materialize_ctes(struct database *db, struct query_select *s,
                     rows_push(&accum, r);
                 }
 
-                for (int iter = 0; iter < 1000; iter++) {
+                for (int iter = 0; iter < 10000; iter++) {
                     ct = db_find_table(db, cd_name);
                     if (!ct) break;
                     struct rows rec_rows = {0};
@@ -1873,6 +1909,23 @@ static void apply_set_operations(struct database *db, struct query *q,
     if (rhs_parsed) {
         struct rows rhs_rows = {0};
         if (db_exec(db, &rhs_q, &rhs_rows, NULL) == 0) {
+            /* validate column count match between LHS and RHS */
+            if (result->count > 0 && rhs_rows.count > 0 &&
+                result->data[0].cells.count != rhs_rows.data[0].cells.count) {
+                arena_set_error(&q->arena, "42601",
+                    "each UNION query must have the same number of columns");
+                for (size_t i = 0; i < rhs_rows.count; i++)
+                    row_free(&rhs_rows.data[i]);
+                free(rhs_rows.data);
+                query_free(&rhs_q);
+                /* clear LHS result to signal error */
+                for (size_t i = 0; i < result->count; i++)
+                    row_free(&result->data[i]);
+                free(result->data);
+                result->data = NULL;
+                result->count = 0;
+                return;
+            }
             /* If the caller uses bump-allocated result text (pgwire path),
              * re-home RHS heap-allocated text cells into the bump so they
              * are compatible with arena_owns_text bulk-free semantics. */
@@ -2622,12 +2675,16 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             /* view expansion: if the table is a view, materialize it */
             struct table *view_temp = NULL;
             char view_temp_name[256] = {0};
+            char *view_sql_copy = NULL;
             if (s->table.len > 0 && !from_sub_table) {
                 struct table *maybe_view = db_find_table_sv(db, s->table);
                 if (maybe_view && maybe_view->view_sql) {
                     snprintf(view_temp_name, sizeof(view_temp_name),
                              "_view_%.*s", (int)s->table.len, s->table.data);
-                    view_temp = materialize_subquery(db, maybe_view->view_sql, view_temp_name);
+                    /* Copy view_sql before materialize_subquery, which may
+                     * da_push(&db->tables) and invalidate maybe_view. */
+                    view_sql_copy = strdup(maybe_view->view_sql);
+                    view_temp = materialize_subquery(db, view_sql_copy, view_temp_name);
                     if (view_temp) {
                         /* rewrite table reference to point to the temp table */
                         s->table = sv_from(view_temp->name, strlen(view_temp->name));
@@ -2650,33 +2707,50 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             int sel_rc;
             if (s->table.len == 0 && s->parsed_columns_count > 0 && result) {
                 /* SELECT <expr>, ... — no table, evaluate expression ASTs */
-                struct row dst = {0};
-                da_init(&dst.cells);
-                for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
-                    struct select_column *sc = &q->arena.select_cols.items[s->parsed_columns_start + i];
-                    struct cell c = eval_expr(sc->expr_idx, &q->arena, NULL, NULL, db, rb);
-                    da_push(&dst.cells, c);
+                /* Check WHERE clause for table-less queries (e.g. SELECT 1 WHERE 1=0) */
+                int where_pass = 1;
+                if (s->where.has_where && s->where.where_cond != IDX_NONE)
+                    where_pass = eval_condition(s->where.where_cond, &q->arena, NULL, NULL, db);
+                if (where_pass) {
+                    struct row dst = {0};
+                    da_init(&dst.cells);
+                    for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+                        struct select_column *sc = &q->arena.select_cols.items[s->parsed_columns_start + i];
+                        struct cell c = eval_expr(sc->expr_idx, &q->arena, NULL, NULL, db, rb);
+                        if (q->arena.errmsg[0]) {
+                            da_free(&dst.cells);
+                            sel_rc = -1;
+                            goto select_done;
+                        }
+                        da_push(&dst.cells, c);
+                    }
+                    rows_push(result, dst);
                 }
-                rows_push(result, dst);
                 sel_rc = 0;
             } else if (s->table.len == 0 && s->insert_rows_count > 0 && result) {
                 /* legacy: SELECT <literal> via insert_rows in arena */
-                struct row *ir = &qa->rows.items[s->insert_rows_start];
-                struct row dst = {0};
-                da_init(&dst.cells);
-                for (size_t i = 0; i < ir->cells.count; i++) {
-                    struct cell c = {0};
-                    c.is_null = ir->cells.items[i].is_null;
-                    c.type = ir->cells.items[i].type;
-                    if (column_type_is_text(c.type)
-                        && ir->cells.items[i].value.as_text)
-                        c.value.as_text = rb ? bump_strdup(rb, ir->cells.items[i].value.as_text)
-                                             : strdup(ir->cells.items[i].value.as_text);
-                    else
-                        c.value = ir->cells.items[i].value;
-                    da_push(&dst.cells, c);
+                /* Check WHERE clause (e.g. SELECT 1 WHERE 1=0) */
+                int where_pass2 = 1;
+                if (s->where.has_where && s->where.where_cond != IDX_NONE)
+                    where_pass2 = eval_condition(s->where.where_cond, &q->arena, NULL, NULL, db);
+                if (where_pass2) {
+                    struct row *ir = &qa->rows.items[s->insert_rows_start];
+                    struct row dst = {0};
+                    da_init(&dst.cells);
+                    for (size_t i = 0; i < ir->cells.count; i++) {
+                        struct cell c = {0};
+                        c.is_null = ir->cells.items[i].is_null;
+                        c.type = ir->cells.items[i].type;
+                        if (column_type_is_text(c.type)
+                            && ir->cells.items[i].value.as_text)
+                            c.value.as_text = rb ? bump_strdup(rb, ir->cells.items[i].value.as_text)
+                                                 : strdup(ir->cells.items[i].value.as_text);
+                        else
+                            c.value = ir->cells.items[i].value;
+                        da_push(&dst.cells, c);
+                    }
+                    rows_push(result, dst);
                 }
-                rows_push(result, dst);
                 sel_rc = 0;
             } else if (s->has_join) {
                 sel_rc = exec_join(db, q, result, rb);
@@ -2684,9 +2758,14 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 sel_rc = db_table_exec_query(db, s->table, q, result, rb);
             }
 
+            select_done:
             /* UNION / INTERSECT / EXCEPT */
             if (sel_rc == 0)
                 apply_set_operations(db, q, s, result, rb);
+
+            /* check if set operation produced an error */
+            if (sel_rc == 0 && q->arena.errmsg[0] != '\0')
+                sel_rc = -1;
 
             /* ORDER BY on combined set operation result */
             if (sel_rc == 0 && s->has_set_op && s->set_order_by != IDX_NONE &&
@@ -2718,9 +2797,29 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                     obi->column);
                             }
                         }
+                        /* For table-less queries or unresolved columns,
+                         * try numeric column index or default to first column */
+                        if (ord_cols[k] < 0) {
+                            char obuf[256];
+                            const char *ord_name = extract_col_name(
+                                obi->column, obuf, sizeof(obuf));
+                            /* try as numeric position (1-based) */
+                            int pos = atoi(ord_name);
+                            if (pos >= 1 && result->count > 0 &&
+                                (size_t)pos <= result->data[0].cells.count)
+                                ord_cols[k] = pos - 1;
+                            else
+                                ord_cols[k] = 0; /* default to first column */
+                        }
                     }
                     _jsort_ctx = (struct join_sort_ctx){ .cols = ord_cols, .descs = ord_descs, .ncols = nord };
                     qsort(result->data, result->count, sizeof(struct row), cmp_rows_join);
+                    /* apply LIMIT from the set operation's trailing clause */
+                    if (ob_q.select.has_limit && (size_t)ob_q.select.limit_count < result->count) {
+                        for (size_t i = (size_t)ob_q.select.limit_count; i < result->count; i++)
+                            row_free(&result->data[i]);
+                        result->count = (size_t)ob_q.select.limit_count;
+                    }
                 }
                 query_free(&ob_q);
             }
@@ -2736,6 +2835,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             /* clean up view temp table */
             if (view_temp)
                 remove_temp_table(db, view_temp);
+            free(view_sql_copy);
 
             /* clean up CTE temp tables (reverse order to keep indices valid) */
             for (size_t ci = n_cte_temps; ci > 0; ci--) {
@@ -3296,6 +3396,13 @@ skip_conflict_nothing:
                 snapshot_cow_table(txn->snapshot, db, t->name);
             switch (a->alter_action) {
                 case ALTER_ADD_COLUMN: {
+                    /* check for duplicate column name */
+                    if (table_find_column(t, a->alter_new_col.name) >= 0) {
+                        arena_set_error(&q->arena, "42701",
+                            "column \"%s\" of relation \"%s\" already exists",
+                            a->alter_new_col.name, t->name);
+                        return -1;
+                    }
                     table_add_column(t, &a->alter_new_col);
                     /* table_add_column deep-copies default_value — free the parser's copy */
                     if (a->alter_new_col.default_value) {

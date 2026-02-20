@@ -26,6 +26,7 @@ enum plan_op {
     PLAN_GENERATE_SERIES, /* virtual table: generate_series(start, stop, step) */
     PLAN_EXPR_PROJECT,   /* expression evaluation: UPPER(x), ABS(y), etc. */
     PLAN_PARQUET_SCAN,   /* read Parquet file directly into col_blocks */
+    PLAN_VEC_PROJECT,    /* vectorized columnar expression eval (no per-row overhead) */
 };
 
 /* ---- Plan builder result ---- */
@@ -44,6 +45,23 @@ struct plan_result {
 #define PLAN_RES_OK(n)   ((struct plan_result){ .node = (n), .status = PLAN_OK })
 #define PLAN_RES_NOTIMPL ((struct plan_result){ .node = IDX_NONE, .status = PLAN_NOTIMPL })
 #define PLAN_RES_ERR     ((struct plan_result){ .node = IDX_NONE, .status = PLAN_ERROR })
+
+/* Vectorized projection operation — one per output column */
+enum vec_op_kind {
+    VEC_PASSTHROUGH,   /* copy input column directly */
+    VEC_COL_OP_LIT,    /* col OP literal */
+    VEC_COL_OP_COL,    /* col OP col */
+};
+
+struct vec_project_op {
+    enum vec_op_kind kind;
+    uint16_t left_col;         /* input column index */
+    uint16_t right_col;        /* for VEC_COL_OP_COL */
+    int      op;               /* enum expr_op (OP_ADD, OP_SUB, etc.) */
+    int64_t  lit_i64;          /* literal value for integer ops */
+    double   lit_f64;          /* literal value for float ops */
+    enum column_type out_type; /* output column type */
+};
 
 /* Plan node: arena-allocated in query_arena.plan_nodes DA.
  * Children referenced by uint32_t index (IDX_NONE = no child). */
@@ -145,6 +163,10 @@ struct plan_node {
             int         *col_map;     /* bump-allocated: col_map[i] = parquet column index */
         } parquet_scan;
         struct {
+            uint16_t ncols;           /* number of output columns */
+            struct vec_project_op *ops; /* bump-allocated: [ncols] */
+        } vec_project;
+        struct {
             uint16_t out_ncols;       /* total output columns (passthrough + window) */
             uint16_t n_pass;          /* number of passthrough columns */
             int     *pass_cols;       /* bump: table column indices for passthrough */
@@ -155,6 +177,8 @@ struct plan_node {
             int     *win_arg_col;     /* bump: arg column index per win expr (-1 = none) */
             int     *win_func;        /* bump: enum win_func per win expr */
             int     *win_offset;      /* bump: offset/ntile per win expr */
+            int     *win_has_default; /* bump: 1 if LAG/LEAD has default value */
+            double  *win_default_dbl; /* bump: default value as double */
             int     *win_has_frame;   /* bump: has_frame per win expr */
             int     *win_frame_start; /* bump: enum frame_bound */
             int     *win_frame_end;   /* bump: enum frame_bound */
@@ -219,7 +243,8 @@ struct distinct_set {
 };
 
 struct simple_agg_state {
-    double   *sums;        /* bump: [agg_count] */
+    double   *sums;        /* bump: [agg_count] — FLOAT/NUMERIC sums */
+    int64_t  *i64_sums;    /* bump: [agg_count] — INT/SMALLINT/BIGINT sums */
     double   *mins;
     double   *maxs;
     const char **text_mins; /* bump: [agg_count] for TEXT MIN/MAX */
@@ -237,7 +262,8 @@ struct simple_agg_state {
 struct hash_agg_state {
     struct block_hash_table ht;
     /* per-group accumulators stored in parallel arrays */
-    double   *sums;        /* bump-allocated: [agg_count * ngroups] */
+    double   *sums;        /* bump: [agg_count * ngroups] — FLOAT/NUMERIC sums */
+    int64_t  *i64_sums;    /* bump: [agg_count * ngroups] — INT/SMALLINT/BIGINT sums */
     double   *mins;
     double   *maxs;
     const char **text_mins; /* bump: [agg_count * ngroups] for TEXT MIN/MAX */
@@ -288,9 +314,11 @@ struct window_state {
     uint32_t  nparts;
     /* pre-computed window result columns */
     int32_t  *win_i32;          /* bump: [n_win * total_rows] */
+    int64_t  *win_i64;          /* bump: [n_win * total_rows] — integer SUM results */
     double   *win_f64;          /* bump: [n_win * total_rows] */
     uint8_t  *win_null;         /* bump: [n_win * total_rows] */
     int      *win_is_dbl;       /* bump: [n_win] — 1 if result is double */
+    int      *win_is_i64;       /* bump: [n_win] — 1 if result is int64 */
     char    **win_str;          /* bump: [n_win * total_rows] — text results */
     int      *win_is_str;       /* bump: [n_win] — 1 if result is text */
 };
