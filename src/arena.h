@@ -42,6 +42,35 @@ static inline void bump_reset(struct bump_alloc *b)
     b->current = b->head;
 }
 
+/* Watermark for partial reset: save/restore allocator position.
+ * Everything allocated after bump_save can be freed by bump_restore
+ * while preserving earlier allocations. */
+struct bump_mark {
+    struct bump_slab *slab;
+    size_t            used;
+};
+
+static inline struct bump_mark bump_save(const struct bump_alloc *b)
+{
+    struct bump_mark m;
+    m.slab = b->current;
+    m.used = b->current ? b->current->used : 0;
+    return m;
+}
+
+static inline void bump_restore(struct bump_alloc *b, struct bump_mark m)
+{
+    /* Zero slabs after the saved slab, then restore saved slab position */
+    if (m.slab) {
+        for (struct bump_slab *s = m.slab->next; s; s = s->next)
+            s->used = 0;
+        m.slab->used = m.used;
+        b->current = m.slab;
+    } else {
+        bump_reset(b);
+    }
+}
+
 static inline void bump_destroy(struct bump_alloc *b)
 {
     struct bump_slab *s = b->head;

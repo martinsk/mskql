@@ -42,6 +42,138 @@ static inline void cell_to_cb_at(struct col_block *cb, uint16_t i, const struct 
     }
 }
 
+/* Pre-compute vectorized binop results for an entire block into vals[]/nulls_out[].
+ * Resolves column types and operator once per block, then runs a tight typed loop.
+ * Returns the number of values written (== count). */
+static uint16_t vec_binop_block(const struct col_block *cba, int col_b,
+                                const struct col_block *cbb, /* NULL if col_b < 0 */
+                                double lit, int op, uint16_t count,
+                                double *vals, uint8_t *nulls_out)
+{
+    /* Materialize left operand as doubles */
+    switch (cba->type) {
+    case COLUMN_TYPE_INT: case COLUMN_TYPE_BOOLEAN: case COLUMN_TYPE_DATE: case COLUMN_TYPE_ENUM:
+        for (uint16_t i = 0; i < count; i++) vals[i] = (double)cba->data.i32[i];
+        break;
+    case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+        for (uint16_t i = 0; i < count; i++) vals[i] = (double)cba->data.i64[i];
+        break;
+    case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
+        memcpy(vals, cba->data.f64, count * sizeof(double));
+        break;
+    case COLUMN_TYPE_SMALLINT:
+        for (uint16_t i = 0; i < count; i++) vals[i] = (double)cba->data.i16[i];
+        break;
+    case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID:
+        memset(vals, 0, count * sizeof(double));
+        break;
+    }
+    memcpy(nulls_out, cba->nulls, count);
+
+    if (col_b >= 0 && cbb) {
+        /* col OP col: apply operator with right column */
+        /* OR nulls first */
+        for (uint16_t i = 0; i < count; i++)
+            nulls_out[i] |= cbb->nulls[i];
+
+        /* Materialize right operand and apply operator in one pass */
+        switch (op) {
+        case OP_MUL:
+            switch (cbb->type) {
+            case COLUMN_TYPE_INT: case COLUMN_TYPE_BOOLEAN: case COLUMN_TYPE_DATE: case COLUMN_TYPE_ENUM:
+                for (uint16_t i = 0; i < count; i++) vals[i] *= (double)cbb->data.i32[i];
+                break;
+            case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+                for (uint16_t i = 0; i < count; i++) vals[i] *= (double)cbb->data.i64[i];
+                break;
+            case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
+                for (uint16_t i = 0; i < count; i++) vals[i] *= cbb->data.f64[i];
+                break;
+            case COLUMN_TYPE_SMALLINT:
+                for (uint16_t i = 0; i < count; i++) vals[i] *= (double)cbb->data.i16[i];
+                break;
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: break;
+            }
+            break;
+        case OP_ADD:
+            switch (cbb->type) {
+            case COLUMN_TYPE_INT: case COLUMN_TYPE_BOOLEAN: case COLUMN_TYPE_DATE: case COLUMN_TYPE_ENUM:
+                for (uint16_t i = 0; i < count; i++) vals[i] += (double)cbb->data.i32[i];
+                break;
+            case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+                for (uint16_t i = 0; i < count; i++) vals[i] += (double)cbb->data.i64[i];
+                break;
+            case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
+                for (uint16_t i = 0; i < count; i++) vals[i] += cbb->data.f64[i];
+                break;
+            case COLUMN_TYPE_SMALLINT:
+                for (uint16_t i = 0; i < count; i++) vals[i] += (double)cbb->data.i16[i];
+                break;
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: break;
+            }
+            break;
+        case OP_SUB:
+            switch (cbb->type) {
+            case COLUMN_TYPE_INT: case COLUMN_TYPE_BOOLEAN: case COLUMN_TYPE_DATE: case COLUMN_TYPE_ENUM:
+                for (uint16_t i = 0; i < count; i++) vals[i] -= (double)cbb->data.i32[i];
+                break;
+            case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+                for (uint16_t i = 0; i < count; i++) vals[i] -= (double)cbb->data.i64[i];
+                break;
+            case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
+                for (uint16_t i = 0; i < count; i++) vals[i] -= cbb->data.f64[i];
+                break;
+            case COLUMN_TYPE_SMALLINT:
+                for (uint16_t i = 0; i < count; i++) vals[i] -= (double)cbb->data.i16[i];
+                break;
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: break;
+            }
+            break;
+        case OP_DIV:
+            switch (cbb->type) {
+            case COLUMN_TYPE_INT: case COLUMN_TYPE_BOOLEAN: case COLUMN_TYPE_DATE: case COLUMN_TYPE_ENUM:
+                for (uint16_t i = 0; i < count; i++) {
+                    double d = (double)cbb->data.i32[i];
+                    vals[i] = d != 0.0 ? vals[i] / d : 0.0;
+                }
+                break;
+            case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+                for (uint16_t i = 0; i < count; i++) {
+                    double d = (double)cbb->data.i64[i];
+                    vals[i] = d != 0.0 ? vals[i] / d : 0.0;
+                }
+                break;
+            case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
+                for (uint16_t i = 0; i < count; i++)
+                    vals[i] = cbb->data.f64[i] != 0.0 ? vals[i] / cbb->data.f64[i] : 0.0;
+                break;
+            case COLUMN_TYPE_SMALLINT:
+                for (uint16_t i = 0; i < count; i++) {
+                    double d = (double)cbb->data.i16[i];
+                    vals[i] = d != 0.0 ? vals[i] / d : 0.0;
+                }
+                break;
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: break;
+            }
+            break;
+        default: break;
+        }
+    } else {
+        /* col OP literal: apply operator with constant */
+        switch (op) {
+        case OP_MUL: for (uint16_t i = 0; i < count; i++) vals[i] *= lit; break;
+        case OP_ADD: for (uint16_t i = 0; i < count; i++) vals[i] += lit; break;
+        case OP_SUB: for (uint16_t i = 0; i < count; i++) vals[i] -= lit; break;
+        case OP_DIV:
+            if (lit != 0.0) { double inv = 1.0 / lit; for (uint16_t i = 0; i < count; i++) vals[i] *= inv; }
+            else { memset(vals, 0, count * sizeof(double)); }
+            break;
+        default: break;
+        }
+    }
+    return count;
+}
+
 /* Read a col_block value at index i into a struct cell.
  * Sets cell->type and cell->value; does NOT handle null or text duplication. */
 static inline void cb_to_cell_at(const struct col_block *cb, uint16_t i, struct cell *cell)
@@ -3063,6 +3195,27 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             uint16_t ngrp = pn->hash_agg.ngroup_cols;
             uint32_t agg_n = pn->hash_agg.agg_count;
 
+            /* Pre-compute vectorized binop aggregate results for the entire block.
+             * This resolves column types and operators once per block instead of per row. */
+            double   *vec_precomp[32] = {0};
+            uint8_t  *vec_nulls[32]   = {0};
+            if (pn->hash_agg.agg_col_indices) {
+                for (uint32_t a = 0; a < agg_n && a < 32; a++) {
+                    if (pn->hash_agg.agg_col_indices[a] != -3) continue;
+                    int ca = pn->hash_agg.agg_vec_col_a[a];
+                    int cb_idx = pn->hash_agg.agg_vec_col_b[a];
+                    vec_precomp[a] = (double *)bump_alloc(&ctx->arena->scratch,
+                                        input.count * sizeof(double));
+                    vec_nulls[a] = (uint8_t *)bump_alloc(&ctx->arena->scratch,
+                                        input.count * sizeof(uint8_t));
+                    vec_binop_block(&input.cols[ca], cb_idx,
+                                    cb_idx >= 0 ? &input.cols[cb_idx] : NULL,
+                                    pn->hash_agg.agg_vec_lit[a],
+                                    pn->hash_agg.agg_vec_op[a],
+                                    input.count, vec_precomp[a], vec_nulls[a]);
+                }
+            }
+
             for (uint16_t i = 0; i < active; i++) {
                 uint16_t ri = row_block_row_idx(&input, i);
 
@@ -3286,6 +3439,20 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         continue;
                     }
 
+                    if (ac == -3) {
+                        /* Vectorized binop aggregate: read from pre-computed block arrays */
+                        if (vec_nulls[a][ri]) continue;
+                        double v = vec_precomp[a][ri];
+                        st->nonnull[idx]++;
+                        st->sums[idx] += v;
+                        if (!st->minmax_init[idx] || v < st->mins[idx])
+                            st->mins[idx] = v;
+                        if (!st->minmax_init[idx] || v > st->maxs[idx])
+                            st->maxs[idx] = v;
+                        st->minmax_init[idx] = 1;
+                        continue;
+                    }
+
                     if (ac == -2) {
                         /* Expression-based aggregate (non-STRING_AGG): reconstruct temp row, eval expr */
                         struct agg_expr *ae = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
@@ -3404,8 +3571,10 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             src_is_float = 1;
                     }
                     /* Expression aggregates: detect float if sums[] was used */
-                    if (src_col == -2 && st->sums[idx] != 0.0)
+                    if ((src_col == -2 || src_col == -3) && st->sums[idx] != 0.0)
                         src_is_float = 1;
+                    /* Vectorized binop always accumulates as double */
+                    if (src_col == -3) src_is_float = 1;
                     if (src_is_float) {
                         dst->type = COLUMN_TYPE_FLOAT;
                         if (st->nonnull[idx] == 0) {
@@ -3437,8 +3606,9 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
                                 avg_is_float = 1;
                         }
-                        if (src_col_avg == -2 && st->sums[idx] != 0.0)
+                        if ((src_col_avg == -2 || src_col_avg == -3) && st->sums[idx] != 0.0)
                             avg_is_float = 1;
+                        if (src_col_avg == -3) avg_is_float = 1;
                         dst->nulls[out_count] = 0;
                         if (avg_is_float)
                             dst->data.f64[out_count] = st->sums[idx] / (double)st->nonnull[idx];
@@ -3452,6 +3622,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     enum column_type src_type_mm = COLUMN_TYPE_INT;
                     if (src_col_mm >= 0 && pn->hash_agg.table)
                         src_type_mm = pn->hash_agg.table->columns.items[src_col_mm].type;
+                    if (src_col_mm == -3) src_type_mm = COLUMN_TYPE_FLOAT;
                     agg_emit_minmax(dst, out_count, src_type_mm,
                                     ae->func == AGG_MIN,
                                     st->mins, st->maxs,
@@ -3542,6 +3713,25 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
         while (plan_next_block(ctx, pn->left, &input) == 0) {
             uint16_t active = row_block_active_count(&input);
+
+            /* Pre-compute vectorized binop aggregate results for the entire block */
+            double   *vec_precomp[32] = {0};
+            uint8_t  *vec_nulls[32]   = {0};
+            for (uint32_t a = 0; a < agg_n && a < 32; a++) {
+                if (pn->simple_agg.agg_col_indices[a] != -3) continue;
+                int ca = pn->simple_agg.agg_vec_col_a[a];
+                int cb_idx = pn->simple_agg.agg_vec_col_b[a];
+                vec_precomp[a] = (double *)bump_alloc(&ctx->arena->scratch,
+                                    input.count * sizeof(double));
+                vec_nulls[a] = (uint8_t *)bump_alloc(&ctx->arena->scratch,
+                                    input.count * sizeof(uint8_t));
+                vec_binop_block(&input.cols[ca], cb_idx,
+                                cb_idx >= 0 ? &input.cols[cb_idx] : NULL,
+                                pn->simple_agg.agg_vec_lit[a],
+                                pn->simple_agg.agg_vec_op[a],
+                                input.count, vec_precomp[a], vec_nulls[a]);
+            }
+
             for (uint16_t r = 0; r < active; r++) {
                 uint16_t ri = row_block_row_idx(&input, r);
                 st->total_rows++;
@@ -3564,6 +3754,20 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         /* COUNT(*): if FILTER is present, track filtered count in nonnull */
                         if (ae_filt->filter_cond != IDX_NONE)
                             st->nonnull[a]++;
+                        continue;
+                    }
+
+                    if (ac == -3) {
+                        /* Vectorized binop aggregate: read from pre-computed block arrays */
+                        if (vec_nulls[a][ri]) continue;
+                        double v = vec_precomp[a][ri];
+                        st->nonnull[a]++;
+                        st->sums[a] += v;
+                        if (!st->minmax_init[a] || v < st->mins[a])
+                            st->mins[a] = v;
+                        if (!st->minmax_init[a] || v > st->maxs[a])
+                            st->maxs[a] = v;
+                        st->minmax_init[a] = 1;
                         continue;
                     }
 
@@ -3674,8 +3878,9 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
                         src_is_float = 1;
                 }
-                if (src_col == -2 && st->sums[a] != 0.0)
+                if ((src_col == -2 || src_col == -3) && st->sums[a] != 0.0)
                     src_is_float = 1;
+                if (src_col == -3) src_is_float = 1;
                 if (st->nonnull[a] == 0) {
                     dst->type = src_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_BIGINT;
                     dst->nulls[0] = 1;
@@ -3709,8 +3914,9 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
                             avg_is_float = 1;
                     }
-                    if (src_col_avg == -2 && st->sums[a] != 0.0)
+                    if ((src_col_avg == -2 || src_col_avg == -3) && st->sums[a] != 0.0)
                         avg_is_float = 1;
+                    if (src_col_avg == -3) avg_is_float = 1;
                     dst->nulls[0] = 0;
                     if (avg_is_float)
                         dst->data.f64[0] = st->sums[a] / (double)st->nonnull[a];
@@ -3724,6 +3930,7 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 enum column_type src_type_mm = COLUMN_TYPE_INT;
                 if (src_col_mm >= 0 && pn->simple_agg.table)
                     src_type_mm = pn->simple_agg.table->columns.items[src_col_mm].type;
+                if (src_col_mm == -3) src_type_mm = COLUMN_TYPE_FLOAT;
                 agg_emit_minmax(dst, 0, src_type_mm,
                                 ae->func == AGG_MIN,
                                 st->mins, st->maxs,
@@ -7185,6 +7392,22 @@ static uint32_t append_filter_node(uint32_t current, struct query_arena *arena,
 static int find_col_in_tables_a(sv col, struct table **tables, uint16_t *offsets,
                                 sv *aliases, int ntables);
 
+/* Forward declarations for vectorized expression aggregate helpers */
+typedef int (*agg_col_resolve_fn)(sv col, void *ctx);
+static void try_vectorize_agg_exprs(struct query_select *s, struct query_arena *arena,
+                                     int *agg_col_idxs,
+                                     int **out_vec_col_a, int **out_vec_col_b,
+                                     int **out_vec_op, double **out_vec_lit,
+                                     agg_col_resolve_fn resolve, void *rctx);
+static int agg_resolve_single_table(sv col, void *ctx);
+static int agg_resolve_multi_table(sv col, void *ctx);
+struct agg_resolve_multi_ctx {
+    struct table **tables;
+    uint16_t *offsets;
+    sv *aliases;
+    int ntables;
+};
+
 /* Column resolver: abstracts column lookup for single-table vs multi-table contexts.
  * resolve(col, ctx) returns the column index (>=0) or -1 if not found.
  * col_type(col_idx, ctx) returns the column type for a resolved index. */
@@ -8114,6 +8337,17 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
         PLAN_NODE(arena, agg_idx).hash_agg.agg_count = s->aggregates_count;
         PLAN_NODE(arena, agg_idx).hash_agg.agg_before_cols = s->agg_before_cols;
         PLAN_NODE(arena, agg_idx).hash_agg.agg_col_indices = agg_col_idxs;
+        /* Try to vectorize expression aggregates (col OP col / col OP lit) */
+        {
+            struct agg_resolve_multi_ctx mc = { tables, offsets, aliases, ntables };
+            int *va, *vb, *vo; double *vl;
+            try_vectorize_agg_exprs(s, arena, agg_col_idxs, &va, &vb, &vo, &vl,
+                                     agg_resolve_multi_table, &mc);
+            PLAN_NODE(arena, agg_idx).hash_agg.agg_vec_col_a = va;
+            PLAN_NODE(arena, agg_idx).hash_agg.agg_vec_col_b = vb;
+            PLAN_NODE(arena, agg_idx).hash_agg.agg_vec_op = vo;
+            PLAN_NODE(arena, agg_idx).hash_agg.agg_vec_lit = vl;
+        }
         /* Build merged table descriptor for eval_expr column resolution */
         PLAN_NODE(arena, agg_idx).hash_agg.table =
             build_merged_table_desc(tables, ntables, aliases, cum_cols, arena);
@@ -8657,6 +8891,16 @@ static struct plan_result build_simple_agg(struct table *t, struct query_select 
     PLAN_NODE(arena, agg_idx).simple_agg.agg_start = s->aggregates_start;
     PLAN_NODE(arena, agg_idx).simple_agg.agg_count = s->aggregates_count;
     PLAN_NODE(arena, agg_idx).simple_agg.agg_col_indices = agg_col_idxs;
+    /* Try to vectorize expression aggregates (col OP col / col OP lit) */
+    {
+        int *va, *vb, *vo; double *vl;
+        try_vectorize_agg_exprs(s, arena, agg_col_idxs, &va, &vb, &vo, &vl,
+                                 agg_resolve_single_table, t);
+        PLAN_NODE(arena, agg_idx).simple_agg.agg_vec_col_a = va;
+        PLAN_NODE(arena, agg_idx).simple_agg.agg_vec_col_b = vb;
+        PLAN_NODE(arena, agg_idx).simple_agg.agg_vec_op = vo;
+        PLAN_NODE(arena, agg_idx).simple_agg.agg_vec_lit = vl;
+    }
     PLAN_NODE(arena, agg_idx).simple_agg.table = t;
     current = agg_idx;
 
@@ -8809,6 +9053,115 @@ static uint32_t try_append_having_filter(uint32_t current,
     return IDX_NONE;
 }
 
+/* Try to vectorize an expression aggregate into a direct col OP col / col OP lit
+ * computation, avoiding per-row eval_expr.  Returns 1 on success (sets *out_col_a,
+ * *out_col_b, *out_op, *out_lit), 0 if the expression is too complex.
+ * col_b == -1 means the right operand is a literal stored in *out_lit. */
+static int try_vectorize_agg_expr(uint32_t expr_idx, struct query_arena *arena,
+                                   agg_col_resolve_fn resolve, void *rctx,
+                                   int *out_col_a, int *out_col_b,
+                                   int *out_op, double *out_lit)
+{
+    if (expr_idx == IDX_NONE) return 0;
+    struct expr *e = &EXPR(arena, expr_idx);
+    if (e->type != EXPR_BINARY_OP) return 0;
+    int op = e->binary.op;
+    if (op != OP_ADD && op != OP_SUB && op != OP_MUL && op != OP_DIV) return 0;
+
+    struct expr *lhs = &EXPR(arena, e->binary.left);
+    struct expr *rhs = &EXPR(arena, e->binary.right);
+
+    int col_a = -1, col_b = -1;
+    double lit = 0;
+
+    /* Resolve left operand */
+    if (lhs->type == EXPR_COLUMN_REF) {
+        col_a = resolve(lhs->column_ref.column, rctx);
+        if (col_a < 0) return 0;
+    } else {
+        return 0; /* left must be a column ref */
+    }
+
+    /* Resolve right operand: column ref or numeric literal */
+    if (rhs->type == EXPR_COLUMN_REF) {
+        col_b = resolve(rhs->column_ref.column, rctx);
+        if (col_b < 0) return 0;
+    } else if (rhs->type == EXPR_LITERAL) {
+        struct cell *c = &rhs->literal;
+        if (c->is_null) return 0;
+        switch (c->type) {
+        case COLUMN_TYPE_INT:      lit = (double)c->value.as_int; break;
+        case COLUMN_TYPE_BIGINT:   lit = (double)c->value.as_bigint; break;
+        case COLUMN_TYPE_SMALLINT: lit = (double)c->value.as_smallint; break;
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:  lit = c->value.as_float; break;
+        case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_DATE: case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID: return 0;
+        }
+        col_b = -1; /* sentinel: use literal */
+    } else {
+        return 0;
+    }
+
+    *out_col_a = col_a;
+    *out_col_b = col_b;
+    *out_op = op;
+    *out_lit = lit;
+    return 1;
+}
+
+/* Resolver callbacks for try_vectorize_agg_expr */
+static int agg_resolve_single_table(sv col, void *ctx) {
+    return table_find_column_sv((struct table *)ctx, col);
+}
+
+static int agg_resolve_multi_table(sv col, void *ctx) {
+    struct agg_resolve_multi_ctx *mc = (struct agg_resolve_multi_ctx *)ctx;
+    return find_col_in_tables_a(col, mc->tables, mc->offsets, mc->aliases, mc->ntables);
+}
+
+/* Allocate and populate vectorized agg arrays for a set of aggregates.
+ * For each aggregate with agg_col_idxs[a] == -2, try to vectorize it;
+ * if successful, change to -3 and fill vec arrays. */
+static void try_vectorize_agg_exprs(struct query_select *s, struct query_arena *arena,
+                                     int *agg_col_idxs,
+                                     int **out_vec_col_a, int **out_vec_col_b,
+                                     int **out_vec_op, double **out_vec_lit,
+                                     agg_col_resolve_fn resolve, void *rctx)
+{
+    uint32_t n = s->aggregates_count;
+    int *va = (int *)bump_alloc(&arena->scratch, n * sizeof(int));
+    int *vb = (int *)bump_alloc(&arena->scratch, n * sizeof(int));
+    int *vo = (int *)bump_alloc(&arena->scratch, n * sizeof(int));
+    double *vl = (double *)bump_calloc(&arena->scratch, n, sizeof(double));
+    memset(va, 0, n * sizeof(int));
+    memset(vb, 0, n * sizeof(int));
+    memset(vo, 0, n * sizeof(int));
+
+    for (uint32_t a = 0; a < n; a++) {
+        if (agg_col_idxs[a] != -2) continue;
+        struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+        if (ae->filter_cond != IDX_NONE) continue; /* FILTER needs eval_condition */
+        if (ae->has_distinct) continue; /* DISTINCT needs dedup logic */
+        int ca, cb, op;
+        double lit;
+        if (try_vectorize_agg_expr(ae->expr_idx, arena, resolve, rctx,
+                                    &ca, &cb, &op, &lit)) {
+            agg_col_idxs[a] = -3; /* vectorized binop */
+            va[a] = ca;
+            vb[a] = cb;
+            vo[a] = op;
+            vl[a] = lit;
+        }
+    }
+    *out_vec_col_a = va;
+    *out_vec_col_b = vb;
+    *out_vec_op = vo;
+    *out_vec_lit = vl;
+}
+
 /* Validate aggregate columns, returning PLAN_OK on success or an error status.
  * On success, agg_col_idxs and grp_col_idxs are populated. */
 static enum plan_status validate_agg_columns(struct table *t, struct query_select *s,
@@ -8932,6 +9285,16 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
     PLAN_NODE(arena, agg_idx).hash_agg.agg_count = s->aggregates_count;
     PLAN_NODE(arena, agg_idx).hash_agg.agg_before_cols = s->agg_before_cols;
     PLAN_NODE(arena, agg_idx).hash_agg.agg_col_indices = agg_col_idxs;
+    /* Try to vectorize expression aggregates (col OP col / col OP lit) */
+    {
+        int *va, *vb, *vo; double *vl;
+        try_vectorize_agg_exprs(s, arena, agg_col_idxs, &va, &vb, &vo, &vl,
+                                 agg_resolve_single_table, t);
+        PLAN_NODE(arena, agg_idx).hash_agg.agg_vec_col_a = va;
+        PLAN_NODE(arena, agg_idx).hash_agg.agg_vec_col_b = vb;
+        PLAN_NODE(arena, agg_idx).hash_agg.agg_vec_op = vo;
+        PLAN_NODE(arena, agg_idx).hash_agg.agg_vec_lit = vl;
+    }
     PLAN_NODE(arena, agg_idx).hash_agg.table = t;
 
     uint32_t current = agg_idx;

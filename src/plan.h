@@ -132,13 +132,21 @@ struct plan_node {
             uint32_t  agg_start;     /* index into arena->aggregates */
             uint32_t  agg_count;
             int       agg_before_cols; /* layout flag */
-            int      *agg_col_indices; /* bump-allocated: pre-resolved column index per aggregate (-1=COUNT(*), -2=expr) */
+            int      *agg_col_indices; /* bump-allocated: pre-resolved column index per aggregate (-1=COUNT(*), -2=expr, -3=vec binop) */
+            int      *agg_vec_col_a;  /* bump: left col index for vectorized binop aggs */
+            int      *agg_vec_col_b;  /* bump: right col index (or -1 if literal) */
+            int      *agg_vec_op;     /* bump: OP_ADD/SUB/MUL/DIV for vectorized binop aggs */
+            double   *agg_vec_lit;    /* bump: literal value when col_b == -1 */
             struct table *table;     /* source table — needed for eval_expr on expression aggregates */
         } hash_agg;
         struct {
             uint32_t agg_start;
             uint32_t agg_count;
-            int      *agg_col_indices; /* pre-resolved: -1=COUNT(*), -2=expr */
+            int      *agg_col_indices; /* pre-resolved: -1=COUNT(*), -2=expr, -3=vec binop */
+            int      *agg_vec_col_a;  /* bump: left col index for vectorized binop aggs */
+            int      *agg_vec_col_b;  /* bump: right col index (or -1 if literal) */
+            int      *agg_vec_op;     /* bump: OP_ADD/SUB/MUL/DIV */
+            double   *agg_vec_lit;    /* bump: literal value when col_b == -1 */
             struct table *table;       /* for eval_expr on expression aggs */
         } simple_agg;
         struct {

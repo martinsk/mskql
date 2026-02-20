@@ -873,6 +873,108 @@ static inline size_t fast_i64_to_str(int64_t v, char *buf)
     return len;
 }
 
+/* Fast double → text matching PostgreSQL's %g format.
+ * Handles common cases (integers, small decimals) with hand-rolled digit extraction.
+ * Falls back to snprintf for edge cases. buf must be >= 32 bytes. Returns length. */
+static inline size_t fast_f64_to_str(double v, char *buf)
+{
+    /* Handle special values — match snprintf("%g") output on macOS/Linux */
+    if (v != v) { memcpy(buf, "nan", 3); buf[3] = '\0'; return 3; }
+    if (v == 1.0/0.0) { memcpy(buf, "inf", 3); buf[3] = '\0'; return 3; }
+    if (v == -1.0/0.0) { memcpy(buf, "-inf", 4); buf[4] = '\0'; return 4; }
+    if (v == 0.0) {
+        /* Distinguish -0 from +0 to match %g */
+        if (1.0/v < 0) { memcpy(buf, "-0", 2); buf[2] = '\0'; return 2; }
+        buf[0] = '0'; buf[1] = '\0'; return 1;
+    }
+
+    int neg = 0;
+    if (v < 0) { neg = 1; v = -v; }
+
+    /* If the value is an exact integer in a reasonable range, use fast_i64_to_str */
+    if (v >= 1.0 && v <= 999999999999999.0 && v == (double)(int64_t)v) {
+        if (neg) { buf[0] = '-'; return 1 + fast_i64_to_str((int64_t)v, buf + 1); }
+        return fast_i64_to_str((int64_t)v, buf);
+    }
+
+    /* For values in a reasonable range, try to format without snprintf.
+     * %g uses up to 6 significant digits by default and strips trailing zeros. */
+    if (v >= 1e-4 && v < 1e6) {
+        /* Multiply to get 6 significant digits as an integer */
+        int exp10 = 0;
+        double scaled = v;
+        if (scaled >= 1e5) { exp10 = 5; }
+        else if (scaled >= 1e4) { exp10 = 4; }
+        else if (scaled >= 1e3) { exp10 = 3; }
+        else if (scaled >= 1e2) { exp10 = 2; }
+        else if (scaled >= 1e1) { exp10 = 1; }
+        else if (scaled >= 1e0) { exp10 = 0; }
+        else if (scaled >= 1e-1) { exp10 = -1; }
+        else if (scaled >= 1e-2) { exp10 = -2; }
+        else if (scaled >= 1e-3) { exp10 = -3; }
+        else { exp10 = -4; }
+
+        /* We want 6 significant digits total */
+        int frac_digits = 5 - exp10; /* digits after decimal point */
+        if (frac_digits < 0) frac_digits = 0;
+        if (frac_digits > 10) frac_digits = 10;
+
+        /* Scale to integer */
+        static const double pow10[] = {1, 10, 100, 1000, 10000, 100000,
+                                        1000000, 10000000, 100000000, 1000000000, 10000000000.0};
+        double mult = pow10[frac_digits];
+        int64_t ival = (int64_t)(v * mult + 0.5);
+
+        /* Verify round-trip: if converting back doesn't match, fall back to snprintf */
+        double check = (double)ival / mult;
+        double relerr = (check - v) / v;
+        if (relerr < 0) relerr = -relerr;
+        if (relerr < 1e-14) {
+            /* Strip trailing zeros from fractional part */
+            while (frac_digits > 0 && ival % 10 == 0) {
+                ival /= 10;
+                frac_digits--;
+            }
+
+            int pos = 0;
+            if (neg) buf[pos++] = '-';
+
+            if (frac_digits == 0) {
+                /* Pure integer */
+                pos += (int)fast_i64_to_str(ival, buf + pos);
+                buf[pos] = '\0';
+                return (size_t)pos;
+            }
+
+            /* Format integer part and fractional part */
+            int64_t int_part = ival;
+            int64_t frac_part = ival;
+            int64_t fdiv = 1;
+            for (int i = 0; i < frac_digits; i++) fdiv *= 10;
+            int_part = ival / fdiv;
+            frac_part = ival % fdiv;
+            if (frac_part < 0) frac_part = -frac_part;
+
+            pos += (int)fast_i64_to_str(int_part, buf + pos);
+            buf[pos++] = '.';
+
+            /* Write fractional digits with leading zeros */
+            char ftmp[12];
+            int flen = 0;
+            int64_t fp = frac_part;
+            do { ftmp[flen++] = '0' + (char)(fp % 10); fp /= 10; } while (fp);
+            /* Pad leading zeros */
+            for (int i = flen; i < frac_digits; i++) buf[pos++] = '0';
+            for (int i = flen - 1; i >= 0; i--) buf[pos++] = ftmp[i];
+            buf[pos] = '\0';
+            return (size_t)pos;
+        }
+    }
+
+    /* Fallback to snprintf for edge cases */
+    return (size_t)snprintf(buf, 32, "%g", neg ? -v : v);
+}
+
 /* Push a col_block cell value directly into a msgbuf as a pgwire text field. */
 static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, uint16_t ri,
                                  struct database *db, struct table *t, uint16_t col_idx)
@@ -905,7 +1007,7 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
         break;
     case COLUMN_TYPE_FLOAT:
     case COLUMN_TYPE_NUMERIC:
-        len = (size_t)snprintf(buf, sizeof(buf), "%g", cb->data.f64[ri]);
+        len = fast_f64_to_str(cb->data.f64[ri], buf);
         txt = buf;
         break;
     case COLUMN_TYPE_DATE:
@@ -955,10 +1057,10 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
     msgbuf_push(m, txt, len);
 }
 
-/* Vectorized block serialization for numeric-only blocks.
+/* Vectorized block serialization for all column types (except ENUM which needs db context).
  * Writes all DataRow messages for a block directly into the wire buffer
  * with a single msgbuf_ensure and no per-cell function calls.
- * Returns number of rows written, or 0 if the block has non-numeric types. */
+ * Returns number of rows written, or 0 if the block has ENUM columns (fall back to per-cell). */
 static uint16_t serialize_numeric_block(struct msgbuf *wire,
                                         const struct row_block *block,
                                         uint16_t ncols)
@@ -966,22 +1068,77 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
     uint16_t active = block->sel ? block->sel_count : block->count;
     if (active == 0) return 0;
 
-    /* Check all columns are numeric (INT/BIGINT/SMALLINT/BOOLEAN) */
+    /* ENUM needs db/table context for ordinal→string lookup — bail out */
     for (uint16_t c = 0; c < ncols; c++) {
-        enum column_type ct = block->cols[c].type;
-        if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BIGINT &&
-            ct != COLUMN_TYPE_SMALLINT && ct != COLUMN_TYPE_BOOLEAN)
+        if (block->cols[c].type == COLUMN_TYPE_ENUM)
             return 0;
     }
 
-    /* Max row size: 'D'(1) + len(4) + ncols(2) + ncols*(fieldlen(4) + max_digits(21)) = 7 + 25*ncols */
-    size_t max_row = 7 + (size_t)ncols * 25;
-    msgbuf_ensure(wire, active * max_row);
+    /* Build flat row-index array once to avoid repeated sel branch in inner loop */
+    uint16_t ri_buf[BLOCK_CAPACITY];
+    if (block->sel) {
+        for (uint16_t r = 0; r < active; r++)
+            ri_buf[r] = (uint16_t)block->sel[r];
+    } else {
+        for (uint16_t r = 0; r < active; r++)
+            ri_buf[r] = r;
+    }
+
+    /* Pre-compute text string lengths for TEXT columns into per-column arrays.
+     * This avoids calling strlen twice (once for estimation, once for serialization).
+     * text_lens[c][r] stores the strlen for column c, row r (0 if null/NULL ptr).
+     * We use a flat stack array: up to 8 text columns × BLOCK_CAPACITY uint16_t = 16KB. */
+    #define MAX_TEXT_COLS_CACHED 8
+    uint16_t text_lens_store[MAX_TEXT_COLS_CACHED][BLOCK_CAPACITY];
+    uint16_t *text_lens[64] = {0};
+    size_t text_total_bytes = 0;
+    size_t fixed_cols = 0;
+    int n_text_cols = 0;
+
+    for (uint16_t c = 0; c < ncols; c++) {
+        if (block->cols[c].type != COLUMN_TYPE_TEXT) {
+            fixed_cols++;
+            continue;
+        }
+        const struct col_block *cb = &block->cols[c];
+        if (n_text_cols >= MAX_TEXT_COLS_CACHED) {
+            /* Too many text columns to cache — fall back to strlen in serialization.
+             * Still compute total bytes for estimation. */
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (!cb->nulls[ri] && cb->data.str[ri])
+                    text_total_bytes += strlen(cb->data.str[ri]) + 4;
+                else
+                    text_total_bytes += 4;
+            }
+            n_text_cols++;
+            continue;
+        }
+        uint16_t *lens = text_lens_store[n_text_cols];
+        text_lens[c] = lens;
+        n_text_cols++;
+        for (uint16_t r = 0; r < active; r++) {
+            uint16_t ri = ri_buf[r];
+            if (!cb->nulls[ri] && cb->data.str[ri]) {
+                size_t slen = strlen(cb->data.str[ri]);
+                lens[r] = (uint16_t)(slen > 65535 ? 65535 : slen);
+                text_total_bytes += slen + 4;
+            } else {
+                lens[r] = 0;
+                text_total_bytes += 4;
+            }
+        }
+    }
+    #undef MAX_TEXT_COLS_CACHED
+
+    size_t max_fixed_per_col = 68; /* interval is the widest fixed-size type */
+    size_t est = (size_t)active * (7 + fixed_cols * max_fixed_per_col) + text_total_bytes;
+    msgbuf_ensure(wire, est);
 
     uint8_t *dst = wire->data + wire->len;
 
     for (uint16_t r = 0; r < active; r++) {
-        uint16_t ri = block->sel ? (uint16_t)block->sel[r] : r;
+        uint16_t ri = ri_buf[r];
         uint8_t *row_start = dst;
         dst[0] = 'D';
         dst += 5; /* skip header + length, fill later */
@@ -995,38 +1152,83 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
                 dst += 4;
                 continue;
             }
-            char buf[24];
+            char buf[68]; /* large enough for interval */
             size_t len;
             switch (cb->type) {
             case COLUMN_TYPE_INT:
                 len = fast_i32_to_str(cb->data.i32[ri], buf);
+                put_u32(dst, (uint32_t)len); dst += 4;
+                memcpy(dst, buf, len); dst += len;
                 break;
             case COLUMN_TYPE_BIGINT:
                 len = fast_i64_to_str(cb->data.i64[ri], buf);
+                put_u32(dst, (uint32_t)len); dst += 4;
+                memcpy(dst, buf, len); dst += len;
                 break;
             case COLUMN_TYPE_SMALLINT:
                 len = fast_i32_to_str((int32_t)cb->data.i16[ri], buf);
+                put_u32(dst, (uint32_t)len); dst += 4;
+                memcpy(dst, buf, len); dst += len;
                 break;
             case COLUMN_TYPE_BOOLEAN:
-                buf[0] = cb->data.i32[ri] ? 't' : 'f';
-                len = 1;
+                put_u32(dst, 1); dst += 4;
+                *dst++ = cb->data.i32[ri] ? 't' : 'f';
                 break;
             case COLUMN_TYPE_FLOAT:
             case COLUMN_TYPE_NUMERIC:
-            case COLUMN_TYPE_TEXT:
-            case COLUMN_TYPE_ENUM:
+                len = fast_f64_to_str(cb->data.f64[ri], buf);
+                put_u32(dst, (uint32_t)len); dst += 4;
+                memcpy(dst, buf, len); dst += len;
+                break;
             case COLUMN_TYPE_DATE:
+                date_to_str(cb->data.i32[ri], buf, sizeof(buf));
+                len = strlen(buf);
+                put_u32(dst, (uint32_t)len); dst += 4;
+                memcpy(dst, buf, len); dst += len;
+                break;
             case COLUMN_TYPE_TIME:
+                time_to_str(cb->data.i64[ri], buf, sizeof(buf));
+                len = strlen(buf);
+                put_u32(dst, (uint32_t)len); dst += 4;
+                memcpy(dst, buf, len); dst += len;
+                break;
             case COLUMN_TYPE_TIMESTAMP:
+                timestamp_to_str(cb->data.i64[ri], buf, sizeof(buf));
+                len = strlen(buf);
+                put_u32(dst, (uint32_t)len); dst += 4;
+                memcpy(dst, buf, len); dst += len;
+                break;
             case COLUMN_TYPE_TIMESTAMPTZ:
+                timestamptz_to_str(cb->data.i64[ri], buf, sizeof(buf));
+                len = strlen(buf);
+                put_u32(dst, (uint32_t)len); dst += 4;
+                memcpy(dst, buf, len); dst += len;
+                break;
             case COLUMN_TYPE_INTERVAL:
+                interval_to_str(cb->data.iv[ri], buf, sizeof(buf));
+                len = strlen(buf);
+                put_u32(dst, (uint32_t)len); dst += 4;
+                memcpy(dst, buf, len); dst += len;
+                break;
+            case COLUMN_TYPE_TEXT: {
+                const char *s = cb->data.str[ri];
+                if (!s) {
+                    put_u32(dst, (uint32_t)-1); dst += 4;
+                } else {
+                    size_t slen = text_lens[c] ? text_lens[c][r] : strlen(s);
+                    put_u32(dst, (uint32_t)slen); dst += 4;
+                    memcpy(dst, s, slen); dst += slen;
+                }
+                break;
+            }
             case COLUMN_TYPE_UUID:
+                uuid_format(&cb->data.uuid[ri], buf);
+                put_u32(dst, 36); dst += 4;
+                memcpy(dst, buf, 36); dst += 36;
+                break;
+            case COLUMN_TYPE_ENUM:
                 __builtin_unreachable();
             }
-            put_u32(dst, (uint32_t)len);
-            dst += 4;
-            memcpy(dst, buf, len);
-            dst += len;
         }
         uint32_t body_len = (uint32_t)(dst - row_start - 1);
         put_u32(row_start + 1, body_len);
@@ -1392,6 +1594,28 @@ static void rcache_store_plan_result(struct rcache_entry *rce, uint32_t rc_hash,
     }
 }
 
+/* ---- CTE plan cache: avoid re-parsing identical inner CTE SQL ---- */
+
+struct cte_plan_cache {
+    uint32_t       sql_hash;     /* hash of inner CTE SQL string */
+    uint64_t       generation;   /* db->total_generation at cache time */
+    struct query   inner_q;      /* cached parsed inner query (owns arena) */
+    uint32_t       plan_node;    /* root plan node index */
+    struct table  *src;          /* source table pointer */
+    struct bump_mark scratch_mark; /* scratch watermark after plan build */
+    int            valid;
+};
+
+static struct cte_plan_cache g_cte_cache;
+
+static void cte_cache_invalidate(void)
+{
+    if (g_cte_cache.valid) {
+        query_free(&g_cte_cache.inner_q);
+        g_cte_cache.valid = 0;
+    }
+}
+
 /* ---- CTE inlining: build a single plan tree for simple CTE queries ---- */
 
 /* Detect and execute the pattern:
@@ -1439,42 +1663,72 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
         s->insert_rows_count > 0)
         return -1;
 
-    /* ---- Parse CTE inner SQL ---- */
-    struct query inner_q = {0};
-    if (query_parse(cte_sql_str, &inner_q) != 0) {
-        query_free(&inner_q);
-        return -1;
+    /* ---- CTE plan cache: try to reuse parsed inner query + plan ---- */
+    uint32_t cte_hash = rcache_hash_sql(cte_sql_str, strlen(cte_sql_str));
+    uint64_t gen = db->total_generation;
+    int cache_hit = (g_cte_cache.valid &&
+                     g_cte_cache.sql_hash == cte_hash &&
+                     g_cte_cache.generation == gen);
+
+    struct query *inner_qp;
+    struct table *src;
+    uint32_t current;
+
+    if (cache_hit) {
+        /* Restore scratch to post-plan-build watermark (frees exec state) */
+        bump_restore(&g_cte_cache.inner_q.arena.scratch,
+                     g_cte_cache.scratch_mark);
+        g_cte_cache.inner_q.arena.errmsg[0] = '\0';
+        inner_qp = &g_cte_cache.inner_q;
+        src = g_cte_cache.src;
+        current = g_cte_cache.plan_node;
+    } else {
+        /* Cache miss — parse and plan from scratch */
+        cte_cache_invalidate();
+
+        struct query *iq = &g_cte_cache.inner_q;
+        memset(iq, 0, sizeof(*iq));
+        if (query_parse(cte_sql_str, iq) != 0) {
+            query_free(iq);
+            return -1;
+        }
+        if (iq->query_type != QUERY_TYPE_SELECT) {
+            query_free(iq);
+            return -1;
+        }
+
+        struct query_select *is = &iq->select;
+        src = NULL;
+        if (is->table.len > 0)
+            src = db_find_table_sv(db, is->table);
+        if (!src) { query_free(iq); return -1; }
+
+        /* For aggregate HAVING, clear lhs_expr so the plan executor can
+         * handle the HAVING filter via the virtual column name. */
+        if (is->has_having && is->having_cond != IDX_NONE) {
+            struct condition *hc = &COND(&iq->arena, is->having_cond);
+            if (hc->type == COND_COMPARE && hc->lhs_expr != IDX_NONE &&
+                hc->column.len > 0 && hc->scalar_subquery_sql == IDX_NONE &&
+                hc->subquery_sql == IDX_NONE && hc->rhs_column.len == 0)
+                hc->lhs_expr = IDX_NONE;
+        }
+
+        struct plan_result pr = plan_build_select(src, is, &iq->arena, db);
+        if (pr.status != PLAN_OK) { query_free(iq); return -1; }
+
+        /* Save cache entry */
+        g_cte_cache.sql_hash = cte_hash;
+        g_cte_cache.generation = gen;
+        g_cte_cache.plan_node = pr.node;
+        g_cte_cache.src = src;
+        g_cte_cache.scratch_mark = bump_save(&iq->arena.scratch);
+        g_cte_cache.valid = 1;
+
+        inner_qp = iq;
+        current = pr.node;
     }
-    if (inner_q.query_type != QUERY_TYPE_SELECT) {
-        query_free(&inner_q);
-        return -1;
-    }
 
-    /* Find the source table for the inner query */
-    struct query_select *is = &inner_q.select;
-    struct table *src = NULL;
-    if (is->table.len > 0)
-        src = db_find_table_sv(db, is->table);
-    if (!src) { query_free(&inner_q); return -1; }
-
-    /* For aggregate HAVING (e.g. SUM(amount) > 500), the parser sets lhs_expr
-     * on the condition.  try_append_having_filter bails on lhs_expr != IDX_NONE,
-     * but the parser also sets a virtual column name ("sum", "count", etc.) that
-     * is sufficient for column-name matching.  Clear lhs_expr so the plan
-     * executor can handle the HAVING filter via the virtual name. */
-    if (is->has_having && is->having_cond != IDX_NONE) {
-        struct condition *hc = &COND(&inner_q.arena, is->having_cond);
-        if (hc->type == COND_COMPARE && hc->lhs_expr != IDX_NONE &&
-            hc->column.len > 0 && hc->scalar_subquery_sql == IDX_NONE &&
-            hc->subquery_sql == IDX_NONE && hc->rhs_column.len == 0)
-            hc->lhs_expr = IDX_NONE;
-    }
-
-    /* Build plan for the inner query (handles WHERE, GROUP BY, HAVING, etc.) */
-    struct plan_result pr = plan_build_select(src, is, &inner_q.arena, db);
-    if (pr.status != PLAN_OK) { query_free(&inner_q); return -1; }
-
-    uint32_t current = pr.node;
+    struct query_select *is = &inner_qp->select;
 
     /* ---- Append outer ORDER BY ---- */
     if (s->has_order_by && s->order_by_count > 0) {
@@ -1496,7 +1750,7 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
 
             /* Try matching against GROUP BY column names */
             for (uint32_t g = 0; g < is->group_by_count; g++) {
-                sv gcol = inner_q.arena.svs.items[is->group_by_start + g];
+                sv gcol = inner_qp->arena.svs.items[is->group_by_start + g];
                 if (sv_eq_ignorecase(obi->column, gcol)) {
                     sort_cols[k] = (int)(grp_offset + g);
                     break;
@@ -1506,7 +1760,7 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
             /* Try matching against aggregate aliases */
             if (sort_cols[k] < 0) {
                 for (uint32_t a = 0; a < agg_n; a++) {
-                    struct agg_expr *ae = &inner_q.arena.aggregates.items[is->aggregates_start + a];
+                    struct agg_expr *ae = &inner_qp->arena.aggregates.items[is->aggregates_start + a];
                     if (ae->alias.len > 0 && sv_eq_ignorecase(obi->column, ae->alias)) {
                         sort_cols[k] = (int)(agg_offset + a);
                         break;
@@ -1534,49 +1788,49 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
             if (sort_cols[k] < 0) { sort_ok = 0; break; }
         }
 
-        if (!sort_ok) { query_free(&inner_q); return -1; }
+        if (!sort_ok) { cte_cache_invalidate(); return -1; }
 
         if (sort_nord > 0) {
-            int *sc = (int *)bump_alloc(&inner_q.arena.scratch, sort_nord * sizeof(int));
-            int *sd = (int *)bump_alloc(&inner_q.arena.scratch, sort_nord * sizeof(int));
-            int *snf = (int *)bump_alloc(&inner_q.arena.scratch, sort_nord * sizeof(int));
+            int *sc = (int *)bump_alloc(&inner_qp->arena.scratch, sort_nord * sizeof(int));
+            int *sd = (int *)bump_alloc(&inner_qp->arena.scratch, sort_nord * sizeof(int));
+            int *snf = (int *)bump_alloc(&inner_qp->arena.scratch, sort_nord * sizeof(int));
             memcpy(sc, sort_cols, sort_nord * sizeof(int));
             memcpy(sd, sort_descs, sort_nord * sizeof(int));
             memcpy(snf, sort_nf, sort_nord * sizeof(int));
-            uint32_t sort_idx = plan_alloc_node(&inner_q.arena, PLAN_SORT);
-            PLAN_NODE(&inner_q.arena, sort_idx).left = current;
-            PLAN_NODE(&inner_q.arena, sort_idx).sort.sort_cols = sc;
-            PLAN_NODE(&inner_q.arena, sort_idx).sort.sort_descs = sd;
-            PLAN_NODE(&inner_q.arena, sort_idx).sort.sort_nulls_first = snf;
-            PLAN_NODE(&inner_q.arena, sort_idx).sort.nsort_cols = sort_nord;
+            uint32_t sort_idx = plan_alloc_node(&inner_qp->arena, PLAN_SORT);
+            PLAN_NODE(&inner_qp->arena, sort_idx).left = current;
+            PLAN_NODE(&inner_qp->arena, sort_idx).sort.sort_cols = sc;
+            PLAN_NODE(&inner_qp->arena, sort_idx).sort.sort_descs = sd;
+            PLAN_NODE(&inner_qp->arena, sort_idx).sort.sort_nulls_first = snf;
+            PLAN_NODE(&inner_qp->arena, sort_idx).sort.nsort_cols = sort_nord;
             current = sort_idx;
         }
     }
 
     /* ---- Append outer LIMIT/OFFSET ---- */
     if (s->has_limit || s->has_offset) {
-        uint32_t lim_idx = plan_alloc_node(&inner_q.arena, PLAN_LIMIT);
-        PLAN_NODE(&inner_q.arena, lim_idx).left = current;
-        PLAN_NODE(&inner_q.arena, lim_idx).limit.has_limit = s->has_limit;
-        PLAN_NODE(&inner_q.arena, lim_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
-        PLAN_NODE(&inner_q.arena, lim_idx).limit.has_offset = s->has_offset;
-        PLAN_NODE(&inner_q.arena, lim_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
+        uint32_t lim_idx = plan_alloc_node(&inner_qp->arena, PLAN_LIMIT);
+        PLAN_NODE(&inner_qp->arena, lim_idx).left = current;
+        PLAN_NODE(&inner_qp->arena, lim_idx).limit.has_limit = s->has_limit;
+        PLAN_NODE(&inner_qp->arena, lim_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
+        PLAN_NODE(&inner_qp->arena, lim_idx).limit.has_offset = s->has_offset;
+        PLAN_NODE(&inner_qp->arena, lim_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
         current = lim_idx;
     }
 
     /* ---- Execute plan and send via columnar wire path ---- */
     struct plan_exec_ctx ctx;
-    plan_exec_init(&ctx, &inner_q.arena, db, current);
+    plan_exec_init(&ctx, &inner_qp->arena, db, current);
 
-    uint16_t ncols = plan_node_ncols(&inner_q.arena, current);
-    if (ncols == 0) { query_free(&inner_q); return -1; }
+    uint16_t ncols = plan_node_ncols(&inner_qp->arena, current);
+    if (ncols == 0) { cte_cache_invalidate(); return -1; }
 
     struct row_block block;
-    row_block_alloc(&block, ncols, &inner_q.arena.scratch);
+    row_block_alloc(&block, ncols, &inner_qp->arena.scratch);
 
     int rc = plan_next_block(&ctx, current, &block);
     if (rc != 0) {
-        if (inner_q.arena.errmsg[0]) { query_free(&inner_q); return -1; }
+        if (inner_qp->arena.errmsg[0]) { cte_cache_invalidate(); return -1; }
         /* No rows — send empty RowDescription */
         enum column_type types[64];
         for (uint16_t i = 0; i < ncols && i < 64; i++)
@@ -1584,10 +1838,9 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
         /* Build RowDescription with CTE column names */
         struct msgbuf rd_buf;
         msgbuf_init(&rd_buf);
-        build_row_desc_for_plan(&rd_buf, &inner_q, src, NULL, 0, ncols, types);
-        if (msg_send(fd, 'T', &rd_buf) != 0) { msgbuf_free(&rd_buf); query_free(&inner_q); return -1; }
+        build_row_desc_for_plan(&rd_buf, inner_qp, src, NULL, 0, ncols, types);
+        if (msg_send(fd, 'T', &rd_buf) != 0) { msgbuf_free(&rd_buf); return -1; }
         msgbuf_free(&rd_buf);
-        query_free(&inner_q);
         return 0;
     }
 
@@ -1599,11 +1852,10 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
     /* Build RowDescription using inner query metadata */
     struct msgbuf rd_buf;
     msgbuf_init(&rd_buf);
-    build_row_desc_for_plan(&rd_buf, &inner_q, src, NULL, 0, ncols, col_types);
+    build_row_desc_for_plan(&rd_buf, inner_qp, src, NULL, 0, ncols, col_types);
 
     if (msg_send(fd, 'T', &rd_buf) != 0) {
         msgbuf_free(&rd_buf);
-        query_free(&inner_q);
         return -1;
     }
 
@@ -1664,7 +1916,6 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
         if (wire.len >= 262144) {
             if (send_all(fd, wire.data, wire.len) != 0) {
                 msgbuf_free(&wire); msgbuf_free(&cache_buf);
-                query_free(&inner_q);
                 return -1;
             }
             wire.len = 0;
@@ -1672,9 +1923,9 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
 
         row_block_reset(&block);
         if (plan_next_block(&ctx, current, &block) != 0) {
-            if (inner_q.arena.errmsg[0]) {
+            if (inner_qp->arena.errmsg[0]) {
                 msgbuf_free(&wire); msgbuf_free(&cache_buf);
-                query_free(&inner_q);
+                cte_cache_invalidate();
                 return -1;
             }
             break;
@@ -1684,7 +1935,6 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
     if (wire.len > 0) {
         if (send_all(fd, wire.data, wire.len) != 0) {
             msgbuf_free(&wire); msgbuf_free(&cache_buf);
-            query_free(&inner_q);
             return -1;
         }
     }
@@ -1692,7 +1942,6 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
 
     rcache_store_plan_result(rce, rc_hash, rc_gen, (int)total_rows, &cache_buf);
     msgbuf_free(&cache_buf);
-    query_free(&inner_q);
     return (int)total_rows;
 }
 
@@ -2750,6 +2999,7 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     if (strncmp(sql, "SELECT __reset_db()", sizeof("SELECT __reset_db()") - 1) == 0) {
         db_reset(db);
         rcache_invalidate_all();
+        cte_cache_invalidate();
         if (!skip_row_desc) {
             m->len = 0;
             msgbuf_push_u16(m, 1); /* 1 column */
