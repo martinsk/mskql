@@ -183,21 +183,6 @@
         .bench-faster { color: #1a7a1a; font-weight: 600; }
         .bench-slower { color: var(--accent); font-weight: 600; }
 
-        .bench-legend {
-            display: flex;
-            gap: 1.5rem;
-            font-size: 0.95rem;
-            color: var(--fg-dim);
-            margin-bottom: 0.8rem;
-        }
-        .bench-legend-swatch {
-            display: inline-block;
-            width: 14px;
-            height: 14px;
-            border-radius: 2px;
-            vertical-align: middle;
-            margin-right: 0.3rem;
-        }
         .bench-bar-cell { padding: 0.4rem 0.4rem 0.4rem 0.8rem; width: 30%; }
         .bench-bar-wrap {
             display: flex;
@@ -221,7 +206,7 @@
 <!-- ═══════════════════════════════════════════════════════════ -->
 
 <h1>mskql</h1>
-<span class="subtitle">An in-memory SQL engine written in C&mdash;faster than PostgreSQL, built entirely by&nbsp;AI</span>
+<span class="subtitle">An in-memory SQL engine written in C&mdash;faster than PostgreSQL and DuckDB on 37 of 84 benchmarks, built entirely by&nbsp;AI</span>
 <p class="byline">
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
@@ -232,11 +217,12 @@
 <hr class="title-rule">
 
 <p>
-    mskql distills the core ideas of a database engine&mdash;wire protocol, parser,
-    query executor, storage&mdash;into ~29,000 lines of C with zero external
+    This project distills the core ideas of a database engine&mdash;wire protocol, parser,
+    query executor, storage&mdash;into ~39,000 lines of C with zero external
     dependencies. One <code>.c</code> file per subsystem. Three AI agents built it
-    in iterative rounds: no human wrote any C code or SQL test. 1,030+ test cases,
-    every one memory-checked. Connect with <code>psql</code> on port&nbsp;5433
+    in iterative rounds: no human wrote any C code or SQL test. 1,240+ test cases,
+    every one memory-checked. Query Parquet files with standard SQL.
+    Connect with <code>psql</code> on port&nbsp;5433
     or <a href="#try-it">try it in the browser</a> via WebAssembly.
 </p>
 
@@ -247,6 +233,7 @@
 <nav class="toc-strip">
 <a href="#wire-compat">Wire protocol</a>
 <a href="#performance">Performance</a>
+<a href="#parquet">Parquet</a>
 <a href="#ai-built">AI-built</a>
 <a href="#try-it">Playground</a>
 <span class="toc-sep"></span>
@@ -266,7 +253,7 @@
 <h2 id="wire-compat">PostgreSQL wire-protocol compatible</h2>
 
 <p>
-    mskql implements PostgreSQL wire protocol&nbsp;v3: Simple Query,
+    The server implements PostgreSQL wire protocol&nbsp;v3: Simple Query,
     Extended Query (prepared statements, <code>$1</code>/<code>$2</code> parameters),
     and COPY. Connect with <code>psql</code>, pgAdmin, DBeaver, or any language driver.
     Default port&nbsp;5433.
@@ -275,45 +262,88 @@
 <pre><code class="language-bash">make && ./build/mskql                         # build & start
 psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 
-<h2 id="performance">Performance vs PostgreSQL</h2>
+<h2 id="performance">Performance: mskql vs PostgreSQL vs DuckDB</h2>
 
 <p>
-    Across 26 batch workloads and 14 concurrent workloads (8 threads),
-    mskql is faster than PostgreSQL in every batch test and 12&nbsp;of&nbsp;14
-    throughput tests. Highlights:
+    84 batch workloads and 15 concurrent throughput workloads, measured on the same
+    machine. On all 28 cached batch workloads and 13 of 15 throughput tests,
+    mskql is faster than PostgreSQL. Against DuckDB, mskql wins 37 of 84 workloads&mdash;aggregates
+    6&times;, expression aggregates 7&times;, joins, CTEs, subqueries.
+    DuckDB wins full scans (4.4&times;) and sorts (4.8&times;).
 </p>
-
-<div class="bench-legend">
-    <span><span class="bench-legend-swatch" style="background:var(--accent)"></span>mskql</span>
-    <span><span class="bench-legend-swatch" style="background:#4a7ab5"></span>PostgreSQL</span>
-</div>
 
 <table>
     <thead>
-        <tr><th>Workload</th><th>Type</th><th>Ratio</th><th></th><th></th></tr>
+        <tr><th>Workload</th><th>Type</th><th>vs PG</th><th>vs DuckDB</th><th>Detail</th></tr>
     </thead>
     <tbody>
-        <tr><td><strong>Expression aggregate</strong> <span class="bench-detail">(SUM(price&times;qty), 5K rows)</span></td><td>batch</td><td class="bench-faster">0.10&times;</td><td>mskql 10&times; faster</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:10%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
-        <tr><td><strong>Group + sum</strong> <span class="bench-detail">(5K rows)</span></td><td>batch</td><td class="bench-faster">0.12&times;</td><td>mskql 8&times; faster</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:12%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
-        <tr><td><strong>Bulk update</strong> <span class="bench-detail">(1K of 5K rows)</span></td><td>batch</td><td class="bench-faster">0.20&times;</td><td>mskql 5&times; faster</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:20%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
-        <tr><td><strong>CTE star-schema</strong> <span class="bench-detail">(join &rarr; agg &rarr; sort, 50K rows)</span></td><td>throughput</td><td class="bench-faster">152&times; QPS</td><td>74,069 vs 485 QPS</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:1%"></span></div></td></tr>
-        <tr><td><strong>Three-table join + group</strong> <span class="bench-detail">(50K rows)</span></td><td>throughput</td><td class="bench-faster">64&times; QPS</td><td>23,560 vs 370 QPS</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:2%"></span></div></td></tr>
-        <tr><td><strong>Group + sum</strong> <span class="bench-detail">(5K rows, throughput)</span></td><td>throughput</td><td class="bench-faster">6.0&times; QPS</td><td>60,541 vs 10,042 QPS</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:100%"></span><span class="bench-bar bench-bar-pg" style="width:17%"></span></div></td></tr>
-        <tr><td><strong>Mixed read/write</strong> <span class="bench-detail">(80/20)</span></td><td>throughput</td><td class="bench-slower">0.78&times; QPS</td><td>PG&rsquo;s MVCC wins on writes</td>
-            <td class="bench-bar-cell"><div class="bench-bar-wrap"><span class="bench-bar bench-bar-mskql" style="width:78%"></span><span class="bench-bar bench-bar-pg" style="width:100%"></span></div></td></tr>
+        <tr><td><strong>Correlated subquery</strong></td><td>batch</td>
+            <td class="bench-faster">0.01&times;</td><td class="bench-faster">0.64&times;</td>
+            <td>24ms vs 3,498ms (PG) / 38ms (Duck)</td></tr>
+        <tr><td><strong>Expression aggregate</strong> <span class="bench-detail">(SUM(price&times;qty))</span></td><td>batch</td>
+            <td class="bench-faster">0.10&times;</td><td class="bench-faster">0.14&times;</td>
+            <td>35ms vs 331ms (PG) / 239ms (Duck)</td></tr>
+        <tr><td><strong>Aggregate</strong> <span class="bench-detail">(GROUP BY, 5K rows)</span></td><td>batch</td>
+            <td class="bench-faster">0.12&times;</td><td class="bench-faster">0.16&times;</td>
+            <td>35ms vs 290ms (PG) / 212ms (Duck)</td></tr>
+        <tr><td><strong>Insert bulk</strong> <span class="bench-detail">(5K rows)</span></td><td>batch</td>
+            <td class="bench-faster">0.33&times;</td><td class="bench-faster">0.13&times;</td>
+            <td>291ms vs 881ms (PG) / 2,204ms (Duck)</td></tr>
+        <tr><td><strong>Analytical CTE</strong> <span class="bench-detail">(join&rarr;agg&rarr;sort)</span></td><td>batch</td>
+            <td class="bench-faster">0.28&times;</td><td class="bench-faster">0.61&times;</td>
+            <td>22ms vs 78ms (PG) / 35ms (Duck)</td></tr>
+        <tr><td><strong>Parquet aggregate</strong> <span class="bench-detail">(50K-row .parquet)</span></td><td>batch</td>
+            <td>&mdash;</td><td class="bench-faster">0.37&times;</td>
+            <td>28ms vs 76ms (Duck)</td></tr>
+        <tr><td><strong>Mixed analytical</strong></td><td>throughput</td>
+            <td class="bench-faster">137&times; QPS</td><td>&mdash;</td>
+            <td>94,729 vs 689 QPS</td></tr>
+        <tr><td><strong>Multi-join</strong></td><td>throughput</td>
+            <td class="bench-faster">78&times; QPS</td><td>&mdash;</td>
+            <td>36,273 vs 462 QPS</td></tr>
+        <tr><td><strong>Full scan</strong> <span class="bench-detail">(5K rows)</span></td><td>batch</td>
+            <td class="bench-faster">0.66&times;</td><td class="bench-slower">4.43&times;</td>
+            <td>306ms vs 69ms&mdash;DuckDB 4.4&times; faster</td></tr>
+        <tr><td><strong>Large sort</strong> <span class="bench-detail">(50K rows)</span></td><td>batch</td>
+            <td class="bench-faster">0.68&times;</td><td class="bench-slower">4.83&times;</td>
+            <td>246ms vs 51ms&mdash;DuckDB 4.8&times; faster</td></tr>
     </tbody>
 </table>
 
 <p>
-    &#8594;&ensp;<a href="bench-vs-pg.html"><strong>All 26 batch + 14 throughput results</strong></a>
+    &#8594;&ensp;<a href="bench-vs-pg.html"><strong>All 84 batch + 15 throughput results</strong></a>
     &ensp;&middot;&ensp;
     <a href="dev/bench/index.html"><strong>Historical charts</strong></a>
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Parquet foreign tables                                     -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="parquet">Query Parquet files with standard SQL</h2>
+
+<p>
+    <code>CREATE FOREIGN TABLE</code> maps a Parquet file to a SQL table.
+    No ETL, no data loading&mdash;query directly with joins, aggregates, and subqueries.
+    The same result cache that accelerates in-memory queries applies to Parquet scans.
+</p>
+
+<pre><code class="language-sql">CREATE FOREIGN TABLE events
+    OPTIONS (filename '/data/events.parquet');
+
+SELECT event_type, COUNT(*), SUM(amount)
+FROM events
+GROUP BY event_type;</code></pre>
+
+<p>
+    9 Parquet workloads (50K&ndash;200K rows). On cached queries, mskql is faster than DuckDB on
+    8 of 9: aggregates 28ms vs 76ms (2.7&times;), subqueries
+    21ms vs 44ms (2&times;), joins 28ms vs 35ms. DuckDB wins cold full scans:
+    32ms vs 449ms (14&times;).
+</p>
+
+<p>
+    &#8594;&ensp;<a href="bench-vs-pg.html#parquet"><strong>All 9 Parquet benchmark results</strong></a>
 </p>
 
 <h2 id="ai-built">Built entirely by AI agents</h2>
@@ -323,7 +353,7 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 <p style="margin-bottom:0.8rem;">
     Three agents in iterative rounds. <strong>Challenger</strong> writes adversarial
     SQL tests. <strong>Reviewer</strong> flags code-quality issues.
-    <strong>Writer</strong> fixes until all 1,030+ tests pass.
+    <strong>Writer</strong> fixes until all 1,240+ tests pass.
     No human wrote any C code or SQL test cases.
 </p>
 <p style="margin-bottom:0;">
@@ -353,7 +383,7 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
   <path d="M244,40 L214,40" stroke="#a00" stroke-width="1.2" fill="none" marker-end="url(#ah)"/>
   <path d="M288,52 C288,72 170,78 52,72 C30,71 18,66 18,52"
         stroke="#ccc" stroke-width="1" fill="none" stroke-dasharray="3,2"/>
-  <text x="170" y="90" text-anchor="middle" font-size="8.5" fill="#555" font-style="italic">iterate until all 1,030+ tests pass</text>
+  <text x="170" y="90" text-anchor="middle" font-size="8.5" fill="#555" font-style="italic">iterate until all 1,240+ tests pass</text>
 </svg>
 </div>
 </div>
@@ -427,7 +457,7 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
     </div>
     <div class="cta-card">
         <h3>Read the source</h3>
-        <p>~29,000 lines of C11. Every subsystem in a single file.</p>
+        <p>~39,000 lines of C11. Every subsystem in a single file.</p>
         <a href="https://github.com/martinsk/mskql" class="cta-link">GitHub &rarr;</a>
     </div>
 </div>
@@ -448,11 +478,11 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
     DML, joins, aggregation, window functions, CTEs, subqueries, 30+ built-in functions.
     &ensp;<a href="grammar.html">Grammar</a>
     <br>
-    <a href="testing.html"><strong>Testing</strong></a>&ensp;&mdash;&ensp;1,030+ test cases,
+    <a href="testing.html"><strong>Testing</strong></a>&ensp;&mdash;&ensp;1,240+ test cases,
     every one under a memory-safety checker. Parallel execution across all cores.
     <br>
     <a href="bench-vs-pg.html"><strong>Benchmarks</strong></a>&ensp;&mdash;&ensp;mskql
-    vs PostgreSQL on 26 batch workloads and 14 throughput workloads.
+    vs PostgreSQL and DuckDB on 84 batch workloads and 15 throughput workloads.
     &ensp;<a href="dev/bench/index.html">Historical charts</a>
 </p>
 

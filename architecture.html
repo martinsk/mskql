@@ -19,7 +19,7 @@
 <hr class="title-rule">
 
 <p>
-    <strong>~29K lines of C. Zero dependencies. Four stages: wire protocol, parser,
+    <strong>~39K lines of C. Zero dependencies. Four stages: wire protocol, parser,
     executor, storage.</strong> Every query flows through the same pipeline.
     The block-oriented plan executor processes 1,024-row column blocks for
     cache-friendly, vectorized execution.
@@ -53,21 +53,22 @@
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators.
-                ~4,500 lines with proper operator precedence,
+                ~10,200 lines with proper operator precedence,
                 CTEs, window functions, set operations, and
                 <code>generate_series()</code> table functions</td>
         </tr>
         <tr>
             <td><strong>Query executor</strong></td>
             <td><code>query.c</code>, <code>database.c</code></td>
-            <td>Block-oriented plan executor (<code>plan.c</code>, ~4,500 lines)
+            <td>Block-oriented plan executor (<code>plan.c</code>, ~10,250 lines)
                 handles most queries with vectorized operators: scan, filter,
-                project, sort, hash join, hash aggregation, index scan,
-                window functions, set operations, CTEs, and
-                <code>generate_series()</code>.
+                project, sort (including Top-N via binary heap), hash join,
+                hash aggregation, index scan, window functions, set operations,
+                CTEs, Parquet foreign-table scans, correlated subquery
+                decorrelation, and <code>generate_series()</code>.
                 A scan cache with generation tracking skips redundant scans.
                 Direct columnar-to-wire serialization bypasses row materialization.
-                Complex queries (correlated subqueries, <code>ROLLUP</code>/<code>CUBE</code>)
+                Complex queries (<code>ROLLUP</code>/<code>CUBE</code>)
                 fall back to the legacy row-at-a-time evaluator
                 (<code>query.c</code>, <code>database.c</code>)</td>
         </tr>
@@ -84,7 +85,7 @@
 <h2 id="memory">Memory model</h2>
 
 <p>
-    mskql uses <strong>six distinct memory regions</strong>, each with a different
+    The engine uses <strong>six distinct memory regions</strong>, each with a different
     lifetime and allocation strategy. Understanding how they interact explains
     why the system achieves zero steady-state <code>malloc</code>/<code>free</code>
     calls and why queries run faster than PostgreSQL on every benchmark.
@@ -255,7 +256,9 @@
     Repeated identical <code>SELECT</code>s skip parsing, planning, and
     execution entirely. The throughput benchmark&rsquo;s analytical CTE
     workload runs at 74,069&nbsp;QPS (152&times; PostgreSQL) because the
-    result is served from cached wire bytes in microseconds.
+    result is served from cached wire bytes in microseconds. On Parquet
+    workloads, the cache makes mskql faster than DuckDB on 8 of 9 repeated
+    queries.
 </p>
 
 <p>
@@ -323,10 +326,11 @@
 
 <p>
     <strong>Fast.</strong> The block-oriented executor with columnar scan caching
-    is faster than PostgreSQL on all 26 batch benchmarks. Aggregate queries run
-    up to 10&times; faster. Direct columnar-to-wire serialization avoids row
-    materialization entirely. The throughput benchmark sustains 74,069&nbsp;QPS
-    on analytical workloads&mdash;152&times; PostgreSQL.
+    is faster than PostgreSQL on all 28 cached batch benchmarks and DuckDB on
+    37 of 84 workloads. Aggregate queries run 6&ndash;10&times; faster than both.
+    Direct columnar-to-wire serialization avoids row materialization entirely.
+    The throughput benchmark sustains 94,729&nbsp;QPS on analytical
+    workloads&mdash;137&times; PostgreSQL.
 </p>
 <p>
     <strong>Simple.</strong> Zero external dependencies. One <code>.c</code> file per
@@ -343,7 +347,7 @@
 <h2 id="now-what">Explore further</h2>
 
 <p>
-    <a href="bench-vs-pg.html">Benchmarks vs PostgreSQL</a> &ensp;&middot;&ensp;
+    <a href="bench-vs-pg.html">Benchmarks</a> &ensp;&middot;&ensp;
     <a href="bench-workloads.html">Benchmark workload details</a> &ensp;&middot;&ensp;
     <a href="grammar.html">SQL grammar</a> &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a> &ensp;&middot;&ensp;

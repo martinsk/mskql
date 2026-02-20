@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Tutorial: Parquet Foreign Tables</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Tutorials</a></p>
+
+<h1>Parquet Foreign Tables</h1>
+<span class="subtitle">Tutorial 11 &mdash; Map Parquet files to SQL tables, query with standard SQL</span>
+<hr class="title-rule">
+
+<p>
+    <strong>This tutorial requires the native mskql server.</strong> Parquet support
+    uses filesystem access and is not available in the WebAssembly playground.
+    Start the server with <code>make &amp;&amp; ./build/mskql</code> and connect
+    with <code>psql -h 127.0.0.1 -p 5433 -U test -d mskql</code>.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  1. What is a foreign table?                                -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="what">1. What is a foreign table?</h2>
+
+<p>
+    A foreign table maps an external Parquet file to a SQL table name.
+    No data is copied into memory&mdash;mskql reads the Parquet file on demand.
+    Once mapped, you query it with the same SQL you use for regular tables:
+    <code>SELECT</code>, <code>WHERE</code>, <code>JOIN</code>,
+    <code>GROUP BY</code>, <code>ORDER BY</code>, subqueries, CTEs.
+</p>
+
+<h2 id="create">2. Create a foreign table</h2>
+
+<pre><code class="language-sql">CREATE FOREIGN TABLE events (
+    id          INT,
+    user_id     INT,
+    event_type  TEXT,
+    amount      INT,
+    score       INT,
+    created_at  TEXT
+) OPTIONS (filename '/path/to/events.parquet');</code></pre>
+
+<p>
+    The column definitions must match the Parquet file&rsquo;s schema.
+    Supported Parquet types: <code>INT32</code>, <code>INT64</code>,
+    <code>FLOAT</code>, <code>DOUBLE</code>, <code>BYTE_ARRAY</code>
+    (&rarr;&nbsp;<code>TEXT</code>), <code>INT96</code>
+    (&rarr;&nbsp;<code>TIMESTAMP</code>).
+</p>
+
+<h2 id="query">3. Query Parquet data</h2>
+
+<h3>Filtered scan</h3>
+<pre><code class="language-sql">SELECT * FROM events
+WHERE amount > 500 AND score > 5000;</code></pre>
+
+<h3>Aggregation</h3>
+<pre><code class="language-sql">SELECT event_type, COUNT(*), SUM(amount), AVG(score)
+FROM events
+GROUP BY event_type;</code></pre>
+
+<h3>Sort</h3>
+<pre><code class="language-sql">SELECT * FROM events
+ORDER BY score DESC;</code></pre>
+
+<h2 id="join">4. Join Parquet files</h2>
+
+<p>
+    Map multiple Parquet files and join them with standard SQL.
+</p>
+
+<pre><code class="language-sql">CREATE FOREIGN TABLE orders (
+    id          INT,
+    customer_id INT,
+    product_id  INT,
+    quantity    INT,
+    amount      INT
+) OPTIONS (filename '/path/to/orders.parquet');
+
+CREATE FOREIGN TABLE customers (
+    id     INT,
+    name   TEXT,
+    region TEXT,
+    tier   TEXT
+) OPTIONS (filename '/path/to/customers.parquet');
+
+SELECT customers.region, COUNT(*), SUM(orders.amount)
+FROM orders
+JOIN customers ON orders.customer_id = customers.id
+GROUP BY customers.region
+ORDER BY customers.region;</code></pre>
+
+<h2 id="mixed">5. Mix Parquet and in-memory tables</h2>
+
+<p>
+    Foreign tables and regular tables work together in the same query.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE local_regions (
+    id          INT,
+    region_name TEXT,
+    tax_rate    INT
+);
+INSERT INTO local_regions VALUES (0, 'north', 10);
+INSERT INTO local_regions VALUES (1, 'south', 8);
+INSERT INTO local_regions VALUES (2, 'east', 12);
+INSERT INTO local_regions VALUES (3, 'west', 9);
+
+CREATE FOREIGN TABLE sales (
+    id        INT,
+    region_id INT,
+    amount    INT
+) OPTIONS (filename '/path/to/sales.parquet');
+
+SELECT lr.region_name, SUM(sales.amount),
+       SUM(sales.amount * lr.tax_rate / 100) AS tax
+FROM sales
+JOIN local_regions lr ON sales.region_id = lr.id
+GROUP BY lr.region_name
+ORDER BY lr.region_name;</code></pre>
+
+<h2 id="subquery">6. Subqueries across Parquet files</h2>
+
+<pre><code class="language-sql">SELECT * FROM events
+WHERE user_id IN (
+    SELECT id FROM customers WHERE tier = 'premium'
+)
+AND amount > 500
+ORDER BY score DESC
+LIMIT 100;</code></pre>
+
+<h2 id="analytical">7. Analytical CTEs</h2>
+
+<pre><code class="language-sql">CREATE FOREIGN TABLE products (
+    id       INT,
+    name     TEXT,
+    category TEXT,
+    price    INT
+) OPTIONS (filename '/path/to/products.parquet');
+
+WITH order_totals AS (
+    SELECT orders.customer_id,
+           SUM(orders.quantity * products.price) AS total
+    FROM orders
+    JOIN products ON orders.product_id = products.id
+    GROUP BY orders.customer_id
+)
+SELECT customers.region, COUNT(*), SUM(ot.total)
+FROM order_totals ot
+JOIN customers ON ot.customer_id = customers.id
+GROUP BY customers.region
+ORDER BY customers.region;</code></pre>
+
+<h2 id="performance">8. Performance</h2>
+
+<p>
+    9 Parquet workloads benchmarked against DuckDB on 50K&ndash;200K row files.
+    On cached queries, mskql is faster than DuckDB on 7 of 9. DuckDB faster on
+    8 of 9 cold (no-cache) queries.
+</p>
+
+<table>
+    <thead>
+        <tr><th>Workload</th><th>mskql (ms)</th><th>DuckDB (ms)</th><th>Cached ratio</th></tr>
+    </thead>
+    <tbody>
+        <tr><td>pq_aggregate (GROUP BY)</td><td>28</td><td>76</td><td><strong>0.37&times;</strong></td></tr>
+        <tr><td>pq_subquery (IN subquery)</td><td>21</td><td>44</td><td><strong>0.49&times;</strong></td></tr>
+        <tr><td>pq_where (filtered scan)</td><td>22</td><td>44</td><td><strong>0.50&times;</strong></td></tr>
+        <tr><td>pq_wide_agg (7 columns)</td><td>27</td><td>42</td><td><strong>0.65&times;</strong></td></tr>
+        <tr><td>pq_analytical (CTE+join+agg)</td><td>29</td><td>41</td><td><strong>0.71&times;</strong></td></tr>
+        <tr><td>pq_join_three (3 files)</td><td>30</td><td>38</td><td><strong>0.79&times;</strong></td></tr>
+        <tr><td>pq_join_two (2 files)</td><td>28</td><td>35</td><td><strong>0.80&times;</strong></td></tr>
+        <tr><td>pq_full_scan (50K rows)</td><td>449</td><td>32</td><td>14.0&times;</td></tr>
+        <tr><td>pq_order_by (sort)</td><td>371</td><td>29</td><td>12.8&times;</td></tr>
+    </tbody>
+</table>
+
+<p>
+    The result cache serves repeated queries from cached wire bytes&mdash;no Parquet
+    re-read. DuckDB re-reads the file every time. On cold reads, DuckDB&rsquo;s
+    native columnar Parquet reader is faster.
+</p>
+
+<p>
+    &#8594;&ensp;<a href="../bench-vs-pg.html#parquet"><strong>Full Parquet benchmark results</strong></a>
+</p>
+
+<h2 id="cleanup">9. Cleanup</h2>
+
+<pre><code class="language-sql">DROP FOREIGN TABLE events;
+DROP FOREIGN TABLE orders;
+DROP FOREIGN TABLE customers;
+DROP FOREIGN TABLE products;
+DROP FOREIGN TABLE sales;
+DROP TABLE local_regions;</code></pre>
+
+<h2 id="next">Explore further</h2>
+
+<p>
+    <a href="index.html">All tutorials</a> &ensp;&middot;&ensp;
+    <a href="../sql-reference.html">SQL reference</a> &ensp;&middot;&ensp;
+    <a href="../grammar.html">Grammar</a> &ensp;&middot;&ensp;
+    <a href="../bench-vs-pg.html">Benchmarks</a> &ensp;&middot;&ensp;
+    <a href="../architecture.html">Architecture</a>
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+
+</body>
+</html>

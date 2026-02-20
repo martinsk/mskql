@@ -56,17 +56,17 @@
 </head>
 <body>
 
-<p class="breadcrumb"><a href="bench-vs-pg.html">&larr; Benchmarks vs PostgreSQL</a></p>
+<p class="breadcrumb"><a href="bench-vs-pg.html">&larr; Benchmarks</a></p>
 
 <h1>Benchmark Workload Details</h1>
 <span class="subtitle">What each workload tests, why it matters, and how mskql handles it</span>
 <hr class="title-rule">
 
 <p>
-    <strong>26 batch workloads and 14 throughput workloads.</strong> Each entry
+    <strong>84 batch workloads and 15 throughput workloads.</strong> Each entry
     below shows the exact SQL, explains what database capability it exercises,
     and describes how mskql&rsquo;s architecture produces the measured result.
-    For the summary numbers, see <a href="bench-vs-pg.html">Benchmarks vs PostgreSQL</a>.
+    For the summary numbers, see <a href="bench-vs-pg.html">Benchmarks</a>.
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -280,7 +280,7 @@
     <div class="now-what">
         <span class="section-label">Now what</span>
         <p>
-            mskql implements <code>DISTINCT</code> via the hash aggregation
+            The <code>DISTINCT</code> path uses the hash aggregation
             path with no aggregate functions. The hash table is bump-allocated,
             and the 100-row result is serialized in a single wire buffer
             flush. The result cache further accelerates repeated executions.
@@ -350,7 +350,7 @@
     <div class="now-what">
         <span class="section-label">Now what</span>
         <p>
-            mskql updates rows in place&mdash;no tuple versioning, no dead
+            Rows are updated in place&mdash;no tuple versioning, no dead
             tuple cleanup. The scan cache is invalidated by the generation
             bump, but the update itself is a direct cell modification in the
             row store. No WAL write, no vacuum needed.
@@ -1018,7 +1018,7 @@ FROM bench_data;</code></pre>
         <span class="section-label">Now what</span>
         <p>
             Both databases spend most of their time in <code>write()</code>
-            system calls. mskql&rsquo;s batched 64&nbsp;KB buffer helps in
+            system calls. The mskql batched 64&nbsp;KB buffer helps in
             batch mode but under concurrent load the network becomes the
             bottleneck.
         </p>
@@ -1076,7 +1076,7 @@ FROM bench_data;</code></pre>
         <span class="section-label">Now what</span>
         <p>
             Each insert appends to the row dynamic array and bumps the
-            generation counter. mskql&rsquo;s single-threaded executor
+            generation counter. The single-threaded executor
             serializes all inserts, but each one is fast enough (115&mu;s)
             to sustain 63K QPS across 8 threads.
         </p>
@@ -1100,7 +1100,7 @@ UPDATE tp_data SET value = $1 WHERE id = $2;</code></pre>
         <p>
             <strong>The only workload where PostgreSQL wins.</strong>
             PostgreSQL&rsquo;s MVCC allows concurrent readers and writers
-            without blocking. mskql&rsquo;s single-threaded executor
+            without blocking. The mskql single-threaded executor
             serializes all queries, so writers block readers.
         </p>
     </div>
@@ -1111,7 +1111,7 @@ UPDATE tp_data SET value = $1 WHERE id = $2;</code></pre>
             This is a fundamental architectural limitation: mskql processes
             one query at a time. Adding MVCC or a concurrent executor would
             close this gap but would add significant complexity to the
-            ~29K-line codebase.
+            ~39K-line codebase.
         </p>
     </div>
 </div>
@@ -1412,7 +1412,7 @@ FROM joined GROUP BY region ORDER BY total DESC;</code></pre>
 <footer class="site-footer">
     <a href="index.html">mskql</a>
     &ensp;&middot;&ensp;
-    <a href="bench-vs-pg.html">Benchmarks vs PostgreSQL</a>
+    <a href="bench-vs-pg.html">Benchmarks</a>
     &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
     &ensp;&middot;&ensp;

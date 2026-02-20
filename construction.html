@@ -13,15 +13,16 @@
 
 <p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
 
-<h1>How This Project Was Built</h1>
+<h1>Construction</h1>
 <span class="subtitle">Adversarial AI collaboration &mdash; zero human code</span>
 <hr class="title-rule">
 
 <p>
-    <strong>~29K lines of C. 1,030+ tests. Zero human code.</strong>
+    <strong>~39K lines of C. 1,240+ tests. Zero human code.</strong>
     Three AI agents&mdash;Challenger, Writer, Reviewer&mdash;collaborated in
     adversarial rounds until every test passed under AddressSanitizer.
-    The result beats PostgreSQL on all 26 batch benchmarks.
+    The result beats PostgreSQL on all 28 cached batch benchmarks and
+    DuckDB on 37 of 84 workloads.
 </p>
 
 <div class="diagram">
@@ -67,8 +68,8 @@
 
   <!-- Result box -->
   <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">1,030+ tests pass</text>
-  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~29,000 lines of C &middot; zero human code</text>
+  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">1,240+ tests pass</text>
+  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~39,000 lines of C &middot; zero human code</text>
 </svg>
 </div>
 
@@ -83,25 +84,80 @@
     cleanly.
 </p>
 
+<h2 id="agents">The three agents</h2>
+
+<p>
+    <strong>The Challenger</strong> studies the current codebase and produces
+    <code>.sql</code> test files targeting corner cases: empty tables, NULL
+    propagation through expressions, multi-column ordering with mixed
+    ASC/DESC, stale index entries after deletes, concurrent readers during
+    writes, and edge cases in type casting. Each round adds 10&ndash;30 new
+    tests.
+</p>
+
+<p>
+    <strong>The Writer</strong> runs the new tests under AddressSanitizer,
+    diagnoses failures, and ships fixes. It also implements new features
+    requested by the test suite&mdash;if the Challenger writes a test for
+    <code>INTERSECT ALL</code>, the Writer adds the parser rule, executor
+    path, and wire serialisation to make it pass.
+</p>
+
+<p>
+    <strong>The Reviewer</strong> reads the source after each round and
+    annotates it with actionable comments: missing error paths, redundant
+    allocations, opportunities to share code between the plan executor and
+    legacy row-by-row path, and architectural improvements like converting
+    ENUM storage from string-based to ordinal.
+</p>
+
 <h2 id="feedback-loop">The feedback loop</h2>
 
 <p>
-    Write code, run 1,030+ tests, fix failures, repeat. The adversarial model
+    Write code, run 1,240+ tests, fix failures, repeat. The adversarial model
     drove correctness the same way rigorous code review does on a human
-    team&mdash;except all three sides were machines.
+    team&mdash;except all three sides were machines. A typical round:
+</p>
+
+<ol>
+    <li>Challenger adds tests for a new feature or edge case.</li>
+    <li>Writer implements the feature and fixes any regressions.</li>
+    <li>Reviewer flags code-quality issues and suggests refactors.</li>
+    <li>Writer addresses review comments and re-runs the full suite.</li>
+    <li>Repeat until all tests pass under ASAN with zero leaks.</li>
+</ol>
+
+<h2 id="result">What came out</h2>
+
+<p>
+    The result: a recursive-descent parser, block-oriented columnar executor,
+    arena-based memory management with bump allocation, a result cache for
+    repeat queries, and a PostgreSQL-compatible wire protocol&mdash;all
+    without a single line of human-written C.
 </p>
 
 <p>
-    The result: a recursive-descent parser, block-oriented vectorized executor,
-    arena-based memory management, and PostgreSQL-compatible wire protocol&mdash;all
-    without a single line of human-written C.
+    Key architectural decisions that emerged from this process:
 </p>
+
+<ul>
+    <li><strong>Columnar plan executor</strong> &mdash; processes data in 1024-row
+        blocks with typed arrays, avoiding per-row dispatch overhead.</li>
+    <li><strong>Bump allocator</strong> &mdash; slab-chained arena for parser and
+        scratch memory; zero per-request allocations at steady state.</li>
+    <li><strong>Result cache</strong> &mdash; caches serialised wire bytes keyed by
+        SQL text; serves repeat queries in microseconds.</li>
+    <li><strong>Direct columnar&rarr;wire send</strong> &mdash; bypasses row-store
+        materialisation, batching DataRow messages into 64KB writes.</li>
+    <li><strong>Native ordinal ENUMs</strong> &mdash; stored as <code>int32_t</code>
+        internally, converted at I/O boundaries only.</li>
+</ul>
 
 <h2 id="now-what">Explore further</h2>
 
 <p>
     <a href="architecture.html">Architecture</a> &ensp;&middot;&ensp;
-    <a href="bench-vs-pg.html">Benchmarks vs PostgreSQL</a> &ensp;&middot;&ensp;
+    <a href="bench-vs-pg.html">Benchmarks</a> &ensp;&middot;&ensp;
     <a href="testing.html">Testing methodology</a> &ensp;&middot;&ensp;
     <a href="playground.html">Try it in the browser</a>
 </p>

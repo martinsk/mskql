@@ -78,12 +78,12 @@
 <p class="breadcrumb"><a href="../index.html">&larr; mskql</a></p>
 
 <h1>Tutorials</h1>
-<span class="subtitle">Ten hands-on SQL workflows, from schema to finished queries</span>
+<span class="subtitle">Eleven hands-on SQL workflows, from schema to Parquet analytics</span>
 <hr class="title-rule">
 
 <p>
-    <strong>Ten self-contained tutorials. Every query runs live in the browser
-    via WebAssembly.</strong> Edit the SQL and re-run. No server required.
+    <strong>Eleven self-contained tutorials.</strong> Tutorials 1&ndash;10 run live in the browser
+    via WebAssembly. Tutorial 11 (Parquet) requires the native server.
 </p>
 
 <div class="tutorial-grid">
@@ -256,6 +256,24 @@
             <span class="card-tag">SERIAL</span>
             <span class="card-tag">ENUM</span>
             <span class="card-tag">NEXTVAL</span>
+        </div>
+    </a>
+
+    <a class="tutorial-card" href="parquet-foreign-tables.html">
+        <span class="card-number">Tutorial 11</span>
+        <div class="card-title">Parquet Foreign Tables</div>
+        <p class="card-desc">
+            Map Parquet files to SQL tables with
+            <code>CREATE&nbsp;FOREIGN&nbsp;TABLE</code>. Run joins,
+            aggregates, subqueries, and CTEs across Parquet data.
+            9 benchmarked workloads on 50K&ndash;200K row files.
+            <em>Requires native server (not WASM).</em>
+        </p>
+        <div class="card-tags">
+            <span class="card-tag">PARQUET</span>
+            <span class="card-tag">FOREIGN TABLE</span>
+            <span class="card-tag">JOIN</span>
+            <span class="card-tag">AGGREGATE</span>
         </div>
     </a>
 

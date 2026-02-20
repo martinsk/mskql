@@ -9,114 +9,7 @@
     <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
     <style>
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-        :root {
-            --body-width: 55%;
-            --fg: #111;
-            --fg-dim: #555;
-            --bg: #fffff8;
-            --accent: #a00;
-            --rule: #ccc;
-            --code-bg: #f3f1eb;
-            --implemented: #1a7a1a;
-            --not-implemented: #999;
-        }
-
-        html { font-size: 15px; }
-
-        body {
-            font-family: 'EB Garamond', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
-            background: var(--bg);
-            color: var(--fg);
-            width: var(--body-width);
-            margin-left: auto;
-            margin-right: auto;
-            padding: 3rem 0 5rem 0;
-        }
-
-        p { font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.2rem; }
-
-        a {
-            color: var(--fg);
-            text-decoration: none;
-            background-image: linear-gradient(var(--accent), var(--accent));
-            background-size: 1px 1px;
-            background-repeat: repeat-x;
-            background-position: 0 1.15em;
-        }
-        a:hover { color: var(--accent); }
-
-        strong { font-weight: 600; }
-
-        h1 {
-            font-weight: 400;
-            font-size: 2.6rem;
-            line-height: 1.15;
-            margin-bottom: 0.4rem;
-        }
-
-        .subtitle {
-            font-style: italic;
-            font-size: 1.3rem;
-            color: var(--fg-dim);
-            display: block;
-            margin-bottom: 0.6rem;
-            line-height: 1.4;
-        }
-
-        .byline {
-            font-size: 0.95rem;
-            color: var(--fg-dim);
-            margin-bottom: 2rem;
-        }
-        .byline a { font-size: 0.95rem; }
-
-        .title-rule {
-            border: none;
-            height: 3px;
-            background: var(--accent);
-            width: 60px;
-            margin: 0 0 2rem 0;
-        }
-
-        h2 {
-            font-weight: 400;
-            font-style: italic;
-            font-size: 1.6rem;
-            margin-top: 2.8rem;
-            margin-bottom: 0.6rem;
-            padding-bottom: 0.15rem;
-        }
-
-        h3 {
-            font-weight: 600;
-            font-style: normal;
-            font-size: 1.15rem;
-            margin-top: 1.6rem;
-            margin-bottom: 0.4rem;
-        }
-
-        code {
-            font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
-            font-size: 0.82rem;
-            background: var(--code-bg);
-            padding: 0.1em 0.35em;
-            border-radius: 2px;
-        }
-
-        pre {
-            background: var(--code-bg);
-            border-left: 3px solid var(--accent);
-            padding: 1rem 1.2rem;
-            overflow-x: auto;
-            font-size: 0.82rem;
-            line-height: 1.55;
-            margin: 1rem 0 1.4rem 0;
-        }
-        pre code { background: none; padding: 0; border-radius: 0; }
-
-        /* ── Grammar production rules ──────────────────────────── */
+        /* ── Grammar production rules (page-specific) ──────────── */
         .grammar {
             font-family: 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
             font-size: 0.8rem;
@@ -156,8 +49,6 @@
             vertical-align: middle;
             margin-left: 0.4rem;
         }
-        .badge-yes { display: none; }
-        .badge-partial { display: none; }
         .badge-no {
             display: inline;
             font-family: 'EB Garamond', Georgia, serif;
@@ -172,71 +63,22 @@
             vertical-align: baseline;
             letter-spacing: 0;
         }
-
-        /* ── Feature table ─────────────────────────────────────── */
-        table {
-            border-collapse: collapse;
-            font-size: 0.95rem;
-            width: 100%;
-            margin: 1rem 0 1.4rem 0;
-        }
-        th, td {
-            padding: 0.4rem 0.8rem;
-            text-align: left;
-            border-bottom: 1px solid var(--rule);
-        }
-        thead th {
-            border-bottom: 2px solid var(--fg);
-            font-weight: 600;
-            font-size: 0.85rem;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-        }
-        tbody tr:last-child td { border-bottom: 2px solid var(--fg); }
-        td code { font-size: 0.8rem; }
-
-
-        /* ── Footer ──────────────────────────────────────────────── */
-        footer.site-footer {
-            margin-top: 3rem;
-            padding-top: 1.5rem;
-            border-top: 1px solid var(--rule);
-            font-size: 0.85rem;
-            color: var(--fg-dim);
-        }
-        footer.site-footer a { font-size: 0.85rem; }
-
-        hr {
-            border: none;
-            border-top: 1px solid var(--rule);
-            margin: 2.5rem 0;
-        }
-
-        @media (max-width: 1100px) {
-            body { width: 80%; }
-        }
-        @media (max-width: 700px) {
-            body { width: 90%; padding: 2rem 0 3rem 0; }
-            h1 { font-size: 2rem; }
-        }
     </style>
 </head>
 <body>
 
 <p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
 
-<h1>mskql</h1>
-<span class="subtitle">SQL Grammar Reference</span>
-<p class="byline">
-    <a href="index.html">&larr; Back to documentation</a>
-    &ensp;&middot;&ensp;
-    <a href="https://github.com/martinsk/mskql">github.com/martinsk/mskql</a>
-</p>
+<h1>SQL Grammar</h1>
+<span class="subtitle">Every production rule accepted by the recursive-descent parser</span>
 <hr class="title-rule">
 
 <p>
-    Every production rule accepted by mskql&rsquo;s recursive-descent parser.
-    Unsupported features are noted inline.
+    <strong>This page lists every production rule accepted by mskql&rsquo;s
+    hand-written recursive-descent parser.</strong> Implemented features are
+    unmarked; features not yet supported are noted inline in italics.
+    See the <a href="sql-reference.html">SQL Reference</a> for a higher-level
+    summary grouped by category.
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -319,7 +161,7 @@
 <span class="nt">from_clause</span> <span class="op">::=</span><br>
 &ensp;&ensp;  <span class="nt">table_name</span> [ [ <span class="kw">AS</span> ] <span class="nt">alias</span> ]<br>
 &ensp;&ensp;| <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> [ <span class="kw">AS</span> ] <span class="nt">alias</span> <span class="comment">&ensp;-- derived table</span><br>
-&ensp;&ensp;| <span class="kw">generate_series</span> <span class="kw">(</span> <span class="nt">start</span> <span class="kw">,</span> <span class="nt">stop</span> [ <span class="kw">,</span> <span class="nt">step</span> ] <span class="kw">)</span> [ <span class="kw">AS</span> <span class="nt">alias</span> <span class="kw">(</span> <span class="nt">col_alias</span> <span class="kw">)</span> ] <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">generate_series</span> <span class="kw">(</span> <span class="nt">start</span> <span class="kw">,</span> <span class="nt">stop</span> [ <span class="kw">,</span> <span class="nt">step</span> ] <span class="kw">)</span> [ <span class="kw">AS</span> <span class="nt">alias</span> <span class="kw">(</span> <span class="nt">col_alias</span> <span class="kw">)</span> ]<br>
 <span class="comment">&ensp;&ensp;-- integer series: generate_series(1, 100)</span><br>
 <span class="comment">&ensp;&ensp;-- integer with step: generate_series(0, 100, 10)</span><br>
 <span class="comment">&ensp;&ensp;-- timestamp series: generate_series('2024-01-01'::date, '2024-12-31'::date, '1 month')</span><br>
@@ -526,7 +368,19 @@
   <span class="kw">DROP VIEW</span> <span class="nt">name</span><br>
 <br>
 <span class="nt">truncate_stmt</span> <span class="op">::=</span>
-  <span class="kw">TRUNCATE</span> [ <span class="kw">TABLE</span> ] <span class="nt">table_name</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+  <span class="kw">TRUNCATE</span> [ <span class="kw">TABLE</span> ] <span class="nt">table_name</span><br>
+<br>
+<span class="nt">create_foreign_table_stmt</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">CREATE FOREIGN TABLE</span> <span class="nt">table_name</span>
+  <span class="kw">(</span> <span class="nt">column_def</span> { <span class="kw">,</span> <span class="nt">column_def</span> } <span class="kw">)</span>
+  <span class="kw">OPTIONS</span> <span class="kw">(</span> <span class="kw">filename</span> <span class="nt">string_literal</span> <span class="kw">)</span>
+ <br>
+<br>
+<span class="comment">-- Maps a Parquet file to a SQL table. Query with standard SQL.</span><br>
+<span class="comment">-- Supported Parquet types: INT32, INT64, FLOAT, DOUBLE, BYTE_ARRAY (→ TEXT), INT96 (→ TIMESTAMP).</span><br>
+<br>
+<span class="nt">drop_foreign_table_stmt</span> <span class="op">::=</span>
+  <span class="kw">DROP FOREIGN TABLE</span> <span class="nt">table_name</span><br>
 </div>
 
 <h3>COPY</h3>
@@ -549,27 +403,27 @@
 
 <div class="grammar">
 <span class="nt">data_type</span> <span class="op">::=</span><br>
-&ensp;&ensp;  <span class="kw">INT</span> | <span class="kw">INTEGER</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">BIGINT</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">FLOAT</span> | <span class="kw">DOUBLE PRECISION</span> | <span class="kw">REAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">NUMERIC</span> | <span class="kw">DECIMAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">TEXT</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">VARCHAR</span> <span class="kw">(</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;  <span class="kw">INT</span> | <span class="kw">INTEGER</span><br>
+&ensp;&ensp;| <span class="kw">BIGINT</span><br>
+&ensp;&ensp;| <span class="kw">FLOAT</span> | <span class="kw">DOUBLE PRECISION</span> | <span class="kw">REAL</span><br>
+&ensp;&ensp;| <span class="kw">NUMERIC</span> | <span class="kw">DECIMAL</span><br>
+&ensp;&ensp;| <span class="kw">TEXT</span><br>
+&ensp;&ensp;| <span class="kw">VARCHAR</span> <span class="kw">(</span> <span class="nt">n</span> <span class="kw">)</span><br>
 &ensp;&ensp;| <span class="kw">CHAR</span> <span class="kw">(</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-no">(not yet supported)</span><br>
-&ensp;&ensp;| <span class="kw">BOOLEAN</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">DATE</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">TIME</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">TIMESTAMP</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">TIMESTAMPTZ</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">INTERVAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">UUID</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">SERIAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">BIGSERIAL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="kw">BOOLEAN</span><br>
+&ensp;&ensp;| <span class="kw">DATE</span><br>
+&ensp;&ensp;| <span class="kw">TIME</span><br>
+&ensp;&ensp;| <span class="kw">TIMESTAMP</span><br>
+&ensp;&ensp;| <span class="kw">TIMESTAMPTZ</span><br>
+&ensp;&ensp;| <span class="kw">INTERVAL</span><br>
+&ensp;&ensp;| <span class="kw">UUID</span><br>
+&ensp;&ensp;| <span class="kw">SERIAL</span><br>
+&ensp;&ensp;| <span class="kw">BIGSERIAL</span><br>
 &ensp;&ensp;| <span class="kw">SMALLINT</span> <span class="badge badge-no">(not yet supported)</span><br>
 &ensp;&ensp;| <span class="kw">BYTEA</span> <span class="badge badge-no">(not yet supported)</span><br>
 &ensp;&ensp;| <span class="kw">JSON</span> | <span class="kw">JSONB</span> <span class="badge badge-no">(not yet supported)</span><br>
 &ensp;&ensp;| <span class="kw">ARRAY</span> <span class="badge badge-no">(not yet supported)</span><br>
-&ensp;&ensp;| <span class="nt">enum_type_name</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;| <span class="nt">enum_type_name</span><br>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -580,16 +434,16 @@
 
 <div class="grammar">
 <span class="nt">expr</span> <span class="op">::=</span><br>
-&ensp;&ensp;  <span class="nt">literal</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">column_ref</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">binary_op</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">unary_op</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">func_call</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CASE WHEN</span> <span class="nt">condition</span> <span class="kw">THEN</span> <span class="nt">expr</span> { <span class="kw">WHEN</span> ... } [ <span class="kw">ELSE</span> <span class="nt">expr</span> ] <span class="kw">END</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="comment">&ensp;-- scalar subquery</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">::</span> <span class="nt">data_type</span> <span class="comment">&ensp;-- postfix cast</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CAST</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">AS</span> <span class="nt">data_type</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">IS</span> [ <span class="kw">NOT</span> ] <span class="kw">NULL</span> <span class="comment">&ensp;-- postfix null test (expression-level)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;  <span class="nt">literal</span><br>
+&ensp;&ensp;| <span class="nt">column_ref</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">binary_op</span> <span class="nt">expr</span><br>
+&ensp;&ensp;| <span class="nt">unary_op</span> <span class="nt">expr</span><br>
+&ensp;&ensp;| <span class="nt">func_call</span><br>
+&ensp;&ensp;| <span class="kw">CASE WHEN</span> <span class="nt">condition</span> <span class="kw">THEN</span> <span class="nt">expr</span> { <span class="kw">WHEN</span> ... } [ <span class="kw">ELSE</span> <span class="nt">expr</span> ] <span class="kw">END</span><br>
+&ensp;&ensp;| <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="comment">&ensp;-- scalar subquery</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">::</span> <span class="nt">data_type</span> <span class="comment">&ensp;-- postfix cast</span><br>
+&ensp;&ensp;| <span class="kw">CAST</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">AS</span> <span class="nt">data_type</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">IS</span> [ <span class="kw">NOT</span> ] <span class="kw">NULL</span> <span class="comment">&ensp;-- postfix null test (expression-level)</span><br>
 <br>
 <span class="nt">binary_op</span> <span class="op">::=</span>
   <span class="kw">+</span> | <span class="kw">-</span> | <span class="kw">*</span> | <span class="kw">/</span> | <span class="kw">%</span> | <span class="kw">||</span><br>
@@ -605,45 +459,45 @@
 
 <div class="grammar">
 <span class="nt">func_call</span> <span class="op">::=</span><br>
-&ensp;&ensp;  <span class="kw">COALESCE</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">NULLIF</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">GREATEST</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">LEAST</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">UPPER</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">LOWER</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">LENGTH</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">TRIM</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CONCAT</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">SUBSTRING</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">FROM</span> <span class="nt">n</span> [ <span class="kw">FOR</span> <span class="nt">n</span> ] <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">NEXTVAL</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CURRVAL</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">GEN_RANDOM_UUID</span> <span class="kw">()</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">NOW</span> <span class="kw">()</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CURRENT_TIMESTAMP</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CURRENT_DATE</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">EXTRACT</span> <span class="kw">(</span> <span class="nt">field</span> <span class="kw">FROM</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">DATE_PART</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">DATE_TRUNC</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">AGE</span> <span class="kw">(</span> <span class="nt">expr</span> [ <span class="kw">,</span> <span class="nt">expr</span> ] <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">TO_CHAR</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">string</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">REPLACE</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">LEFT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> / <span class="kw">RIGHT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">LPAD</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> [ <span class="kw">,</span> <span class="nt">fill</span> ] <span class="kw">)</span> / <span class="kw">RPAD</span> <span class="kw">(</span> ... <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CONCAT_WS</span> <span class="kw">(</span> <span class="nt">sep</span> <span class="kw">,</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">POSITION</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">IN</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">SPLIT_PART</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">delim</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">REPEAT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">REVERSE</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">INITCAP</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">ABS</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">CEIL</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">FLOOR</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">ROUND</span> <span class="kw">(</span> <span class="nt">expr</span> [ <span class="kw">,</span> <span class="nt">n</span> ] <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">POWER</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">SQRT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">MOD</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">SIGN</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">RANDOM</span> <span class="kw">()</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">STRING_AGG</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">delimiter</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">ARRAY_AGG</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;  <span class="kw">COALESCE</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">NULLIF</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">GREATEST</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">LEAST</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">UPPER</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">LOWER</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">LENGTH</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">TRIM</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">CONCAT</span> <span class="kw">(</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">SUBSTRING</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">FROM</span> <span class="nt">n</span> [ <span class="kw">FOR</span> <span class="nt">n</span> ] <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">NEXTVAL</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">CURRVAL</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">GEN_RANDOM_UUID</span> <span class="kw">()</span><br>
+&ensp;&ensp;| <span class="kw">NOW</span> <span class="kw">()</span><br>
+&ensp;&ensp;| <span class="kw">CURRENT_TIMESTAMP</span><br>
+&ensp;&ensp;| <span class="kw">CURRENT_DATE</span><br>
+&ensp;&ensp;| <span class="kw">EXTRACT</span> <span class="kw">(</span> <span class="nt">field</span> <span class="kw">FROM</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">DATE_PART</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">DATE_TRUNC</span> <span class="kw">(</span> <span class="nt">string</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">AGE</span> <span class="kw">(</span> <span class="nt">expr</span> [ <span class="kw">,</span> <span class="nt">expr</span> ] <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">TO_CHAR</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">string</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">REPLACE</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">LEFT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span> / <span class="kw">RIGHT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">LPAD</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> [ <span class="kw">,</span> <span class="nt">fill</span> ] <span class="kw">)</span> / <span class="kw">RPAD</span> <span class="kw">(</span> ... <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">CONCAT_WS</span> <span class="kw">(</span> <span class="nt">sep</span> <span class="kw">,</span> <span class="nt">expr</span> { <span class="kw">,</span> <span class="nt">expr</span> } <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">POSITION</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">IN</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">SPLIT_PART</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">delim</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">REPEAT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">REVERSE</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">INITCAP</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">ABS</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">CEIL</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">FLOOR</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">ROUND</span> <span class="kw">(</span> <span class="nt">expr</span> [ <span class="kw">,</span> <span class="nt">n</span> ] <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">POWER</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">SQRT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">MOD</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">SIGN</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">RANDOM</span> <span class="kw">()</span><br>
+&ensp;&ensp;| <span class="kw">STRING_AGG</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">delimiter</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">ARRAY_AGG</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -654,21 +508,21 @@
 
 <div class="grammar">
 <span class="nt">condition</span> <span class="op">::=</span><br>
-&ensp;&ensp;  <span class="nt">condition</span> <span class="kw">AND</span> <span class="nt">condition</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">condition</span> <span class="kw">OR</span> <span class="nt">condition</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">NOT</span> <span class="nt">condition</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">cmp_op</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">BETWEEN</span> <span class="nt">expr</span> <span class="kw">AND</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> [ <span class="kw">NOT</span> ] <span class="kw">IN</span> <span class="kw">(</span> <span class="nt">value_list</span> | <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">(</span> <span class="nt">expr_list</span> <span class="kw">)</span> <span class="kw">IN</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="comment">&ensp;-- multi-column IN</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">cmp_op</span> <span class="kw">ANY</span> <span class="kw">(</span> <span class="nt">value_list</span> | <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">cmp_op</span> <span class="kw">ALL</span> <span class="kw">(</span> <span class="nt">value_list</span> | <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> [ <span class="kw">NOT</span> ] <span class="kw">LIKE</span> <span class="nt">pattern</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">ILIKE</span> <span class="nt">pattern</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">IS</span> [ <span class="kw">NOT</span> ] <span class="kw">NULL</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">IS</span> [ <span class="kw">NOT</span> ] <span class="kw">DISTINCT FROM</span> <span class="nt">expr</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">EXISTS</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">NOT EXISTS</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;  <span class="nt">condition</span> <span class="kw">AND</span> <span class="nt">condition</span><br>
+&ensp;&ensp;| <span class="nt">condition</span> <span class="kw">OR</span> <span class="nt">condition</span><br>
+&ensp;&ensp;| <span class="kw">NOT</span> <span class="nt">condition</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">cmp_op</span> <span class="nt">expr</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">BETWEEN</span> <span class="nt">expr</span> <span class="kw">AND</span> <span class="nt">expr</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> [ <span class="kw">NOT</span> ] <span class="kw">IN</span> <span class="kw">(</span> <span class="nt">value_list</span> | <span class="nt">select_stmt</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">(</span> <span class="nt">expr_list</span> <span class="kw">)</span> <span class="kw">IN</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span> <span class="comment">&ensp;-- multi-column IN</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">cmp_op</span> <span class="kw">ANY</span> <span class="kw">(</span> <span class="nt">value_list</span> | <span class="nt">select_stmt</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="nt">cmp_op</span> <span class="kw">ALL</span> <span class="kw">(</span> <span class="nt">value_list</span> | <span class="nt">select_stmt</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> [ <span class="kw">NOT</span> ] <span class="kw">LIKE</span> <span class="nt">pattern</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">ILIKE</span> <span class="nt">pattern</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">IS</span> [ <span class="kw">NOT</span> ] <span class="kw">NULL</span><br>
+&ensp;&ensp;| <span class="nt">expr</span> <span class="kw">IS</span> [ <span class="kw">NOT</span> ] <span class="kw">DISTINCT FROM</span> <span class="nt">expr</span><br>
+&ensp;&ensp;| <span class="kw">EXISTS</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">NOT EXISTS</span> <span class="kw">(</span> <span class="nt">select_stmt</span> <span class="kw">)</span><br>
 &ensp;&ensp;| <span class="nt">expr</span> <span class="kw">SIMILAR TO</span> <span class="nt">pattern</span> <span class="badge badge-no">(not yet supported)</span><br>
 &ensp;&ensp;| <span class="nt">expr</span> <span class="kw">~</span> <span class="nt">pattern</span> <span class="comment">&ensp;-- POSIX regex</span> <span class="badge badge-no">(not yet supported)</span><br>
 <br>
@@ -684,9 +538,9 @@
 
 <div class="grammar">
 <span class="nt">transaction_stmt</span> <span class="op">::=</span><br>
-&ensp;&ensp;  <span class="kw">BEGIN</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">COMMIT</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
-&ensp;&ensp;| <span class="kw">ROLLBACK</span> <span class="badge badge-yes">IMPLEMENTED</span><br>
+&ensp;&ensp;  <span class="kw">BEGIN</span><br>
+&ensp;&ensp;| <span class="kw">COMMIT</span><br>
+&ensp;&ensp;| <span class="kw">ROLLBACK</span><br>
 &ensp;&ensp;| <span class="kw">SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">(not yet supported)</span><br>
 &ensp;&ensp;| <span class="kw">RELEASE SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">(not yet supported)</span><br>
 &ensp;&ensp;| <span class="kw">ROLLBACK TO SAVEPOINT</span> <span class="nt">name</span> <span class="badge badge-no">(not yet supported)</span><br>

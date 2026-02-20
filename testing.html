@@ -15,11 +15,11 @@
 <p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
 
 <h1>Testing</h1>
-<span class="subtitle">1,030+ tests &middot; two layers of verification &middot; zero tolerance for leaks</span>
+<span class="subtitle">1,240+ tests &middot; two layers of verification &middot; zero tolerance for leaks</span>
 <hr class="title-rule">
 
 <p>
-    <strong>1,030+ tests. Every one runs under AddressSanitizer.</strong>
+    <strong>1,240+ tests. Every one runs under AddressSanitizer.</strong>
     A correct query that leaks 16&nbsp;bytes is a failure.
     Tests run in parallel across all CPU cores, each in an isolated server instance.
 </p>
@@ -152,23 +152,27 @@ SELECT id, name, age FROM t_aac ORDER BY id;
 
 <table>
     <thead>
-        <tr><th>Section</th><th>Purpose</th></tr>
+        <tr><th>Section</th><th>Required?</th><th>Purpose</th></tr>
     </thead>
     <tbody>
         <tr>
             <td><code>-- &lt;test name&gt;</code></td>
+            <td>Yes</td>
             <td>First comment line; used in pass/fail reporting</td>
         </tr>
         <tr>
             <td><code>-- setup:</code></td>
-            <td>SQL run before the test; output not checked</td>
+            <td>Optional</td>
+            <td>SQL run before the test; output not checked. Use for CREATE TABLE, INSERT, etc.</td>
         </tr>
         <tr>
             <td><code>-- input:</code></td>
+            <td>Yes</td>
             <td>SQL whose output is checked against expected</td>
         </tr>
         <tr>
             <td><code>-- expected output:</code></td>
+            <td>Yes</td>
             <td>Expected lines, compared with <code>psql&nbsp;-tA</code> output</td>
         </tr>
     </tbody>
@@ -219,7 +223,7 @@ SELECT id, name, age FROM t_aac ORDER BY id;
 <h2 id="coverage">What is tested</h2>
 
 <p>
-    The 1,030+ test cases cover DDL
+    The 1,240+ test cases cover DDL
     (<code>IF&nbsp;NOT&nbsp;EXISTS</code>, <code>CHECK</code> constraints),
     DML, joins,
     aggregation (including expression aggregates, positional <code>GROUP&nbsp;BY</code>,
@@ -251,7 +255,7 @@ SELECT id, name, age FROM t_aac ORDER BY id;
 
 <h2 id="running">Running the tests</h2>
 
-<pre><code class="language-bash">make test                          # full suite: build with ASAN, run all 1,030+ tests
+<pre><code class="language-bash">make test                          # full suite: build with ASAN, run all 1,240+ tests
 MSKQL_NO_LEAK_CHECK=1 make test   # skip leak checking (faster, less strict)</code></pre>
 
 <h2 id="so-what">Why this matters</h2>
@@ -259,7 +263,7 @@ MSKQL_NO_LEAK_CHECK=1 make test   # skip leak checking (faster, less strict)</co
 <p>
     Arena allocation eliminates use-after-free and leak classes by construction.
     AddressSanitizer catches the rest. The result: zero known memory bugs across
-    1,030+ adversarial test cases.
+    1,240+ adversarial test cases.
 </p>
 
 <h2 id="now-what">Explore further</h2>
