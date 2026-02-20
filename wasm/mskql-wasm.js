@@ -58,6 +58,20 @@ class MskqlDB {
 
                 /* abort */
                 js_abort: () => { throw new Error("mskql: abort() called"); },
+
+                /* compiler intrinsic: 128-bit integer multiply (i64 × i64 → i128) */
+                __multi3: (result_ptr, a_lo, a_hi, b_lo, b_hi) => {
+                    /* Convert to BigInt, multiply, write 128-bit result */
+                    const a = (BigInt(a_hi) << 32n) | BigInt(a_lo >>> 0);
+                    const b = (BigInt(b_hi) << 32n) | BigInt(b_lo >>> 0);
+                    const product = a * b;
+                    const mask32 = 0xFFFFFFFFn;
+                    const view = new Uint32Array(this.memory.buffer, result_ptr, 4);
+                    view[0] = Number(product & mask32);
+                    view[1] = Number((product >> 32n) & mask32);
+                    view[2] = Number((product >> 64n) & mask32);
+                    view[3] = Number((product >> 96n) & mask32);
+                },
             }
         };
 
