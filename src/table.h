@@ -16,6 +16,7 @@ struct scan_cache {
     void   **col_data;      /* [ncols] heap-allocated typed arrays */
     uint8_t **col_nulls;    /* [ncols] heap-allocated null bitmaps */
     enum column_type *col_types; /* [ncols] column types */
+    uint32_t **col_str_lens; /* [ncols] heap-allocated length arrays; non-NULL only for TEXT cols */
 };
 
 /* Cached hash join build result for a specific join key column.
@@ -28,6 +29,7 @@ struct join_cache {
     void   **col_data;       /* [ncols] heap-allocated typed arrays */
     uint8_t **col_nulls;     /* [ncols] null bitmaps */
     enum column_type *col_types; /* [ncols] column types */
+    uint32_t **col_str_lens; /* [ncols] heap-allocated length arrays; non-NULL only for TEXT cols */
     uint32_t *hashes;        /* [nrows] hash values */
     uint32_t *nexts;         /* [nrows] next pointers */
     uint32_t *buckets;       /* [nbuckets] bucket heads */

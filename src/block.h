@@ -13,11 +13,15 @@
 #define BLOCK_CAPACITY 1024
 
 /* Column block: a contiguous typed array for a single column.
- * All data is bump-allocated from arena->scratch — no per-block free. */
+ * All data is bump-allocated from arena->scratch — no per-block free.
+ * str_lens: bump-allocated uint32_t[BLOCK_CAPACITY], non-NULL only for TEXT columns.
+ *   str_lens[i] == strlen(data.str[i]) when data.str[i] != NULL.
+ *   NULL means lengths are unknown — callers must fall back to strlen. */
 struct col_block {
     enum column_type type;
     uint16_t         count;                    /* 0..BLOCK_CAPACITY */
     uint8_t          nulls[BLOCK_CAPACITY];    /* 0=not-null, 1=null */
+    uint32_t        *str_lens;                 /* TEXT only: bump-alloc'd lengths, or NULL */
     union {
         int16_t          i16[BLOCK_CAPACITY];         /* SMALLINT */
         int32_t          i32[BLOCK_CAPACITY];         /* INT, BOOLEAN, DATE */
@@ -83,12 +87,15 @@ static inline void *cb_data_ptr(const struct col_block *cb, uint32_t i)
     __builtin_unreachable();
 }
 
-/* Reset a row_block for reuse (zero counts, keep allocated memory). */
+/* Reset a row_block for reuse (zero counts, keep allocated memory).
+ * Clears str_lens to prevent stale pointers across plan_next_block calls. */
 static inline void row_block_reset(struct row_block *rb)
 {
     rb->count = 0;
-    for (uint16_t i = 0; i < rb->ncols; i++)
+    for (uint16_t i = 0; i < rb->ncols; i++) {
         rb->cols[i].count = 0;
+        rb->cols[i].str_lens = NULL;
+    }
     rb->sel = NULL;
     rb->sel_count = 0;
 }
@@ -144,13 +151,25 @@ static inline uint32_t block_hash_f64(double v)
     return h;
 }
 
-/* FNV-1a hash for string */
+/* FNV-1a hash for string (null-terminated, length unknown) */
 static inline uint32_t block_hash_str(const char *s)
 {
     uint32_t h = FNV_OFFSET;
     if (!s) return h;
     while (*s) {
         h ^= (uint8_t)*s++;
+        h *= FNV_PRIME;
+    }
+    return h;
+}
+
+/* FNV-1a hash for string with known length — avoids null scan */
+static inline uint32_t block_hash_str_n(const char *s, uint32_t len)
+{
+    uint32_t h = FNV_OFFSET;
+    if (!s) return h;
+    for (uint32_t i = 0; i < len; i++) {
+        h ^= (uint8_t)s[i];
         h *= FNV_PRIME;
     }
     return h;
@@ -176,6 +195,8 @@ static inline uint32_t block_hash_cell(const struct col_block *cb, uint16_t i)
         case COLUMN_TYPE_NUMERIC:
             return block_hash_f64(cb->data.f64[i]);
         case COLUMN_TYPE_TEXT:
+            if (cb->str_lens)
+                return block_hash_str_n(cb->data.str[i], cb->str_lens[i]);
             return block_hash_str(cb->data.str[i]);
         case COLUMN_TYPE_ENUM:
             return block_hash_i32(cb->data.i32[i]);
@@ -219,6 +240,10 @@ static inline int block_cell_eq(const struct col_block *a, uint16_t ai,
         case COLUMN_TYPE_TEXT:
             if (!a->data.str[ai] || !b->data.str[bi])
                 return a->data.str[ai] == b->data.str[bi];
+            if (a->str_lens && b->str_lens) {
+                if (a->str_lens[ai] != b->str_lens[bi]) return 0;
+                return memcmp(a->data.str[ai], b->data.str[bi], a->str_lens[ai]) == 0;
+            }
             return strcmp(a->data.str[ai], b->data.str[bi]) == 0;
         case COLUMN_TYPE_ENUM:
             return a->data.i32[ai] == b->data.i32[bi];

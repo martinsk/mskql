@@ -1023,10 +1023,12 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
              * Still compute total bytes for estimation. */
             for (uint16_t r = 0; r < active; r++) {
                 uint16_t ri = ri_buf[r];
-                if (!cb->nulls[ri] && cb->data.str[ri])
-                    text_total_bytes += strlen(cb->data.str[ri]) + 4;
-                else
+                if (!cb->nulls[ri] && cb->data.str[ri]) {
+                    size_t slen = cb->str_lens ? cb->str_lens[ri] : strlen(cb->data.str[ri]);
+                    text_total_bytes += slen + 4;
+                } else {
                     text_total_bytes += 4;
+                }
             }
             n_text_cols++;
             continue;
@@ -1037,7 +1039,7 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
         for (uint16_t r = 0; r < active; r++) {
             uint16_t ri = ri_buf[r];
             if (!cb->nulls[ri] && cb->data.str[ri]) {
-                size_t slen = strlen(cb->data.str[ri]);
+                size_t slen = cb->str_lens ? cb->str_lens[ri] : strlen(cb->data.str[ri]);
                 lens[r] = (uint16_t)(slen > 65535 ? 65535 : slen);
                 text_total_bytes += slen + 4;
             } else {

@@ -232,10 +232,12 @@ static void scan_cache_free(struct scan_cache *sc)
     for (uint16_t i = 0; i < sc->ncols; i++) {
         free(sc->col_data[i]);
         free(sc->col_nulls[i]);
+        if (sc->col_str_lens) free(sc->col_str_lens[i]);
     }
     free(sc->col_data);
     free(sc->col_nulls);
     free(sc->col_types);
+    free(sc->col_str_lens);
     memset(sc, 0, sizeof(*sc));
 }
 
@@ -252,6 +254,7 @@ static void scan_cache_build(struct table *t)
     sc->col_data = (void **)calloc(ncols, sizeof(void *));
     sc->col_nulls = (uint8_t **)calloc(ncols, sizeof(uint8_t *));
     sc->col_types = (enum column_type *)calloc(ncols, sizeof(enum column_type));
+    sc->col_str_lens = (uint32_t **)calloc(ncols, sizeof(uint32_t *));
 
     for (uint16_t c = 0; c < ncols; c++) {
         enum column_type ct = t->columns.items[c].type;
@@ -381,6 +384,8 @@ static void scan_cache_build(struct table *t)
         }
         case COLUMN_TYPE_TEXT: {
             char **dst = (char **)sc->col_data[c];
+            sc->col_str_lens[c] = (uint32_t *)calloc(nrows ? nrows : 1, sizeof(uint32_t));
+            uint32_t *lens = sc->col_str_lens[c];
             for (size_t r = 0; r < nrows; r++) {
                 struct cell *cell = &t->rows.items[r].cells.items[c];
                 if (cell->is_null || cell->type != ct
@@ -388,6 +393,7 @@ static void scan_cache_build(struct table *t)
                     sc->col_nulls[c][r] = 1;
                 } else {
                     dst[r] = cell->value.as_text;
+                    lens[r] = (uint32_t)strlen(cell->value.as_text);
                 }
             }
             break;
@@ -434,6 +440,8 @@ static int scan_cache_extend(struct table *t)
         sc->col_data[c] = realloc(sc->col_data[c], new_nrows * elem_sz);
         sc->col_nulls[c] = (uint8_t *)realloc(sc->col_nulls[c], new_nrows);
         memset(sc->col_nulls[c] + old_nrows, 0, new_nrows - old_nrows);
+        if (ct == COLUMN_TYPE_TEXT && sc->col_str_lens && sc->col_str_lens[c])
+            sc->col_str_lens[c] = (uint32_t *)realloc(sc->col_str_lens[c], new_nrows * sizeof(uint32_t));
 
         /* Fill only the new rows */
         for (size_t r = old_nrows; r < new_nrows; r++) {
@@ -442,6 +450,8 @@ static int scan_cache_extend(struct table *t)
                 sc->col_nulls[c][r] = 1;
             } else {
                 cell_to_flat_at(sc->col_data[c], r, cell, ct);
+                if (ct == COLUMN_TYPE_TEXT && sc->col_str_lens && sc->col_str_lens[c] && cell->value.as_text)
+                    sc->col_str_lens[c][r] = (uint32_t)strlen(cell->value.as_text);
             }
         }
     }
@@ -467,6 +477,8 @@ void scan_cache_update_row(struct table *t, size_t row_idx)
         }
         sc->col_nulls[c][row_idx] = 0;
         cell_to_flat_at(sc->col_data[c], row_idx, cell, ct);
+        if (ct == COLUMN_TYPE_TEXT && sc->col_str_lens && sc->col_str_lens[c] && cell->value.as_text)
+            sc->col_str_lens[c][row_idx] = (uint32_t)strlen(cell->value.as_text);
     }
     /* Keep cache generation in sync with table */
     sc->generation = t->generation;
@@ -518,7 +530,9 @@ static uint16_t scan_cache_read(struct scan_cache *sc, size_t *cursor,
         case COLUMN_TYPE_INTERVAL:
             memcpy(cb->data.iv, (struct interval *)sc->col_data[tc] + start, nrows * sizeof(struct interval)); break;
         case COLUMN_TYPE_TEXT:
-            memcpy(cb->data.str, (char **)sc->col_data[tc] + start, nrows * sizeof(char *)); break;
+            memcpy(cb->data.str, (char **)sc->col_data[tc] + start, nrows * sizeof(char *));
+            cb->str_lens = NULL;
+            break;
         case COLUMN_TYPE_ENUM:
             memcpy(cb->data.i32, (int32_t *)sc->col_data[tc] + start, nrows * sizeof(int32_t)); break;
         case COLUMN_TYPE_UUID:
@@ -1906,12 +1920,23 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case COLUMN_TYPE_TEXT: {
                 const char *cmp_str = pn->filter.cmp_val.value.as_text;
                 char * const *vals = cb->data.str;
+                const uint32_t *lens = cb->str_lens;
                 const uint8_t *nulls = cb->nulls;
                 if (!cmp_str) cmp_str = "";
-                size_t cmp_len = strlen(cmp_str);
+                uint32_t cmp_len = (uint32_t)strlen(cmp_str);
                 switch (op) {
-                    case CMP_EQ: FILTER_LOOP(!nulls[r] && vals[r] && strlen(vals[r]) == cmp_len && memcmp(vals[r], cmp_str, cmp_len) == 0); break;
-                    case CMP_NE: FILTER_LOOP(!nulls[r] && vals[r] && (strlen(vals[r]) != cmp_len || memcmp(vals[r], cmp_str, cmp_len) != 0)); break;
+                    case CMP_EQ:
+                        if (lens)
+                            FILTER_LOOP(!nulls[r] && vals[r] && lens[r] == cmp_len && memcmp(vals[r], cmp_str, cmp_len) == 0)
+                        else
+                            FILTER_LOOP(!nulls[r] && vals[r] && strlen(vals[r]) == cmp_len && memcmp(vals[r], cmp_str, cmp_len) == 0);
+                        break;
+                    case CMP_NE:
+                        if (lens)
+                            FILTER_LOOP(!nulls[r] && vals[r] && (lens[r] != cmp_len || memcmp(vals[r], cmp_str, cmp_len) != 0))
+                        else
+                            FILTER_LOOP(!nulls[r] && vals[r] && (strlen(vals[r]) != cmp_len || memcmp(vals[r], cmp_str, cmp_len) != 0));
+                        break;
                     case CMP_LT: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) <  0); break;
                     case CMP_GT: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) >  0); break;
                     case CMP_LE: FILTER_LOOP(!nulls[r] && vals[r] && strcmp(vals[r], cmp_str) <= 0); break;
@@ -2102,6 +2127,10 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             if (r == 0) {
                 /* First row: set the output column type */
                 ocb->type = result.is_null ? COLUMN_TYPE_TEXT : result.type;
+                /* Allocate str_lens for TEXT output columns */
+                if (column_type_is_text(ocb->type))
+                    ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                            BLOCK_CAPACITY, sizeof(uint32_t));
             }
 
             if (result.is_null) {
@@ -2111,6 +2140,8 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 /* If types match exactly, use cell_to_cb_at directly */
                 if (result.type == ocb->type) {
                     cell_to_cb_at(ocb, r, &result);
+                    if (ocb->str_lens && result.value.as_text)
+                        ocb->str_lens[r] = (uint32_t)strlen(result.value.as_text);
                 } else {
                     /* Coerce result into the output column's storage class */
                     double dv = 0.0;
@@ -2131,11 +2162,12 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     case STORE_STR: {
                         /* Numeric result but text output column — convert */
                         char buf[64];
+                        size_t slen;
                         if (have_numeric)
-                            snprintf(buf, sizeof(buf), "%g", dv);
-                        else
-                            buf[0] = '\0';
-                        ocb->data.str[r] = bump_strdup(&ctx->arena->scratch, buf);
+                            slen = (size_t)snprintf(buf, sizeof(buf), "%g", dv);
+                        else { buf[0] = '\0'; slen = 0; }
+                        ocb->data.str[r] = bump_strndup(&ctx->arena->scratch, buf, slen);
+                        if (ocb->str_lens) ocb->str_lens[r] = (uint32_t)slen;
                         break;
                     }
                     case STORE_IV:
@@ -2365,25 +2397,31 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         } else if (vop->kind == VEC_FUNC_UPPER || vop->kind == VEC_FUNC_LOWER) {
             int is_upper = (vop->kind == VEC_FUNC_UPPER);
             memcpy(ocb->nulls, lcb->nulls, count);
+            if (!ocb->str_lens)
+                ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                        BLOCK_CAPACITY, sizeof(uint32_t));
             for (uint16_t i = 0; i < count; i++) {
                 if (lcb->nulls[i] || !lcb->data.str[i]) {
                     ocb->data.str[i] = NULL;
                     continue;
                 }
                 const char *src = lcb->data.str[i];
-                size_t slen = strlen(src);
+                size_t slen = lcb->str_lens ? lcb->str_lens[i] : strlen(src);
                 char *dst = (char *)bump_alloc(&ctx->arena->scratch, slen + 1);
                 for (size_t j = 0; j < slen; j++)
                     dst[j] = is_upper ? (char)toupper((unsigned char)src[j])
                                       : (char)tolower((unsigned char)src[j]);
                 dst[slen] = '\0';
                 ocb->data.str[i] = dst;
+                ocb->str_lens[i] = (uint32_t)slen;
             }
         } else if (vop->kind == VEC_FUNC_LENGTH) {
             memcpy(ocb->nulls, lcb->nulls, count);
             for (uint16_t i = 0; i < count; i++) {
                 if (lcb->nulls[i]) { ocb->data.i32[i] = 0; ocb->nulls[i] = 1; continue; }
-                ocb->data.i32[i] = lcb->data.str[i] ? (int32_t)strlen(lcb->data.str[i]) : 0;
+                ocb->data.i32[i] = lcb->data.str[i]
+                    ? (lcb->str_lens ? (int32_t)lcb->str_lens[i] : (int32_t)strlen(lcb->data.str[i]))
+                    : 0;
             }
         } else if (vop->kind == VEC_FUNC_ABS_I32) {
             memcpy(ocb->nulls, lcb->nulls, count);
@@ -2525,6 +2563,9 @@ static void flat_col_init(struct flat_col *fc, enum column_type type,
     fc->type = type;
     fc->nulls = (uint8_t *)bump_calloc(scratch, cap, 1);
     fc->data = bump_calloc(scratch, cap, jc_elem_size(type));
+    fc->str_lens = column_type_is_text(type)
+        ? (uint32_t *)bump_calloc(scratch, cap, sizeof(uint32_t))
+        : NULL;
 }
 
 static void flat_col_grow(struct flat_col *fc, uint32_t old_cap, uint32_t new_cap,
@@ -2537,6 +2578,11 @@ static void flat_col_grow(struct flat_col *fc, uint32_t old_cap, uint32_t new_ca
     memcpy(new_data, fc->data, old_cap * esz);
     fc->nulls = new_nulls;
     fc->data = new_data;
+    if (fc->str_lens) {
+        uint32_t *new_lens = (uint32_t *)bump_calloc(scratch, new_cap, sizeof(uint32_t));
+        memcpy(new_lens, fc->str_lens, old_cap * sizeof(uint32_t));
+        fc->str_lens = new_lens;
+    }
 }
 
 static void flat_col_set_from_cb(struct flat_col *fc, uint32_t dst_i,
@@ -2545,20 +2591,27 @@ static void flat_col_set_from_cb(struct flat_col *fc, uint32_t dst_i,
     fc->nulls[dst_i] = src->nulls[src_i];
     size_t esz = col_type_elem_size(fc->type);
     memcpy((uint8_t *)fc->data + dst_i * esz, cb_data_ptr(src, (uint32_t)src_i), esz);
+    if (fc->str_lens && !src->nulls[src_i]) {
+        const char *s = src->data.str[src_i];
+        fc->str_lens[dst_i] = s
+            ? (src->str_lens ? src->str_lens[src_i] : (uint32_t)strlen(s))
+            : 0;
+    }
 }
 
 static uint32_t flat_col_hash(const struct flat_col *fc, uint32_t idx)
 {
     if (fc->nulls[idx]) return 0x9e3779b9u;
-    uint32_t h = 2166136261u;
     if (column_type_is_text(fc->type)) {
         const char *s = ((const char **)fc->data)[idx];
-        if (s) for (; *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; }
-    } else {
-        size_t esz = jc_elem_size(fc->type);
-        const uint8_t *p = (const uint8_t *)fc->data + idx * esz;
-        for (size_t i = 0; i < esz; i++) { h ^= p[i]; h *= 16777619u; }
+        if (fc->str_lens)
+            return block_hash_str_n(s, fc->str_lens[idx]);
+        return block_hash_str(s);
     }
+    uint32_t h = 2166136261u;
+    size_t esz = jc_elem_size(fc->type);
+    const uint8_t *p = (const uint8_t *)fc->data + idx * esz;
+    for (size_t i = 0; i < esz; i++) { h ^= p[i]; h *= 16777619u; }
     return h;
 }
 
@@ -2587,6 +2640,10 @@ static int flat_col_eq(const struct flat_col *a, uint32_t ai,
         const char *sb = b->data.str[bi];
         if (!sa && !sb) return 1;
         if (!sa || !sb) return 0;
+        if (a->str_lens && b->str_lens) {
+            if (a->str_lens[ai] != b->str_lens[bi]) return 0;
+            return memcmp(sa, sb, a->str_lens[ai]) == 0;
+        }
         return strcmp(sa, sb) == 0;
     }
     case COLUMN_TYPE_ENUM:
@@ -2604,6 +2661,8 @@ static void flat_col_copy_to_out(const struct flat_col *fc, uint32_t src_i,
     dst->nulls[dst_i] = fc->nulls[src_i];
     size_t esz = col_type_elem_size(fc->type);
     memcpy(cb_data_ptr(dst, (uint32_t)dst_i), (const uint8_t *)fc->data + src_i * esz, esz);
+    if (fc->str_lens && dst->str_lens)
+        dst->str_lens[dst_i] = fc->str_lens[src_i];
 }
 
 /* Restore hash join state from a table's join_cache into bump-allocated state */
@@ -2623,6 +2682,14 @@ static int hash_join_restore_from_cache(struct plan_exec_ctx *ctx,
         memcpy(st->build_cols[c].nulls, jc->col_nulls[c], jc->nrows);
         st->build_cols[c].data = bump_alloc(&ctx->arena->scratch, esz * jc->nrows);
         memcpy(st->build_cols[c].data, jc->col_data[c], esz * jc->nrows);
+        if (jc->col_str_lens && jc->col_str_lens[c]) {
+            st->build_cols[c].str_lens = (uint32_t *)bump_alloc(&ctx->arena->scratch,
+                                                                jc->nrows * sizeof(uint32_t));
+            memcpy(st->build_cols[c].str_lens, jc->col_str_lens[c],
+                   jc->nrows * sizeof(uint32_t));
+        } else {
+            st->build_cols[c].str_lens = NULL;
+        }
     }
 
     /* Restore hash table */
@@ -2649,10 +2716,12 @@ static void hash_join_save_to_cache(struct hash_join_state *st,
         for (uint16_t i = 0; i < jc->ncols; i++) {
             free(jc->col_data[i]);
             free(jc->col_nulls[i]);
+            if (jc->col_str_lens) free(jc->col_str_lens[i]);
         }
         free(jc->col_data);
         free(jc->col_nulls);
         free(jc->col_types);
+        free(jc->col_str_lens);
         free(jc->hashes);
         free(jc->nexts);
         free(jc->buckets);
@@ -2667,6 +2736,7 @@ static void hash_join_save_to_cache(struct hash_join_state *st,
     jc->col_data = (void **)malloc(st->build_ncols * sizeof(void *));
     jc->col_nulls = (uint8_t **)malloc(st->build_ncols * sizeof(uint8_t *));
     jc->col_types = (enum column_type *)malloc(st->build_ncols * sizeof(enum column_type));
+    jc->col_str_lens = (uint32_t **)calloc(st->build_ncols, sizeof(uint32_t *));
 
     for (uint16_t c = 0; c < st->build_ncols; c++) {
         jc->col_types[c] = st->build_cols[c].type;
@@ -2675,6 +2745,11 @@ static void hash_join_save_to_cache(struct hash_join_state *st,
         memcpy(jc->col_data[c], st->build_cols[c].data, esz * st->build_count);
         jc->col_nulls[c] = (uint8_t *)malloc(st->build_count);
         memcpy(jc->col_nulls[c], st->build_cols[c].nulls, st->build_count);
+        if (st->build_cols[c].str_lens) {
+            jc->col_str_lens[c] = (uint32_t *)malloc(st->build_count * sizeof(uint32_t));
+            memcpy(jc->col_str_lens[c], st->build_cols[c].str_lens,
+                   st->build_count * sizeof(uint32_t));
+        }
     }
 
     jc->hashes = (uint32_t *)malloc(st->build_count * sizeof(uint32_t));
@@ -3176,6 +3251,12 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         uint16_t ngrp = pn->hash_agg.ngroup_cols;
         st->group_keys = (struct col_block *)bump_calloc(&ctx->arena->scratch,
                                                          ngrp, sizeof(struct col_block));
+        /* Pre-allocate str_lens for TEXT group key columns */
+        for (uint16_t g = 0; g < ngrp; g++) {
+            int gc = pn->hash_agg.group_cols[g];
+            /* We don't know the type yet (no input seen), so defer to first row */
+            (void)gc;
+        }
 
         uint32_t agg_n = pn->hash_agg.agg_count;
         uint32_t max_groups = st->group_cap;
@@ -3308,8 +3389,15 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             &ctx->arena->scratch, ngrp, sizeof(struct col_block));
                         for (uint16_t g = 0; g < ngrp; g++) {
                             new_keys[g].type = st->group_keys[g].type;
-                            new_keys[g].count = (uint16_t)(old_cap < BLOCK_CAPACITY ? old_cap : BLOCK_CAPACITY);
-                            cb_bulk_copy(&new_keys[g], &st->group_keys[g], old_cap < BLOCK_CAPACITY ? old_cap : BLOCK_CAPACITY);
+                            uint16_t copy_cnt = (uint16_t)(old_cap < BLOCK_CAPACITY ? old_cap : BLOCK_CAPACITY);
+                            new_keys[g].count = copy_cnt;
+                            cb_bulk_copy(&new_keys[g], &st->group_keys[g], copy_cnt);
+                            if (st->group_keys[g].str_lens) {
+                                new_keys[g].str_lens = (uint32_t *)bump_calloc(
+                                    &ctx->arena->scratch, new_cap, sizeof(uint32_t));
+                                memcpy(new_keys[g].str_lens, st->group_keys[g].str_lens,
+                                       old_cap * sizeof(uint32_t));
+                            }
                         }
                         st->group_keys = new_keys;
 
@@ -3340,8 +3428,17 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         int gc = pn->hash_agg.group_cols[g];
                         struct col_block *src = &input.cols[gc];
                         struct col_block *dst = &st->group_keys[g];
-                        if (group_idx == 0) dst->type = src->type;
+                        if (group_idx == 0) {
+                            dst->type = src->type;
+                            if (column_type_is_text(src->type))
+                                dst->str_lens = (uint32_t *)bump_calloc(
+                                    &ctx->arena->scratch, st->group_cap, sizeof(uint32_t));
+                        }
                         cb_copy_value(dst, group_idx, src, ri);
+                        if (dst->str_lens && !src->nulls[ri] && src->data.str[ri])
+                            dst->str_lens[group_idx] = src->str_lens
+                                ? src->str_lens[ri]
+                                : (uint32_t)strlen(src->data.str[ri]);
                     }
                     /* Insert into hash table */
                     st->ht.hashes[group_idx] = h;
@@ -4339,11 +4436,12 @@ struct block_sort_ctx {
     /* Flat arrays for fast comparator (one per sort key, bump-allocated) */
     void            **flat_keys;       /* [nsort_cols] contiguous typed array per sort key */
     uint8_t         **flat_nulls;      /* [nsort_cols] contiguous null bitmap per sort key */
-    enum column_type *key_types;       /* [nsort_cols] */
+    enum column_type *key_types;         /* [nsort_cols] */
     /* Flat arrays for ALL columns — used by emit phase to avoid block remap */
-    void            **flat_col_data;   /* [ncols] contiguous typed arrays */
-    uint8_t         **flat_col_nulls;  /* [ncols] contiguous null bitmaps */
-    enum column_type *flat_col_types;  /* [ncols] column types */
+    void            **flat_col_data;     /* [ncols] contiguous typed arrays */
+    uint8_t         **flat_col_nulls;    /* [ncols] contiguous null bitmaps */
+    enum column_type *flat_col_types;    /* [ncols] column types */
+    uint32_t        **flat_col_str_lens; /* [ncols] TEXT col lengths for emit, NULL for non-TEXT */
 };
 static struct block_sort_ctx _bsort_ctx;
 
@@ -4520,6 +4618,10 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                                      nsk * sizeof(void *));
         _bsort_ctx.flat_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch,
                                                          nsk * sizeof(uint8_t *));
+        /* Reset flat_col_str_lens — previous query's bump pointers are invalid after arena reset */
+        _bsort_ctx.flat_col_str_lens = NULL;
+        uint32_t **new_flat_col_str_lens = (uint32_t **)bump_calloc(&ctx->arena->scratch,
+                                                                      child_ncols, sizeof(uint32_t *));
         _bsort_ctx.key_types = (enum column_type *)bump_alloc(&ctx->arena->scratch,
                                                                nsk * sizeof(enum column_type));
         for (uint16_t k = 0; k < nsk; k++) {
@@ -4528,6 +4630,31 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             _bsort_ctx.flat_nulls[k] = _bsort_ctx.flat_col_nulls[sci];
             _bsort_ctx.key_types[k] = _bsort_ctx.flat_col_types[sci];
         }
+        /* Build flat_col_str_lens for ALL TEXT columns (used by emit phase) */
+        for (uint16_t ci = 0; ci < child_ncols; ci++) {
+            if (!column_type_is_text(_bsort_ctx.flat_col_types[ci]) || total == 0) continue;
+            uint32_t *slens = (uint32_t *)bump_alloc(&ctx->arena->scratch,
+                                                     total * sizeof(uint32_t));
+            const char **strs = (const char **)_bsort_ctx.flat_col_data[ci];
+            const uint8_t *snulls = _bsort_ctx.flat_col_nulls[ci];
+            uint32_t fi = 0;
+            for (uint32_t b = 0; b < st->nblocks; b++) {
+                struct col_block *src = &st->collected[b].cols[ci];
+                uint16_t cnt = st->collected[b].count;
+                if (src->str_lens) {
+                    memcpy(slens + fi, src->str_lens, cnt * sizeof(uint32_t));
+                } else {
+                    for (uint16_t ri = 0; ri < cnt; ri++) {
+                        uint32_t gi = fi + ri;
+                        slens[gi] = (!snulls[gi] && strs[gi])
+                            ? (uint32_t)strlen(strs[gi]) : 0;
+                    }
+                }
+                fi += cnt;
+            }
+            new_flat_col_str_lens[ci] = slens;
+        }
+        _bsort_ctx.flat_col_str_lens = new_flat_col_str_lens;
 
         /* With flat arrays, sorted_indices are simple 0..total-1 indices */
         for (uint32_t i = 0; i < total; i++)
@@ -4622,6 +4749,17 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             char *const *s = (char *const *)src_data;
             for (uint16_t r = 0; r < out_count; r++)
                 ocb->data.str[r] = s[idx[r]];
+            /* Populate str_lens from flat_col_str_lens (column-indexed) if available, else clear */
+            uint32_t *fsl = (_bsort_ctx.flat_col_str_lens) ? _bsort_ctx.flat_col_str_lens[c] : NULL;
+            if (fsl) {
+                if (!ocb->str_lens)
+                    ocb->str_lens = (uint32_t *)bump_alloc(&ctx->arena->scratch,
+                                                           BLOCK_CAPACITY * sizeof(uint32_t));
+                for (uint16_t r = 0; r < out_count; r++)
+                    ocb->str_lens[r] = fsl[idx[r]];
+            } else {
+                ocb->str_lens = NULL;
+            }
             break;
         }
         case COLUMN_TYPE_ENUM: {
@@ -5855,10 +5993,14 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         ocb->count = out_count;
 
         if (st->win_is_str[w]) {
+            ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                    BLOCK_CAPACITY, sizeof(uint32_t));
             for (uint16_t r = 0; r < out_count; r++) {
                 uint32_t fi = idx[r];
                 ocb->nulls[r] = st->win_null[fi * nw + w];
                 ocb->data.str[r] = st->win_str[fi * nw + w];
+                if (!ocb->nulls[r] && ocb->data.str[r])
+                    ocb->str_lens[r] = (uint32_t)strlen(ocb->data.str[r]);
             }
         } else if (st->win_is_dbl[w]) {
             for (uint16_t r = 0; r < out_count; r++) {

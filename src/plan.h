@@ -245,11 +245,13 @@ struct parquet_scan_state {
 };
 
 /* Flat column storage for hash join build side — no BLOCK_CAPACITY limit.
- * Data arrays are bump-allocated and can grow via realloc-style copy. */
+ * Data arrays are bump-allocated and can grow via realloc-style copy.
+ * str_lens: bump-allocated uint32_t[cap], non-NULL only for TEXT columns. */
 struct flat_col {
     enum column_type type;
-    uint8_t         *nulls;   /* bump: [cap] */
-    void            *data;    /* bump: int32_t[cap] / int64_t[cap] / double[cap] / char*[cap] */
+    uint8_t         *nulls;     /* bump: [cap] */
+    void            *data;      /* bump: int32_t[cap] / int64_t[cap] / double[cap] / char*[cap] */
+    uint32_t        *str_lens;  /* bump: [cap], TEXT only — strlen of each entry, or NULL */
 };
 
 struct hash_join_state {

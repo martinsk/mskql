@@ -231,10 +231,12 @@ void table_free(struct table *t)
         for (uint16_t i = 0; i < t->scan_cache.ncols; i++) {
             free(t->scan_cache.col_data[i]);
             free(t->scan_cache.col_nulls[i]);
+            if (t->scan_cache.col_str_lens) free(t->scan_cache.col_str_lens[i]);
         }
         free(t->scan_cache.col_data);
         free(t->scan_cache.col_nulls);
         free(t->scan_cache.col_types);
+        free(t->scan_cache.col_str_lens);
     }
 
     /* free join cache */
@@ -242,10 +244,12 @@ void table_free(struct table *t)
         for (uint16_t i = 0; i < t->join_cache.ncols; i++) {
             free(t->join_cache.col_data[i]);
             free(t->join_cache.col_nulls[i]);
+            if (t->join_cache.col_str_lens) free(t->join_cache.col_str_lens[i]);
         }
         free(t->join_cache.col_data);
         free(t->join_cache.col_nulls);
         free(t->join_cache.col_types);
+        free(t->join_cache.col_str_lens);
         free(t->join_cache.hashes);
         free(t->join_cache.nexts);
         free(t->join_cache.buckets);
