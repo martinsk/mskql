@@ -30,6 +30,7 @@ struct cell {
     enum column_type type;
     int is_null;
     union cell_value value;
+    int8_t numeric_scale; /* for NUMERIC/ROUND: decimal places to display (-1 = auto) */
 };
 
 struct row {

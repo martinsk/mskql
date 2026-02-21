@@ -396,27 +396,11 @@ void interval_to_str(struct interval iv, char *buf, size_t len)
     int ss = (int)(total_sec % 60);
 
     if (hh != 0 || mm != 0 || ss != 0) {
-        /* PostgreSQL-style: use HH:MM:SS only when multiple time components;
-         * otherwise use human-readable units */
-        int nparts = (hh != 0) + (mm != 0) + (ss != 0);
-        if (nparts == 1 && !wrote) {
-            /* single time component, no date parts — use human-readable */
-            if (hh != 0) {
-                int v = neg_time ? -hh : hh;
-                snprintf(p, left, "%d hour%s", v, (v == 1 || v == -1) ? "" : "s");
-            } else if (mm != 0) {
-                int v = neg_time ? -mm : mm;
-                snprintf(p, left, "%d minute%s", v, (v == 1 || v == -1) ? "" : "s");
-            } else {
-                int v = neg_time ? -ss : ss;
-                snprintf(p, left, "%d sec%s", v, (v == 1 || v == -1) ? "" : "s");
-            }
-        } else {
-            if (neg_time)
-                snprintf(p, left, "-%02d:%02d:%02d", hh, mm, ss);
-            else
-                snprintf(p, left, "%02d:%02d:%02d", hh, mm, ss);
-        }
+        /* PostgreSQL always uses HH:MM:SS for time components */
+        if (neg_time)
+            snprintf(p, left, "-%02d:%02d:%02d", hh, mm, ss);
+        else
+            snprintf(p, left, "%02d:%02d:%02d", hh, mm, ss);
     } else if (!wrote) {
         snprintf(p, left, "00:00:00");
     } else {

@@ -264,7 +264,13 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c,
             txt = buf;
             break;
         case COLUMN_TYPE_NUMERIC:
-            len = (size_t)snprintf(buf, sizeof(buf), "%g", c->value.as_numeric);
+            if (c->numeric_scale > 0) {
+                len = (size_t)snprintf(buf, sizeof(buf), "%.*f", (int)c->numeric_scale, c->value.as_numeric);
+            } else {
+                len = (size_t)snprintf(buf, sizeof(buf), "%.15g", c->value.as_numeric);
+                if (strchr(buf, 'e') || strchr(buf, 'E'))
+                    len = (size_t)snprintf(buf, sizeof(buf), "%.2f", c->value.as_numeric);
+            }
             txt = buf;
             break;
         case COLUMN_TYPE_DATE:
@@ -686,6 +692,9 @@ static int send_row_description(int fd, struct database *db, struct query *q,
     case QUERY_TYPE_SET:
     case QUERY_TYPE_SHOW:
     case QUERY_TYPE_CREATE_FOREIGN_TABLE:
+    case QUERY_TYPE_ALTER_SEQUENCE:
+    case QUERY_TYPE_SAVEPOINT:
+    case QUERY_TYPE_VALUES:
         break;
     }
 
@@ -788,6 +797,10 @@ static int send_row_description(int fd, struct database *db, struct query *q,
                 case AGG_MAX:        colname = "max";        break;
                 case AGG_STRING_AGG: colname = "string_agg"; break;
                 case AGG_ARRAY_AGG:  colname = "array_agg";  break;
+                case AGG_BOOL_AND:   colname = "bool_and";   break;
+                case AGG_BOOL_OR:    colname = "bool_or";    break;
+                case AGG_STDDEV:     colname = "stddev";     break;
+                case AGG_VARIANCE:   colname = "variance";   break;
                 case AGG_NONE:       colname = "?";          break;
             }
             if (result->count > 0)
@@ -873,106 +886,10 @@ static inline size_t fast_i64_to_str(int64_t v, char *buf)
     return len;
 }
 
-/* Fast double → text matching PostgreSQL's %g format.
- * Handles common cases (integers, small decimals) with hand-rolled digit extraction.
- * Falls back to snprintf for edge cases. buf must be >= 32 bytes. Returns length. */
+/* Format double using PostgreSQL-compatible precision (15 significant digits). */
 static inline size_t fast_f64_to_str(double v, char *buf)
 {
-    /* Handle special values — match snprintf("%g") output on macOS/Linux */
-    if (v != v) { memcpy(buf, "nan", 3); buf[3] = '\0'; return 3; }
-    if (v == 1.0/0.0) { memcpy(buf, "inf", 3); buf[3] = '\0'; return 3; }
-    if (v == -1.0/0.0) { memcpy(buf, "-inf", 4); buf[4] = '\0'; return 4; }
-    if (v == 0.0) {
-        /* Distinguish -0 from +0 to match %g */
-        if (1.0/v < 0) { memcpy(buf, "-0", 2); buf[2] = '\0'; return 2; }
-        buf[0] = '0'; buf[1] = '\0'; return 1;
-    }
-
-    int neg = 0;
-    if (v < 0) { neg = 1; v = -v; }
-
-    /* If the value is an exact integer in a reasonable range, use fast_i64_to_str */
-    if (v >= 1.0 && v <= 999999999999999.0 && v == (double)(int64_t)v) {
-        if (neg) { buf[0] = '-'; return 1 + fast_i64_to_str((int64_t)v, buf + 1); }
-        return fast_i64_to_str((int64_t)v, buf);
-    }
-
-    /* For values in a reasonable range, try to format without snprintf.
-     * %g uses up to 6 significant digits by default and strips trailing zeros. */
-    if (v >= 1e-4 && v < 1e6) {
-        /* Multiply to get 6 significant digits as an integer */
-        int exp10 = 0;
-        double scaled = v;
-        if (scaled >= 1e5) { exp10 = 5; }
-        else if (scaled >= 1e4) { exp10 = 4; }
-        else if (scaled >= 1e3) { exp10 = 3; }
-        else if (scaled >= 1e2) { exp10 = 2; }
-        else if (scaled >= 1e1) { exp10 = 1; }
-        else if (scaled >= 1e0) { exp10 = 0; }
-        else if (scaled >= 1e-1) { exp10 = -1; }
-        else if (scaled >= 1e-2) { exp10 = -2; }
-        else if (scaled >= 1e-3) { exp10 = -3; }
-        else { exp10 = -4; }
-
-        /* We want 6 significant digits total */
-        int frac_digits = 5 - exp10; /* digits after decimal point */
-        if (frac_digits < 0) frac_digits = 0;
-        if (frac_digits > 10) frac_digits = 10;
-
-        /* Scale to integer */
-        static const double pow10[] = {1, 10, 100, 1000, 10000, 100000,
-                                        1000000, 10000000, 100000000, 1000000000, 10000000000.0};
-        double mult = pow10[frac_digits];
-        int64_t ival = (int64_t)(v * mult + 0.5);
-
-        /* Verify round-trip: if converting back doesn't match, fall back to snprintf */
-        double check = (double)ival / mult;
-        double relerr = (check - v) / v;
-        if (relerr < 0) relerr = -relerr;
-        if (relerr < 1e-14) {
-            /* Strip trailing zeros from fractional part */
-            while (frac_digits > 0 && ival % 10 == 0) {
-                ival /= 10;
-                frac_digits--;
-            }
-
-            int pos = 0;
-            if (neg) buf[pos++] = '-';
-
-            if (frac_digits == 0) {
-                /* Pure integer */
-                pos += (int)fast_i64_to_str(ival, buf + pos);
-                buf[pos] = '\0';
-                return (size_t)pos;
-            }
-
-            /* Format integer part and fractional part */
-            int64_t int_part = ival;
-            int64_t frac_part = ival;
-            int64_t fdiv = 1;
-            for (int i = 0; i < frac_digits; i++) fdiv *= 10;
-            int_part = ival / fdiv;
-            frac_part = ival % fdiv;
-            if (frac_part < 0) frac_part = -frac_part;
-
-            pos += (int)fast_i64_to_str(int_part, buf + pos);
-            buf[pos++] = '.';
-
-            /* Write fractional digits with leading zeros */
-            char ftmp[12];
-            int flen = 0;
-            int64_t fp = frac_part;
-            do { ftmp[flen++] = '0' + (char)(fp % 10); fp /= 10; } while (fp);
-            /* Pad leading zeros */
-            for (int i = flen; i < frac_digits; i++) buf[pos++] = '0';
-            for (int i = flen - 1; i >= 0; i--) buf[pos++] = ftmp[i];
-            buf[pos] = '\0';
-            return (size_t)pos;
-        }
-    }
-
-    /* Fallback to snprintf for edge cases */
-    return (size_t)snprintf(buf, 32, "%g", neg ? -v : v);
+    return (size_t)snprintf(buf, 32, "%g", v);
 }
 
 /* Push a col_block cell value directly into a msgbuf as a pgwire text field. */
@@ -1372,6 +1289,7 @@ static int send_row_desc_plan(int fd, struct table *t, struct table **join_table
                 case EXPR_CASE_WHEN:
                 case EXPR_SUBQUERY:
                 case EXPR_IS_NULL:
+                case EXPR_IS_DISTINCT:
                 case EXPR_EXISTS:
                 case EXPR_BETWEEN:
                 case EXPR_IN_LIST:
@@ -1398,6 +1316,10 @@ static int send_row_desc_plan(int fd, struct table *t, struct table **join_table
                     case AGG_MAX:        colname = "max";        break;
                     case AGG_STRING_AGG: colname = "string_agg"; break;
                     case AGG_ARRAY_AGG:  colname = "array_agg";  break;
+                    case AGG_BOOL_AND:   colname = "bool_and";   break;
+                    case AGG_BOOL_OR:    colname = "bool_or";    break;
+                    case AGG_STDDEV:     colname = "stddev";     break;
+                    case AGG_VARIANCE:   colname = "variance";   break;
                     case AGG_NONE:       break;
                 }
             }
@@ -2486,6 +2408,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     struct query_arena *qa = &q->arena;
     struct table *from_sub_temp = NULL;
     uint32_t saved_from_sub_sql = s->from_subquery_sql;
+    sv saved_table = s->table;
 
     uint32_t saved_ctes_count = s->ctes_count;
     uint32_t saved_ctes_start = s->ctes_start;
@@ -2524,6 +2447,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         s->cte_name = saved_cte_name;
         s->cte_sql = saved_cte_sql;
         s->from_subquery_sql = saved_from_sub_sql;
+        s->table = saved_table;
         if (from_sub_temp) remove_temp_table(db, from_sub_temp);
         for (size_t ci = n_cte_temps; ci > 0; ci--)
             remove_temp_table(db, cte_temps[ci - 1]);
@@ -2550,13 +2474,13 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     if (s->table.len > 0)
         t = db_find_table_sv(db, s->table);
     if (!t && !s->has_generate_series) {
-        if (from_sub_temp) { s->from_subquery_sql = saved_from_sub_sql; remove_temp_table(db, from_sub_temp); }
+        if (from_sub_temp) { s->from_subquery_sql = saved_from_sub_sql; s->table = saved_table; remove_temp_table(db, from_sub_temp); from_sub_temp = NULL; }
         goto cte_restore_bail;
     }
     /* Views are stored as tables with 0 columns and view_sql set —
      * bail to legacy path which handles view expansion. */
     if (t && t->view_sql) {
-        if (from_sub_temp) { s->from_subquery_sql = saved_from_sub_sql; remove_temp_table(db, from_sub_temp); }
+        if (from_sub_temp) { s->from_subquery_sql = saved_from_sub_sql; s->table = saved_table; remove_temp_table(db, from_sub_temp); from_sub_temp = NULL; }
         goto cte_restore_bail;
     }
 
@@ -2736,8 +2660,23 @@ static int handle_copy_to_stdout(int fd, struct database *db, struct query *q,
         return -1;
     }
     char delim = q->copy.is_csv ? ',' : '\t';
-    /* CopyOutResponse: 'H', int32 len, int8 format(0=text), int16 ncols, int16[ncols] col_formats(0=text) */
-    uint16_t ncols = (uint16_t)ct->columns.count;
+    /* Resolve column list to indices */
+    int col_idxs[64];
+    uint16_t ncols;
+    if (q->copy.col_count > 0) {
+        ncols = (uint16_t)q->copy.col_count;
+        for (int ci = 0; ci < q->copy.col_count; ci++) {
+            col_idxs[ci] = table_find_column_sv(ct, q->copy.col_names[ci]);
+            if (col_idxs[ci] < 0) {
+                send_error(fd, m, "ERROR", "42703", "column not found in table");
+                return -1;
+            }
+        }
+    } else {
+        ncols = (uint16_t)ct->columns.count;
+        for (uint16_t ci = 0; ci < ncols; ci++) col_idxs[ci] = (int)ci;
+    }
+    /* CopyOutResponse */
     m->len = 0;
     msgbuf_push_byte(m, 0); /* overall format: text */
     msgbuf_push_u16(m, ncols);
@@ -2749,7 +2688,7 @@ static int handle_copy_to_stdout(int fd, struct database *db, struct query *q,
         m->len = 0;
         for (uint16_t i = 0; i < ncols; i++) {
             if (i > 0) msgbuf_push_byte(m, (uint8_t)delim);
-            const char *cn = ct->columns.items[i].name;
+            const char *cn = ct->columns.items[col_idxs[i]].name;
             msgbuf_push(m, (const uint8_t *)cn, strlen(cn));
         }
         msgbuf_push_byte(m, '\n');
@@ -2759,9 +2698,11 @@ static int handle_copy_to_stdout(int fd, struct database *db, struct query *q,
     for (size_t r = 0; r < ct->rows.count; r++) {
         struct row *row = &ct->rows.items[r];
         m->len = 0;
-        for (uint16_t c = 0; c < ncols && c < (uint16_t)row->cells.count; c++) {
+        for (uint16_t c = 0; c < ncols; c++) {
             if (c > 0) msgbuf_push_byte(m, (uint8_t)delim);
-            struct cell *cell = &row->cells.items[c];
+            int ci = col_idxs[c];
+            struct cell *cell = (ci < (int)row->cells.count) ? &row->cells.items[ci] : NULL;
+            if (!cell) cell = &row->cells.items[0]; /* fallback — shouldn't happen */
             if (cell->is_null || (column_type_is_text(cell->type) && !cell->value.as_text)) {
                 if (q->copy.is_csv) {
                     /* CSV: empty field for NULL */
@@ -2971,8 +2912,23 @@ static void build_command_tag(int fd, struct database *db, struct query *q,
         case QUERY_TYPE_CREATE_FOREIGN_TABLE:
             snprintf(tag_buf, tag_sz, "CREATE FOREIGN TABLE");
             break;
+        case QUERY_TYPE_ALTER_SEQUENCE:
+            snprintf(tag_buf, tag_sz, "ALTER SEQUENCE");
+            break;
+        case QUERY_TYPE_SAVEPOINT:
+            snprintf(tag_buf, tag_sz, "SAVEPOINT");
+            break;
+        case QUERY_TYPE_VALUES:
+            if (!skip_row_desc)
+                send_row_description(fd, db, q, result);
+            send_data_rows(fd, result, db, t);
+            snprintf(tag_buf, tag_sz, "SELECT %zu", result->count);
+            break;
     }
 }
+
+/* forward declaration — defined after handle_query_inner */
+static void copy_in_process_line(struct client_state *c, struct database *db, const char *line, size_t len);
 
 /* ---- handle_query_inner orchestrator ---- */
 
@@ -3087,6 +3043,48 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     if (q.query_type == QUERY_TYPE_COPY && !q.copy.is_from)
         return handle_copy_to_stdout(fd, db, &q, m);
 
+    /* COPY FROM 'file' — read file directly and insert rows */
+    if (q.query_type == QUERY_TYPE_COPY && q.copy.is_from && q.copy.file_path.len > 0) {
+        struct table *ct = db_find_table_sv(db, q.copy.table);
+        if (!ct) {
+            send_error(fd, m, "ERROR", "42P01", "table not found");
+            return -1;
+        }
+        char path[4096];
+        size_t plen = q.copy.file_path.len < sizeof(path) - 1 ? q.copy.file_path.len : sizeof(path) - 1;
+        memcpy(path, q.copy.file_path.data, plen);
+        path[plen] = '\0';
+        FILE *fp = fopen(path, "r");
+        if (!fp) {
+            char errmsg[4160];
+            snprintf(errmsg, sizeof(errmsg), "could not open file: %s", path);
+            send_error(fd, m, "ERROR", "58030", errmsg);
+            return -1;
+        }
+        /* Set up a temporary client_state-like context for copy_in_process_line */
+        struct client_state tmp_c;
+        memset(&tmp_c, 0, sizeof(tmp_c));
+        tmp_c.copy_in_table = ct;
+        tmp_c.copy_in_delim = q.copy.is_csv ? ',' : '\t';
+        tmp_c.copy_in_is_csv = q.copy.is_csv;
+        char line[65536];
+        size_t row_count = 0;
+        while (fgets(line, sizeof(line), fp)) {
+            size_t len = strlen(line);
+            /* strip trailing newline */
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) len--;
+            if (len == 0) continue;
+            copy_in_process_line(&tmp_c, db, line, len);
+            row_count++;
+        }
+        fclose(fp);
+        ct->scan_cache.generation = 0;
+        char tag[64];
+        snprintf(tag, sizeof(tag), "COPY %zu", row_count);
+        send_command_complete(fd, m, tag);
+        return 0;
+    }
+
     /* COPY FROM STDIN — send CopyInResponse and return 1 to signal copy-in mode */
     if (q.query_type == QUERY_TYPE_COPY && q.copy.is_from) {
         struct table *ct = db_find_table_sv(db, q.copy.table);
@@ -3114,6 +3112,8 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     conn_arena->plan_nodes = q.arena.plan_nodes;
     conn_arena->cells = q.arena.cells;
     conn_arena->svs = q.arena.svs;
+    conn_arena->conditions = q.arena.conditions;
+    conn_arena->joins = q.arena.joins;
     memcpy(conn_arena->errmsg, q.arena.errmsg, sizeof(conn_arena->errmsg));
     memcpy(conn_arena->sqlstate, q.arena.sqlstate, sizeof(conn_arena->sqlstate));
 
@@ -3143,6 +3143,8 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     case QUERY_TYPE_TRUNCATE: case QUERY_TYPE_EXPLAIN: case QUERY_TYPE_COPY:
     case QUERY_TYPE_SET: case QUERY_TYPE_SHOW:
     case QUERY_TYPE_CREATE_FOREIGN_TABLE:
+    case QUERY_TYPE_ALTER_SEQUENCE: case QUERY_TYPE_SAVEPOINT:
+    case QUERY_TYPE_VALUES:
         break;
     }
     build_command_tag(fd, db, &q, result, m, skip_row_desc, rc, tag, sizeof(tag), t);

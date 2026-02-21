@@ -8,6 +8,6 @@ INSERT INTO "t1" VALUES (3, '30 minutes');
 SELECT * FROM "t1";
 -- expected output:
 1|1 day
-2|2 hours
-3|30 minutes
+2|02:00:00
+3|00:30:00
 -- expected status: 0

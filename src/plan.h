@@ -106,6 +106,7 @@ struct plan_node {
             struct cell *in_values;    /* bump-allocated array for CMP_IN literal list */
             uint32_t    in_count;      /* number of values in in_values */
             const char *like_pattern;  /* bump-allocated pattern for CMP_LIKE/CMP_ILIKE */
+            char        like_escape;   /* custom ESCAPE char for CMP_LIKE, 0 = default '\\' */
         } filter;
         struct {
             uint16_t ncols;          /* number of output columns */
@@ -210,6 +211,12 @@ struct plan_node {
             int     *win_frame_end;   /* bump: enum frame_bound */
             int     *win_frame_start_n;
             int     *win_frame_end_n;
+            double  *win_frame_start_val; /* bump: value offset for RANGE N PRECEDING/FOLLOWING */
+            double  *win_frame_end_val;
+            int     *win_frame_mode;  /* bump: enum frame_mode per win expr */
+            int     *win_frame_exclude; /* bump: enum frame_exclude per win expr */
+            int     *win_has_filter;  /* bump: 1 if FILTER clause present */
+            uint32_t *win_filter_expr; /* bump: expr index for FILTER condition */
             int      sort_part_col;   /* global partition col for sort (-1 = none) */
             int      sort_ord_col;    /* global order col for sort (-1 = none) */
             int      sort_ord_desc;   /* global order direction */
@@ -279,6 +286,7 @@ struct simple_agg_state {
     size_t    total_rows;
     int      *minmax_init;
     struct distinct_set *distinct_sets; /* bump: [agg_count], only used for DISTINCT aggs */
+    double   *sumsq;       /* bump: [agg_count] — sum of squares for STDDEV */
     int       input_done;
     int       emit_done;
     struct row tmp_row;
@@ -302,6 +310,8 @@ struct hash_agg_state {
     char   **str_accum;    /* bump: [agg_count * group_cap] concatenated strings */
     size_t  *str_accum_len; /* bump: [agg_count * group_cap] current length */
     size_t  *str_accum_cap; /* bump: [agg_count * group_cap] allocated capacity */
+    /* STDDEV accumulator */
+    double  *sumsq;        /* bump: [agg_count * group_cap] sum of squares */
     /* group key values stored in col_blocks */
     struct col_block *group_keys;
     uint32_t  ngroups;

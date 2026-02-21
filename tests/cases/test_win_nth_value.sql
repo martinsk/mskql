@@ -7,7 +7,7 @@ INSERT INTO "t1" VALUES (3, 30);
 -- input:
 SELECT val, NTH_VALUE(val, 2) OVER (ORDER BY id) FROM "t1";
 -- expected output:
-10|20
+10|
 20|20
 30|20
 -- expected status: 0

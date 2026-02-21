@@ -52,7 +52,7 @@ int db_create_table(struct database *db, const char *name, struct column *cols)
 struct table *db_find_table(struct database *db, const char *name)
 {
     for (size_t i = 0; i < db->tables.count; i++) {
-        if (strcmp(db->tables.items[i].name, name) == 0) {
+        if (strcasecmp(db->tables.items[i].name, name) == 0) {
             return &db->tables.items[i];
         }
     }
@@ -62,7 +62,7 @@ struct table *db_find_table(struct database *db, const char *name)
 struct table *db_find_table_sv(struct database *db, sv name)
 {
     for (size_t i = 0; i < db->tables.count; i++) {
-        if (sv_eq_cstr(name, db->tables.items[i].name)) {
+        if (sv_eq_ignorecase_cstr(name, db->tables.items[i].name)) {
             return &db->tables.items[i];
         }
     }
@@ -337,8 +337,12 @@ static int join_cmp_match(const struct cell *a, const struct cell *b, enum cmp_o
         case CMP_NOT_EXISTS:
         case CMP_REGEX_MATCH:
         case CMP_REGEX_NOT_MATCH:
+        case CMP_REGEX_ICASE_MATCH:
+        case CMP_REGEX_ICASE_NOT_MATCH:
         case CMP_IS_NOT_TRUE:
         case CMP_IS_NOT_FALSE:
+        case CMP_SIMILAR_TO:
+        case CMP_NOT_SIMILAR_TO:
             return r == 0;
     }
     return 0;
@@ -409,7 +413,8 @@ static int do_single_join(struct table *t1, const char *alias1,
                 }
             }
         }
-    } else if (join_op == CMP_EQ) {
+    } else if (join_op == CMP_EQ && join_on_cond == IDX_NONE) {
+        /* simple single-column equi-join via left_col/right_col */
         char buf[256], buf2[256];
         const char *left_col = extract_col_name(left_col_sv, buf, sizeof(buf));
         const char *right_col = extract_col_name(right_col_sv, buf2, sizeof(buf2));
@@ -425,6 +430,10 @@ static int do_single_join(struct table *t1, const char *alias1,
             return -1;
         }
     }
+    /* else: join_on_cond is a compound condition — use nested-loop eval_condition path */
+
+    /* If join_on_cond is set but not a simple single-equality (so use_hash_join=0),
+     * fall through to the join_on_cond nested-loop path below. */
 
     if (use_hash_join) {
         /* Hash join: build on t2 (typically smaller), probe with t1 */
@@ -549,26 +558,130 @@ static void free_merged_rows(struct rows *mr)
     free(mr->data);
 }
 
-/* resolve USING and NATURAL join columns; returns the join column sv for both sides */
-static void resolve_join_cols(struct join_info *ji, struct table *left, struct table *right)
+/* AND two conditions together */
+static uint32_t make_and_cond(struct query_arena *a, uint32_t left, uint32_t right)
 {
+    uint32_t ci = arena_alloc_cond(a);
+    COND(a, ci).type = COND_AND;
+    COND(a, ci).left = left;
+    COND(a, ci).right = right;
+    COND(a, ci).subquery_sql = IDX_NONE;
+    COND(a, ci).scalar_subquery_sql = IDX_NONE;
+    COND(a, ci).in_values_start = 0;
+    COND(a, ci).in_values_count = 0;
+    return ci;
+}
+
+/* Build a qualified EQ condition: left_alias.col = right_alias.col */
+static uint32_t make_qualified_eq_cond(struct query_arena *a,
+                                       const char *left_alias, const char *right_alias,
+                                       const char *col)
+{
+    char lbuf[256], rbuf[256];
+    if (left_alias && left_alias[0])
+        snprintf(lbuf, sizeof(lbuf), "%s.%s", left_alias, col);
+    else
+        snprintf(lbuf, sizeof(lbuf), "%s", col);
+    if (right_alias && right_alias[0])
+        snprintf(rbuf, sizeof(rbuf), "%s.%s", right_alias, col);
+    else
+        snprintf(rbuf, sizeof(rbuf), "%s", col);
+
+    const char *lc = bump_strdup(&a->bump, lbuf);
+    const char *rc = bump_strdup(&a->bump, rbuf);
+    uint32_t ci = arena_alloc_cond(a);
+    COND(a, ci).type = COND_COMPARE;
+    COND(a, ci).op = CMP_EQ;
+    COND(a, ci).left = IDX_NONE;
+    COND(a, ci).right = IDX_NONE;
+    COND(a, ci).subquery_sql = IDX_NONE;
+    COND(a, ci).scalar_subquery_sql = IDX_NONE;
+    COND(a, ci).in_values_start = 0;
+    COND(a, ci).in_values_count = 0;
+    COND(a, ci).lhs_expr = IDX_NONE;
+    COND(a, ci).column = sv_from_cstr(lc);
+    COND(a, ci).rhs_column = sv_from_cstr(rc);
+    return ci;
+}
+
+/* resolve USING and NATURAL join columns; builds join_on_cond for multi-column cases.
+ * left_alias/right_alias must match the aliases used by do_single_join/build_merged_columns_ex. */
+static void resolve_join_cols(struct join_info *ji, struct table *left, struct table *right,
+                              struct query_arena *a,
+                              const char *left_alias, const char *right_alias)
+{
+    /* use provided aliases, fall back to table names */
+    const char *la = (left_alias && left_alias[0]) ? left_alias : (left->name ? left->name : "");
+    const char *ra = (right_alias && right_alias[0]) ? right_alias : (right->name ? right->name : "");
+
     if (ji->has_using) {
-        /* USING(col) — same column name on both sides */
-        ji->join_left_col = ji->using_col;
-        ji->join_right_col = ji->using_col;
+        /* Parse comma-separated column list from using_col span */
+        /* First check if it's a single column (no comma) */
+        int has_comma = 0;
+        for (size_t k = 0; k < ji->using_col.len; k++) {
+            if (ji->using_col.data[k] == ',') { has_comma = 1; break; }
+        }
+        if (!has_comma) {
+            /* single column — use legacy path */
+            ji->join_left_col = ji->using_col;
+            ji->join_right_col = ji->using_col;
+            return;
+        }
+        /* multi-column USING: build AND condition tree with qualified names */
+        uint32_t cond = IDX_NONE;
+        const char *p = ji->using_col.data;
+        const char *end = p + ji->using_col.len;
+        sv first_col = sv_from(NULL, 0);
+        while (p < end) {
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+            const char *col_start = p;
+            while (p < end && *p != ',') p++;
+            const char *col_end = p;
+            while (col_end > col_start && (col_end[-1] == ' ' || col_end[-1] == '\t')) col_end--;
+            if (col_end > col_start) {
+                char col_buf[128];
+                size_t col_len = (size_t)(col_end - col_start);
+                if (col_len >= sizeof(col_buf)) col_len = sizeof(col_buf) - 1;
+                memcpy(col_buf, col_start, col_len);
+                col_buf[col_len] = '\0';
+                if (first_col.len == 0)
+                    first_col = sv_from(bump_strdup(&a->bump, col_buf), col_len);
+                uint32_t eq = make_qualified_eq_cond(a, la, ra, col_buf);
+                cond = (cond == IDX_NONE) ? eq : make_and_cond(a, cond, eq);
+            }
+            if (p < end) p++; /* skip comma */
+        }
+        if (cond != IDX_NONE) {
+            ji->join_on_cond = cond;
+            ji->join_left_col = first_col;
+            ji->join_right_col = first_col;
+        }
     } else if (ji->is_natural) {
-        /* NATURAL JOIN — find first column with same name in both tables */
+        /* NATURAL JOIN — find ALL columns with same name in both tables */
+        uint32_t cond = IDX_NONE;
+        sv first_col = sv_from(NULL, 0);
         for (size_t i = 0; i < left->columns.count; i++) {
             for (size_t j = 0; j < right->columns.count; j++) {
-                if (strcmp(left->columns.items[i].name, right->columns.items[j].name) == 0) {
-                    ji->join_left_col = sv_from_cstr(left->columns.items[i].name);
-                    ji->join_right_col = sv_from_cstr(right->columns.items[j].name);
-                    return;
+                if (strcasecmp(left->columns.items[i].name, right->columns.items[j].name) == 0) {
+                    const char *col = left->columns.items[i].name;
+                    if (first_col.len == 0)
+                        first_col = sv_from_cstr(bump_strdup(&a->bump, col));
+                    if (a) {
+                        uint32_t eq = make_qualified_eq_cond(a, la, ra, col);
+                        cond = (cond == IDX_NONE) ? eq : make_and_cond(a, cond, eq);
+                    }
                 }
             }
         }
-        /* no matching column found — degrade to cross join */
-        ji->join_type = 4;
+        if (first_col.len == 0) {
+            /* no matching column found — degrade to cross join */
+            ji->join_type = 4;
+            return;
+        }
+        ji->join_left_col = first_col;
+        ji->join_right_col = first_col;
+        if (cond != IDX_NONE)
+            ji->join_on_cond = cond;
     }
 }
 
@@ -797,16 +910,25 @@ static void exec_lateral_join(struct database *db, struct table *t1, const char 
 
 /* Non-lateral first join: materialize subquery if needed, then do_single_join.
  * Returns 0 on success, -1 on error. */
-static int exec_first_join(struct database *db, struct table *t1, const char **a1,
+static int exec_first_join(struct database *db, struct table **t1_ptr, const char **a1,
                            struct join_info *ji, struct query_arena *a,
                            struct rows *merged, struct table *merged_t)
 {
+    struct table *t1 = *t1_ptr;
     struct table *sq_temp = NULL;
     if (!ji->is_lateral && ji->lateral_subquery_sql != IDX_NONE && ji->join_alias.len > 0) {
         const char *sq_sql = ASTRING(a, ji->lateral_subquery_sql);
         char alias_buf[128];
         snprintf(alias_buf, sizeof(alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
+        /* save t1 name before materialize_subquery may reallocate db->tables */
+        char t1_name_buf[256] = {0};
+        if (t1->name) snprintf(t1_name_buf, sizeof(t1_name_buf), "%s", t1->name);
         sq_temp = materialize_subquery(db, sq_sql, alias_buf);
+        /* re-fetch t1 — da_push in materialize_subquery may have moved db->tables */
+        if (t1_name_buf[0]) {
+            t1 = db_find_table(db, t1_name_buf);
+            *t1_ptr = t1;
+        }
         ji->join_table = ji->join_alias;
     }
     struct table *t2 = db_find_table_sv(db, ji->join_table);
@@ -817,7 +939,6 @@ static int exec_first_join(struct database *db, struct table *t1, const char **a
         if (sq_temp) remove_temp_table(db, sq_temp);
         return -1;
     }
-    resolve_join_cols(ji, t1, t2);
     char t2_alias_buf[128] = {0};
     if (ji->join_alias.len > 0)
         snprintf(t2_alias_buf, sizeof(t2_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
@@ -825,6 +946,7 @@ static int exec_first_join(struct database *db, struct table *t1, const char **a
     /* use table names as fallback aliases to disambiguate columns */
     if (!*a1) *a1 = t1->name;
     if (!a2) a2 = t2->name;
+    resolve_join_cols(ji, t1, t2, a, *a1, a2);
     if (do_single_join(t1, *a1, t2, a2, ji->join_left_col, ji->join_right_col, ji->join_type,
                        ji->join_op, merged, merged_t, a, ji->join_on_cond, NULL) != 0) {
         free_merged_rows(merged);
@@ -834,29 +956,36 @@ static int exec_first_join(struct database *db, struct table *t1, const char **a
     }
     if (sq_temp) remove_temp_table(db, sq_temp);
 
-    /* NATURAL JOIN / USING: remove the duplicate right-side join column */
-    if ((ji->is_natural || ji->has_using) && ji->join_right_col.len > 0 && ji->join_type != 4) {
-        /* find the right-side join column in the merged metadata (right portion).
-         * Merged names may be aliased (e.g. "t2.id"), so match the bare part after '.'. */
-        int skip_idx = -1;
+    /* NATURAL JOIN / USING: remove duplicate right-side join columns.
+     * Build a list of right-side column names to remove, then remove them
+     * from highest index to lowest to avoid index shifting issues. */
+    if ((ji->is_natural || ji->has_using) && ji->join_type != 4) {
         size_t ncols1 = t1->columns.count;
-        for (size_t c = ncols1; c < merged_t->columns.count; c++) {
+        /* collect indices of right-side columns that duplicate a left-side column */
+        int skip_indices[64];
+        int skip_count = 0;
+        for (size_t c = ncols1; c < merged_t->columns.count && skip_count < 64; c++) {
             const char *mname = merged_t->columns.items[c].name;
             const char *dot = strrchr(mname, '.');
             const char *bare = dot ? dot + 1 : mname;
-            if (strncasecmp(bare, ji->join_right_col.data, ji->join_right_col.len) == 0 &&
-                bare[ji->join_right_col.len] == '\0') {
-                skip_idx = (int)c;
-                break;
+            /* check if this right-side column matches any left-side column */
+            for (size_t lc = 0; lc < ncols1; lc++) {
+                const char *lname = merged_t->columns.items[lc].name;
+                const char *ldot = strrchr(lname, '.');
+                const char *lbare = ldot ? ldot + 1 : lname;
+                if (strcasecmp(bare, lbare) == 0) {
+                    skip_indices[skip_count++] = (int)c;
+                    break;
+                }
             }
         }
-        if (skip_idx >= 0) {
-            /* remove column from metadata */
+        /* remove from highest index to lowest */
+        for (int si = skip_count - 1; si >= 0; si--) {
+            int skip_idx = skip_indices[si];
             column_free(&merged_t->columns.items[skip_idx]);
             for (size_t c = (size_t)skip_idx; c + 1 < merged_t->columns.count; c++)
                 merged_t->columns.items[c] = merged_t->columns.items[c + 1];
             merged_t->columns.count--;
-            /* remove cell from every row */
             for (size_t r = 0; r < merged->count; r++) {
                 struct row *row = &merged->data[r];
                 if ((size_t)skip_idx < row->cells.count) {
@@ -880,11 +1009,27 @@ static int exec_join_chain(struct database *db, struct query_select *s,
 {
     for (uint32_t jn = 1; jn < s->joins_count; jn++) {
         struct join_info *ji = &a->joins.items[s->joins_start + jn];
+        struct table *sq_temp = NULL;
+        /* materialize subquery join if needed */
+        if (!ji->is_lateral && ji->lateral_subquery_sql != IDX_NONE && ji->join_alias.len > 0) {
+            const char *sq_sql = ASTRING(a, ji->lateral_subquery_sql);
+            char alias_buf[128];
+            snprintf(alias_buf, sizeof(alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
+            sq_temp = materialize_subquery(db, sq_sql, alias_buf);
+            if (!sq_temp) {
+                arena_set_error(a, "42P01", "failed to materialize subquery '%s'", alias_buf);
+                free_merged_rows(merged);
+                free_merged_columns(merged_t);
+                return -1;
+            }
+            ji->join_table = ji->join_alias;
+        }
         struct table *tn = db_find_table_sv(db, ji->join_table);
         if (!tn) {
             arena_set_error(a, "42P01", "table '%.*s' not found", (int)ji->join_table.len, ji->join_table.data);
             free_merged_rows(merged);
             free_merged_columns(merged_t);
+            if (sq_temp) remove_temp_table(db, sq_temp);
             return -1;
         }
 
@@ -892,8 +1037,6 @@ static int exec_join_chain(struct database *db, struct query_select *s,
         merged_t->rows.items = merged->data;
         merged_t->rows.count = merged->count;
         merged_t->rows.capacity = merged->count;
-
-        resolve_join_cols(ji, merged_t, tn);
 
         struct rows next_merged = {0};
         struct table next_meta = {0};
@@ -903,11 +1046,14 @@ static int exec_join_chain(struct database *db, struct query_select *s,
         char jn_alias_buf[128] = {0};
         if (ji->join_alias.len > 0)
             snprintf(jn_alias_buf, sizeof(jn_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
+        const char *jn_a2 = jn_alias_buf[0] ? jn_alias_buf : tn->name;
+        resolve_join_cols(ji, merged_t, tn, a, NULL, jn_a2);
         if (do_single_join(merged_t, NULL, tn, jn_alias_buf[0] ? jn_alias_buf : NULL,
                            ji->join_left_col, ji->join_right_col, ji->join_type,
                            ji->join_op, &next_merged, &next_meta, a, ji->join_on_cond, NULL) != 0) {
             free_merged_rows(merged);
             free_merged_columns(merged_t);
+            if (sq_temp) remove_temp_table(db, sq_temp);
             return -1;
         }
 
@@ -916,6 +1062,7 @@ static int exec_join_chain(struct database *db, struct query_select *s,
             row_free(&merged->data[i]);
         free(merged->data);
         free_merged_columns(merged_t);
+        if (sq_temp) remove_temp_table(db, sq_temp);
 
         *merged = next_merged;
         *merged_t = next_meta;
@@ -925,7 +1072,7 @@ static int exec_join_chain(struct database *db, struct query_select *s,
 
 /* Post-join GROUP BY / aggregate (including ROLLUP/CUBE).
  * Returns aggregate result code. Frees merged rows and columns. */
-static int exec_join_aggregate(struct query_select *s, struct query_arena *a,
+static int exec_join_aggregate(struct database *db, struct query_select *s, struct query_arena *a,
                                struct table *merged_t, struct rows *merged,
                                struct rows *result, struct bump_alloc *rb)
 {
@@ -1015,7 +1162,7 @@ static int exec_join_aggregate(struct query_select *s, struct query_arena *a,
                 int saved_has_where2 = s->where.has_where;
                 s->where.has_where = 0;
                 struct rows sub = {0};
-                query_group_by(merged_t, s, a, &sub, rb);
+                query_group_by(merged_t, s, a, &sub, rb, db);
                 s->where.has_where = saved_has_where2;
                 for (size_t r = 0; r < sub.count; r++) {
                     if (!s->agg_before_cols) {
@@ -1062,7 +1209,7 @@ static int exec_join_aggregate(struct query_select *s, struct query_arena *a,
         s->group_by_exprs_start = orig_exprs_start;
         rc = 0;
     } else if (s->has_group_by)
-        rc = query_group_by(merged_t, s, a, result, rb);
+        rc = query_group_by(merged_t, s, a, result, rb, db);
     else
         rc = query_aggregate(merged_t, s, a, result, rb);
     free_merged_rows(merged);
@@ -1193,6 +1340,8 @@ static void exec_join_project(struct query_select *s, struct query_arena *a,
 static int exec_join(struct database *db, struct query *q, struct rows *result, struct bump_alloc *rb)
 {
     struct query_select *s = &q->select;
+    /* NOTE: re-fetch t1 after any materialize_subquery call since da_push
+     * on db->tables may reallocate the array, invalidating old pointers. */
     struct table *t1 = db_find_table_sv(db, s->table);
     if (!t1) { arena_set_error(&q->arena, "42P01", "table '%.*s' not found", (int)s->table.len, s->table.data); return -1; }
 
@@ -1211,9 +1360,13 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
 
     /* first join */
     if (ji->is_lateral && ji->lateral_subquery_sql != IDX_NONE) {
+        /* re-fetch t1 — it may have moved if materialize_subquery was called before us */
+        t1 = db_find_table_sv(db, s->table);
+        if (!t1) { arena_set_error(&q->arena, "42P01", "table '%.*s' not found", (int)s->table.len, s->table.data); return -1; }
         exec_lateral_join(db, t1, a1, ji, a, &merged, &merged_t);
     } else {
-        if (exec_first_join(db, t1, &a1, ji, a, &merged, &merged_t) != 0)
+        /* exec_first_join may call materialize_subquery → re-fetch t1 after */
+        if (exec_first_join(db, &t1, &a1, ji, a, &merged, &merged_t) != 0)
             return -1;
     }
 
@@ -1276,7 +1429,7 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
 
     /* aggregate or project */
     if (s->has_group_by || s->aggregates_count > 0)
-        return exec_join_aggregate(s, a, &merged_t, &merged, result, rb);
+        return exec_join_aggregate(db, s, a, &merged_t, &merged, result, rb);
 
     exec_join_project(s, a, db, &merged_t, &merged, result, rb);
     return 0;
@@ -1592,7 +1745,33 @@ struct table *materialize_subquery(struct database *db, const char *sql,
     da_init(&ct.columns);
     da_init(&ct.rows);
     da_init(&ct.indexes);
-    /* infer column names */
+    /* infer column names — for DML with RETURNING, fall through to fallback */
+    if (sq.query_type != QUERY_TYPE_SELECT && sq_rows.count > 0) {
+        /* DELETE/INSERT/UPDATE RETURNING: infer source table columns */
+        sv src_table = {0};
+        if (sq.query_type == QUERY_TYPE_DELETE) src_table = sq.del.table;
+        else if (sq.query_type == QUERY_TYPE_INSERT) src_table = sq.insert.table;
+        else if (sq.query_type == QUERY_TYPE_UPDATE) src_table = sq.update.table;
+        struct table *src_t = src_table.len > 0 ? db_find_table_sv(db, src_table) : NULL;
+        size_t ncells = sq_rows.data[0].cells.count;
+        if (src_t && ncells == src_t->columns.count) {
+            for (size_t c = 0; c < ncells; c++) {
+                struct column col = {0};
+                col.name = strdup(src_t->columns.items[c].name);
+                col.type = sq_rows.data[0].cells.items[c].type;
+                da_push(&ct.columns, col);
+            }
+        } else {
+            for (size_t c = 0; c < ncells; c++) {
+                struct column col = {0};
+                char buf[32];
+                snprintf(buf, sizeof(buf), "column%zu", c + 1);
+                col.name = strdup(buf);
+                col.type = sq_rows.data[0].cells.items[c].type;
+                da_push(&ct.columns, col);
+            }
+        }
+    }
     if (sq.query_type == QUERY_TYPE_SELECT && sq_rows.count > 0) {
         size_t ncells = sq_rows.data[0].cells.count;
         /* For generate_series queries, use the column alias directly */
@@ -2061,6 +2240,25 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             struct query_create_table *crt = &q->create_table;
             if (crt->if_not_exists && db_find_table_sv(db, crt->table))
                 return 0;
+            /* CREATE TABLE name LIKE source_table */
+            if (crt->like_table.len > 0) {
+                struct table *src = db_find_table_sv(db, crt->like_table);
+                if (!src) {
+                    arena_set_error(&q->arena, "42P01", "table '%.*s' not found",
+                                    (int)crt->like_table.len, crt->like_table.data);
+                    return -1;
+                }
+                struct table t;
+                table_init_own(&t, sv_to_cstr(crt->table));
+                for (size_t c = 0; c < src->columns.count; c++) {
+                    struct column col = {0};
+                    col.name = strdup(src->columns.items[c].name);
+                    col.type = src->columns.items[c].type;
+                    da_push(&t.columns, col);
+                }
+                da_push(&db->tables, t);
+                return 0;
+            }
             /* CREATE TABLE ... AS SELECT */
             if (crt->as_select_sql != IDX_NONE) {
                 const char *sel_sql = ASTRING(&q->arena, crt->as_select_sql);
@@ -2241,23 +2439,45 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
         }
         case QUERY_TYPE_DROP: {
             sv drop_tbl = q->drop_table.table;
+            int found = 0;
             for (size_t i = 0; i < db->tables.count; i++) {
                 if (sv_eq_cstr(drop_tbl, db->tables.items[i].name)) {
                     /* COW trigger for DROP TABLE */
                     if (txn && txn->in_transaction && txn->snapshot)
                         snapshot_cow_table(txn->snapshot, db, db->tables.items[i].name);
                     table_free(&db->tables.items[i]);
-                    /* shift remaining tables down */
-                    for (size_t j = i; j + 1 < db->tables.count; j++) {
+                    for (size_t j = i; j + 1 < db->tables.count; j++)
                         db->tables.items[j] = db->tables.items[j + 1];
-                    }
                     db->tables.count--;
-                    return 0;
+                    found = 1;
+                    break;
                 }
             }
-            if (q->drop_table.if_exists) return 0;
-            arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)drop_tbl.len, drop_tbl.data);
-            return -1;
+            if (!found) {
+                if (q->drop_table.if_exists) return 0;
+                arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)drop_tbl.len, drop_tbl.data);
+                return -1;
+            }
+            /* CASCADE: drop all tables that have a foreign key referencing the dropped table */
+            if (q->drop_table.cascade) {
+                char drop_name[256];
+                snprintf(drop_name, sizeof(drop_name), "%.*s", (int)drop_tbl.len, drop_tbl.data);
+                restart_cascade:
+                for (size_t i = 0; i < db->tables.count; i++) {
+                    struct table *dep = &db->tables.items[i];
+                    for (size_t c = 0; c < dep->columns.count; c++) {
+                        if (dep->columns.items[c].fk_table &&
+                            strcasecmp(dep->columns.items[c].fk_table, drop_name) == 0) {
+                            table_free(dep);
+                            for (size_t j = i; j + 1 < db->tables.count; j++)
+                                db->tables.items[j] = db->tables.items[j + 1];
+                            db->tables.count--;
+                            goto restart_cascade;
+                        }
+                    }
+                }
+            }
+            return 0;
         }
         case QUERY_TYPE_CREATE_TYPE: {
             /* Ownership transfer: enum_values strings were allocated by parser.c
@@ -2337,9 +2557,24 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
              * prefixed with "VIEW:" so we can detect it later */
             const char *sql = ASTRING(&q->arena, cv->sql_idx);
             /* check for existing view/table */
-            if (db_find_table_sv(db, cv->name)) {
-                arena_set_error(&q->arena, "42P07", "relation '%.*s' already exists", (int)cv->name.len, cv->name.data);
-                return -1;
+            struct table *existing = db_find_table_sv(db, cv->name);
+            if (existing) {
+                if (cv->or_replace && existing->view_sql) {
+                    /* DROP the existing view so we can recreate it */
+                    for (size_t i = 0; i < db->tables.count; i++) {
+                        if (db->tables.items[i].view_sql &&
+                            sv_eq_cstr(cv->name, db->tables.items[i].name)) {
+                            table_free(&db->tables.items[i]);
+                            for (size_t j = i; j + 1 < db->tables.count; j++)
+                                db->tables.items[j] = db->tables.items[j + 1];
+                            db->tables.count--;
+                            break;
+                        }
+                    }
+                } else {
+                    arena_set_error(&q->arena, "42P07", "relation '%.*s' already exists", (int)cv->name.len, cv->name.data);
+                    return -1;
+                }
             }
             struct table vt;
             char vname[512];
@@ -2421,28 +2656,66 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             return 0;
         }
         case QUERY_TYPE_TRUNCATE: {
-            struct table *t = db_find_table_sv(db, q->del.table);
-            if (!t) {
-                arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)q->del.table.len, q->del.table.data);
-                return -1;
+            /* collect table names: use truncate_tables_start/count if set, else del.table */
+            uint32_t tt_count = q->del.truncate_tables_count;
+            uint32_t tt_start = q->del.truncate_tables_start;
+            if (tt_count == 0) {
+                /* legacy single-table path */
+                tt_count = 1;
+                tt_start = 0; /* unused — use del.table directly */
             }
-            /* COW trigger for TRUNCATE */
-            if (txn && txn->in_transaction && txn->snapshot)
-                snapshot_cow_table(txn->snapshot, db, t->name);
-            /* free all rows */
-            for (size_t i = 0; i < t->rows.count; i++)
-                row_free(&t->rows.items[i]);
-            t->rows.count = 0;
-            t->generation++;
-            db->total_generation++;
-            /* reset SERIAL counters */
-            for (size_t i = 0; i < t->columns.count; i++) {
-                if (t->columns.items[i].is_serial)
-                    t->columns.items[i].serial_next = 1;
+            for (uint32_t ti = 0; ti < tt_count; ti++) {
+                sv tname = (q->del.truncate_tables_count > 0)
+                    ? q->arena.svs.items[tt_start + ti]
+                    : q->del.table;
+                struct table *t = db_find_table_sv(db, tname);
+                if (!t) {
+                    arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist",
+                                    (int)tname.len, tname.data);
+                    return -1;
+                }
+                /* COW trigger for TRUNCATE */
+                if (txn && txn->in_transaction && txn->snapshot)
+                    snapshot_cow_table(txn->snapshot, db, t->name);
+                /* free all rows */
+                for (size_t i = 0; i < t->rows.count; i++)
+                    row_free(&t->rows.items[i]);
+                t->rows.count = 0;
+                t->generation++;
+                db->total_generation++;
+                /* reset SERIAL counters */
+                for (size_t i = 0; i < t->columns.count; i++) {
+                    if (t->columns.items[i].is_serial)
+                        t->columns.items[i].serial_next = 1;
+                }
+                /* clear indexes */
+                for (size_t i = 0; i < t->indexes.count; i++)
+                    index_reset(&t->indexes.items[i]);
+                /* CASCADE: truncate tables that have FK columns referencing this table */
+                if (q->del.truncate_cascade) {
+                    for (size_t ti2 = 0; ti2 < db->tables.count; ti2++) {
+                        struct table *ref = &db->tables.items[ti2];
+                        if (ref == t) continue;
+                        int has_fk = 0;
+                        for (size_t ci = 0; ci < ref->columns.count; ci++) {
+                            if (ref->columns.items[ci].fk_table &&
+                                strcmp(ref->columns.items[ci].fk_table, t->name) == 0) {
+                                has_fk = 1; break;
+                            }
+                        }
+                        if (!has_fk) continue;
+                        if (txn && txn->in_transaction && txn->snapshot)
+                            snapshot_cow_table(txn->snapshot, db, ref->name);
+                        for (size_t ri = 0; ri < ref->rows.count; ri++)
+                            row_free(&ref->rows.items[ri]);
+                        ref->rows.count = 0;
+                        ref->generation++;
+                        db->total_generation++;
+                        for (size_t ii = 0; ii < ref->indexes.count; ii++)
+                            index_reset(&ref->indexes.items[ii]);
+                    }
+                }
             }
-            /* clear indexes */
-            for (size_t i = 0; i < t->indexes.count; i++)
-                index_reset(&t->indexes.items[i]);
             return 0;
         }
         case QUERY_TYPE_CREATE_INDEX: {
@@ -2845,6 +3118,28 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
 
             return sel_rc;
         }
+        case QUERY_TYPE_VALUES: {
+            struct query_insert *ins = &q->insert;
+            result->data = NULL; result->count = 0; result->capacity = 0;
+            struct row *ir_data = &q->arena.rows.items[ins->insert_rows_start];
+            uint32_t ir_count = ins->insert_rows_count;
+            for (uint32_t ri = 0; ri < ir_count; ri++) {
+                struct row *src = &ir_data[ri];
+                struct row dst;
+                da_init(&dst.cells);
+                for (size_t ci = 0; ci < src->cells.count; ci++) {
+                    struct cell c = src->cells.items[ci];
+                    if (c.is_null == 2) {
+                        c = eval_expr((uint32_t)c.value.as_int, &q->arena, NULL, NULL, db, NULL);
+                    } else if (column_type_is_text(c.type) && c.value.as_text) {
+                        c.value.as_text = rb ? bump_strdup(rb, c.value.as_text) : strdup(c.value.as_text);
+                    }
+                    da_push(&dst.cells, c);
+                }
+                rows_push(result, dst);
+            }
+            return 0;
+        }
         case QUERY_TYPE_INSERT: {
             struct query_insert *ins = &q->insert;
             /* INSERT ... SELECT */
@@ -3035,6 +3330,24 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                     da_push(&merged_row.cells, t->rows.items[conflict_row].cells.items[mc]);
                                 for (size_t mc = 0; mc < ir_items[ri].cells.count; mc++)
                                     da_push(&merged_row.cells, ir_items[ri].cells.items[mc]);
+
+                                /* check ON CONFLICT DO UPDATE WHERE condition */
+                                if (ins->conflict_where_cond != IDX_NONE) {
+                                    int passes = eval_condition(ins->conflict_where_cond, &q->arena,
+                                                                &merged_row, &merged_t, db);
+                                    if (!passes) {
+                                        da_free(&merged_t.columns);
+                                        da_free(&merged_row.cells);
+                                        /* skip update, remove this insert row */
+                                        da_free(&ir_items[ri].cells);
+                                        for (uint32_t j = ri; j + 1 < ir_count; j++)
+                                            ir_items[j] = ir_items[j + 1];
+                                        ir_count--;
+                                        ins->insert_rows_count = ir_count;
+                                        memset(&ir_items[ir_count], 0, sizeof(ir_items[ir_count]));
+                                        continue;
+                                    }
+                                }
 
                                 /* apply SET clauses to the existing row */
                                 for (uint32_t sc = 0; sc < ins->conflict_set_count; sc++) {
@@ -3610,7 +3923,9 @@ skip_conflict_nothing:
         case QUERY_TYPE_COPY:
             return 0; /* handled in pgwire */
         case QUERY_TYPE_SET:
-            return 0; /* no-op: silently accept SET/RESET/DISCARD */
+        case QUERY_TYPE_ALTER_SEQUENCE:
+        case QUERY_TYPE_SAVEPOINT:
+            return 0; /* no-op */
         case QUERY_TYPE_SHOW: {
             /* return a single-row, single-column result */
             sv param = q->show.parameter;

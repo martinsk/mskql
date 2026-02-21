@@ -9,6 +9,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
+#include <regex.h>
 
 /* forward declarations for cell helpers used by legacy eval functions */
 static void cell_release(struct cell *c);
@@ -17,22 +18,19 @@ static struct cell cell_deep_copy(const struct cell *src);
 static struct cell cell_deep_copy_rb(const struct cell *src, struct bump_alloc *rb);
 static int cell_is_null(const struct cell *c);
 
-/* SQL LIKE pattern matching: % = any sequence, _ = any single char.
- * Iterative algorithm: tracks a single backtrack point for the last '%'
- * seen, giving O(n*m) worst case instead of exponential. */
-int like_match(const char *pattern, const char *text, int case_insensitive)
+/* SQL LIKE pattern matching with configurable escape character.
+ * % = any sequence, _ = any single char, escape_char escapes the next char.
+ * Iterative algorithm: tracks a single backtrack point for the last '%'. */
+int like_match_esc(const char *pattern, const char *text, int case_insensitive, char escape_char)
 {
-    const char *star_p = NULL; /* pattern position after last '%' */
-    const char *star_t = NULL; /* text position at last '%' match */
+    const char *star_p = NULL;
+    const char *star_t = NULL;
     while (*text) {
-        if (*pattern == '\\' && (pattern[1] == '%' || pattern[1] == '_' || pattern[1] == '\\')) {
-            /* escaped literal character */
+        if (escape_char && *pattern == escape_char &&
+            (pattern[1] == '%' || pattern[1] == '_' || pattern[1] == escape_char)) {
             char pc = pattern[1], tc = *text;
-            if (case_insensitive) { pc = tolower((unsigned char)pc); tc = tolower((unsigned char)tc); }
-            if (pc == tc) {
-                pattern += 2; text++;
-                continue;
-            }
+            if (case_insensitive) { pc = (char)tolower((unsigned char)pc); tc = (char)tolower((unsigned char)tc); }
+            if (pc == tc) { pattern += 2; text++; continue; }
             if (star_p) { pattern = star_p; text = ++star_t; continue; }
             return 0;
         }
@@ -42,27 +40,20 @@ int like_match(const char *pattern, const char *text, int case_insensitive)
             star_t = text;
             continue;
         }
-        if (*pattern == '_') {
-            pattern++; text++;
-            continue;
-        }
+        if (*pattern == '_') { pattern++; text++; continue; }
         char pc = *pattern, tc = *text;
-        if (case_insensitive) { pc = tolower((unsigned char)pc); tc = tolower((unsigned char)tc); }
-        if (pc == tc) {
-            pattern++; text++;
-            continue;
-        }
-        /* mismatch — backtrack to last '%' if possible */
-        if (star_p) {
-            pattern = star_p;
-            text = ++star_t;
-            continue;
-        }
+        if (case_insensitive) { pc = (char)tolower((unsigned char)pc); tc = (char)tolower((unsigned char)tc); }
+        if (pc == tc) { pattern++; text++; continue; }
+        if (star_p) { pattern = star_p; text = ++star_t; continue; }
         return 0;
     }
-    /* consume trailing '%' wildcards and escaped chars */
     while (*pattern == '%') pattern++;
     return *pattern == '\0';
+}
+
+int like_match(const char *pattern, const char *text, int case_insensitive)
+{
+    return like_match_esc(pattern, text, case_insensitive, '\\');
 }
 
 /* condition_free, query_free, and all query_*_free functions live in parser.c
@@ -115,7 +106,7 @@ static int cell_to_sql_literal(const struct cell *cv, char *buf, size_t bufsize)
         return 0;
     case COLUMN_TYPE_FLOAT:
     case COLUMN_TYPE_NUMERIC:
-        snprintf(buf, bufsize, "%g", cv->value.as_float);
+        snprintf(buf, bufsize, "%.15g", cv->value.as_float);
         return 0;
     case COLUMN_TYPE_BOOLEAN:
         snprintf(buf, bufsize, "%s", cv->value.as_bool ? "TRUE" : "FALSE");
@@ -312,8 +303,12 @@ static inline int cmp_result_matches_op(int r, enum cmp_op op)
     case CMP_NOT_EXISTS:
     case CMP_REGEX_MATCH:
     case CMP_REGEX_NOT_MATCH:
+    case CMP_REGEX_ICASE_MATCH:
+    case CMP_REGEX_ICASE_NOT_MATCH:
     case CMP_IS_NOT_TRUE:
     case CMP_IS_NOT_FALSE:
+    case CMP_SIMILAR_TO:
+    case CMP_NOT_SIMILAR_TO:
         return 0;
     }
     return 0;
@@ -537,41 +532,56 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
                 if (!column_type_is_text(c->type) || !c->value.as_text)
                     goto cond_cleanup;
                 if (!cond->value.value.as_text) goto cond_cleanup;
-                cond_result = like_match(cond->value.value.as_text, c->value.as_text,
-                                  cond->op == CMP_ILIKE);
+                char esc = cond->escape_char ? cond->escape_char : '\\';
+                cond_result = like_match_esc(cond->value.value.as_text, c->value.as_text,
+                                  cond->op == CMP_ILIKE, esc);
                 goto cond_cleanup;
             }
-            /* ~ / !~ regex match (simple stub supporting ^, $, and () groups) */
-            if (cond->op == CMP_REGEX_MATCH || cond->op == CMP_REGEX_NOT_MATCH) {
+            /* SIMILAR TO / NOT SIMILAR TO */
+            if (cond->op == CMP_SIMILAR_TO || cond->op == CMP_NOT_SIMILAR_TO) {
+                if (lhs_is_null) { cond_result = -1; goto cond_cleanup; }
+                if (!column_type_is_text(c->type) || !c->value.as_text)
+                    goto cond_cleanup;
+                if (!cond->value.value.as_text) goto cond_cleanup;
+                const char *sp = cond->value.value.as_text;
+                const char *str = c->value.as_text;
+                char regpat[4096]; size_t ri2 = 0;
+                regpat[ri2++] = '^';
+                for (const char *p = sp; *p && ri2 < sizeof(regpat) - 4; p++) {
+                    if (*p == '%') { regpat[ri2++] = '.'; regpat[ri2++] = '*'; }
+                    else if (*p == '_') { regpat[ri2++] = '.'; }
+                    else { regpat[ri2++] = *p; }
+                }
+                regpat[ri2++] = '$'; regpat[ri2] = '\0';
+                regex_t re2;
+                int match2 = 0;
+                if (regcomp(&re2, regpat, REG_EXTENDED) == 0) {
+                    match2 = (regexec(&re2, str, 0, NULL, 0) == 0);
+                    regfree(&re2);
+                }
+                cond_result = (cond->op == CMP_NOT_SIMILAR_TO) ? !match2 : match2;
+                goto cond_cleanup;
+            }
+            /* ~ / !~ / ~* / !~* regex match using POSIX ERE */
+            if (cond->op == CMP_REGEX_MATCH || cond->op == CMP_REGEX_NOT_MATCH ||
+                cond->op == CMP_REGEX_ICASE_MATCH || cond->op == CMP_REGEX_ICASE_NOT_MATCH) {
                 if (!column_type_is_text(c->type) || !c->value.as_text)
                     goto cond_cleanup;
                 if (!cond->value.value.as_text) goto cond_cleanup;
                 const char *pat = cond->value.value.as_text;
                 const char *str = c->value.as_text;
-                /* strip anchors and parentheses to get a simplified pattern */
-                char simpat[256];
-                size_t si = 0;
-                int anchored_start = 0, anchored_end = 0;
-                for (const char *p = pat; *p && si < sizeof(simpat) - 1; p++) {
-                    if (p == pat && *p == '^') { anchored_start = 1; continue; }
-                    if (*p == '$' && *(p+1) == '\0') { anchored_end = 1; continue; }
-                    if (*p == '(' || *p == ')') continue;
-                    if (*p == '.' && *(p+1) == '*') { p++; continue; } /* .* = skip */
-                    simpat[si++] = *p;
-                }
-                simpat[si] = '\0';
+                int icase = (cond->op == CMP_REGEX_ICASE_MATCH ||
+                             cond->op == CMP_REGEX_ICASE_NOT_MATCH);
+                int is_not = (cond->op == CMP_REGEX_NOT_MATCH ||
+                              cond->op == CMP_REGEX_ICASE_NOT_MATCH);
+                regex_t re;
+                int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
                 int match = 0;
-                if (anchored_start && anchored_end) {
-                    match = (strcmp(str, simpat) == 0);
-                } else if (anchored_start) {
-                    match = (strncmp(str, simpat, si) == 0);
-                } else if (anchored_end) {
-                    size_t slen = strlen(str);
-                    match = (slen >= si && strcmp(str + slen - si, simpat) == 0);
-                } else {
-                    match = (strstr(str, simpat) != NULL);
+                if (regcomp(&re, pat, flags) == 0) {
+                    match = (regexec(&re, str, 0, NULL, 0) == 0);
+                    regfree(&re);
                 }
-                cond_result = (cond->op == CMP_REGEX_MATCH) ? match : !match;
+                cond_result = is_not ? !match : match;
                 goto cond_cleanup;
             }
             /* ANY/ALL/SOME: col op ANY(SELECT ...) or col op ANY(ARRAY[...]) */
@@ -1532,8 +1542,21 @@ static const char *cell_format_buf(const struct cell *c, char *buf, size_t bufsz
     switch (c->type) {
     case COLUMN_TYPE_SMALLINT: snprintf(buf, bufsz, "%d", (int)c->value.as_smallint); break;
     case COLUMN_TYPE_INT:      snprintf(buf, bufsz, "%d", c->value.as_int); break;
-    case COLUMN_TYPE_FLOAT:
-    case COLUMN_TYPE_NUMERIC:  snprintf(buf, bufsz, "%g", c->value.as_float); break;
+    case COLUMN_TYPE_FLOAT:   snprintf(buf, bufsz, "%.15g", c->value.as_float); break;
+    case COLUMN_TYPE_NUMERIC: {
+        /* use fixed-point; strip trailing zeros unless scale is set */
+        if (c->numeric_scale > 0) {
+            snprintf(buf, bufsz, "%.*f", (int)c->numeric_scale, c->value.as_float);
+        } else {
+            /* format with enough precision to avoid scientific notation */
+            snprintf(buf, bufsz, "%.15g", c->value.as_float);
+            /* if result contains 'e' or 'E', reformat as fixed-point */
+            if (strchr(buf, 'e') || strchr(buf, 'E')) {
+                snprintf(buf, bufsz, "%.2f", c->value.as_float);
+            }
+        }
+        break;
+    }
     case COLUMN_TYPE_BIGINT:   snprintf(buf, bufsz, "%lld", c->value.as_bigint); break;
     case COLUMN_TYPE_BOOLEAN:  snprintf(buf, bufsz, "%s", c->value.as_bool ? "true" : "false"); break;
     case COLUMN_TYPE_DATE:     date_to_str(c->value.as_date, buf, bufsz); break;
@@ -1663,11 +1686,60 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
             case OP_GE: result = (cmp >= 0); break;
             case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
             case OP_CONCAT: case OP_NEG: case OP_EXP: case OP_AND: case OP_OR:
-            case OP_NOT: case OP_LIKE: break;
+            case OP_NOT: case OP_LIKE:
+            case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+            case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+            case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT: break;
             }
             return cell_make_bool(result);
         }
         /* numeric comparison falls through to existing code below */
+    }
+
+    /* regex operators: ~ !~ ~* !~* */
+    if (e->binary.op == OP_REGEX_MATCH || e->binary.op == OP_REGEX_NOT_MATCH ||
+        e->binary.op == OP_REGEX_ICASE_MATCH || e->binary.op == OP_REGEX_ICASE_NOT_MATCH) {
+        if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
+            cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+            return cell_make_null();
+        }
+        char *str = cell_to_text_rb(&lhs, rb);
+        char *pat = cell_to_text_rb(&rhs, rb);
+        int icase = (e->binary.op == OP_REGEX_ICASE_MATCH ||
+                     e->binary.op == OP_REGEX_ICASE_NOT_MATCH);
+        int is_not = (e->binary.op == OP_REGEX_NOT_MATCH ||
+                      e->binary.op == OP_REGEX_ICASE_NOT_MATCH);
+        int match = 0;
+        if (str && pat) {
+            regex_t re;
+            int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
+            if (regcomp(&re, pat, flags) == 0) {
+                match = (regexec(&re, str, 0, NULL, 0) == 0);
+                regfree(&re);
+            }
+        }
+        if (!rb) { free(str); free(pat); }
+        cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+        return cell_make_bool(is_not ? !match : match);
+    }
+
+    /* reject text operands in arithmetic — PostgreSQL: operator does not exist: text + integer */
+    if ((e->binary.op == OP_ADD || e->binary.op == OP_SUB ||
+         e->binary.op == OP_MUL || e->binary.op == OP_DIV || e->binary.op == OP_MOD) &&
+        (column_type_is_text(lhs.type) || column_type_is_text(rhs.type))) {
+        const char *opname = e->binary.op == OP_ADD ? "+" :
+                             e->binary.op == OP_SUB ? "-" :
+                             e->binary.op == OP_MUL ? "*" :
+                             e->binary.op == OP_DIV ? "/" : "%";
+        const char *lname = column_type_is_text(lhs.type) ? "text" :
+                            (lhs.type == COLUMN_TYPE_BIGINT ? "bigint" :
+                             lhs.type == COLUMN_TYPE_FLOAT  ? "double precision" : "integer");
+        const char *rname = column_type_is_text(rhs.type) ? "text" :
+                            (rhs.type == COLUMN_TYPE_BIGINT ? "bigint" :
+                             rhs.type == COLUMN_TYPE_FLOAT  ? "double precision" : "integer");
+        cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+        arena_set_error(arena, "42883", "operator does not exist: %s %s %s", lname, opname, rname);
+        return cell_make_null();
     }
 
     /* arithmetic: NULL propagation */
@@ -1754,6 +1826,59 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
             return r;
         }
 
+        /* interval * integer or integer * interval */
+        if (lhs_is_interval && (rhs.type == COLUMN_TYPE_INT || rhs.type == COLUMN_TYPE_BIGINT) &&
+            e->binary.op == OP_MUL) {
+            long long factor = (rhs.type == COLUMN_TYPE_INT) ? rhs.value.as_int : rhs.value.as_bigint;
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_INTERVAL;
+            r.value.as_interval.months = (int32_t)(lhs.value.as_interval.months * factor);
+            r.value.as_interval.days   = (int32_t)(lhs.value.as_interval.days   * factor);
+            r.value.as_interval.usec   = lhs.value.as_interval.usec * factor;
+            return r;
+        }
+        if (rhs_is_interval && (lhs.type == COLUMN_TYPE_INT || lhs.type == COLUMN_TYPE_BIGINT) &&
+            e->binary.op == OP_MUL) {
+            long long factor = (lhs.type == COLUMN_TYPE_INT) ? lhs.value.as_int : lhs.value.as_bigint;
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_INTERVAL;
+            r.value.as_interval.months = (int32_t)(rhs.value.as_interval.months * factor);
+            r.value.as_interval.days   = (int32_t)(rhs.value.as_interval.days   * factor);
+            r.value.as_interval.usec   = rhs.value.as_interval.usec * factor;
+            return r;
+        }
+        /* interval / integer */
+        if (lhs_is_interval && (rhs.type == COLUMN_TYPE_INT || rhs.type == COLUMN_TYPE_BIGINT) &&
+            e->binary.op == OP_DIV) {
+            long long divisor = (rhs.type == COLUMN_TYPE_INT) ? rhs.value.as_int : rhs.value.as_bigint;
+            if (divisor == 0) {
+                arena_set_error(arena, "22012", "division by zero");
+                return cell_make_null();
+            }
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_INTERVAL;
+            /* convert to total usec, divide, then reconstruct */
+            int64_t total_usec = lhs.value.as_interval.usec
+                + (int64_t)lhs.value.as_interval.days * 86400LL * 1000000LL
+                + (int64_t)lhs.value.as_interval.months * 30LL * 86400LL * 1000000LL;
+            total_usec /= divisor;
+            r.value.as_interval.months = 0;
+            r.value.as_interval.days   = (int32_t)(total_usec / (86400LL * 1000000LL));
+            r.value.as_interval.usec   = total_usec % (86400LL * 1000000LL);
+            return r;
+        }
+        /* interval * float */
+        if (lhs_is_interval && (rhs.type == COLUMN_TYPE_FLOAT || rhs.type == COLUMN_TYPE_NUMERIC) &&
+            e->binary.op == OP_MUL) {
+            double factor = rhs.value.as_float;
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_INTERVAL;
+            r.value.as_interval.months = (int32_t)round(lhs.value.as_interval.months * factor);
+            r.value.as_interval.days   = (int32_t)round(lhs.value.as_interval.days   * factor);
+            r.value.as_interval.usec   = (int64_t)round((double)lhs.value.as_interval.usec * factor);
+            return r;
+        }
+
         /* date/timestamp +/- integer days */
         if (lhs_is_dt && (rhs.type == COLUMN_TYPE_INT || rhs.type == COLUMN_TYPE_BIGINT) &&
             (e->binary.op == OP_ADD || e->binary.op == OP_SUB)) {
@@ -1831,7 +1956,13 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         case OP_GT: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(la > ra); }
         case OP_LE: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(la <= ra); }
         case OP_GE: { cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb); return cell_make_bool(la >= ra); }
-        case OP_CONCAT: case OP_NEG: case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE: break;
+        case OP_BITAND:  res = la & ra; break;
+        case OP_BITOR:   res = la | ra; break;
+        case OP_LSHIFT:  res = la << ra; break;
+        case OP_RSHIFT:  res = la >> ra; break;
+        case OP_CONCAT: case OP_NEG: case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE:
+        case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+        case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH: break;
         }
         cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
         return cell_make_bigint(res);
@@ -1870,7 +2001,25 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         case OP_GT: return cell_make_bool(la > ra);
         case OP_LE: return cell_make_bool(la <= ra);
         case OP_GE: return cell_make_bool(la >= ra);
-        case OP_CONCAT: case OP_NEG: case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE: break;
+        case OP_BITAND:  res = la & ra; break;
+        case OP_BITOR:   res = la | ra; break;
+        case OP_LSHIFT:  res = la << ra; break;
+        case OP_RSHIFT:  res = la >> ra; break;
+        case OP_CONCAT: case OP_NEG: case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE:
+        case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+        case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH: break;
+        }
+        /* if both operands were SMALLINT, result must fit in SMALLINT */
+        int both_smallint = (lhs.type == COLUMN_TYPE_SMALLINT && rhs.type == COLUMN_TYPE_SMALLINT);
+        if (both_smallint) {
+            if (res < -32768 || res > 32767) {
+                arena_set_error(arena, "22003", "smallint out of range");
+                return cell_make_null();
+            }
+            struct cell r = {0};
+            r.type = COLUMN_TYPE_SMALLINT;
+            r.value.as_smallint = (int16_t)res;
+            return r;
         }
         if (res >= INT32_MIN && res <= INT32_MAX)
             return cell_make_int((int)res);
@@ -1886,7 +2035,13 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         case OP_ADD: result_v = lv + rv; break;
         case OP_SUB: result_v = lv - rv; break;
         case OP_MUL: result_v = lv * rv; break;
-        case OP_DIV: result_v = lv / rv; break;
+        case OP_DIV:
+            if (rv == 0.0) {
+                arena_set_error(arena, "22012", "division by zero");
+                return cell_make_null();
+            }
+            result_v = lv / rv;
+            break;
         case OP_MOD: result_v = fmod(lv, rv); break;
         case OP_EXP: result_v = pow(lv, rv); break;
         case OP_CONCAT: break;
@@ -1897,7 +2052,13 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         case OP_GT: return cell_make_bool(lv > rv);
         case OP_LE: return cell_make_bool(lv <= rv);
         case OP_GE: return cell_make_bool(lv >= rv);
-        case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE: break;
+        case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE:
+        case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+        case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH: break;
+        case OP_BITAND: result_v = (double)((long long)lv & (long long)rv); break;
+        case OP_BITOR:  result_v = (double)((long long)lv | (long long)rv); break;
+        case OP_LSHIFT: result_v = (double)((long long)lv << (int)rv); break;
+        case OP_RSHIFT: result_v = (double)((long long)lv >> (int)rv); break;
     }
     return cell_make_float(result_v);
 }
@@ -2129,7 +2290,7 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
                 result_v = iv.months / 12;
             else if (strcasecmp(field, "month") == 0)
                 result_v = iv.months % 12;
-            else if (strcasecmp(field, "day") == 0)
+            else if (strcasecmp(field, "day") == 0 || strcasecmp(field, "days") == 0)
                 result_v = iv.days;
             else if (strcasecmp(field, "hour") == 0)
                 result_v = (double)(iv.usec / USEC_PER_HOUR);
@@ -2213,6 +2374,17 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
             a_c.type = COLUMN_TYPE_TIMESTAMP;
             a_c.value.as_timestamp = now_usec;
         }
+        /* Coerce TEXT args to TIMESTAMP */
+        if (a_c.type == COLUMN_TYPE_TEXT && a_c.value.as_text) {
+            int64_t ts = timestamp_from_str(a_c.value.as_text);
+            a_c.type = COLUMN_TYPE_TIMESTAMP;
+            a_c.value.as_timestamp = ts;
+        }
+        if (b_c.type == COLUMN_TYPE_TEXT && b_c.value.as_text) {
+            int64_t ts = timestamp_from_str(b_c.value.as_text);
+            b_c.type = COLUMN_TYPE_TIMESTAMP;
+            b_c.value.as_timestamp = ts;
+        }
         if (cell_is_null(&a_c) || cell_is_null(&b_c)) {
             cell_release_rb(&a_c, rb);
             cell_release_rb(&b_c, rb);
@@ -2271,45 +2443,90 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         }
         const char *fmt = (column_type_is_text(fmt_c.type) && fmt_c.value.as_text)
                           ? fmt_c.value.as_text : "";
-        /* extract y/m/d/h/mi/s from the source cell */
-        int y = 0, mo = 0, d = 0, hh = 0, mi = 0, ss = 0;
-        if (src_c.type == COLUMN_TYPE_DATE) {
-            days_to_ymd(src_c.value.as_date, &y, &mo, &d);
-        } else if (src_c.type == COLUMN_TYPE_TIMESTAMP || src_c.type == COLUMN_TYPE_TIMESTAMPTZ) {
-            int64_t usec = src_c.value.as_timestamp;
-            int32_t days;
-            int64_t time_part;
-            if (usec >= 0) { days = (int32_t)(usec / USEC_PER_DAY); time_part = usec % USEC_PER_DAY; }
-            else { days = (int32_t)((usec - USEC_PER_DAY + 1) / USEC_PER_DAY); time_part = usec - (int64_t)days * USEC_PER_DAY; }
-            days_to_ymd(days, &y, &mo, &d);
-            hh = (int)(time_part / USEC_PER_HOUR);
-            mi = (int)((time_part % USEC_PER_HOUR) / USEC_PER_MIN);
-            ss = (int)((time_part % USEC_PER_MIN) / USEC_PER_SEC);
-        }
-        /* simple PG format conversion: YYYY, MM, DD, HH24, MI, SS */
         char buf[256] = {0};
-        char *out = buf;
-        const char *fp = fmt;
-        while (*fp && (size_t)(out - buf) < sizeof(buf) - 10) {
-            if (strncasecmp(fp, "YYYY", 4) == 0) {
-                out += sprintf(out, "%04d", y); fp += 4;
-            } else if (strncasecmp(fp, "MM", 2) == 0) {
-                out += sprintf(out, "%02d", mo); fp += 2;
-            } else if (strncasecmp(fp, "DD", 2) == 0) {
-                out += sprintf(out, "%02d", d); fp += 2;
-            } else if (strncasecmp(fp, "HH24", 4) == 0) {
-                out += sprintf(out, "%02d", hh); fp += 4;
-            } else if (strncasecmp(fp, "HH", 2) == 0) {
-                out += sprintf(out, "%02d", hh); fp += 2;
-            } else if (strncasecmp(fp, "MI", 2) == 0) {
-                out += sprintf(out, "%02d", mi); fp += 2;
-            } else if (strncasecmp(fp, "SS", 2) == 0) {
-                out += sprintf(out, "%02d", ss); fp += 2;
-            } else {
-                *out++ = *fp++;
+        /* numeric source: format using 9/0 picture patterns */
+        if (src_c.type == COLUMN_TYPE_INT || src_c.type == COLUMN_TYPE_BIGINT ||
+            src_c.type == COLUMN_TYPE_FLOAT || src_c.type == COLUMN_TYPE_NUMERIC ||
+            src_c.type == COLUMN_TYPE_SMALLINT) {
+            double val = cell_to_double(&src_c);
+            /* count integer digits and decimal digits in format */
+            int fmt_int_digits = 0, fmt_dec_digits = 0;
+            int seen_dot = 0;
+            int has_leading_zero = 0;
+            for (const char *fp = fmt; *fp; fp++) {
+                if (*fp == '.') { seen_dot = 1; continue; }
+                if (*fp == '9' || *fp == '0') {
+                    if (*fp == '0' && !seen_dot && fmt_int_digits == 0) has_leading_zero = 1;
+                    if (!seen_dot) fmt_int_digits++;
+                    else fmt_dec_digits++;
+                }
             }
+            /* format the number */
+            char num_buf[128];
+            if (fmt_dec_digits > 0) {
+                snprintf(num_buf, sizeof(num_buf), "%.*f", fmt_dec_digits, val);
+            } else {
+                snprintf(num_buf, sizeof(num_buf), "%.0f", val);
+            }
+            /* find integer and decimal parts */
+            char *dot_pos = strchr(num_buf, '.');
+            int int_len = dot_pos ? (int)(dot_pos - num_buf) : (int)strlen(num_buf);
+            int neg = (num_buf[0] == '-');
+            int abs_int_len = int_len - (neg ? 1 : 0);
+            /* PostgreSQL TO_CHAR: prepend sign char (space for positive, '-' for negative) */
+            char *out = buf;
+            int pad = fmt_int_digits - abs_int_len;
+            if (!neg) {
+                /* positive: leading space as sign placeholder */
+                if ((size_t)(out - buf) < sizeof(buf) - 2) *out++ = ' ';
+            }
+            if (!has_leading_zero) {
+                for (int p = 0; p < pad && (size_t)(out - buf) < sizeof(buf) - 2; p++)
+                    *out++ = ' ';
+            }
+            /* copy the formatted number */
+            for (const char *p = num_buf; *p && (size_t)(out - buf) < sizeof(buf) - 2; p++)
+                *out++ = *p;
+            *out = '\0';
+        } else {
+            /* date/timestamp source */
+            int y = 0, mo = 0, d = 0, hh = 0, mi = 0, ss = 0;
+            if (src_c.type == COLUMN_TYPE_DATE) {
+                days_to_ymd(src_c.value.as_date, &y, &mo, &d);
+            } else if (src_c.type == COLUMN_TYPE_TIMESTAMP || src_c.type == COLUMN_TYPE_TIMESTAMPTZ) {
+                int64_t usec = src_c.value.as_timestamp;
+                int32_t days;
+                int64_t time_part;
+                if (usec >= 0) { days = (int32_t)(usec / USEC_PER_DAY); time_part = usec % USEC_PER_DAY; }
+                else { days = (int32_t)((usec - USEC_PER_DAY + 1) / USEC_PER_DAY); time_part = usec - (int64_t)days * USEC_PER_DAY; }
+                days_to_ymd(days, &y, &mo, &d);
+                hh = (int)(time_part / USEC_PER_HOUR);
+                mi = (int)((time_part % USEC_PER_HOUR) / USEC_PER_MIN);
+                ss = (int)((time_part % USEC_PER_MIN) / USEC_PER_SEC);
+            }
+            char *out = buf;
+            const char *fp = fmt;
+            while (*fp && (size_t)(out - buf) < sizeof(buf) - 10) {
+                if (strncasecmp(fp, "YYYY", 4) == 0) {
+                    out += sprintf(out, "%04d", y); fp += 4;
+                } else if (strncasecmp(fp, "MM", 2) == 0) {
+                    out += sprintf(out, "%02d", mo); fp += 2;
+                } else if (strncasecmp(fp, "DD", 2) == 0) {
+                    out += sprintf(out, "%02d", d); fp += 2;
+                } else if (strncasecmp(fp, "HH24", 4) == 0) {
+                    out += sprintf(out, "%02d", hh); fp += 4;
+                } else if (strncasecmp(fp, "HH", 2) == 0) {
+                    out += sprintf(out, "%02d", hh); fp += 2;
+                } else if (strncasecmp(fp, "MI", 2) == 0) {
+                    out += sprintf(out, "%02d", mi); fp += 2;
+                } else if (strncasecmp(fp, "SS", 2) == 0) {
+                    out += sprintf(out, "%02d", ss); fp += 2;
+                } else {
+                    *out++ = *fp++;
+                }
+            }
+            *out = '\0';
         }
-        *out = '\0';
         cell_release_rb(&src_c, rb);
         cell_release_rb(&fmt_c, rb);
         struct cell r = {0};
@@ -2392,7 +2609,7 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
     case FUNC_ROUND: {
         if (nargs == 0) return cell_make_null();
         struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
-        if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_FLOAT; return arg; }
+        if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_NUMERIC; return arg; }
         double v = cell_to_double_val(&arg);
         int places = 0;
         if (nargs >= 2) {
@@ -2400,12 +2617,14 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
             places = (int)cell_to_double_val(&p);
             cell_release_rb(&p, rb);
         }
-        if (places == 0) {
-            return cell_make_float(round(v));
-        } else {
-            double factor = pow(10.0, (double)places);
-            return cell_make_float(round(v * factor) / factor);
-        }
+        double factor = pow(10.0, (double)places);
+        double rounded = round(v * factor) / factor;
+        /* Return NUMERIC so cell_to_string uses fixed-point formatting */
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_NUMERIC;
+        r.value.as_float = rounded;
+        r.numeric_scale = places > 0 ? places : 0;
+        return r;
     }
 
     case FUNC_POWER: {
@@ -2899,12 +3118,476 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         return r;
     }
 
+    case FUNC_EXP: {
+        if (nargs == 0) return cell_make_null();
+        struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&a)) { a.type = COLUMN_TYPE_FLOAT; return a; }
+        double v = cell_to_double_val(&a);
+        cell_release_rb(&a, rb);
+        return cell_make_float(exp(v));
+    }
+
+    case FUNC_LN: {
+        if (nargs == 0) return cell_make_null();
+        struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&a)) { a.type = COLUMN_TYPE_FLOAT; return a; }
+        double v = cell_to_double_val(&a);
+        cell_release_rb(&a, rb);
+        if (v <= 0.0) {
+            arena_set_error(arena, "2201E", "cannot take logarithm of a non-positive number");
+            return cell_make_null();
+        }
+        double result = log(v);
+        /* return integer if result is whole */
+        if (result == floor(result) && fabs(result) < 1e15)
+            return cell_make_int((int)result);
+        return cell_make_float(result);
+    }
+
+    case FUNC_ASCII: {
+        if (nargs == 0) return cell_make_null();
+        struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&a)) { cell_release_rb(&a, rb); return cell_make_null(); }
+        int code = 0;
+        if (column_type_is_text(a.type) && a.value.as_text && a.value.as_text[0])
+            code = (unsigned char)a.value.as_text[0];
+        cell_release_rb(&a, rb);
+        return cell_make_int(code);
+    }
+
+    case FUNC_CHR: {
+        if (nargs == 0) return cell_make_null();
+        struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&a)) { cell_release_rb(&a, rb); return cell_make_null(); }
+        int code = (int)cell_to_double_val(&a);
+        cell_release_rb(&a, rb);
+        char tmp2[2] = { (char)(code & 0xFF), '\0' };
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = rb ? bump_strdup(rb, tmp2) : strdup(tmp2);
+        return r;
+    }
+
+    case FUNC_FORMAT: {
+        /* FORMAT(fmt, arg1, arg2, ...) — simple %s substitution */
+        if (nargs == 0) return cell_make_null();
+        struct cell fmt_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&fmt_c) || !column_type_is_text(fmt_c.type) || !fmt_c.value.as_text) {
+            cell_release_rb(&fmt_c, rb);
+            return cell_make_null();
+        }
+        const char *fmt = fmt_c.value.as_text;
+        char out_buf[4096];
+        size_t out_pos = 0;
+        uint32_t arg_idx = 1;
+        for (size_t fi = 0; fmt[fi] && out_pos < sizeof(out_buf) - 1; fi++) {
+            if (fmt[fi] == '%' && fmt[fi+1] == 's' && arg_idx < nargs) {
+                struct cell ac = eval_expr(FUNC_ARG(arena, args_start, arg_idx++), arena, t, row, db, rb);
+                char tmp[256];
+                const char *sv_str = NULL;
+                if (cell_is_null(&ac)) {
+                    sv_str = "";
+                } else if (column_type_is_text(ac.type)) {
+                    sv_str = ac.value.as_text ? ac.value.as_text : "";
+                } else {
+                    cell_format_buf(&ac, tmp, sizeof(tmp));
+                    sv_str = tmp;
+                }
+                size_t slen = strlen(sv_str);
+                if (out_pos + slen < sizeof(out_buf) - 1) {
+                    memcpy(out_buf + out_pos, sv_str, slen);
+                    out_pos += slen;
+                }
+                cell_release_rb(&ac, rb);
+                fi++; /* skip 's' */
+            } else {
+                out_buf[out_pos++] = fmt[fi];
+            }
+        }
+        out_buf[out_pos] = '\0';
+        cell_release_rb(&fmt_c, rb);
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = rb ? bump_strdup(rb, out_buf) : strdup(out_buf);
+        return r;
+    }
+
+    case FUNC_MD5: {
+        if (nargs == 0) return cell_make_null();
+        struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&a)) { cell_release_rb(&a, rb); return cell_make_null(); }
+        const char *input = (column_type_is_text(a.type) && a.value.as_text) ? a.value.as_text : "";
+        /* Simple MD5 implementation */
+        /* Use a portable MD5 — implement inline */
+        uint32_t s0 = 0x67452301, s1 = 0xefcdab89, s2 = 0x98badcfe, s3 = 0x10325476;
+        static const uint32_t K[64] = {
+            0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+            0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+            0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+            0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+            0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+            0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+            0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+            0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391
+        };
+        static const int rot[64] = {
+            7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+            5, 9,14,20,5, 9,14,20,5, 9,14,20,5, 9,14,20,
+            4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+            6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21
+        };
+        size_t msg_len = strlen(input);
+        size_t padded_len = ((msg_len + 8) / 64 + 1) * 64;
+        uint8_t *msg = calloc(padded_len, 1);
+        memcpy(msg, input, msg_len);
+        msg[msg_len] = 0x80;
+        uint64_t bit_len = (uint64_t)msg_len * 8;
+        memcpy(msg + padded_len - 8, &bit_len, 8);
+        for (size_t chunk = 0; chunk < padded_len; chunk += 64) {
+            uint32_t M[16];
+            memcpy(M, msg + chunk, 64);
+            uint32_t a = s0, b = s1, c = s2, d = s3;
+            for (int i = 0; i < 64; i++) {
+                uint32_t F, g;
+                if (i < 16)      { F = (b & c) | (~b & d); g = (uint32_t)i; }
+                else if (i < 32) { F = (d & b) | (~d & c); g = (5*(uint32_t)i + 1) % 16; }
+                else if (i < 48) { F = b ^ c ^ d;           g = (3*(uint32_t)i + 5) % 16; }
+                else             { F = c ^ (b | ~d);         g = (7*(uint32_t)i) % 16; }
+                F += a + K[i] + M[g];
+                a = d; d = c; c = b;
+                b += (F << rot[i]) | (F >> (32 - rot[i]));
+            }
+            s0 += a; s1 += b; s2 += c; s3 += d;
+        }
+        free(msg);
+        cell_release_rb(&a, rb);
+        char hex[33];
+        uint8_t digest[16];
+        memcpy(digest,     &s0, 4); memcpy(digest+4,  &s1, 4);
+        memcpy(digest+8,   &s2, 4); memcpy(digest+12, &s3, 4);
+        for (int i = 0; i < 16; i++) snprintf(hex + i*2, 3, "%02x", digest[i]);
+        struct cell md5_r = {0};
+        md5_r.type = COLUMN_TYPE_TEXT;
+        md5_r.value.as_text = rb ? bump_strdup(rb, hex) : strdup(hex);
+        return md5_r;
+    }
+
+    case FUNC_CURRENT_TIME:
+    case FUNC_LOCALTIME: {
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TIME;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        int64_t usec_of_day = (ts.tv_sec % 86400) * 1000000LL + ts.tv_nsec / 1000;
+        r.value.as_time = usec_of_day;
+        return r;
+    }
+
+    case FUNC_MAKE_DATE: {
+        if (nargs < 3) return cell_make_null();
+        struct cell y = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell m = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        struct cell d = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
+        if (cell_is_null(&y) || cell_is_null(&m) || cell_is_null(&d)) {
+            cell_release_rb(&y, rb); cell_release_rb(&m, rb); cell_release_rb(&d, rb);
+            return cell_make_null();
+        }
+        int year  = (int)cell_to_double_val(&y);
+        int month = (int)cell_to_double_val(&m);
+        int day   = (int)cell_to_double_val(&d);
+        cell_release_rb(&y, rb); cell_release_rb(&m, rb); cell_release_rb(&d, rb);
+        /* compute days since 2000-01-01 using pure arithmetic (no mktime/timezone) */
+        /* Use the Julian Day Number approach */
+        int a = (14 - month) / 12;
+        int yr = year + 4800 - a;
+        int mo = month + 12 * a - 3;
+        int jdn = day + (153 * mo + 2) / 5 + 365 * yr + yr / 4 - yr / 100 + yr / 400 - 32045;
+        /* JDN of 2000-01-01 = 2451545 */
+        int32_t days = (int32_t)(jdn - 2451545);
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_DATE;
+        r.value.as_date = days;
+        return r;
+    }
+
+    case FUNC_TRUNC: {
+        if (nargs < 1) return cell_make_null();
+        struct cell v = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&v)) return cell_make_null();
+        double dv = cell_to_double_val(&v);
+        cell_release_rb(&v, rb);
+        int scale = 0;
+        if (nargs >= 2) {
+            struct cell sc = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+            if (!cell_is_null(&sc)) scale = (int)cell_to_double_val(&sc);
+            cell_release_rb(&sc, rb);
+        }
+        double factor = pow(10.0, (double)scale);
+        double result = (dv >= 0) ? floor(dv * factor) / factor : ceil(dv * factor) / factor;
+        return cell_make_float(result);
+    }
+
+    case FUNC_TO_DATE: {
+        if (nargs < 2) return cell_make_null();
+        struct cell sv0 = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell sv1 = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&sv0) || cell_is_null(&sv1)) {
+            cell_release_rb(&sv0, rb); cell_release_rb(&sv1, rb);
+            return cell_make_null();
+        }
+        const char *str = sv0.value.as_text ? sv0.value.as_text : "";
+        /* parse YYYY-MM-DD from the string regardless of format arg */
+        int year = 0, month = 0, day = 0;
+        sscanf(str, "%d-%d-%d", &year, &month, &day);
+        cell_release_rb(&sv0, rb); cell_release_rb(&sv1, rb);
+        int a2 = (14 - month) / 12;
+        int yr2 = year + 4800 - a2;
+        int mo2 = month + 12 * a2 - 3;
+        int jdn2 = day + (153 * mo2 + 2) / 5 + 365 * yr2 + yr2 / 4 - yr2 / 100 + yr2 / 400 - 32045;
+        struct cell r2 = {0};
+        r2.type = COLUMN_TYPE_DATE;
+        r2.value.as_date = (int32_t)(jdn2 - 2451545);
+        return r2;
+    }
+
+    case FUNC_TO_TIMESTAMP: {
+        if (nargs < 2) return cell_make_null();
+        struct cell sv0 = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell sv1 = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&sv0) || cell_is_null(&sv1)) {
+            cell_release_rb(&sv0, rb); cell_release_rb(&sv1, rb);
+            return cell_make_null();
+        }
+        const char *str = sv0.value.as_text ? sv0.value.as_text : "";
+        int year = 0, month = 0, day = 0, hour = 0, min = 0, sec = 0;
+        sscanf(str, "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &min, &sec);
+        cell_release_rb(&sv0, rb); cell_release_rb(&sv1, rb);
+        int a3 = (14 - month) / 12;
+        int yr3 = year + 4800 - a3;
+        int mo3 = month + 12 * a3 - 3;
+        int jdn3 = day + (153 * mo3 + 2) / 5 + 365 * yr3 + yr3 / 4 - yr3 / 100 + yr3 / 400 - 32045;
+        int64_t days3 = (int64_t)(jdn3 - 2451545);
+        int64_t usec3 = days3 * 86400000000LL + (int64_t)hour * 3600000000LL + (int64_t)min * 60000000LL + (int64_t)sec * 1000000LL;
+        struct cell r3 = {0};
+        r3.type = COLUMN_TYPE_TIMESTAMP;
+        r3.value.as_timestamp = usec3;
+        return r3;
+    }
+
+    case FUNC_TRANSLATE: {
+        if (nargs < 3) return cell_make_null();
+        struct cell sv0 = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell sv1 = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        struct cell sv2 = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
+        if (cell_is_null(&sv0) || cell_is_null(&sv1) || cell_is_null(&sv2)) {
+            cell_release_rb(&sv0, rb); cell_release_rb(&sv1, rb); cell_release_rb(&sv2, rb);
+            return cell_make_null();
+        }
+        const char *src  = sv0.value.as_text ? sv0.value.as_text : "";
+        const char *from = sv1.value.as_text ? sv1.value.as_text : "";
+        const char *to   = sv2.value.as_text ? sv2.value.as_text : "";
+        size_t srclen = strlen(src);
+        char *out = malloc(srclen + 1);
+        size_t oi = 0;
+        for (size_t i = 0; i < srclen; i++) {
+            const char *p = strchr(from, src[i]);
+            if (p) {
+                size_t idx = (size_t)(p - from);
+                if (idx < strlen(to)) out[oi++] = to[idx];
+                /* else: character is deleted */
+            } else {
+                out[oi++] = src[i];
+            }
+        }
+        out[oi] = '\0';
+        cell_release_rb(&sv0, rb); cell_release_rb(&sv1, rb); cell_release_rb(&sv2, rb);
+        struct cell r4 = {0};
+        r4.type = COLUMN_TYPE_TEXT;
+        r4.value.as_text = rb ? bump_strdup(rb, out) : out;
+        if (rb) free(out);
+        return r4;
+    }
+
+    case FUNC_QUOTE_IDENT: {
+        if (nargs < 1) return cell_make_null();
+        struct cell s = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        if (cell_is_null(&s)) return cell_make_null();
+        const char *str = s.value.as_text ? s.value.as_text : "";
+        /* Check if identifier needs quoting: contains non-alnum/underscore or is uppercase */
+        int needs_quote = 0;
+        for (const char *p = str; *p; p++) {
+            if (!(*p >= 'a' && *p <= 'z') && !(*p >= '0' && *p <= '9') && *p != '_') {
+                needs_quote = 1; break;
+            }
+        }
+        char *out;
+        if (needs_quote) {
+            size_t len = strlen(str);
+            if (rb) {
+                char *tmp = bump_alloc(rb, len + 3);
+                tmp[0] = '"';
+                memcpy(tmp + 1, str, len);
+                tmp[len + 1] = '"';
+                tmp[len + 2] = '\0';
+                out = tmp;
+            } else {
+                out = malloc(len + 3);
+                out[0] = '"';
+                memcpy(out + 1, str, len);
+                out[len + 1] = '"';
+                out[len + 2] = '\0';
+            }
+        } else {
+            out = rb ? bump_strdup(rb, str) : strdup(str);
+        }
+        cell_release_rb(&s, rb);
+        struct cell r = {0};
+        r.type = COLUMN_TYPE_TEXT;
+        r.value.as_text = out;
+        return r;
+    }
+
+    case FUNC_STRPOS: {
+        if (nargs < 2) return cell_make_null();
+        struct cell haystack = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell needle   = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&haystack) || cell_is_null(&needle)) {
+            cell_release_rb(&haystack, rb); cell_release_rb(&needle, rb);
+            return cell_make_null();
+        }
+        const char *hs = haystack.value.as_text ? haystack.value.as_text : "";
+        const char *nd = needle.value.as_text   ? needle.value.as_text   : "";
+        const char *found = strstr(hs, nd);
+        int pos = found ? (int)(found - hs) + 1 : 0;
+        cell_release_rb(&haystack, rb); cell_release_rb(&needle, rb);
+        return cell_make_int(pos);
+    }
+
+    case FUNC_REGEXP_REPLACE: {
+        if (nargs < 3) return cell_make_null();
+        struct cell src  = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell pat  = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        struct cell repl = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb);
+        if (cell_is_null(&src) || cell_is_null(&pat) || cell_is_null(&repl)) {
+            cell_release_rb(&src, rb); cell_release_rb(&pat, rb); cell_release_rb(&repl, rb);
+            return cell_make_null();
+        }
+        const char *s = src.value.as_text  ? src.value.as_text  : "";
+        const char *p = pat.value.as_text  ? pat.value.as_text  : "";
+        const char *r = repl.value.as_text ? repl.value.as_text : "";
+        /* Simple literal string replacement (no regex engine) */
+        char *result = NULL;
+        size_t plen = strlen(p), rlen = strlen(r), slen = strlen(s);
+        if (plen == 0) {
+            result = strdup(s);
+        } else {
+            size_t cap = slen + rlen + 1;
+            result = malloc(cap);
+            size_t out_len = 0;
+            const char *cur = s;
+            while (*cur) {
+                const char *found2 = strstr(cur, p);
+                if (!found2) {
+                    size_t tail = strlen(cur);
+                    while (out_len + tail + 1 > cap) { cap *= 2; result = realloc(result, cap); }
+                    memcpy(result + out_len, cur, tail);
+                    out_len += tail;
+                    break;
+                }
+                size_t pre = (size_t)(found2 - cur);
+                while (out_len + pre + rlen + 1 > cap) { cap *= 2; result = realloc(result, cap); }
+                memcpy(result + out_len, cur, pre); out_len += pre;
+                memcpy(result + out_len, r, rlen); out_len += rlen;
+                cur = found2 + plen;
+            }
+            result[out_len] = '\0';
+        }
+        cell_release_rb(&src, rb); cell_release_rb(&pat, rb); cell_release_rb(&repl, rb);
+        struct cell rc = {0};
+        rc.type = COLUMN_TYPE_TEXT;
+        rc.value.as_text = rb ? bump_strdup(rb, result) : result;
+        if (rb) free(result);
+        return rc;
+    }
+
+    case FUNC_SETVAL: {
+        /* SETVAL(seq, val) — set sequence value, return val */
+        if (nargs < 2) return cell_make_null();
+        struct cell val = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        return val;
+    }
+
+    case FUNC_AGG_BOOL_AND:
+    case FUNC_AGG_BOOL_OR: {
+        if (!t) break;
+        if (t->rows.count == 0 && row && t->columns.count > 0) {
+            const char *agg_name = (fn == FUNC_AGG_BOOL_AND) ? "bool_and" : "bool_or";
+            for (size_t ci = 0; ci < t->columns.count; ci++) {
+                if (t->columns.items[ci].name &&
+                    strcasecmp(t->columns.items[ci].name, agg_name) == 0 &&
+                    ci < row->cells.count)
+                    return cell_deep_copy_rb(&row->cells.items[ci], rb);
+            }
+        }
+        int result_bool = (fn == FUNC_AGG_BOOL_AND) ? 1 : 0;
+        int has_val = 0;
+        for (size_t i = 0; i < t->rows.count; i++) {
+            struct cell v = (nargs > 0)
+                ? eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, &t->rows.items[i], db, NULL)
+                : cell_make_null();
+            if (cell_is_null(&v)) continue;
+            has_val = 1;
+            int bv = (v.type == COLUMN_TYPE_BOOLEAN) ? v.value.as_bool : (cell_to_double_val(&v) != 0.0);
+            if (fn == FUNC_AGG_BOOL_AND) { if (!bv) { result_bool = 0; break; } }
+            else                         { if (bv)  { result_bool = 1; break; } }
+        }
+        if (!has_val) return cell_make_null();
+        return cell_make_bool(result_bool);
+    }
+
+    case FUNC_AGG_STDDEV:
+    case FUNC_AGG_VARIANCE: {
+        if (!t) break;
+        double sum2 = 0, sum_sq = 0;
+        size_t n = 0;
+        for (size_t i = 0; i < t->rows.count; i++) {
+            struct cell v = (nargs > 0)
+                ? eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, &t->rows.items[i], db, NULL)
+                : cell_make_null();
+            if (cell_is_null(&v)) continue;
+            double dv = cell_to_double_val(&v);
+            sum2 += dv; sum_sq += dv * dv; n++;
+        }
+        if (n < 2) return cell_make_null();
+        double variance = (sum_sq - sum2 * sum2 / (double)n) / (double)(n - 1);
+        return cell_make_float(fn == FUNC_AGG_VARIANCE ? variance : sqrt(variance));
+    }
+
     case FUNC_AGG_SUM:
     case FUNC_AGG_COUNT:
     case FUNC_AGG_AVG:
     case FUNC_AGG_MIN:
     case FUNC_AGG_MAX: {
         if (!t) break;
+        /* HAVING context: if the table has no rows but has a named aggregate column,
+         * look up the pre-computed value from the current row by column name. */
+        if (t->rows.count == 0 && row && t->columns.count > 0) {
+            const char *agg_name = NULL;
+            if (fn == FUNC_AGG_SUM)   agg_name = "sum";
+            else if (fn == FUNC_AGG_COUNT) agg_name = "count";
+            else if (fn == FUNC_AGG_AVG)   agg_name = "avg";
+            else if (fn == FUNC_AGG_MIN)   agg_name = "min";
+            else if (fn == FUNC_AGG_MAX)   agg_name = "max";
+            if (agg_name) {
+                for (size_t ci = 0; ci < t->columns.count; ci++) {
+                    if (t->columns.items[ci].name &&
+                        strcasecmp(t->columns.items[ci].name, agg_name) == 0 &&
+                        ci < row->cells.count) {
+                        return cell_deep_copy_rb(&row->cells.items[ci], rb);
+                    }
+                }
+            }
+        }
         double sum = 0;
         size_t nonnull = 0;
         struct cell min_c = {0}, max_c = {0};
@@ -2978,17 +3661,36 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
         struct cell r = {0};
         r.type = target;
         switch (target) {
-        case COLUMN_TYPE_SMALLINT: r.value.as_smallint = (int16_t)v; break;
+        case COLUMN_TYPE_SMALLINT:
+            if (v < -32768.0 || v > 32767.0) {
+                arena_set_error(arena, "22003", "smallint out of range");
+                return cell_make_null();
+            }
+            r.value.as_smallint = (int16_t)v;
+            break;
         case COLUMN_TYPE_INT:      r.value.as_int = (int)v; break;
         case COLUMN_TYPE_BIGINT:   r.value.as_bigint = (long long)v; break;
         case COLUMN_TYPE_FLOAT:    r.value.as_float = v; break;
         case COLUMN_TYPE_NUMERIC: {
-            if (e->cast.scale >= 0) {
+            int prec = e->cast.precision;
+            int scale = e->cast.scale;
+            if (scale >= 0) {
                 double factor = 1.0;
-                for (int s = 0; s < e->cast.scale; s++) factor *= 10.0;
+                for (int s = 0; s < scale; s++) factor *= 10.0;
                 v = round(v * factor) / factor;
             }
+            /* check precision overflow: total digits must fit in precision */
+            if (prec > 0 && scale >= 0) {
+                int int_digits = prec - scale;
+                double max_val = 1.0;
+                for (int d = 0; d < int_digits; d++) max_val *= 10.0;
+                if (fabs(v) >= max_val) {
+                    arena_set_error(arena, "22003", "numeric field overflow");
+                    return cell_make_null();
+                }
+            }
             r.value.as_float = v;
+            if (scale > 0) r.numeric_scale = (int8_t)scale;
             break;
         }
         case COLUMN_TYPE_BOOLEAN:
@@ -3303,6 +4005,7 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         struct cell operand = eval_expr(e->unary.operand, arena, t, row, db, rb);
         if (cell_is_null(&operand)) return operand;
         switch (e->unary.op) {
+        case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT: break;
         case OP_NEG:
             switch (operand.type) {
             case COLUMN_TYPE_SMALLINT: operand.value.as_smallint = -operand.value.as_smallint; break;
@@ -3352,6 +4055,8 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         case OP_AND:
         case OP_OR:
         case OP_LIKE:
+        case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+        case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
             break; /* not unary ops */
         }
         return operand;
@@ -3434,6 +4139,20 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         return r;
     }
 
+    case EXPR_IS_DISTINCT: {
+        struct cell lv = eval_expr(e->is_distinct.left,  arena, t, row, db, rb);
+        struct cell rv = eval_expr(e->is_distinct.right, arena, t, row, db, rb);
+        int lnull = cell_is_null(&lv);
+        int rnull = cell_is_null(&rv);
+        int not_distinct; /* IS NOT DISTINCT FROM */
+        if (lnull && rnull)       not_distinct = 1;
+        else if (lnull || rnull)  not_distinct = 0;
+        else                      not_distinct = (cell_compare(&lv, &rv) == 0);
+        cell_release_rb(&lv, rb);
+        cell_release_rb(&rv, rb);
+        return cell_make_bool(e->is_distinct.negate ? not_distinct : !not_distinct);
+    }
+
     case EXPR_BETWEEN: {
         struct cell val = eval_expr(e->between.operand, arena, t, row, db, rb);
         struct cell low = eval_expr(e->between.low, arena, t, row, db, rb);
@@ -3442,9 +4161,20 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             cell_release_rb(&val, rb); cell_release_rb(&low, rb); cell_release_rb(&high, rb);
             return cell_make_null();
         }
-        int cmp_low = cell_compare(&val, &low);
-        int cmp_high = cell_compare(&val, &high);
-        int in_range = (cmp_low >= 0 && cmp_high <= 0);
+        int in_range;
+        if (e->between.symmetric) {
+            /* SYMMETRIC: try both orderings */
+            int cmp_lo1 = cell_compare(&val, &low);
+            int cmp_hi1 = cell_compare(&val, &high);
+            int cmp_lo2 = cell_compare(&val, &high);
+            int cmp_hi2 = cell_compare(&val, &low);
+            in_range = (cmp_lo1 >= 0 && cmp_hi1 <= 0) ||
+                       (cmp_lo2 >= 0 && cmp_hi2 <= 0);
+        } else {
+            int cmp_low = cell_compare(&val, &low);
+            int cmp_high = cell_compare(&val, &high);
+            in_range = (cmp_low >= 0 && cmp_high <= 0);
+        }
         cell_release_rb(&val, rb); cell_release_rb(&low, rb); cell_release_rb(&high, rb);
         return cell_make_bool(e->between.negate ? !in_range : in_range);
     }
@@ -3477,7 +4207,39 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
         }
         char *vs = cell_to_text_rb(&val, rb);
         char *ps = cell_to_text_rb(&pat, rb);
-        int match = like_match(ps ? ps : "", vs ? vs : "", e->like.case_insensitive);
+        int match;
+        if (e->like.similar_to) {
+            /* SIMILAR TO: convert SQL pattern to POSIX regex anchored at both ends.
+             * SQL SIMILAR TO uses % and _ as wildcards, plus regex alternation |. */
+            const char *sp = ps ? ps : "";
+            char regpat[4096];
+            size_t ri = 0;
+            regpat[ri++] = '^';
+            for (const char *p = sp; *p && ri < sizeof(regpat) - 4; p++) {
+                if (*p == '%') { regpat[ri++] = '.'; regpat[ri++] = '*'; }
+                else if (*p == '_') { regpat[ri++] = '.'; }
+                else if (*p == '.' || *p == '*' || *p == '+' || *p == '?' ||
+                         *p == '{' || *p == '}' || *p == '[' || *p == ']' ||
+                         *p == '(' || *p == ')' || *p == '^' || *p == '$' ||
+                         *p == '\\') {
+                    /* pass through regex metacharacters as-is for SIMILAR TO */
+                    regpat[ri++] = *p;
+                } else {
+                    regpat[ri++] = *p;
+                }
+            }
+            regpat[ri++] = '$';
+            regpat[ri] = '\0';
+            regex_t re;
+            int rflags = REG_EXTENDED | (e->like.case_insensitive ? REG_ICASE : 0);
+            match = (regcomp(&re, regpat, rflags) == 0 &&
+                     regexec(&re, vs ? vs : "", 0, NULL, 0) == 0);
+            regfree(&re);
+        } else {
+            match = like_match_esc(ps ? ps : "", vs ? vs : "",
+                                   e->like.case_insensitive,
+                                   e->like.escape_char ? e->like.escape_char : '\\');
+        }
         if (!rb) { free(vs); free(ps); }
         cell_release_rb(&val, rb); cell_release_rb(&pat, rb);
         return cell_make_bool(e->like.negate ? !match : match);
@@ -3804,6 +4566,10 @@ static struct cell agg_build_result_cell(const struct agg_expr *ae, size_t a,
     case AGG_COUNT:
     case AGG_STRING_AGG:
     case AGG_ARRAY_AGG:
+    case AGG_BOOL_AND:
+    case AGG_BOOL_OR:
+    case AGG_STDDEV:
+    case AGG_VARIANCE:
         break;
     }
     return c;
@@ -4191,44 +4957,106 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                 }
                 break;
             }
+            case AGG_BOOL_AND:
+            case AGG_BOOL_OR: {
+                c.type = COLUMN_TYPE_BOOLEAN;
+                if (nonnull_count[a] == 0) { c.is_null = 1; break; }
+                int result_b = (ae->func == AGG_BOOL_AND) ? 1 : 0;
+                for (size_t i = 0; i < t->rows.count; i++) {
+                    if (s->where.has_where) {
+                        if (s->where.where_cond != IDX_NONE) {
+                            if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL)) continue;
+                        } else if (where_col >= 0) {
+                            if (!cell_equal(&t->rows.items[i].cells.items[where_col], &s->where.where_value)) continue;
+                        }
+                    }
+                    struct cell ev; struct cell *cv;
+                    if (agg_col[a] == -2) { ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL); cv = &ev; }
+                    else if (agg_col[a] >= 0) { cv = &t->rows.items[i].cells.items[agg_col[a]]; }
+                    else continue;
+                    if (cv->is_null) continue;
+                    int bv = (cv->type == COLUMN_TYPE_BOOLEAN) ? cv->value.as_bool : (cell_to_double_val(cv) != 0.0);
+                    if (ae->func == AGG_BOOL_AND) { if (!bv) { result_b = 0; break; } }
+                    else                          { if (bv)  { result_b = 1; break; } }
+                }
+                c.value.as_bool = result_b;
+                break;
+            }
+            case AGG_STDDEV:
+            case AGG_VARIANCE: {
+                c.type = COLUMN_TYPE_FLOAT;
+                if (nonnull_count[a] < 2) { c.is_null = 1; break; }
+                double s2 = 0, sq = 0; size_t n2 = 0;
+                for (size_t i = 0; i < t->rows.count; i++) {
+                    if (s->where.has_where) {
+                        if (s->where.where_cond != IDX_NONE) {
+                            if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL)) continue;
+                        } else if (where_col >= 0) {
+                            if (!cell_equal(&t->rows.items[i].cells.items[where_col], &s->where.where_value)) continue;
+                        }
+                    }
+                    struct cell ev2; struct cell *cv2;
+                    if (agg_col[a] == -2) { ev2 = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL); cv2 = &ev2; }
+                    else if (agg_col[a] >= 0) { cv2 = &t->rows.items[i].cells.items[agg_col[a]]; }
+                    else continue;
+                    if (cv2->is_null) continue;
+                    double dv2 = cell_to_double_val(cv2);
+                    s2 += dv2; sq += dv2 * dv2; n2++;
+                }
+                if (n2 < 2) { c.is_null = 1; break; }
+                double var2 = (sq - s2*s2/(double)n2) / (double)(n2-1);
+                c.value.as_float = (ae->func == AGG_VARIANCE) ? var2 : sqrt(var2);
+                break;
+            }
             case AGG_NONE:
                 break;
         }
         da_push(&dst.cells, c);
     }
     /* HAVING filter (without GROUP BY): evaluate condition against result row */
-    if (s->has_having && s->having_cond != IDX_NONE) {
-        struct table having_t = {0};
-        da_init(&having_t.columns);
-        da_init(&having_t.rows);
-        da_init(&having_t.indexes);
-        for (uint32_t a = 0; a < naggs; a++) {
-            struct agg_expr *ae_h = &arena->aggregates.items[s->aggregates_start + a];
-            char agg_name[256];
-            const char *fn = "?";
-            switch (ae_h->func) {
-                case AGG_COUNT: fn = "count"; break;
-                case AGG_SUM:   fn = "sum"; break;
-                case AGG_AVG:   fn = "avg"; break;
-                case AGG_MIN:   fn = "min"; break;
-                case AGG_MAX:   fn = "max"; break;
-                case AGG_STRING_AGG: fn = "string_agg"; break;
-                case AGG_ARRAY_AGG:  fn = "array_agg"; break;
-                case AGG_NONE: fn = "none"; break;
+    if (s->has_having) {
+        int passes = 1;
+        if (s->having_expr != IDX_NONE) {
+            struct cell hv = eval_expr(s->having_expr, arena, NULL, &dst, NULL, NULL);
+            passes = !cell_is_null(&hv) && hv.value.as_bool;
+            cell_release_rb(&hv, NULL);
+        } else if (s->having_cond != IDX_NONE) {
+            struct table having_t = {0};
+            da_init(&having_t.columns);
+            da_init(&having_t.rows);
+            da_init(&having_t.indexes);
+            for (uint32_t a = 0; a < naggs; a++) {
+                struct agg_expr *ae_h = &arena->aggregates.items[s->aggregates_start + a];
+                char agg_name[256];
+                const char *fn = "?";
+                switch (ae_h->func) {
+                    case AGG_COUNT: fn = "count"; break;
+                    case AGG_SUM:   fn = "sum"; break;
+                    case AGG_AVG:   fn = "avg"; break;
+                    case AGG_MIN:   fn = "min"; break;
+                    case AGG_MAX:   fn = "max"; break;
+                    case AGG_STRING_AGG: fn = "string_agg"; break;
+                    case AGG_ARRAY_AGG:  fn = "array_agg"; break;
+                    case AGG_BOOL_AND:   fn = "bool_and"; break;
+                    case AGG_BOOL_OR:    fn = "bool_or"; break;
+                    case AGG_STDDEV:     fn = "stddev"; break;
+                    case AGG_VARIANCE:   fn = "variance"; break;
+                    case AGG_NONE: fn = "none"; break;
+                }
+                if (sv_eq_cstr(ae_h->column, "*"))
+                    snprintf(agg_name, sizeof(agg_name), "%s", fn);
+                else
+                    snprintf(agg_name, sizeof(agg_name), "%s", fn);
+                struct column col_h = { .name = strdup(agg_name),
+                                        .type = dst.cells.items[a].type,
+                                        .enum_type_name = NULL };
+                da_push(&having_t.columns, col_h);
             }
-            if (sv_eq_cstr(ae_h->column, "*"))
-                snprintf(agg_name, sizeof(agg_name), "%s", fn);
-            else
-                snprintf(agg_name, sizeof(agg_name), "%s", fn);
-            struct column col_h = { .name = strdup(agg_name),
-                                    .type = dst.cells.items[a].type,
-                                    .enum_type_name = NULL };
-            da_push(&having_t.columns, col_h);
+            passes = eval_condition(s->having_cond, arena, &dst, &having_t, NULL);
+            for (size_t i = 0; i < having_t.columns.count; i++)
+                column_free(&having_t.columns.items[i]);
+            da_free(&having_t.columns);
         }
-        int passes = eval_condition(s->having_cond, arena, &dst, &having_t, NULL);
-        for (size_t i = 0; i < having_t.columns.count; i++)
-            column_free(&having_t.columns.items[i]);
-        da_free(&having_t.columns);
         if (!passes) {
             da_free(&dst.cells);
             return 0;
@@ -4361,10 +5189,76 @@ static double cell_to_double(const struct cell *c)
     return 0.0;
 }
 
+/* Forward declaration for parse_over_clause (defined in parser.c via query_parse_into) */
+extern int query_parse_into(const char *sql, struct query *out, struct query_arena *arena);
+
 static int query_window(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
 {
     size_t nrows = t->rows.count;
     size_t nexprs = s->select_exprs_count;
+
+    /* resolve named window references: OVER w → look up WINDOW w AS (...) definition */
+    if (s->win_defs_count > 0) {
+        for (size_t e = 0; e < nexprs; e++) {
+            struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
+            if ((se->kind == SEL_WINDOW || se->kind == SEL_EXPR_WIN) &&
+                se->win.named_window.len > 0) {
+                /* find matching window definition */
+                for (uint32_t d = 0; d < s->win_defs_count; d++) {
+                    sv wname = arena->svs.items[s->win_defs_start + d * 2];
+                    sv wdef  = arena->svs.items[s->win_defs_start + d * 2 + 1];
+                    if (sv_eq_ignorecase(wname, se->win.named_window)) {
+                        /* parse the window definition text as OVER (...) content */
+                        /* build a fake SQL: "SELECT 1 OVER (" + def + ")" and parse */
+                        char fake_sql[4096];
+                        snprintf(fake_sql, sizeof(fake_sql),
+                                 "SELECT ROW_NUMBER() OVER (%.*s) FROM t",
+                                 (int)wdef.len, wdef.data);
+                        struct query tmp_q;
+                        memset(&tmp_q, 0, sizeof(tmp_q));
+                        query_arena_init(&tmp_q.arena);
+                        if (query_parse_into(fake_sql, &tmp_q, &tmp_q.arena) == 0 &&
+                            tmp_q.select.select_exprs_count > 0) {
+                            struct select_expr *tmp_se = &tmp_q.arena.select_exprs.items[
+                                tmp_q.select.select_exprs_start];
+                            struct win_expr *tw = &tmp_se->win;
+                            /* copy all ORDER BY svs into main arena bump (so they survive arena_destroy) */
+                            uint32_t new_oc_start = (uint32_t)arena->svs.count;
+                            for (uint32_t oi = 0; oi < tw->order_cols_count * 2; oi++) {
+                                sv osv = tmp_q.arena.svs.items[tw->order_cols_start + oi];
+                                const char *cp = bump_strndup(&arena->bump, osv.data, osv.len);
+                                arena_push_sv(arena, sv_from(cp, osv.len));
+                            }
+                            /* copy partition_col sv data into bump */
+                            const char *pc_copy = bump_strndup(&arena->bump, tw->partition_col.data, tw->partition_col.len);
+                            /* preserve func/arg/filter from original se->win */
+                            enum win_func saved_func = se->win.func;
+                            sv saved_arg = se->win.arg_column;
+                            int saved_filter = se->win.has_filter;
+                            uint32_t saved_filter_idx = se->win.filter_expr_idx;
+                            /* overwrite with parsed window definition */
+                            se->win = *tw;
+                            se->win.func = saved_func;
+                            se->win.arg_column = saved_arg;
+                            se->win.has_filter = saved_filter;
+                            se->win.filter_expr_idx = saved_filter_idx;
+                            se->win.named_window = sv_from(NULL, 0); /* clear to avoid re-resolution */
+                            /* fix up sv pointers to use bump-copied data */
+                            se->win.partition_col = sv_from(pc_copy, tw->partition_col.len);
+                            if (tw->order_cols_count > 0) {
+                                se->win.order_cols_start = new_oc_start;
+                                se->win.order_descs_start = new_oc_start;
+                                se->win.order_col = arena->svs.items[new_oc_start];
+                                se->win.order_desc = (arena->svs.items[new_oc_start + 1].data[0] == '1') ? 1 : 0;
+                            }
+                        }
+                        query_arena_destroy(&tmp_q.arena);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     /* resolve column indices for plain columns and window args — single allocation */
     int *_win_buf = bump_calloc(&arena->scratch, 4 * nexprs + 1, sizeof(int));
@@ -4408,6 +5302,7 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                 }
             }
             if (se->win.has_order) {
+                /* resolve first ORDER BY column for legacy ord_idx */
                 ord_idx[e] = table_find_column_sv(t, se->win.order_col);
                 if (ord_idx[e] < 0) {
                     arena_set_error(arena, "42703", "order column '%.*s' not found", (int)se->win.order_col.len, se->win.order_col.data);
@@ -4468,6 +5363,11 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
             if (ord_idx[e] >= 0 && global_ord < 0) {
                 global_ord = ord_idx[e];
                 global_ord_desc = arena->select_exprs.items[s->select_exprs_start + e].win.order_desc;
+                /* if multi-column ORDER BY, add remaining columns to sort */
+                struct select_expr *se2 = &arena->select_exprs.items[s->select_exprs_start + e];
+                if (se2->win.order_cols_count > 1) {
+                    /* additional columns will be added after global_part in sort_cols below */
+                }
             }
         }
     }
@@ -4482,9 +5382,30 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
         sort_ncols++;
     }
     if (global_ord >= 0) {
-        sort_cols[sort_ncols] = global_ord;
-        sort_descs[sort_ncols] = global_ord_desc;
-        sort_ncols++;
+        /* check for multi-column ORDER BY */
+        int added_ord = 0;
+        for (size_t e = 0; e < nexprs && !added_ord; e++) {
+            struct select_expr *se2 = &arena->select_exprs.items[s->select_exprs_start + e];
+            if ((se2->kind == SEL_WINDOW || se2->kind == SEL_EXPR_WIN) &&
+                se2->win.has_order && se2->win.order_cols_count > 0) {
+                for (uint32_t oi = 0; oi < se2->win.order_cols_count && sort_ncols < 17; oi++) {
+                    sv ocol = arena->svs.items[se2->win.order_cols_start + oi * 2];
+                    sv odesc = arena->svs.items[se2->win.order_cols_start + oi * 2 + 1];
+                    int ci = table_find_column_sv(t, ocol);
+                    if (ci >= 0) {
+                        sort_cols[sort_ncols] = ci;
+                        sort_descs[sort_ncols] = (odesc.data[0] == '1') ? 1 : 0;
+                        sort_ncols++;
+                    }
+                }
+                added_ord = 1;
+            }
+        }
+        if (!added_ord) {
+            sort_cols[sort_ncols] = global_ord;
+            sort_descs[sort_ncols] = global_ord_desc;
+            sort_ncols++;
+        }
     }
     if (sort_ncols > 0) {
         _sort_ctx.table = t;
@@ -4780,17 +5701,32 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                         double running_sum = 0.0;
                         int running_nn = 0;
                         int running_count = 0;
+                        int running_any = 0; /* 1 if any row passed FILTER so far */
                         for (size_t i = ps; i < pe; i++) {
-                            if (arg_idx[e] >= 0) {
-                                struct cell *ac = &t->rows.items[sorted_idx[i]].cells.items[arg_idx[e]];
-                                if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text)) {
-                                    running_sum += cell_to_double(ac);
-                                    running_nn++;
-                                }
+                            /* FILTER (WHERE expr): check if this row passes */
+                            int filter_pass = 1;
+                            if (se->win.has_filter && se->win.filter_expr_idx != IDX_NONE) {
+                                struct cell fc = eval_expr(se->win.filter_expr_idx, arena, t, &t->rows.items[sorted_idx[i]], NULL, rb);
+                                filter_pass = (!fc.is_null && fc.type == COLUMN_TYPE_BOOLEAN && fc.value.as_bool != 0);
+                                cell_release_rb(&fc, rb);
                             }
-                            running_count++;
+                            if (filter_pass) {
+                                if (arg_idx[e] >= 0) {
+                                    struct cell *ac = &t->rows.items[sorted_idx[i]].cells.items[arg_idx[e]];
+                                    if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text)) {
+                                        running_sum += cell_to_double(ac);
+                                        running_nn++;
+                                    }
+                                }
+                                running_count++;
+                                running_any = 1;
+                            }
                             size_t oi = sorted_idx[i];
-                            if (se->win.func == WIN_SUM) {
+                            /* if FILTER is active and no rows have passed yet → NULL */
+                            int emit_null = (se->win.has_filter && !running_any);
+                            if (emit_null) {
+                                win_is_null[oi * nexprs + e] = 1;
+                            } else if (se->win.func == WIN_SUM) {
                                 if (arg_idx[e] >= 0 &&
                                     t->columns.items[arg_idx[e]].type == COLUMN_TYPE_FLOAT) {
                                     win_is_dbl[e] = 1;
@@ -4810,30 +5746,92 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                             }
                         }
                     } else {
-                        /* with frame: compute per-row */
+                        /* with frame: compute per-row.
+                         * Supports ROWS/RANGE/GROUPS frame modes,
+                         * EXCLUDE CURRENT ROW, and FILTER (WHERE ...). */
+                        /* For GROUPS mode: precompute group boundaries within partition.
+                         * A group is a set of consecutive rows with equal ORDER BY key. */
+                        size_t *group_of = NULL; /* group index for each partition row */
+                        size_t ngroups = 0;
+                        if (se->win.frame_mode == FRAME_MODE_GROUPS && ord_idx[e] >= 0) {
+                            group_of = bump_alloc(&arena->scratch, psize * sizeof(size_t));
+                            size_t g = 0;
+                            group_of[0] = 0;
+                            for (size_t i = 1; i < psize; i++) {
+                                struct cell *ca = &t->rows.items[sorted_idx[ps + i - 1]].cells.items[ord_idx[e]];
+                                struct cell *cb = &t->rows.items[sorted_idx[ps + i]].cells.items[ord_idx[e]];
+                                if (!cell_equal_nullsafe(ca, cb)) g++;
+                                group_of[i] = g;
+                            }
+                            ngroups = (psize > 0) ? group_of[psize - 1] + 1 : 0;
+                        }
+
                         for (size_t i = ps; i < pe; i++) {
                             size_t my_pos = i - ps;
                             size_t fs = 0, fe = psize;
-                            switch (se->win.frame_start) {
-                                case FRAME_UNBOUNDED_PRECEDING: fs = 0; break;
-                                case FRAME_CURRENT_ROW: fs = my_pos; break;
-                                case FRAME_N_PRECEDING: fs = (my_pos >= (size_t)se->win.frame_start_n) ? my_pos - (size_t)se->win.frame_start_n : 0; break;
-                                case FRAME_N_FOLLOWING: fs = my_pos + (size_t)se->win.frame_start_n; break;
-                                case FRAME_UNBOUNDED_FOLLOWING: fs = psize; break;
+
+                            if (se->win.frame_mode == FRAME_MODE_GROUPS && group_of) {
+                                /* GROUPS: frame bounds are in group counts */
+                                size_t my_group = group_of[my_pos];
+                                size_t gs = 0, ge = ngroups;
+                                switch (se->win.frame_start) {
+                                    case FRAME_UNBOUNDED_PRECEDING: gs = 0; break;
+                                    case FRAME_CURRENT_ROW: gs = my_group; break;
+                                    case FRAME_N_PRECEDING: gs = (my_group >= (size_t)se->win.frame_start_n) ? my_group - (size_t)se->win.frame_start_n : 0; break;
+                                    case FRAME_N_FOLLOWING: gs = my_group + (size_t)se->win.frame_start_n; break;
+                                    case FRAME_UNBOUNDED_FOLLOWING: gs = ngroups; break;
+                                }
+                                switch (se->win.frame_end) {
+                                    case FRAME_UNBOUNDED_FOLLOWING: ge = ngroups; break;
+                                    case FRAME_CURRENT_ROW: ge = my_group + 1; break;
+                                    case FRAME_N_FOLLOWING: ge = my_group + (size_t)se->win.frame_end_n + 1; if (ge > ngroups) ge = ngroups; break;
+                                    case FRAME_N_PRECEDING: ge = (my_group >= (size_t)se->win.frame_end_n) ? my_group - (size_t)se->win.frame_end_n + 1 : 0; break;
+                                    case FRAME_UNBOUNDED_PRECEDING: ge = 0; break;
+                                }
+                                /* convert group bounds to row bounds */
+                                fs = psize; fe = 0;
+                                for (size_t k = 0; k < psize; k++) {
+                                    if (group_of[k] >= gs && group_of[k] < ge) {
+                                        if (k < fs) fs = k;
+                                        if (k + 1 > fe) fe = k + 1;
+                                    }
+                                }
+                                if (fs > psize) fs = psize;
+                            } else {
+                                /* ROWS or RANGE mode */
+                                switch (se->win.frame_start) {
+                                    case FRAME_UNBOUNDED_PRECEDING: fs = 0; break;
+                                    case FRAME_CURRENT_ROW: fs = my_pos; break;
+                                    case FRAME_N_PRECEDING: fs = (my_pos >= (size_t)se->win.frame_start_n) ? my_pos - (size_t)se->win.frame_start_n : 0; break;
+                                    case FRAME_N_FOLLOWING: fs = my_pos + (size_t)se->win.frame_start_n; break;
+                                    case FRAME_UNBOUNDED_FOLLOWING: fs = psize; break;
+                                }
+                                switch (se->win.frame_end) {
+                                    case FRAME_UNBOUNDED_FOLLOWING: fe = psize; break;
+                                    case FRAME_CURRENT_ROW: fe = my_pos + 1; break;
+                                    case FRAME_N_FOLLOWING: fe = my_pos + (size_t)se->win.frame_end_n + 1; if (fe > psize) fe = psize; break;
+                                    case FRAME_N_PRECEDING: fe = (my_pos >= (size_t)se->win.frame_end_n) ? my_pos - (size_t)se->win.frame_end_n + 1 : 0; break;
+                                    case FRAME_UNBOUNDED_PRECEDING: fe = 0; break;
+                                }
+                                if (fs > psize) fs = psize;
                             }
-                            switch (se->win.frame_end) {
-                                case FRAME_UNBOUNDED_FOLLOWING: fe = psize; break;
-                                case FRAME_CURRENT_ROW: fe = my_pos + 1; break;
-                                case FRAME_N_FOLLOWING: fe = my_pos + (size_t)se->win.frame_end_n + 1; if (fe > psize) fe = psize; break;
-                                case FRAME_N_PRECEDING: fe = (my_pos >= (size_t)se->win.frame_end_n) ? my_pos - (size_t)se->win.frame_end_n + 1 : 0; break;
-                                case FRAME_UNBOUNDED_PRECEDING: fe = 0; break;
-                            }
-                            if (fs > psize) fs = psize;
+
                             double frame_sum = 0.0;
                             int frame_nn = 0;
                             int frame_count = 0;
                             for (size_t fi = fs; fi < fe; fi++) {
+                                /* EXCLUDE CURRENT ROW: skip the current row (fi is partition-relative position) */
+                                if (se->win.frame_exclude == FRAME_EXCLUDE_CURRENT_ROW &&
+                                    fi == my_pos) continue;
+                                (void)0;
                                 size_t j = sorted_idx[ps + fi];
+                                /* FILTER (WHERE expr): skip rows that don't match */
+                                if (se->win.has_filter && se->win.filter_expr_idx != IDX_NONE) {
+                                    struct cell fc = eval_expr(se->win.filter_expr_idx, arena, t, &t->rows.items[j], NULL, rb);
+                                    int passes = (!fc.is_null && fc.type == COLUMN_TYPE_BOOLEAN && fc.value.as_bool != 0);
+                                    cell_release_rb(&fc, rb);
+                                    if (!passes) continue;
+                                }
                                 frame_count++;
                                 if (arg_idx[e] >= 0) {
                                     struct cell *ac = &t->rows.items[j].cells.items[arg_idx[e]];
@@ -5146,6 +6144,10 @@ static int grp_find_result_col(struct table *t, int *grp_cols, size_t ngrp,
             case AGG_MAX:        agg_name = "max";        break;
             case AGG_STRING_AGG: agg_name = "string_agg"; break;
             case AGG_ARRAY_AGG:  agg_name = "array_agg";  break;
+            case AGG_BOOL_AND:   agg_name = "bool_and";   break;
+            case AGG_BOOL_OR:    agg_name = "bool_or";    break;
+            case AGG_STDDEV:     agg_name = "stddev";     break;
+            case AGG_VARIANCE:   agg_name = "variance";   break;
             case AGG_NONE: break;
         }
         if (sv_eq_cstr(name, agg_name))
@@ -5154,7 +6156,7 @@ static int grp_find_result_col(struct table *t, int *grp_cols, size_t ngrp,
     return -1;
 }
 
-int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
+int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb, struct database *db)
 {
     /* resolve GROUP BY column indices (grp_cols[k] = -2 means expression-based) */
     size_t ngrp = s->group_by_count;
@@ -5186,11 +6188,17 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                             if (e->type == EXPR_COLUMN_REF) {
                                 grp_cols[k] = table_find_column_sv(t, e->column_ref.column);
                                 if (grp_cols[k] >= 0) break;
+                            } else {
+                                /* alias refers to a complex expression (e.g. CASE WHEN) — use as expr group key */
+                                grp_cols[k] = -2;
+                                grp_expr[k] = sc->expr_idx;
+                                break;
                             }
                         }
                     }
                     /* fallback: scan raw s->columns text for "colname AS alias" */
-                    if (grp_cols[k] < 0 && s->columns.len > 0) {
+                    if (grp_cols[k] == -2) { /* already resolved to expression */ }
+                    else if (grp_cols[k] < 0 && s->columns.len > 0) {
                         const char *p = s->columns.data;
                         const char *end = s->columns.data + s->columns.len;
                         while (p < end) {
@@ -5231,7 +6239,9 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                             if (*p == ',') p++;
                         }
                     }
-                    if (grp_cols[k] < 0) {
+                    if (grp_cols[k] < -1) {
+                        /* -2 = expression-based (valid), anything else is not found */
+                    } else if (grp_cols[k] < 0) {
                         arena_set_error(arena, "42703", "GROUP BY column '%.*s' not found", (int)gbcol.len, gbcol.data);
                         return -1;
                     }
@@ -5239,9 +6249,29 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             }
         }
     } else {
-        grp_cols[0] = table_find_column_sv(t, s->group_by_col);
+        sv gbcol0 = s->group_by_col;
+        fprintf(stderr, "[QGB-ELSE] group_by_col='%.*s' group_by_count=%u\n", (int)gbcol0.len, gbcol0.data, s->group_by_count);
+        grp_cols[0] = table_find_column_sv(t, gbcol0);
         if (grp_cols[0] < 0) {
-            arena_set_error(arena, "42703", "GROUP BY column '%.*s' not found", (int)s->group_by_col.len, s->group_by_col.data);
+            /* try SELECT alias */
+            for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
+                struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
+                if (sc->alias.len > 0 && sv_eq_ignorecase(sc->alias, gbcol0) && sc->expr_idx != IDX_NONE) {
+                    struct expr *e = &EXPR(arena, sc->expr_idx);
+                    if (e->type == EXPR_COLUMN_REF) {
+                        grp_cols[0] = table_find_column_sv(t, e->column_ref.column);
+                    } else {
+                        grp_cols[0] = -2;
+                        grp_expr[0] = sc->expr_idx;
+                    }
+                    break;
+                }
+            }
+        }
+        if (grp_cols[0] < -1) {
+            /* -2 = expression-based (valid) */
+        } else if (grp_cols[0] < 0) {
+            arena_set_error(arena, "42703", "GROUP BY column '%.*s' not found", (int)gbcol0.len, gbcol0.data);
             return -1;
         }
     }
@@ -5343,7 +6373,7 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
      * Column order must match result row layout (agg_before_cols). */
     struct table having_t = {0};
     int has_having_t = 0;
-    if (s->has_having && s->having_cond != IDX_NONE) {
+    if (s->has_having && (s->having_cond != IDX_NONE || s->having_expr != IDX_NONE)) {
         has_having_t = 1;
         da_init(&having_t.columns);
         da_init(&having_t.rows);
@@ -5372,6 +6402,10 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                 case AGG_MAX:        agg_name = "max";        break;
                 case AGG_STRING_AGG: agg_name = "string_agg"; break;
                 case AGG_ARRAY_AGG:  agg_name = "array_agg";  break;
+                case AGG_BOOL_AND:   agg_name = "bool_and";   break;
+                case AGG_BOOL_OR:    agg_name = "bool_or";    break;
+                case AGG_STDDEV:     agg_name = "stddev";     break;
+                case AGG_VARIANCE:   agg_name = "variance";   break;
                 case AGG_NONE: break;
             }
             int ac_idx = gagg_cols[a];
@@ -5635,6 +6669,45 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                     }
                     break;
                 }
+                case AGG_BOOL_AND:
+                case AGG_BOOL_OR: {
+                    c.type = COLUMN_TYPE_BOOLEAN;
+                    if (gnonnull[a] == 0) { c.is_null = 1; break; }
+                    int rb2 = (ae->func == AGG_BOOL_AND) ? 1 : 0;
+                    for (size_t m3 = 0; m3 < matching_count; m3++) {
+                        size_t ri3 = matching[m3];
+                        struct cell ev3; struct cell *cv3;
+                        if (ac_idx == -2) { ev3 = eval_expr(ae->expr_idx, arena, t, &t->rows.items[ri3], NULL, NULL); cv3 = &ev3; }
+                        else if (ac_idx >= 0) { cv3 = &t->rows.items[ri3].cells.items[ac_idx]; }
+                        else continue;
+                        if (cv3->is_null) continue;
+                        int bv3 = (cv3->type == COLUMN_TYPE_BOOLEAN) ? cv3->value.as_bool : (cell_to_double_val(cv3) != 0.0);
+                        if (ae->func == AGG_BOOL_AND) { if (!bv3) { rb2 = 0; break; } }
+                        else                          { if (bv3)  { rb2 = 1; break; } }
+                    }
+                    c.value.as_bool = rb2;
+                    break;
+                }
+                case AGG_STDDEV:
+                case AGG_VARIANCE: {
+                    c.type = COLUMN_TYPE_FLOAT;
+                    if (gnonnull[a] < 2) { c.is_null = 1; break; }
+                    double s3 = 0, sq3 = 0; size_t n3 = 0;
+                    for (size_t m4 = 0; m4 < matching_count; m4++) {
+                        size_t ri4 = matching[m4];
+                        struct cell ev4; struct cell *cv4;
+                        if (ac_idx == -2) { ev4 = eval_expr(ae->expr_idx, arena, t, &t->rows.items[ri4], NULL, NULL); cv4 = &ev4; }
+                        else if (ac_idx >= 0) { cv4 = &t->rows.items[ri4].cells.items[ac_idx]; }
+                        else continue;
+                        if (cv4->is_null) continue;
+                        double dv4 = cell_to_double_val(cv4);
+                        s3 += dv4; sq3 += dv4*dv4; n3++;
+                    }
+                    if (n3 < 2) { c.is_null = 1; break; }
+                    double var3 = (sq3 - s3*s3/(double)n3) / (double)(n3-1);
+                    c.value.as_float = (ae->func == AGG_VARIANCE) ? var3 : sqrt(var3);
+                    break;
+                }
                 case AGG_NONE:
                     break;
             }
@@ -5662,15 +6735,24 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
          * Only enter this path when a parsed column has a complex expression
          * (CASE WHEN, BINARY_OP, etc.) — simple column refs and direct aggregate
          * calls are already represented in the raw group-key + aggregate row. */
+        /* When has_expr_aggs=1 but parsed_columns_count=0 (parser took the fast-path
+         * and didn't build an expression tree for COALESCE(SUM(...),...)), run
+         * query_aggregate on this group's rows and prepend the group key columns. */
         int need_expr_rebuild = 0;
         if (s->has_expr_aggs) {
             need_expr_rebuild = 1;
-        } else if (s->parsed_columns_count > 0) {
+        } else if (s->parsed_columns_count > 0 && !s->group_by_rollup && !s->group_by_cube) {
             for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
                 struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
                 if (sc->expr_idx != IDX_NONE) {
                     enum expr_type et = EXPR(arena, sc->expr_idx).type;
-                    if (et == EXPR_CASE_WHEN) {
+                    if (et == EXPR_CASE_WHEN || et == EXPR_LITERAL || et == EXPR_SUBQUERY) {
+                        need_expr_rebuild = 1;
+                        break;
+                    }
+                    /* Also trigger for any expression containing an aggregate
+                     * (e.g. COALESCE(SUM(...),0), SUM(val)+1) */
+                    if (expr_has_agg(arena, sc->expr_idx)) {
                         need_expr_rebuild = 1;
                         break;
                     }
@@ -5730,10 +6812,19 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             dst = (struct row){0};
             da_init(&dst.cells);
             size_t agg_placeholder = 0;
+            struct row *grp_row_ptr = (grp_t.rows.count > 0) ? &grp_t.rows.items[0] : NULL;
             for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
                 struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
                 if (sc->expr_idx != IDX_NONE) {
-                    struct cell c = eval_expr(sc->expr_idx, arena, &grp_t, &grp_t.rows.items[0], NULL, rb);
+                    /* For aggregate-containing expressions (COALESCE(SUM(...),...) or
+                     * CASE WHEN SUM(...)...), pass row=NULL so eval_expr iterates all
+                     * rows in grp_t for the aggregate. For simple column refs, use
+                     * grp_row_ptr to get the actual value. */
+                    int has_agg_inside = expr_has_agg(arena, sc->expr_idx);
+                    struct row *eval_row = has_agg_inside ? NULL : grp_row_ptr;
+                    struct cell c = eval_row
+                        ? eval_expr(sc->expr_idx, arena, &grp_t, eval_row, db, rb)
+                        : eval_expr(sc->expr_idx, arena, &grp_t, NULL, db, rb);
                     da_push(&dst.cells, c);
                 } else if (saved_agg && agg_placeholder < agg_n) {
                     /* Aggregate placeholder — restore saved aggregate value */
@@ -5747,7 +6838,18 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
 
         /* HAVING filter */
         if (has_having_t) {
-            int passes = eval_condition(s->having_cond, arena, &dst, &having_t, NULL);
+            int passes = 1;
+            if (s->having_expr != IDX_NONE) {
+                /* evaluate expression against having_t (named agg columns) */
+                da_push(&having_t.rows, dst);
+                struct cell hv = eval_expr(s->having_expr, arena, &having_t,
+                                           &having_t.rows.items[having_t.rows.count - 1], NULL, rb);
+                having_t.rows.count--; /* pop without freeing */
+                passes = !cell_is_null(&hv) && hv.value.as_bool;
+                cell_release_rb(&hv, rb);
+            } else {
+                passes = eval_condition(s->having_cond, arena, &dst, &having_t, NULL);
+            }
             if (!passes) {
                 if (rb) da_free(&dst.cells);
                 else    row_free(&dst);
@@ -5980,7 +7082,7 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
                     s->group_by_count = tmp_count;
                     s->group_by_col = ASV(arena, tmp_start);
                     struct rows sub = {0};
-                    query_group_by(t, s, arena, &sub, NULL);
+                    query_group_by(t, s, arena, &sub, NULL, db);
                     /* NULL-out columns not in this grouping set */
                     for (size_t r = 0; r < sub.count; r++) {
                         if (!s->agg_before_cols) {
@@ -6030,12 +7132,23 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
             s->group_by_cube = orig_cube;
             return 0;
         }
-        return query_group_by(t, s, arena, result, rb);
+        return query_group_by(t, s, arena, result, rb, db);
     }
 
     /* dispatch to aggregate path if aggregates are present */
     if (s->aggregates_count > 0)
         return query_aggregate(t, s, arena, result, rb);
+
+    /* error: aggregate in ORDER BY without GROUP BY */
+    if (s->has_order_by && s->order_by_count > 0) {
+        for (uint32_t oi = 0; oi < s->order_by_count; oi++) {
+            struct order_by_item *obi = &arena->order_items.items[s->order_by_start + oi];
+            if (obi->expr_idx != IDX_NONE && expr_has_agg(arena, obi->expr_idx)) {
+                arena_set_error(arena, "42803", "aggregate functions are not allowed in ORDER BY");
+                return -1;
+            }
+        }
+    }
 
     /* Inline aggregate expressions (e.g. SUM(val) + 1): evaluate each
      * parsed_column expression once to produce a single result row.
@@ -6623,7 +7736,15 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                 free(idx_row_ids);
                 return -1;
             }
-            if (scp->expr_idx != IDX_NONE) {
+            if (scp->is_default) {
+                int ci2 = col_idxs[sc];
+                if (ci2 >= 0 && t->columns.items[ci2].has_default && t->columns.items[ci2].default_value)
+                    cell_copy(&new_vals[sc], t->columns.items[ci2].default_value);
+                else {
+                    new_vals[sc].type = COLUMN_TYPE_INT;
+                    new_vals[sc].is_null = 1;
+                }
+            } else if (scp->expr_idx != IDX_NONE) {
                 new_vals[sc] = eval_expr(scp->expr_idx, arena, t, &t->rows.items[i], db, NULL);
             } else {
                 cell_copy(&new_vals[sc], &scp->value);
@@ -7338,6 +8459,9 @@ int query_exec(struct table *t, struct query *q, struct rows *result, struct dat
         case QUERY_TYPE_SET:
         case QUERY_TYPE_SHOW:
         case QUERY_TYPE_CREATE_FOREIGN_TABLE:
+        case QUERY_TYPE_ALTER_SEQUENCE:
+        case QUERY_TYPE_SAVEPOINT:
+        case QUERY_TYPE_VALUES:
             return -1;
         case QUERY_TYPE_SELECT:
             return query_select_exec(t, &q->select, &q->arena, result, db, rb);

@@ -19,7 +19,11 @@ enum agg_func {
     AGG_MIN,
     AGG_MAX,
     AGG_STRING_AGG,
-    AGG_ARRAY_AGG
+    AGG_ARRAY_AGG,
+    AGG_BOOL_AND,
+    AGG_BOOL_OR,
+    AGG_STDDEV,
+    AGG_VARIANCE
 };
 
 struct agg_expr {
@@ -60,6 +64,21 @@ enum frame_bound {
     FRAME_UNBOUNDED_FOLLOWING
 };
 
+/* window frame mode */
+enum frame_mode {
+    FRAME_MODE_ROWS,
+    FRAME_MODE_RANGE,
+    FRAME_MODE_GROUPS
+};
+
+/* window frame exclusion */
+enum frame_exclude {
+    FRAME_EXCLUDE_NONE,
+    FRAME_EXCLUDE_CURRENT_ROW,
+    FRAME_EXCLUDE_GROUP,
+    FRAME_EXCLUDE_TIES
+};
+
 struct win_expr {
     enum win_func func;
     sv arg_column;       /* column arg for SUM/COUNT/AVG/LAG/LEAD/etc, empty for ROW_NUMBER/RANK */
@@ -67,16 +86,30 @@ struct win_expr {
     sv partition_col;
     int has_order;
     sv order_col;
-    int order_desc; /* 1 = DESC, 0 = ASC (default) */
+    int order_desc; /* 1 = DESC, 0 = ASC (default) for first column */
+    /* multi-column ORDER BY: stored in arena.svs */
+    uint32_t order_cols_start; /* index into arena.svs */
+    uint32_t order_cols_count; /* 0 = use order_col/order_desc only */
+    /* per-column DESC flags stored in arena.svs as "0"/"1" strings */
+    uint32_t order_descs_start; /* index into arena.svs (parallel to order_cols) */
     int offset;     /* for LAG/LEAD (default 1), NTH_VALUE (n), NTILE (buckets) */
     int has_default;     /* LAG/LEAD: 1 if a default value was provided */
     struct cell default_val; /* LAG/LEAD: default value when out of range */
     /* window frame */
     int has_frame;
+    enum frame_mode  frame_mode;    /* ROWS / RANGE / GROUPS */
     enum frame_bound frame_start;
     enum frame_bound frame_end;
     int frame_start_n; /* for N PRECEDING/FOLLOWING */
     int frame_end_n;
+    double frame_start_val; /* for RANGE N PRECEDING/FOLLOWING with value offset */
+    double frame_end_val;
+    enum frame_exclude frame_exclude; /* EXCLUDE CURRENT ROW / GROUP / TIES */
+    /* FILTER (WHERE expr) */
+    int has_filter;
+    uint32_t filter_expr_idx; /* index into arena.exprs */
+    /* named window reference: OVER w */
+    sv named_window; /* name of WINDOW definition, empty if inline */
 };
 
 enum select_expr_kind {
@@ -118,8 +151,12 @@ enum cmp_op {
     CMP_NOT_EXISTS,
     CMP_REGEX_MATCH,
     CMP_REGEX_NOT_MATCH,
+    CMP_REGEX_ICASE_MATCH,
+    CMP_REGEX_ICASE_NOT_MATCH,
     CMP_IS_NOT_TRUE,
-    CMP_IS_NOT_FALSE
+    CMP_IS_NOT_FALSE,
+    CMP_SIMILAR_TO,
+    CMP_NOT_SIMILAR_TO
 };
 
 enum cond_type {
@@ -156,6 +193,8 @@ struct condition {
     int multi_tuple_width;
     uint32_t multi_values_start;  /* index into arena.cells */
     uint32_t multi_values_count;
+    /* for CMP_LIKE with custom ESCAPE */
+    char escape_char;
     /* for ANY/ALL/SOME: col op ANY(ARRAY[...]) */
     int is_any;
     int is_all;
@@ -168,6 +207,7 @@ int eval_condition(uint32_t cond_idx, struct query_arena *arena,
                    struct database *db);
 
 int like_match(const char *pattern, const char *text, int case_insensitive);
+int like_match_esc(const char *pattern, const char *text, int case_insensitive, char escape_char);
 
 /* ---------------------------------------------------------------------------
  * Expression AST — tagged union for all SQL expressions.
@@ -184,6 +224,7 @@ enum expr_type {
     EXPR_SUBQUERY,      /* (SELECT ...) */
     EXPR_CAST,          /* CAST(expr AS type) or expr::type */
     EXPR_IS_NULL,       /* expr IS NULL / expr IS NOT NULL */
+    EXPR_IS_DISTINCT,   /* expr IS [NOT] DISTINCT FROM expr */
     EXPR_EXISTS,        /* EXISTS(SELECT ...) / NOT EXISTS(SELECT ...) */
     EXPR_BETWEEN,       /* expr BETWEEN low AND high */
     EXPR_IN_LIST,       /* expr IN (val1, val2, ...) */
@@ -208,7 +249,15 @@ enum expr_op {
     OP_AND,             /* AND */
     OP_OR,              /* OR */
     OP_NOT,             /* NOT (unary) */
-    OP_LIKE             /* LIKE */
+    OP_LIKE,            /* LIKE */
+    OP_REGEX_MATCH,     /* ~ */
+    OP_REGEX_NOT_MATCH, /* !~ */
+    OP_REGEX_ICASE_MATCH,     /* ~* */
+    OP_REGEX_ICASE_NOT_MATCH, /* !~* */
+    OP_BITAND,          /* & */
+    OP_BITOR,           /* | */
+    OP_LSHIFT,          /* << */
+    OP_RSHIFT           /* >> */
 };
 
 enum expr_func {
@@ -272,12 +321,37 @@ enum expr_func {
     FUNC_CURRENT_SCHEMA,
     FUNC_CURRENT_SCHEMAS,
     FUNC_PG_IS_IN_RECOVERY,
+    /* additional math functions */
+    FUNC_EXP,
+    FUNC_LN,
+    /* additional string functions */
+    FUNC_ASCII,
+    FUNC_CHR,
+    FUNC_FORMAT,
+    FUNC_MD5,
+    FUNC_QUOTE_IDENT,
+    FUNC_STRPOS,
+    FUNC_REGEXP_REPLACE,
+    /* additional date/time functions */
+    FUNC_CURRENT_TIME,
+    FUNC_LOCALTIME,
+    FUNC_MAKE_DATE,
+    FUNC_TRUNC,
+    FUNC_TO_DATE,
+    FUNC_TO_TIMESTAMP,
+    FUNC_TRANSLATE,
+    /* sequence functions */
+    FUNC_SETVAL,
     /* aggregate functions (used when aggregates appear inside expressions) */
     FUNC_AGG_SUM,
     FUNC_AGG_COUNT,
     FUNC_AGG_AVG,
     FUNC_AGG_MIN,
-    FUNC_AGG_MAX
+    FUNC_AGG_MAX,
+    FUNC_AGG_BOOL_AND,
+    FUNC_AGG_BOOL_OR,
+    FUNC_AGG_STDDEV,
+    FUNC_AGG_VARIANCE
 };
 
 struct case_when_branch {
@@ -336,11 +410,19 @@ struct expr {
             int negate;                /* 1 for IS NOT NULL */
         } is_null;
 
+        /* EXPR_IS_DISTINCT */
+        struct {
+            uint32_t left;             /* index into arena.exprs */
+            uint32_t right;            /* index into arena.exprs */
+            int negate;                /* 1 for IS NOT DISTINCT FROM */
+        } is_distinct;
+
         /* EXPR_CAST */
         struct {
             uint32_t operand;          /* index into arena.exprs */
             enum column_type target;   /* target type */
             int scale;                 /* for NUMERIC(p,s): number of decimal places, -1 = unset */
+            int precision;             /* for NUMERIC(p,s): total digits, 0 = unset */
         } cast;
 
         /* EXPR_EXISTS */
@@ -355,6 +437,7 @@ struct expr {
             uint32_t low;              /* index into arena.exprs */
             uint32_t high;             /* index into arena.exprs */
             int negate;                /* 1 for NOT BETWEEN */
+            int symmetric;             /* 1 for BETWEEN SYMMETRIC */
         } between;
 
         /* EXPR_IN_LIST */
@@ -371,6 +454,8 @@ struct expr {
             uint32_t pattern;          /* index into arena.exprs */
             int negate;                /* 1 for NOT LIKE */
             int case_insensitive;      /* 1 for ILIKE */
+            char escape_char;          /* custom ESCAPE char, 0 = default '\\' */
+            int similar_to;            /* 1 for SIMILAR TO (uses regex-like syntax) */
         } like;
     };
 
@@ -385,6 +470,7 @@ struct set_clause {
     sv column;
     struct cell value;     /* literal value (used when expr_idx is IDX_NONE) */
     uint32_t expr_idx;     /* index into arena.exprs, or IDX_NONE */
+    int is_default;        /* 1 if SET col = DEFAULT */
 };
 
 enum query_type {
@@ -411,14 +497,20 @@ enum query_type {
     QUERY_TYPE_COPY,
     QUERY_TYPE_SET,
     QUERY_TYPE_SHOW,
-    QUERY_TYPE_CREATE_FOREIGN_TABLE
+    QUERY_TYPE_CREATE_FOREIGN_TABLE,
+    QUERY_TYPE_ALTER_SEQUENCE,
+    QUERY_TYPE_SAVEPOINT,
+    QUERY_TYPE_VALUES
 };
 
 struct query_copy {
-    sv table;       /* table name */
-    int is_from;    /* 1 = COPY FROM, 0 = COPY TO */
-    int is_csv;     /* WITH CSV */
-    int has_header; /* WITH CSV HEADER */
+    sv table;           /* table name */
+    int is_from;        /* 1 = COPY FROM, 0 = COPY TO */
+    int is_csv;         /* WITH CSV */
+    int has_header;     /* WITH CSV HEADER */
+    sv col_names[16];   /* optional column list (max 16 columns) */
+    int col_count;      /* 0 = all columns */
+    sv file_path;       /* non-empty = COPY FROM/TO 'file' instead of STDIN/STDOUT */
 };
 
 struct query_create_foreign_table {
@@ -510,6 +602,7 @@ struct query_select {
     /* HAVING */
     int has_having;
     uint32_t having_cond;  /* index into arena.conditions, or IDX_NONE */
+    uint32_t having_expr;  /* index into arena.exprs for full-expression HAVING, or IDX_NONE */
     /* ORDER BY */
     int has_order_by;
     sv order_by_col;
@@ -554,6 +647,9 @@ struct query_select {
     /* literal SELECT (no table): rows in arena.rows */
     uint32_t insert_rows_start; /* index into arena.rows (consecutive) */
     uint32_t insert_rows_count;
+    /* WINDOW clause: named window definitions stored as name/def pairs in arena.svs */
+    uint32_t win_defs_start; /* index into arena.svs (pairs: name, def_text) */
+    uint32_t win_defs_count; /* number of definitions (each takes 2 svs) */
 };
 
 struct query_insert {
@@ -576,6 +672,7 @@ struct query_insert {
     int on_conflict_do_update;
     uint32_t conflict_set_start; /* index into arena.set_clauses (consecutive) */
     uint32_t conflict_set_count;
+    uint32_t conflict_where_cond; /* index into arena.conditions, or IDX_NONE */
     /* DEFAULT VALUES */
     int is_default_values;
     /* CTE support for WITH ... INSERT INTO ... SELECT */
@@ -610,6 +707,10 @@ struct query_delete {
     /* RETURNING */
     int has_returning;
     sv returning_columns;
+    /* TRUNCATE multi-table: extra table names stored in arena.svs */
+    uint32_t truncate_tables_start; /* index into arena.svs */
+    uint32_t truncate_tables_count; /* 0 = use del.table only */
+    int truncate_cascade;           /* 1 = CASCADE */
 };
 
 struct query_create_table {
@@ -618,6 +719,7 @@ struct query_create_table {
     uint32_t columns_count;
     int if_not_exists;
     uint32_t as_select_sql; /* index into arena.strings, or IDX_NONE — CREATE TABLE ... AS SELECT */
+    sv like_table;          /* CREATE TABLE t LIKE src — source table name, or empty */
     /* table-level PRIMARY KEY (col1, col2, ...) */
     uint32_t pk_columns_start; /* index into arena.svs */
     uint32_t pk_columns_count;
@@ -629,6 +731,7 @@ struct query_create_table {
 struct query_drop_table {
     sv table;
     int if_exists;
+    int cascade;
 };
 
 struct query_alter {
@@ -676,6 +779,7 @@ struct query_drop_sequence {
 struct query_create_view {
     sv name;
     uint32_t sql_idx;  /* index into arena.strings — the SELECT body */
+    int or_replace;    /* 1 if CREATE OR REPLACE VIEW */
 };
 
 struct query_drop_view {
@@ -721,6 +825,11 @@ static inline int query_is_read_only(enum query_type qt)
     case QUERY_TYPE_COPY:
     case QUERY_TYPE_CREATE_FOREIGN_TABLE:
         return 0;
+    case QUERY_TYPE_ALTER_SEQUENCE:
+    case QUERY_TYPE_SAVEPOINT:
+        return 1;
+    case QUERY_TYPE_VALUES:
+        return 1;
     }
     __builtin_unreachable();
 }
@@ -753,8 +862,9 @@ struct query {
 
 int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db, struct bump_alloc *rb);
 int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb);
-int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb);
+int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb, struct database *db);
 void emit_returning_row(struct table *t, struct row *src, sv returning_columns, int return_all, struct rows *result, struct bump_alloc *rb);
+int expr_has_agg(struct query_arena *a, uint32_t expr_idx);
 
 /* arena helpers that need complete type definitions — must come after all structs */
 #include "arena_helpers.h"
