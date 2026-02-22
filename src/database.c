@@ -2894,6 +2894,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                             c.value.as_date = cur;
                             da_push(&r.cells, c);
                             da_push(&gt.rows, r);
+                            table_flat_append_row(&gt, &gt.rows.items[gt.rows.count - 1]);
                             cur = date_add_interval(cur, ts_step_iv);
                         }
                     } else {
@@ -2910,6 +2911,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                             c.value.as_timestamp = cur;
                             da_push(&r.cells, c);
                             da_push(&gt.rows, r);
+                            table_flat_append_row(&gt, &gt.rows.items[gt.rows.count - 1]);
                             cur = timestamp_add_interval(cur, ts_step_iv);
                         }
                     }
@@ -2949,6 +2951,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                         }
                         da_push(&r.cells, c);
                         da_push(&gt.rows, r);
+                        table_flat_append_row(&gt, &gt.rows.items[gt.rows.count - 1]);
                     }
                 }
                 da_push(&db->tables, gt);

@@ -325,6 +325,7 @@ static inline void flat_table_free(struct flat_table *ft)
     ft->cap   = 0;
 }
 
+
 /* Grow all column arrays to new_cap. Caller must ensure new_cap > ft->cap.
  * Existing data is preserved; new slots are zero-initialized. */
 static inline void flat_table_grow(struct flat_table *ft, size_t new_cap)

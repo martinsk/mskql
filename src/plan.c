@@ -238,11 +238,11 @@ static void scan_cache_build(struct table *t)
     scan_cache_free(sc);
 
     uint16_t ncols = (uint16_t)t->columns.count;
-    size_t nrows = t->rows.count;
+    size_t nrows = t->flat.nrows;
     sc->generation = t->generation;
 
-    /* Fast path: t->flat is already populated — copy directly without touching row-store */
-    if (t->flat.col_data && t->flat.ncols == ncols && t->flat.nrows == nrows) {
+    /* Fast path: copy directly from t->flat */
+    if (t->flat.col_data && t->flat.ncols == ncols) {
         flat_table_init(&sc->ft, ncols, nrows ? nrows : 1);
         for (uint16_t c = 0; c < ncols; c++)
             sc->ft.col_types[c] = t->flat.col_types[c];
@@ -271,7 +271,7 @@ static int scan_cache_extend(struct table *t)
     uint16_t ncols = (uint16_t)t->columns.count;
     if (ncols != sc->ft.ncols) return 0; /* schema changed — full rebuild */
     size_t old_nrows = sc->ft.nrows;
-    size_t new_nrows = t->rows.count;
+    size_t new_nrows = t->flat.nrows;
     if (new_nrows <= old_nrows) return 0; /* not an append */
 
     for (uint16_t c = 0; c < ncols; c++) {
@@ -550,7 +550,7 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     /* Try scan cache: if table hasn't changed, read from cached flat arrays */
     struct table *t = pn->seq_scan.table;
     struct scan_cache *sc = &t->scan_cache;
-    if (sc->ft.col_data && sc->generation == t->generation && sc->ft.nrows == t->rows.count) {
+    if (sc->ft.col_data && sc->generation == t->generation && sc->ft.nrows == t->flat.nrows) {
         uint16_t n = scan_cache_read(sc, &st->cursor, out,
                                      pn->seq_scan.col_map, pn->seq_scan.ncols);
         if (n == 0) return -1;
@@ -558,7 +558,7 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     }
 
     /* Cache stale — try incremental extend for append-only workloads */
-    if (sc->ft.col_data && sc->ft.nrows < t->rows.count && st->cursor == 0) {
+    if (sc->ft.col_data && sc->ft.nrows < t->flat.nrows && st->cursor == 0) {
         if (scan_cache_extend(t)) {
             uint16_t n = scan_cache_read(&t->scan_cache, &st->cursor, out,
                                          pn->seq_scan.col_map, pn->seq_scan.ncols);
