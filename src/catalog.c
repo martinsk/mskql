@@ -88,6 +88,7 @@ static void push_row(struct table *t, struct cell *cells, size_t ncols)
     for (size_t i = 0; i < ncols; i++)
         da_push(&r.cells, cells[i]);
     da_push(&t->rows, r);
+    table_flat_append_row(t, &t->rows.items[t->rows.count - 1]);
 }
 
 /* Remove existing catalog table by name if it exists */

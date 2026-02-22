@@ -257,4 +257,186 @@ static inline int block_cell_eq(const struct col_block *a, uint16_t ai,
     __builtin_unreachable();
 }
 
+/* ---- Flat table: heap-allocated columnar storage for N rows, M columns ----
+ *
+ * Used as the unified representation for:
+ *   - scan_cache  (table.h) — persistent columnar mirror of the row-store
+ *   - join_cache  (table.h) — hash join build side cached per inner table
+ *   - hash_join_state build side (plan.h) — scratch build side during query
+ *   - set_op_state, top_n_state, window_state (plan.h) — scratch columnar buffers
+ *
+ * Ownership: the module that calls flat_table_init() owns the arrays and must
+ * call flat_table_free() when done. Cross-module ownership is not permitted.
+ *
+ * str_lens[c] is non-NULL only for TEXT columns; stores strlen of each entry. */
+struct flat_table {
+    uint16_t          ncols;
+    size_t            nrows;    /* number of valid rows */
+    size_t            cap;      /* allocated capacity (rows) */
+    void            **col_data;      /* [ncols] heap-allocated typed arrays */
+    uint8_t         **col_nulls;     /* [ncols] heap-allocated null bitmaps */
+    enum column_type *col_types;     /* [ncols] */
+    uint32_t        **col_str_lens;  /* [ncols] non-NULL only for TEXT cols */
+};
+
+/* Allocate the per-column pointer arrays for a flat_table.
+ * Call this first, then set ft->col_types[c] for each column,
+ * then call flat_table_alloc_cols() to allocate the typed data arrays. */
+static inline void flat_table_init(struct flat_table *ft, uint16_t ncols, size_t cap)
+{
+    ft->ncols = ncols;
+    ft->nrows = 0;
+    ft->cap   = cap;
+    ft->col_data     = (void **)calloc(ncols, sizeof(void *));
+    ft->col_nulls    = (uint8_t **)calloc(ncols, sizeof(uint8_t *));
+    ft->col_types    = (enum column_type *)calloc(ncols, sizeof(enum column_type));
+    ft->col_str_lens = (uint32_t **)calloc(ncols, sizeof(uint32_t *));
+}
+
+/* Allocate typed data arrays after col_types[] have been set.
+ * Must be called exactly once after flat_table_init + setting col_types. */
+static inline void flat_table_alloc_cols(struct flat_table *ft)
+{
+    for (uint16_t c = 0; c < ft->ncols; c++) {
+        ft->col_data[c]  = calloc(ft->cap ? ft->cap : 1, col_type_elem_size(ft->col_types[c]));
+        ft->col_nulls[c] = (uint8_t *)calloc(ft->cap ? ft->cap : 1, 1);
+    }
+}
+
+/* Free all heap arrays owned by ft. Does not free ft itself. */
+static inline void flat_table_free(struct flat_table *ft)
+{
+    if (!ft->col_data) return;
+    for (uint16_t c = 0; c < ft->ncols; c++) {
+        free(ft->col_data[c]);
+        free(ft->col_nulls[c]);
+        if (ft->col_str_lens) free(ft->col_str_lens[c]);
+    }
+    free(ft->col_data);
+    free(ft->col_nulls);
+    free(ft->col_types);
+    free(ft->col_str_lens);
+    ft->col_data = NULL;
+    ft->col_nulls = NULL;
+    ft->col_types = NULL;
+    ft->col_str_lens = NULL;
+    ft->ncols = 0;
+    ft->nrows = 0;
+    ft->cap   = 0;
+}
+
+/* Grow all column arrays to new_cap. Caller must ensure new_cap > ft->cap.
+ * Existing data is preserved; new slots are zero-initialized. */
+static inline void flat_table_grow(struct flat_table *ft, size_t new_cap)
+{
+    for (uint16_t c = 0; c < ft->ncols; c++) {
+        size_t esz = col_type_elem_size(ft->col_types[c]);
+        void *nd = realloc(ft->col_data[c], new_cap * esz);
+        if (nd) {
+            memset((char *)nd + ft->cap * esz, 0, (new_cap - ft->cap) * esz);
+            ft->col_data[c] = nd;
+        }
+        uint8_t *nn = (uint8_t *)realloc(ft->col_nulls[c], new_cap);
+        if (nn) {
+            memset(nn + ft->cap, 0, new_cap - ft->cap);
+            ft->col_nulls[c] = nn;
+        }
+        if (ft->col_str_lens && ft->col_str_lens[c]) {
+            uint32_t *nl = (uint32_t *)realloc(ft->col_str_lens[c], new_cap * sizeof(uint32_t));
+            if (nl) {
+                memset(nl + ft->cap, 0, (new_cap - ft->cap) * sizeof(uint32_t));
+                ft->col_str_lens[c] = nl;
+            }
+        }
+    }
+    ft->cap = new_cap;
+}
+
+/* Hash a single value in flat_table column c at row r. */
+static inline uint32_t flat_table_hash_cell(const struct flat_table *ft, uint16_t c, size_t r)
+{
+    if (ft->col_nulls[c][r]) return 0;
+    switch (ft->col_types[c]) {
+    case COLUMN_TYPE_SMALLINT:
+        return block_hash_i32((int32_t)((int16_t *)ft->col_data[c])[r]);
+    case COLUMN_TYPE_INT:
+    case COLUMN_TYPE_BOOLEAN:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_ENUM:
+        return block_hash_i32(((int32_t *)ft->col_data[c])[r]);
+    case COLUMN_TYPE_BIGINT:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_TIME:
+        return block_hash_i64(((int64_t *)ft->col_data[c])[r]);
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:
+        return block_hash_f64(((double *)ft->col_data[c])[r]);
+    case COLUMN_TYPE_TEXT: {
+        const char *s = ((const char **)ft->col_data[c])[r];
+        if (ft->col_str_lens && ft->col_str_lens[c])
+            return block_hash_str_n(s, ft->col_str_lens[c][r]);
+        return block_hash_str(s);
+    }
+    case COLUMN_TYPE_UUID: {
+        struct uuid_val u = ((struct uuid_val *)ft->col_data[c])[r];
+        uint64_t uh = uuid_hash(u);
+        return (uint32_t)(uh ^ (uh >> 32));
+    }
+    case COLUMN_TYPE_INTERVAL: {
+        struct interval iv = ((struct interval *)ft->col_data[c])[r];
+        uint32_t h = FNV_OFFSET;
+        uint8_t *p = (uint8_t *)&iv;
+        for (int j = 0; j < (int)sizeof(struct interval); j++) { h ^= p[j]; h *= FNV_PRIME; }
+        return h;
+    }
+    }
+    __builtin_unreachable();
+}
+
+/* Compare two cells in the same flat_table column: returns 1 if equal, 0 if not. */
+static inline int flat_table_eq_cell(const struct flat_table *ft, uint16_t c,
+                                     size_t ra, size_t rb)
+{
+    if (ft->col_nulls[c][ra] || ft->col_nulls[c][rb]) return 0;
+    switch (ft->col_types[c]) {
+    case COLUMN_TYPE_SMALLINT:
+        return ((int16_t *)ft->col_data[c])[ra] == ((int16_t *)ft->col_data[c])[rb];
+    case COLUMN_TYPE_INT:
+    case COLUMN_TYPE_BOOLEAN:
+    case COLUMN_TYPE_DATE:
+    case COLUMN_TYPE_ENUM:
+        return ((int32_t *)ft->col_data[c])[ra] == ((int32_t *)ft->col_data[c])[rb];
+    case COLUMN_TYPE_BIGINT:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ:
+    case COLUMN_TYPE_TIME:
+        return ((int64_t *)ft->col_data[c])[ra] == ((int64_t *)ft->col_data[c])[rb];
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:
+        return ((double *)ft->col_data[c])[ra] == ((double *)ft->col_data[c])[rb];
+    case COLUMN_TYPE_TEXT: {
+        const char *sa = ((const char **)ft->col_data[c])[ra];
+        const char *sb = ((const char **)ft->col_data[c])[rb];
+        if (!sa || !sb) return sa == sb;
+        if (ft->col_str_lens && ft->col_str_lens[c]) {
+            if (ft->col_str_lens[c][ra] != ft->col_str_lens[c][rb]) return 0;
+            return memcmp(sa, sb, ft->col_str_lens[c][ra]) == 0;
+        }
+        return strcmp(sa, sb) == 0;
+    }
+    case COLUMN_TYPE_UUID: {
+        struct uuid_val ua = ((struct uuid_val *)ft->col_data[c])[ra];
+        struct uuid_val ub = ((struct uuid_val *)ft->col_data[c])[rb];
+        return uuid_equal(ua, ub);
+    }
+    case COLUMN_TYPE_INTERVAL: {
+        struct interval ia = ((struct interval *)ft->col_data[c])[ra];
+        struct interval ib = ((struct interval *)ft->col_data[c])[rb];
+        return ia.months == ib.months && ia.days == ib.days && ia.usec == ib.usec;
+    }
+    }
+    __builtin_unreachable();
+}
+
 #endif

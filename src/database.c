@@ -1603,6 +1603,7 @@ static void snapshot_restore(struct database *db, struct db_snapshot *snap)
             *t = snap->saved_tables[i];
             memset(&snap->saved_tables[i], 0, sizeof(struct table));
             snap->saved_valid[i] = 0;
+            table_flat_rebuild_from_rows(t);
         }
     }
     /* Remove tables created during the transaction (not in original snapshot) */
@@ -1629,6 +1630,7 @@ static void snapshot_restore(struct database *db, struct db_snapshot *snap)
             da_push(&db->tables, snap->saved_tables[i]);
             memset(&snap->saved_tables[i], 0, sizeof(struct table));
             snap->saved_valid[i] = 0;
+            table_flat_rebuild_from_rows(&db->tables.items[db->tables.count - 1]);
         }
     }
     /* Restore types */
@@ -1856,8 +1858,10 @@ struct table *materialize_subquery(struct database *db, const char *sql,
         columns_done: (void)0;
     }
     /* move rows — transfer ownership, no cell_copy/strdup needed */
-    for (size_t i = 0; i < sq_rows.count; i++)
+    for (size_t i = 0; i < sq_rows.count; i++) {
         da_push(&ct.rows, sq_rows.data[i]);
+        table_flat_append_row(&ct, &ct.rows.items[ct.rows.count - 1]);
+    }
     free(sq_rows.data);
     query_free(&sq);
     free(gs_rewritten);
@@ -2020,6 +2024,7 @@ static void materialize_ctes(struct database *db, struct query_select *s,
                     for (size_t ri = 0; ri < ct->rows.count; ri++)
                         row_free(&ct->rows.items[ri]);
                     ct->rows.count = 0;
+                    flat_table_free(&ct->flat);
                     ct->generation++;
                     db->total_generation++;
 
@@ -2040,6 +2045,7 @@ static void materialize_ctes(struct database *db, struct query_select *s,
                             da_push(&wr.cells, cp);
                         }
                         da_push(&ct->rows, wr);
+                        table_flat_append_row(ct, &wr);
                     }
                     for (size_t ri = 0; ri < rec_rows.count; ri++)
                         row_free(&rec_rows.data[ri]);
@@ -2051,8 +2057,11 @@ static void materialize_ctes(struct database *db, struct query_select *s,
                     for (size_t ri = 0; ri < ct->rows.count; ri++)
                         row_free(&ct->rows.items[ri]);
                     ct->rows.count = 0;
-                    for (size_t ri = 0; ri < accum.count; ri++)
+                    flat_table_free(&ct->flat);
+                    for (size_t ri = 0; ri < accum.count; ri++) {
                         da_push(&ct->rows, accum.data[ri]);
+                        table_flat_append_row(ct, &accum.data[ri]);
+                    }
                     free(accum.data);
                 } else {
                     // NOTE: if ct is NULL the table was removed during iteration.
@@ -2365,6 +2374,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                         da_push(&nr.cells, cp);
                     }
                     da_push(&t.rows, nr);
+                    table_flat_append_row(&t, &t.rows.items[t.rows.count - 1]);
                 }
                 da_push(&db->tables, t);
                 /* store row count in result for command tag */
@@ -2681,6 +2691,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 for (size_t i = 0; i < t->rows.count; i++)
                     row_free(&t->rows.items[i]);
                 t->rows.count = 0;
+                flat_table_free(&t->flat);
                 t->generation++;
                 db->total_generation++;
                 /* reset SERIAL counters */
@@ -2709,6 +2720,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                         for (size_t ri = 0; ri < ref->rows.count; ri++)
                             row_free(&ref->rows.items[ri]);
                         ref->rows.count = 0;
+                        flat_table_free(&ref->flat);
                         ref->generation++;
                         db->total_generation++;
                         for (size_t ii = 0; ii < ref->indexes.count; ii++)
@@ -3265,6 +3277,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                         }
                     }
                     da_push(&t->rows, r);
+                    table_flat_append_row(t, &r);
                     t->generation++;
                     db->total_generation++;
                 }
@@ -3389,6 +3402,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                                 }
                                 da_free(&merged_t.columns);
                                 da_free(&merged_row.cells);
+                                table_flat_update_row(t, conflict_row, &t->rows.items[conflict_row]);
+                                t->generation++;
+                                db->total_generation++;
                                 /* emit RETURNING row for the updated row */
                                 if (ins->has_returning && result) {
                                     int ret_all = (ins->returning_columns.len == 1 &&
@@ -3552,6 +3568,7 @@ skip_conflict_nothing:
                         for (size_t k = idx; k + 1 < dt->rows.count; k++)
                             dt->rows.items[k] = dt->rows.items[k + 1];
                         dt->rows.count--;
+                        table_flat_delete_row(dt, idx);
                         deleted++;
                         dt->generation++;
                         db->total_generation++;
@@ -3677,7 +3694,12 @@ skip_conflict_nothing:
                             free(dst->value.as_text);
                         *dst = new_vals[sc];
                     }
+                    table_flat_update_row(t, i, &t->rows.items[i]);
                     da_free(&merged_row.cells);
+                }
+                if (updated > 0) {
+                    t->generation++;
+                    db->total_generation++;
                 }
                 /* free merged table descriptor */
                 for (size_t c = 0; c < merged_meta.columns.count; c++)
@@ -3735,6 +3757,10 @@ skip_conflict_nothing:
                         }
                         da_push(&t->rows.items[i].cells, pad_cell);
                     }
+                    /* schema changed — rebuild flat storage from updated row-store */
+                    table_flat_rebuild_from_rows(t);
+                    t->generation++;
+                    db->total_generation++;
                     return 0;
                 }
                 case ALTER_DROP_COLUMN: {
@@ -3765,6 +3791,10 @@ skip_conflict_nothing:
                             r->cells.count--;
                         }
                     }
+                    /* schema changed — rebuild flat storage from updated row-store */
+                    table_flat_rebuild_from_rows(t);
+                    t->generation++;
+                    db->total_generation++;
                     return 0;
                 }
                 case ALTER_RENAME_TABLE: {
@@ -3849,6 +3879,8 @@ skip_conflict_nothing:
                                 c->type = new_type;
                             }
                         }
+                        /* rebuild flat storage with new types/values */
+                        table_flat_rebuild_from_rows(t);
                         t->generation++;
                         db->total_generation++;
                     }

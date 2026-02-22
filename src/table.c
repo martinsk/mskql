@@ -1,4 +1,5 @@
 #include "table.h"
+#include "block.h"
 #include "row.h"
 #include "stringview.h"
 #include <string.h>
@@ -13,6 +14,7 @@ void table_init(struct table *t, const char *name)
     da_init(&t->rows);
     da_init(&t->indexes);
     t->generation = 0;
+    memset(&t->flat, 0, sizeof(t->flat));
     memset(&t->scan_cache, 0, sizeof(t->scan_cache));
     memset(&t->join_cache, 0, sizeof(t->join_cache));
     memset(&t->pq_cache, 0, sizeof(t->pq_cache));
@@ -27,6 +29,7 @@ void table_init_own(struct table *t, char *name)
     da_init(&t->rows);
     da_init(&t->indexes);
     t->generation = 0;
+    memset(&t->flat, 0, sizeof(t->flat));
     memset(&t->scan_cache, 0, sizeof(t->scan_cache));
     memset(&t->join_cache, 0, sizeof(t->join_cache));
     memset(&t->pq_cache, 0, sizeof(t->pq_cache));
@@ -72,6 +75,7 @@ void table_deep_copy(struct table *dst, const struct table *src)
     da_init(&dst->rows);
     da_init(&dst->indexes);
     dst->generation = src->generation;
+    memset(&dst->flat, 0, sizeof(dst->flat));
     memset(&dst->scan_cache, 0, sizeof(dst->scan_cache));
     memset(&dst->join_cache, 0, sizeof(dst->join_cache));
 
@@ -196,6 +200,125 @@ int resolve_alias_to_column(struct table *t, sv columns, sv alias)
     return -1;
 }
 
+void table_flat_init_schema(struct table *t)
+{
+    flat_table_free(&t->flat);
+    uint16_t ncols = (uint16_t)t->columns.count;
+    if (ncols == 0) return;
+    flat_table_init(&t->flat, ncols, 16);
+    for (uint16_t c = 0; c < ncols; c++)
+        t->flat.col_types[c] = t->columns.items[c].type;
+    flat_table_alloc_cols(&t->flat);
+}
+
+void table_flat_append_row(struct table *t, const struct row *row)
+{
+    /* Lazy init: initialize flat storage from schema on first append */
+    if (t->flat.ncols == 0 && t->columns.count > 0)
+        table_flat_init_schema(t);
+    uint16_t ncols = t->flat.ncols;
+    if (ncols == 0) return;
+
+    /* Grow if needed */
+    if (t->flat.nrows >= t->flat.cap) {
+        size_t new_cap = t->flat.cap * 2;
+        if (new_cap < 16) new_cap = 16;
+        flat_table_grow(&t->flat, new_cap);
+    }
+
+    size_t r = t->flat.nrows;
+    for (uint16_t c = 0; c < ncols && c < (uint16_t)row->cells.count; c++) {
+        const struct cell *cell = &row->cells.items[c];
+        enum column_type ct = t->flat.col_types[c];
+        if (cell->is_null) {
+            t->flat.col_nulls[c][r] = 1;
+            continue;
+        }
+        t->flat.col_nulls[c][r] = 0;
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT:  ((int16_t *)t->flat.col_data[c])[r] = cell->value.as_smallint; break;
+        case COLUMN_TYPE_INT:       ((int32_t *)t->flat.col_data[c])[r] = cell->value.as_int; break;
+        case COLUMN_TYPE_BOOLEAN:   ((int32_t *)t->flat.col_data[c])[r] = cell->value.as_bool; break;
+        case COLUMN_TYPE_DATE:      ((int32_t *)t->flat.col_data[c])[r] = cell->value.as_date; break;
+        case COLUMN_TYPE_BIGINT:    ((int64_t *)t->flat.col_data[c])[r] = cell->value.as_bigint; break;
+        case COLUMN_TYPE_TIME:      ((int64_t *)t->flat.col_data[c])[r] = cell->value.as_time; break;
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: ((int64_t *)t->flat.col_data[c])[r] = cell->value.as_timestamp; break;
+        case COLUMN_TYPE_FLOAT:     ((double *)t->flat.col_data[c])[r] = cell->value.as_float; break;
+        case COLUMN_TYPE_NUMERIC:   ((double *)t->flat.col_data[c])[r] = cell->value.as_numeric; break;
+        case COLUMN_TYPE_INTERVAL:  ((struct interval *)t->flat.col_data[c])[r] = cell->value.as_interval; break;
+        case COLUMN_TYPE_TEXT:
+            ((const char **)t->flat.col_data[c])[r] = cell->value.as_text;
+            if (t->flat.col_str_lens && t->flat.col_str_lens[c] && cell->value.as_text)
+                t->flat.col_str_lens[c][r] = (uint32_t)strlen(cell->value.as_text);
+            break;
+        case COLUMN_TYPE_ENUM:      ((int32_t *)t->flat.col_data[c])[r] = cell->value.as_enum; break;
+        case COLUMN_TYPE_UUID:      ((struct uuid_val *)t->flat.col_data[c])[r] = cell->value.as_uuid; break;
+        }
+    }
+    t->flat.nrows++;
+}
+
+void table_flat_update_row(struct table *t, size_t row_idx, const struct row *row)
+{
+    if (row_idx >= t->flat.nrows || t->flat.ncols == 0) return;
+    uint16_t ncols = t->flat.ncols;
+    for (uint16_t c = 0; c < ncols && c < (uint16_t)row->cells.count; c++) {
+        const struct cell *cell = &row->cells.items[c];
+        enum column_type ct = t->flat.col_types[c];
+        if (cell->is_null) { t->flat.col_nulls[c][row_idx] = 1; continue; }
+        t->flat.col_nulls[c][row_idx] = 0;
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT:  ((int16_t *)t->flat.col_data[c])[row_idx] = cell->value.as_smallint; break;
+        case COLUMN_TYPE_INT:       ((int32_t *)t->flat.col_data[c])[row_idx] = cell->value.as_int; break;
+        case COLUMN_TYPE_BOOLEAN:   ((int32_t *)t->flat.col_data[c])[row_idx] = cell->value.as_bool; break;
+        case COLUMN_TYPE_DATE:      ((int32_t *)t->flat.col_data[c])[row_idx] = cell->value.as_date; break;
+        case COLUMN_TYPE_BIGINT:    ((int64_t *)t->flat.col_data[c])[row_idx] = cell->value.as_bigint; break;
+        case COLUMN_TYPE_TIME:      ((int64_t *)t->flat.col_data[c])[row_idx] = cell->value.as_time; break;
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: ((int64_t *)t->flat.col_data[c])[row_idx] = cell->value.as_timestamp; break;
+        case COLUMN_TYPE_FLOAT:     ((double *)t->flat.col_data[c])[row_idx] = cell->value.as_float; break;
+        case COLUMN_TYPE_NUMERIC:   ((double *)t->flat.col_data[c])[row_idx] = cell->value.as_numeric; break;
+        case COLUMN_TYPE_INTERVAL:  ((struct interval *)t->flat.col_data[c])[row_idx] = cell->value.as_interval; break;
+        case COLUMN_TYPE_TEXT:
+            ((const char **)t->flat.col_data[c])[row_idx] = cell->value.as_text;
+            if (t->flat.col_str_lens && t->flat.col_str_lens[c] && cell->value.as_text)
+                t->flat.col_str_lens[c][row_idx] = (uint32_t)strlen(cell->value.as_text);
+            break;
+        case COLUMN_TYPE_ENUM:      ((int32_t *)t->flat.col_data[c])[row_idx] = cell->value.as_enum; break;
+        case COLUMN_TYPE_UUID:      ((struct uuid_val *)t->flat.col_data[c])[row_idx] = cell->value.as_uuid; break;
+        }
+    }
+}
+
+void table_flat_delete_row(struct table *t, size_t row_idx)
+{
+    if (row_idx >= t->flat.nrows || t->flat.ncols == 0) return;
+    uint16_t ncols = t->flat.ncols;
+    size_t tail = t->flat.nrows - row_idx - 1;
+    if (tail > 0) {
+        for (uint16_t c = 0; c < ncols; c++) {
+            size_t esz = col_type_elem_size(t->flat.col_types[c]);
+            uint8_t *data = (uint8_t *)t->flat.col_data[c];
+            memmove(data + row_idx * esz, data + (row_idx + 1) * esz, tail * esz);
+            memmove(t->flat.col_nulls[c] + row_idx, t->flat.col_nulls[c] + row_idx + 1, tail);
+            if (t->flat.col_str_lens && t->flat.col_str_lens[c])
+                memmove(t->flat.col_str_lens[c] + row_idx, t->flat.col_str_lens[c] + row_idx + 1,
+                        tail * sizeof(uint32_t));
+        }
+    }
+    t->flat.nrows--;
+}
+
+void table_flat_rebuild_from_rows(struct table *t)
+{
+    flat_table_free(&t->flat);
+    if (t->rows.count == 0 || t->columns.count == 0) return;
+    table_flat_init_schema(t);
+    for (size_t r = 0; r < t->rows.count; r++)
+        table_flat_append_row(t, &t->rows.items[r]);
+}
+
 void table_free(struct table *t)
 {
     free(t->name);
@@ -226,30 +349,15 @@ void table_free(struct table *t)
     }
     da_free(&t->indexes);
 
+    /* free primary flat storage */
+    flat_table_free(&t->flat);
+
     /* free scan cache */
-    if (t->scan_cache.col_data) {
-        for (uint16_t i = 0; i < t->scan_cache.ncols; i++) {
-            free(t->scan_cache.col_data[i]);
-            free(t->scan_cache.col_nulls[i]);
-            if (t->scan_cache.col_str_lens) free(t->scan_cache.col_str_lens[i]);
-        }
-        free(t->scan_cache.col_data);
-        free(t->scan_cache.col_nulls);
-        free(t->scan_cache.col_types);
-        free(t->scan_cache.col_str_lens);
-    }
+    flat_table_free(&t->scan_cache.ft);
 
     /* free join cache */
     if (t->join_cache.valid) {
-        for (uint16_t i = 0; i < t->join_cache.ncols; i++) {
-            free(t->join_cache.col_data[i]);
-            free(t->join_cache.col_nulls[i]);
-            if (t->join_cache.col_str_lens) free(t->join_cache.col_str_lens[i]);
-        }
-        free(t->join_cache.col_data);
-        free(t->join_cache.col_nulls);
-        free(t->join_cache.col_types);
-        free(t->join_cache.col_str_lens);
+        flat_table_free(&t->join_cache.ft);
         free(t->join_cache.hashes);
         free(t->join_cache.nexts);
         free(t->join_cache.buckets);

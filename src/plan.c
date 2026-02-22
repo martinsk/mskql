@@ -228,17 +228,8 @@ static inline void cell_to_flat_at(void *data, size_t i, const struct cell *cell
 
 static void scan_cache_free(struct scan_cache *sc)
 {
-    if (!sc->col_data) return;
-    for (uint16_t i = 0; i < sc->ncols; i++) {
-        free(sc->col_data[i]);
-        free(sc->col_nulls[i]);
-        if (sc->col_str_lens) free(sc->col_str_lens[i]);
-    }
-    free(sc->col_data);
-    free(sc->col_nulls);
-    free(sc->col_types);
-    free(sc->col_str_lens);
-    memset(sc, 0, sizeof(*sc));
+    flat_table_free(&sc->ft);
+    sc->generation = 0;
 }
 
 static void scan_cache_build(struct table *t)
@@ -249,174 +240,24 @@ static void scan_cache_build(struct table *t)
     uint16_t ncols = (uint16_t)t->columns.count;
     size_t nrows = t->rows.count;
     sc->generation = t->generation;
-    sc->ncols = ncols;
-    sc->nrows = nrows;
-    sc->col_data = (void **)calloc(ncols, sizeof(void *));
-    sc->col_nulls = (uint8_t **)calloc(ncols, sizeof(uint8_t *));
-    sc->col_types = (enum column_type *)calloc(ncols, sizeof(enum column_type));
-    sc->col_str_lens = (uint32_t **)calloc(ncols, sizeof(uint32_t *));
 
-    for (uint16_t c = 0; c < ncols; c++) {
-        enum column_type ct = t->columns.items[c].type;
-        /* Detect actual type from first non-null cell */
-        for (size_t r = 0; r < nrows; r++) {
-            struct cell *cell = &t->rows.items[r].cells.items[c];
-            if (!cell->is_null) { ct = cell->type; break; }
-        }
-        sc->col_types[c] = ct;
-
-        size_t elem_sz = col_type_elem_size(ct);
-
-        sc->col_data[c] = calloc(nrows ? nrows : 1, elem_sz);
-        sc->col_nulls[c] = (uint8_t *)calloc(nrows ? nrows : 1, 1);
-
-        /* Fill from row-store */
-        switch (ct) {
-        case COLUMN_TYPE_SMALLINT: {
-            int16_t *dst = (int16_t *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != COLUMN_TYPE_SMALLINT) {
-                    sc->col_nulls[c][r] = 1;
-                } else {
-                    dst[r] = cell->value.as_smallint;
-                }
+    /* Fast path: t->flat is already populated — copy directly without touching row-store */
+    if (t->flat.col_data && t->flat.ncols == ncols && t->flat.nrows == nrows) {
+        flat_table_init(&sc->ft, ncols, nrows ? nrows : 1);
+        for (uint16_t c = 0; c < ncols; c++)
+            sc->ft.col_types[c] = t->flat.col_types[c];
+        flat_table_alloc_cols(&sc->ft);
+        sc->ft.nrows = nrows;
+        for (uint16_t c = 0; c < ncols; c++) {
+            size_t esz = col_type_elem_size(sc->ft.col_types[c]);
+            memcpy(sc->ft.col_data[c], t->flat.col_data[c], nrows * esz);
+            memcpy(sc->ft.col_nulls[c], t->flat.col_nulls[c], nrows);
+            if (sc->ft.col_types[c] == COLUMN_TYPE_TEXT && t->flat.col_str_lens && t->flat.col_str_lens[c]) {
+                sc->ft.col_str_lens[c] = (uint32_t *)calloc(nrows ? nrows : 1, sizeof(uint32_t));
+                memcpy(sc->ft.col_str_lens[c], t->flat.col_str_lens[c], nrows * sizeof(uint32_t));
             }
-            break;
         }
-        case COLUMN_TYPE_INT: {
-            int32_t *dst = (int32_t *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != COLUMN_TYPE_INT) {
-                    sc->col_nulls[c][r] = 1;
-                } else {
-                    dst[r] = cell->value.as_int;
-                }
-            }
-            break;
-        }
-        case COLUMN_TYPE_FLOAT: {
-            double *dst = (double *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != COLUMN_TYPE_FLOAT) {
-                    sc->col_nulls[c][r] = 1;
-                } else {
-                    dst[r] = cell->value.as_float;
-                }
-            }
-            break;
-        }
-        case COLUMN_TYPE_BIGINT: {
-            int64_t *dst = (int64_t *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != COLUMN_TYPE_BIGINT) {
-                    sc->col_nulls[c][r] = 1;
-                } else {
-                    dst[r] = cell->value.as_bigint;
-                }
-            }
-            break;
-        }
-        case COLUMN_TYPE_NUMERIC: {
-            double *dst = (double *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != COLUMN_TYPE_NUMERIC) {
-                    sc->col_nulls[c][r] = 1;
-                } else {
-                    dst[r] = cell->value.as_numeric;
-                }
-            }
-            break;
-        }
-        case COLUMN_TYPE_BOOLEAN: {
-            int32_t *dst = (int32_t *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != COLUMN_TYPE_BOOLEAN) {
-                    sc->col_nulls[c][r] = 1;
-                } else {
-                    dst[r] = cell->value.as_bool;
-                }
-            }
-            break;
-        }
-        case COLUMN_TYPE_DATE: {
-            int32_t *dst = (int32_t *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != ct) { sc->col_nulls[c][r] = 1; }
-                else { dst[r] = cell->value.as_date; }
-            }
-            break;
-        }
-        case COLUMN_TYPE_TIME: {
-            int64_t *dst = (int64_t *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != ct) { sc->col_nulls[c][r] = 1; }
-                else { dst[r] = cell->value.as_time; }
-            }
-            break;
-        }
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ: {
-            int64_t *dst = (int64_t *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || (cell->type != COLUMN_TYPE_TIMESTAMP && cell->type != COLUMN_TYPE_TIMESTAMPTZ)) {
-                    sc->col_nulls[c][r] = 1;
-                } else { dst[r] = cell->value.as_timestamp; }
-            }
-            break;
-        }
-        case COLUMN_TYPE_INTERVAL: {
-            struct interval *dst = (struct interval *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != ct) { sc->col_nulls[c][r] = 1; }
-                else { dst[r] = cell->value.as_interval; }
-            }
-            break;
-        }
-        case COLUMN_TYPE_TEXT: {
-            char **dst = (char **)sc->col_data[c];
-            sc->col_str_lens[c] = (uint32_t *)calloc(nrows ? nrows : 1, sizeof(uint32_t));
-            uint32_t *lens = sc->col_str_lens[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != ct
-                    || !cell->value.as_text) {
-                    sc->col_nulls[c][r] = 1;
-                } else {
-                    dst[r] = cell->value.as_text;
-                    lens[r] = (uint32_t)strlen(cell->value.as_text);
-                }
-            }
-            break;
-        }
-        case COLUMN_TYPE_ENUM: {
-            int32_t *dst = (int32_t *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != ct) { sc->col_nulls[c][r] = 1; }
-                else { dst[r] = cell->value.as_enum; }
-            }
-            break;
-        }
-        case COLUMN_TYPE_UUID: {
-            struct uuid_val *dst = (struct uuid_val *)sc->col_data[c];
-            for (size_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[r].cells.items[c];
-                if (cell->is_null || cell->type != ct) { sc->col_nulls[c][r] = 1; }
-                else { dst[r] = cell->value.as_uuid; }
-            }
-            break;
-        }
-        }
+        return;
     }
 }
 
@@ -426,36 +267,35 @@ static void scan_cache_build(struct table *t)
 static int scan_cache_extend(struct table *t)
 {
     struct scan_cache *sc = &t->scan_cache;
-    if (!sc->col_data) return 0;
+    if (!sc->ft.col_data) return 0;
     uint16_t ncols = (uint16_t)t->columns.count;
-    if (ncols != sc->ncols) return 0; /* schema changed — full rebuild */
-    size_t old_nrows = sc->nrows;
+    if (ncols != sc->ft.ncols) return 0; /* schema changed — full rebuild */
+    size_t old_nrows = sc->ft.nrows;
     size_t new_nrows = t->rows.count;
     if (new_nrows <= old_nrows) return 0; /* not an append */
 
     for (uint16_t c = 0; c < ncols; c++) {
-        enum column_type ct = sc->col_types[c];
+        enum column_type ct = sc->ft.col_types[c];
         size_t elem_sz = col_type_elem_size(ct);
 
-        sc->col_data[c] = realloc(sc->col_data[c], new_nrows * elem_sz);
-        sc->col_nulls[c] = (uint8_t *)realloc(sc->col_nulls[c], new_nrows);
-        memset(sc->col_nulls[c] + old_nrows, 0, new_nrows - old_nrows);
-        if (ct == COLUMN_TYPE_TEXT && sc->col_str_lens && sc->col_str_lens[c])
-            sc->col_str_lens[c] = (uint32_t *)realloc(sc->col_str_lens[c], new_nrows * sizeof(uint32_t));
+        sc->ft.col_data[c] = realloc(sc->ft.col_data[c], new_nrows * elem_sz);
+        sc->ft.col_nulls[c] = (uint8_t *)realloc(sc->ft.col_nulls[c], new_nrows);
+        memset(sc->ft.col_nulls[c] + old_nrows, 0, new_nrows - old_nrows);
+        if (ct == COLUMN_TYPE_TEXT && sc->ft.col_str_lens && sc->ft.col_str_lens[c])
+            sc->ft.col_str_lens[c] = (uint32_t *)realloc(sc->ft.col_str_lens[c], new_nrows * sizeof(uint32_t));
 
-        /* Fill only the new rows */
         for (size_t r = old_nrows; r < new_nrows; r++) {
             struct cell *cell = &t->rows.items[r].cells.items[c];
             if (cell->is_null || cell->type != ct) {
-                sc->col_nulls[c][r] = 1;
+                sc->ft.col_nulls[c][r] = 1;
             } else {
-                cell_to_flat_at(sc->col_data[c], r, cell, ct);
-                if (ct == COLUMN_TYPE_TEXT && sc->col_str_lens && sc->col_str_lens[c] && cell->value.as_text)
-                    sc->col_str_lens[c][r] = (uint32_t)strlen(cell->value.as_text);
+                cell_to_flat_at(sc->ft.col_data[c], r, cell, ct);
+                if (ct == COLUMN_TYPE_TEXT && sc->ft.col_str_lens && sc->ft.col_str_lens[c] && cell->value.as_text)
+                    sc->ft.col_str_lens[c][r] = (uint32_t)strlen(cell->value.as_text);
             }
         }
     }
-    sc->nrows = new_nrows;
+    sc->ft.nrows = new_nrows;
     sc->generation = t->generation;
     return 1;
 }
@@ -465,22 +305,21 @@ static int scan_cache_extend(struct table *t)
 void scan_cache_update_row(struct table *t, size_t row_idx)
 {
     struct scan_cache *sc = &t->scan_cache;
-    if (!sc->col_data || row_idx >= sc->nrows) return;
+    if (!sc->ft.col_data || row_idx >= sc->ft.nrows) return;
 
-    for (uint16_t c = 0; c < sc->ncols; c++) {
+    for (uint16_t c = 0; c < sc->ft.ncols; c++) {
         struct cell *cell = &t->rows.items[row_idx].cells.items[c];
-        enum column_type ct = sc->col_types[c];
+        enum column_type ct = sc->ft.col_types[c];
 
         if (cell->is_null || cell->type != ct) {
-            sc->col_nulls[c][row_idx] = 1;
+            sc->ft.col_nulls[c][row_idx] = 1;
             continue;
         }
-        sc->col_nulls[c][row_idx] = 0;
-        cell_to_flat_at(sc->col_data[c], row_idx, cell, ct);
-        if (ct == COLUMN_TYPE_TEXT && sc->col_str_lens && sc->col_str_lens[c] && cell->value.as_text)
-            sc->col_str_lens[c][row_idx] = (uint32_t)strlen(cell->value.as_text);
+        sc->ft.col_nulls[c][row_idx] = 0;
+        cell_to_flat_at(sc->ft.col_data[c], row_idx, cell, ct);
+        if (ct == COLUMN_TYPE_TEXT && sc->ft.col_str_lens && sc->ft.col_str_lens[c] && cell->value.as_text)
+            sc->ft.col_str_lens[c][row_idx] = (uint32_t)strlen(cell->value.as_text);
     }
-    /* Keep cache generation in sync with table */
     sc->generation = t->generation;
 }
 
@@ -491,7 +330,7 @@ static uint16_t scan_cache_read(struct scan_cache *sc, size_t *cursor,
                                 struct row_block *out, int *col_map, uint16_t ncols)
 {
     size_t start = *cursor;
-    size_t end = sc->nrows;
+    size_t end = sc->ft.nrows;
     if (end - start > BLOCK_CAPACITY)
         end = start + BLOCK_CAPACITY;
 
@@ -503,40 +342,39 @@ static uint16_t scan_cache_read(struct scan_cache *sc, size_t *cursor,
     for (uint16_t c = 0; c < ncols; c++) {
         int tc = col_map[c];
         struct col_block *cb = &out->cols[c];
-        cb->type = sc->col_types[tc];
+        cb->type = sc->ft.col_types[tc];
         cb->count = nrows;
 
-        /* Copy slice from flat cache arrays into col_block */
-        memcpy(cb->nulls, sc->col_nulls[tc] + start, nrows);
+        memcpy(cb->nulls, sc->ft.col_nulls[tc] + start, nrows);
 
-        enum column_type ct = sc->col_types[tc];
+        enum column_type ct = sc->ft.col_types[tc];
         switch (ct) {
         case COLUMN_TYPE_SMALLINT:
-            memcpy(cb->data.i16, (int16_t *)sc->col_data[tc] + start, nrows * sizeof(int16_t)); break;
+            memcpy(cb->data.i16, (int16_t *)sc->ft.col_data[tc] + start, nrows * sizeof(int16_t)); break;
         case COLUMN_TYPE_INT:
         case COLUMN_TYPE_BOOLEAN:
-            memcpy(cb->data.i32, (int32_t *)sc->col_data[tc] + start, nrows * sizeof(int32_t)); break;
+            memcpy(cb->data.i32, (int32_t *)sc->ft.col_data[tc] + start, nrows * sizeof(int32_t)); break;
         case COLUMN_TYPE_BIGINT:
-            memcpy(cb->data.i64, (int64_t *)sc->col_data[tc] + start, nrows * sizeof(int64_t)); break;
+            memcpy(cb->data.i64, (int64_t *)sc->ft.col_data[tc] + start, nrows * sizeof(int64_t)); break;
         case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_NUMERIC:
-            memcpy(cb->data.f64, (double *)sc->col_data[tc] + start, nrows * sizeof(double)); break;
+            memcpy(cb->data.f64, (double *)sc->ft.col_data[tc] + start, nrows * sizeof(double)); break;
         case COLUMN_TYPE_DATE:
-            memcpy(cb->data.i32, (int32_t *)sc->col_data[tc] + start, nrows * sizeof(int32_t)); break;
+            memcpy(cb->data.i32, (int32_t *)sc->ft.col_data[tc] + start, nrows * sizeof(int32_t)); break;
         case COLUMN_TYPE_TIME:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
-            memcpy(cb->data.i64, (int64_t *)sc->col_data[tc] + start, nrows * sizeof(int64_t)); break;
+            memcpy(cb->data.i64, (int64_t *)sc->ft.col_data[tc] + start, nrows * sizeof(int64_t)); break;
         case COLUMN_TYPE_INTERVAL:
-            memcpy(cb->data.iv, (struct interval *)sc->col_data[tc] + start, nrows * sizeof(struct interval)); break;
+            memcpy(cb->data.iv, (struct interval *)sc->ft.col_data[tc] + start, nrows * sizeof(struct interval)); break;
         case COLUMN_TYPE_TEXT:
-            memcpy(cb->data.str, (char **)sc->col_data[tc] + start, nrows * sizeof(char *));
+            memcpy(cb->data.str, (char **)sc->ft.col_data[tc] + start, nrows * sizeof(char *));
             cb->str_lens = NULL;
             break;
         case COLUMN_TYPE_ENUM:
-            memcpy(cb->data.i32, (int32_t *)sc->col_data[tc] + start, nrows * sizeof(int32_t)); break;
+            memcpy(cb->data.i32, (int32_t *)sc->ft.col_data[tc] + start, nrows * sizeof(int32_t)); break;
         case COLUMN_TYPE_UUID:
-            memcpy(cb->data.uuid, (struct uuid_val *)sc->col_data[tc] + start, nrows * sizeof(struct uuid_val)); break;
+            memcpy(cb->data.uuid, (struct uuid_val *)sc->ft.col_data[tc] + start, nrows * sizeof(struct uuid_val)); break;
         }
     }
 
@@ -642,114 +480,6 @@ uint32_t plan_alloc_node(struct query_arena *arena, enum plan_op op)
 
 /* ---- Block utility functions ---- */
 
-/* Decompose row-store rows into columnar col_blocks.
- * Scans up to BLOCK_CAPACITY rows from table starting at *cursor.
- * col_map[i] = which table column to read for output column i.
- * Returns number of rows scanned. */
-uint16_t scan_table_block(struct table *t, size_t *cursor,
-                          struct row_block *out, int *col_map, uint16_t ncols,
-                          struct bump_alloc *scratch)
-{
-    (void)scratch;
-    size_t start = *cursor;
-    size_t end = t->rows.count;
-    if (end - start > BLOCK_CAPACITY)
-        end = start + BLOCK_CAPACITY;
-
-    uint16_t nrows = (uint16_t)(end - start);
-    if (nrows == 0) return 0;
-
-    out->count = nrows;
-
-    for (uint16_t c = 0; c < ncols; c++) {
-        int tc = col_map[c];
-        struct col_block *cb = &out->cols[c];
-        /* Use the first non-null cell's type to determine the col_block type.
-         * This handles ALTER TABLE ALTER COLUMN TYPE where column def and
-         * cell types may diverge. Fall back to column def if all null. */
-        enum column_type col_type = t->columns.items[tc].type;
-        cb->type = col_type;
-        for (uint16_t r = 0; r < nrows; r++) {
-            struct cell *cell = &t->rows.items[start + r].cells.items[tc];
-            if (!cell->is_null) { cb->type = cell->type; col_type = cell->type; break; }
-        }
-        cb->count = nrows;
-
-        /* Fast paths for common column types */
-        switch (col_type) {
-        case COLUMN_TYPE_SMALLINT:
-            for (uint16_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[start + r].cells.items[tc];
-                if (cell->is_null || cell->type != COLUMN_TYPE_SMALLINT) {
-                    cb->nulls[r] = 1;
-                } else {
-                    cb->nulls[r] = 0;
-                    cb->data.i16[r] = cell->value.as_smallint;
-                }
-            }
-            break;
-        case COLUMN_TYPE_INT:
-            for (uint16_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[start + r].cells.items[tc];
-                if (cell->is_null || cell->type != COLUMN_TYPE_INT) {
-                    cb->nulls[r] = 1;
-                } else {
-                    cb->nulls[r] = 0;
-                    cb->data.i32[r] = cell->value.as_int;
-                }
-            }
-            break;
-        case COLUMN_TYPE_FLOAT:
-            for (uint16_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[start + r].cells.items[tc];
-                if (cell->is_null || cell->type != COLUMN_TYPE_FLOAT) {
-                    cb->nulls[r] = 1;
-                } else {
-                    cb->nulls[r] = 0;
-                    cb->data.f64[r] = cell->value.as_float;
-                }
-            }
-            break;
-        case COLUMN_TYPE_BIGINT:
-            for (uint16_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[start + r].cells.items[tc];
-                if (cell->is_null || cell->type != COLUMN_TYPE_BIGINT) {
-                    cb->nulls[r] = 1;
-                } else {
-                    cb->nulls[r] = 0;
-                    cb->data.i64[r] = cell->value.as_bigint;
-                }
-            }
-            break;
-        case COLUMN_TYPE_NUMERIC:
-        case COLUMN_TYPE_BOOLEAN:
-        case COLUMN_TYPE_TEXT:
-        case COLUMN_TYPE_ENUM:
-        case COLUMN_TYPE_DATE:
-        case COLUMN_TYPE_TIME:
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ:
-        case COLUMN_TYPE_INTERVAL:
-        case COLUMN_TYPE_UUID: {
-            for (uint16_t r = 0; r < nrows; r++) {
-                struct cell *cell = &t->rows.items[start + r].cells.items[tc];
-                if (cell->is_null || cell->type != cb->type
-                    || (column_type_is_text(cell->type) && !cell->value.as_text)) {
-                    cb->nulls[r] = 1;
-                    continue;
-                }
-                cb->nulls[r] = 0;
-                cell_to_cb_at(cb, r, cell);
-            }
-            break;
-        }
-        }
-    }
-
-    *cursor = end;
-    return nrows;
-}
-
 /* Convert a row_block back to struct rows for final output.
  * When rb is non-NULL, text is bump-allocated (bulk-freed).
  * Otherwise text is strdup'd (caller owns the result rows). */
@@ -820,7 +550,7 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     /* Try scan cache: if table hasn't changed, read from cached flat arrays */
     struct table *t = pn->seq_scan.table;
     struct scan_cache *sc = &t->scan_cache;
-    if (sc->col_data && sc->generation == t->generation && sc->nrows == t->rows.count) {
+    if (sc->ft.col_data && sc->generation == t->generation && sc->ft.nrows == t->rows.count) {
         uint16_t n = scan_cache_read(sc, &st->cursor, out,
                                      pn->seq_scan.col_map, pn->seq_scan.ncols);
         if (n == 0) return -1;
@@ -828,7 +558,7 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     }
 
     /* Cache stale — try incremental extend for append-only workloads */
-    if (sc->col_data && sc->nrows < t->rows.count && st->cursor == 0) {
+    if (sc->ft.col_data && sc->ft.nrows < t->rows.count && st->cursor == 0) {
         if (scan_cache_extend(t)) {
             uint16_t n = scan_cache_read(&t->scan_cache, &st->cursor, out,
                                          pn->seq_scan.col_map, pn->seq_scan.ncols);
@@ -838,20 +568,16 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     }
 
     /* Cache miss or stale — build cache on first scan, then read from it */
-    if (st->cursor == 0 && t->rows.count > 0) {
+    if (st->cursor == 0) {
         scan_cache_build(t);
-        uint16_t n = scan_cache_read(&t->scan_cache, &st->cursor, out,
-                                     pn->seq_scan.col_map, pn->seq_scan.ncols);
-        if (n == 0) return -1;
-        return 0;
+        if (t->scan_cache.ft.col_data) {
+            uint16_t n = scan_cache_read(&t->scan_cache, &st->cursor, out,
+                                         pn->seq_scan.col_map, pn->seq_scan.ncols);
+            if (n == 0) return -1;
+            return 0;
+        }
     }
-
-    /* Fallback: direct row-store scan (shouldn't normally reach here) */
-    uint16_t n = scan_table_block(t, &st->cursor,
-                                  out, pn->seq_scan.col_map,
-                                  pn->seq_scan.ncols, &ctx->arena->scratch);
-    if (n == 0) return -1;
-    return 0;
+    return -1;
 }
 
 static int index_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -2670,35 +2396,36 @@ static int hash_join_restore_from_cache(struct plan_exec_ctx *ctx,
                                         struct hash_join_state *st,
                                         struct join_cache *jc)
 {
-    st->build_ncols = jc->ncols;
-    st->build_count = jc->nrows;
-    st->build_cap = jc->nrows;
+    uint16_t ncols = jc->ft.ncols;
+    uint32_t nrows = (uint32_t)jc->ft.nrows;
+    st->build_ncols = ncols;
+    st->build_count = nrows;
+    st->build_cap = nrows;
     st->build_cols = (struct flat_col *)bump_calloc(&ctx->arena->scratch,
-                                                    jc->ncols, sizeof(struct flat_col));
-    for (uint16_t c = 0; c < jc->ncols; c++) {
-        st->build_cols[c].type = jc->col_types[c];
-        size_t esz = jc_elem_size(jc->col_types[c]);
-        st->build_cols[c].nulls = (uint8_t *)bump_alloc(&ctx->arena->scratch, jc->nrows);
-        memcpy(st->build_cols[c].nulls, jc->col_nulls[c], jc->nrows);
-        st->build_cols[c].data = bump_alloc(&ctx->arena->scratch, esz * jc->nrows);
-        memcpy(st->build_cols[c].data, jc->col_data[c], esz * jc->nrows);
-        if (jc->col_str_lens && jc->col_str_lens[c]) {
+                                                    ncols, sizeof(struct flat_col));
+    for (uint16_t c = 0; c < ncols; c++) {
+        st->build_cols[c].type = jc->ft.col_types[c];
+        size_t esz = jc_elem_size(jc->ft.col_types[c]);
+        st->build_cols[c].nulls = (uint8_t *)bump_alloc(&ctx->arena->scratch, nrows);
+        memcpy(st->build_cols[c].nulls, jc->ft.col_nulls[c], nrows);
+        st->build_cols[c].data = bump_alloc(&ctx->arena->scratch, esz * nrows);
+        memcpy(st->build_cols[c].data, jc->ft.col_data[c], esz * nrows);
+        if (jc->ft.col_str_lens && jc->ft.col_str_lens[c]) {
             st->build_cols[c].str_lens = (uint32_t *)bump_alloc(&ctx->arena->scratch,
-                                                                jc->nrows * sizeof(uint32_t));
-            memcpy(st->build_cols[c].str_lens, jc->col_str_lens[c],
-                   jc->nrows * sizeof(uint32_t));
+                                                                nrows * sizeof(uint32_t));
+            memcpy(st->build_cols[c].str_lens, jc->ft.col_str_lens[c],
+                   nrows * sizeof(uint32_t));
         } else {
             st->build_cols[c].str_lens = NULL;
         }
     }
 
-    /* Restore hash table */
     st->ht.nbuckets = jc->nbuckets;
-    st->ht.count = jc->nrows;
-    st->ht.hashes = (uint32_t *)bump_alloc(&ctx->arena->scratch, jc->nrows * sizeof(uint32_t));
-    memcpy(st->ht.hashes, jc->hashes, jc->nrows * sizeof(uint32_t));
-    st->ht.nexts = (uint32_t *)bump_alloc(&ctx->arena->scratch, jc->nrows * sizeof(uint32_t));
-    memcpy(st->ht.nexts, jc->nexts, jc->nrows * sizeof(uint32_t));
+    st->ht.count = nrows;
+    st->ht.hashes = (uint32_t *)bump_alloc(&ctx->arena->scratch, nrows * sizeof(uint32_t));
+    memcpy(st->ht.hashes, jc->hashes, nrows * sizeof(uint32_t));
+    st->ht.nexts = (uint32_t *)bump_alloc(&ctx->arena->scratch, nrows * sizeof(uint32_t));
+    memcpy(st->ht.nexts, jc->nexts, nrows * sizeof(uint32_t));
     st->ht.buckets = (uint32_t *)bump_alloc(&ctx->arena->scratch, jc->nbuckets * sizeof(uint32_t));
     memcpy(st->ht.buckets, jc->buckets, jc->nbuckets * sizeof(uint32_t));
 
@@ -2713,49 +2440,40 @@ static void hash_join_save_to_cache(struct hash_join_state *st,
 {
     /* Free old cache if present */
     if (jc->valid) {
-        for (uint16_t i = 0; i < jc->ncols; i++) {
-            free(jc->col_data[i]);
-            free(jc->col_nulls[i]);
-            if (jc->col_str_lens) free(jc->col_str_lens[i]);
-        }
-        free(jc->col_data);
-        free(jc->col_nulls);
-        free(jc->col_types);
-        free(jc->col_str_lens);
+        flat_table_free(&jc->ft);
         free(jc->hashes);
         free(jc->nexts);
         free(jc->buckets);
     }
 
+    uint16_t ncols = st->build_ncols;
+    uint32_t nrows = st->build_count;
+
     jc->generation = generation;
     jc->key_col = key_col;
-    jc->ncols = st->build_ncols;
-    jc->nrows = st->build_count;
     jc->nbuckets = st->ht.nbuckets;
 
-    jc->col_data = (void **)malloc(st->build_ncols * sizeof(void *));
-    jc->col_nulls = (uint8_t **)malloc(st->build_ncols * sizeof(uint8_t *));
-    jc->col_types = (enum column_type *)malloc(st->build_ncols * sizeof(enum column_type));
-    jc->col_str_lens = (uint32_t **)calloc(st->build_ncols, sizeof(uint32_t *));
+    flat_table_init(&jc->ft, ncols, nrows ? nrows : 1);
+    for (uint16_t c = 0; c < ncols; c++)
+        jc->ft.col_types[c] = st->build_cols[c].type;
+    flat_table_alloc_cols(&jc->ft);
+    jc->ft.nrows = nrows;
 
-    for (uint16_t c = 0; c < st->build_ncols; c++) {
-        jc->col_types[c] = st->build_cols[c].type;
+    for (uint16_t c = 0; c < ncols; c++) {
         size_t esz = jc_elem_size(st->build_cols[c].type);
-        jc->col_data[c] = malloc(esz * st->build_count);
-        memcpy(jc->col_data[c], st->build_cols[c].data, esz * st->build_count);
-        jc->col_nulls[c] = (uint8_t *)malloc(st->build_count);
-        memcpy(jc->col_nulls[c], st->build_cols[c].nulls, st->build_count);
+        memcpy(jc->ft.col_data[c], st->build_cols[c].data, esz * nrows);
+        memcpy(jc->ft.col_nulls[c], st->build_cols[c].nulls, nrows);
         if (st->build_cols[c].str_lens) {
-            jc->col_str_lens[c] = (uint32_t *)malloc(st->build_count * sizeof(uint32_t));
-            memcpy(jc->col_str_lens[c], st->build_cols[c].str_lens,
-                   st->build_count * sizeof(uint32_t));
+            jc->ft.col_str_lens[c] = (uint32_t *)malloc(nrows * sizeof(uint32_t));
+            memcpy(jc->ft.col_str_lens[c], st->build_cols[c].str_lens,
+                   nrows * sizeof(uint32_t));
         }
     }
 
-    jc->hashes = (uint32_t *)malloc(st->build_count * sizeof(uint32_t));
-    memcpy(jc->hashes, st->ht.hashes, st->build_count * sizeof(uint32_t));
-    jc->nexts = (uint32_t *)malloc(st->build_count * sizeof(uint32_t));
-    memcpy(jc->nexts, st->ht.nexts, st->build_count * sizeof(uint32_t));
+    jc->hashes = (uint32_t *)malloc(nrows * sizeof(uint32_t));
+    memcpy(jc->hashes, st->ht.hashes, nrows * sizeof(uint32_t));
+    jc->nexts = (uint32_t *)malloc(nrows * sizeof(uint32_t));
+    memcpy(jc->nexts, st->ht.nexts, nrows * sizeof(uint32_t));
     jc->buckets = (uint32_t *)malloc(st->ht.nbuckets * sizeof(uint32_t));
     memcpy(jc->buckets, st->ht.buckets, st->ht.nbuckets * sizeof(uint32_t));
 

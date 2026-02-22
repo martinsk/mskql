@@ -6,35 +6,28 @@
 #include "column.h"
 #include "row.h"
 #include "index.h"
+#include "block.h"
 
 /* Cached columnar representation of a table for fast repeated scans.
- * Invalidated when table->generation changes. */
+ * Invalidated when table->generation changes.
+ * Uses struct flat_table for the columnar data arrays. */
 struct scan_cache {
-    uint64_t generation;    /* generation when cache was built */
-    uint16_t ncols;         /* number of cached columns */
-    size_t   nrows;         /* total rows cached */
-    void   **col_data;      /* [ncols] heap-allocated typed arrays */
-    uint8_t **col_nulls;    /* [ncols] heap-allocated null bitmaps */
-    enum column_type *col_types; /* [ncols] column types */
-    uint32_t **col_str_lens; /* [ncols] heap-allocated length arrays; non-NULL only for TEXT cols */
+    uint64_t         generation; /* generation when cache was built */
+    struct flat_table ft;        /* columnar data: ft.nrows == cached row count */
 };
 
 /* Cached hash join build result for a specific join key column.
- * Invalidated when table->generation changes. */
+ * Invalidated when table->generation changes.
+ * Uses struct flat_table for the columnar data arrays. */
 struct join_cache {
-    uint64_t generation;     /* generation when cache was built */
-    int      key_col;        /* inner key column index */
-    uint16_t ncols;          /* number of columns in build_cols */
-    uint32_t nrows;          /* number of rows in build_cols */
-    void   **col_data;       /* [ncols] heap-allocated typed arrays */
-    uint8_t **col_nulls;     /* [ncols] null bitmaps */
-    enum column_type *col_types; /* [ncols] column types */
-    uint32_t **col_str_lens; /* [ncols] heap-allocated length arrays; non-NULL only for TEXT cols */
-    uint32_t *hashes;        /* [nrows] hash values */
-    uint32_t *nexts;         /* [nrows] next pointers */
-    uint32_t *buckets;       /* [nbuckets] bucket heads */
-    uint32_t  nbuckets;      /* number of hash buckets */
-    int       valid;
+    uint64_t         generation; /* generation when cache was built */
+    int              key_col;    /* inner key column index */
+    struct flat_table ft;        /* columnar data */
+    uint32_t        *hashes;     /* [ft.nrows] hash values */
+    uint32_t        *nexts;      /* [ft.nrows] next pointers */
+    uint32_t        *buckets;    /* [nbuckets] bucket heads */
+    uint32_t         nbuckets;   /* number of hash buckets */
+    int              valid;
 };
 
 /* Cached columnar representation of a parquet foreign table.
@@ -57,7 +50,8 @@ struct table {
     DYNAMIC_ARRAY(struct column) columns;
     DYNAMIC_ARRAY(struct row) rows;
     DYNAMIC_ARRAY(struct index) indexes;
-    uint64_t generation;  /* bumped on every INSERT/UPDATE/DELETE for scan cache invalidation */
+    uint64_t generation;       /* bumped on every INSERT/UPDATE/DELETE for scan cache invalidation */
+    struct flat_table flat;    /* primary columnar storage — written on every INSERT/UPDATE/DELETE */
     struct scan_cache scan_cache; /* cached columnar representation */
     struct join_cache join_cache; /* cached hash join build for inner table */
     struct parquet_cache pq_cache; /* cached parquet columnar data */
@@ -68,6 +62,25 @@ void table_init_own(struct table *t, char *name); /* takes ownership of name */
 void table_add_column(struct table *t, struct column *col);
 void table_free(struct table *t);
 void table_deep_copy(struct table *dst, const struct table *src);
+
+/* Initialize t->flat columnar arrays from t->columns schema.
+ * Must be called after all columns have been added via table_add_column.
+ * Safe to call multiple times — frees existing flat before reinitializing. */
+void table_flat_init_schema(struct table *t);
+
+/* Append one row to t->flat. Grows arrays as needed.
+ * row must have cells.count == t->columns.count.
+ * Text pointers are stored by reference (same ownership as row-store). */
+void table_flat_append_row(struct table *t, const struct row *row);
+
+/* Patch one row in t->flat after an UPDATE (row_idx must be < t->flat.nrows). */
+void table_flat_update_row(struct table *t, size_t row_idx, const struct row *row);
+
+/* Remove one row from t->flat by shifting rows [row_idx+1..nrows) left by one. */
+void table_flat_delete_row(struct table *t, size_t row_idx);
+
+/* Rebuild t->flat entirely from t->rows (used after schema changes like ALTER). */
+void table_flat_rebuild_from_rows(struct table *t);
 
 /* column lookup — exact match first, then strips "table." prefix and retries */
 #include "stringview.h"

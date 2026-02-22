@@ -462,11 +462,6 @@ void scan_cache_update_row(struct table *t, size_t row_idx);
 void row_block_alloc(struct row_block *rb, uint16_t ncols,
                      struct bump_alloc *scratch);
 
-/* Scan up to BLOCK_CAPACITY rows from a table starting at cursor.
- * Returns number of rows scanned. Updates *cursor. */
-uint16_t scan_table_block(struct table *t, size_t *cursor,
-                          struct row_block *out, int *col_map, uint16_t ncols,
-                          struct bump_alloc *scratch);
 
 /* Convert a row_block back to struct rows (for final output). */
 void block_to_rows(const struct row_block *blk, struct rows *result, struct bump_alloc *rb);

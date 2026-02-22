@@ -3080,7 +3080,7 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
             row_count++;
         }
         fclose(fp);
-        ct->scan_cache.generation = 0;
+        ct->scan_cache.generation = 0; /* invalidate: force rebuild on next scan */
         char tag[64];
         snprintf(tag, sizeof(tag), "COPY %zu", row_count);
         send_command_complete(fd, m, tag);
@@ -3219,6 +3219,7 @@ static void copy_in_process_line(struct client_state *c, struct database *db, co
         da_push(&new_row.cells, cell);
     }
     da_push(&ct->rows, new_row);
+    table_flat_append_row(ct, &ct->rows.items[ct->rows.count - 1]);
     ct->generation++;
     db->total_generation++;
     c->copy_in_row_count++;
@@ -3924,7 +3925,7 @@ static int process_messages(struct client_state *c, struct database *db)
                     }
                     /* Invalidate scan cache */
                     if (c->copy_in_table)
-                        c->copy_in_table->scan_cache.generation = 0;
+                        c->copy_in_table->scan_cache.generation = 0; /* invalidate */
                     char tag[128];
                     snprintf(tag, sizeof(tag), "COPY %zu", c->copy_in_row_count);
                     send_command_complete(c->fd, &c->send_buf, tag);

@@ -7641,6 +7641,7 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct que
             for (size_t j = i; j + 1 < t->rows.count; j++)
                 t->rows.items[j] = t->rows.items[j + 1];
             t->rows.count--;
+            table_flat_delete_row(t, i);
             deleted++;
             t->generation++;
             db->total_generation++;
@@ -7848,12 +7849,13 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
     if (updated > 0) {
         t->generation++;
         db->total_generation++;
-        /* patch scan cache in-place for each updated row (avoids full rebuild) */
-        if (t->scan_cache.col_data && t->scan_cache.nrows == t->rows.count) {
-            size_t scan2_count = use_index_scan ? idx_row_count : t->rows.count;
-            for (size_t si2 = 0; si2 < scan2_count; si2++) {
-                size_t ri = use_index_scan ? idx_row_ids[si2] : si2;
-                if (ri < t->rows.count)
+        /* patch flat storage and scan cache in-place for each updated row */
+        size_t scan2_count = use_index_scan ? idx_row_count : t->rows.count;
+        for (size_t si2 = 0; si2 < scan2_count; si2++) {
+            size_t ri = use_index_scan ? idx_row_ids[si2] : si2;
+            if (ri < t->rows.count) {
+                table_flat_update_row(t, ri, &t->rows.items[ri]);
+                if (t->scan_cache.ft.col_data && t->scan_cache.ft.nrows == t->rows.count)
                     scan_cache_update_row(t, ri);
             }
         }
@@ -7944,6 +7946,7 @@ static int fk_enforce_delete(struct database *db, struct table *parent_t,
                                 &child_t->rows.items[r + 1],
                                 (child_t->rows.count - r - 1) * sizeof(struct row));
                         child_t->rows.count--;
+                        table_flat_delete_row(child_t, r);
                         child_t->generation++;
                         db->total_generation++;
                         continue; /* don't increment r */
@@ -7951,6 +7954,7 @@ static int fk_enforce_delete(struct database *db, struct table *parent_t,
                         cell_free_text(child_val);
                         memset(&child_val->value, 0, sizeof(child_val->value));
                         child_val->is_null = 1;
+                        table_flat_update_row(child_t, r, &child_t->rows.items[r]);
                         child_t->generation++;
                         db->total_generation++;
                         r++;
@@ -7963,6 +7967,7 @@ static int fk_enforce_delete(struct database *db, struct table *parent_t,
                             memset(&child_val->value, 0, sizeof(child_val->value));
                             child_val->is_null = 1;
                         }
+                        table_flat_update_row(child_t, r, &child_t->rows.items[r]);
                         child_t->generation++;
                         db->total_generation++;
                         r++;
@@ -8010,6 +8015,7 @@ static int fk_enforce_update(struct database *db, struct table *parent_t,
                     case FK_CASCADE:
                         cell_free_text(child_val);
                         cell_copy(child_val, new_val);
+                        table_flat_update_row(child_t, r, &child_t->rows.items[r]);
                         child_t->generation++;
                         db->total_generation++;
                         break;
@@ -8017,6 +8023,7 @@ static int fk_enforce_update(struct database *db, struct table *parent_t,
                         cell_free_text(child_val);
                         memset(&child_val->value, 0, sizeof(child_val->value));
                         child_val->is_null = 1;
+                        table_flat_update_row(child_t, r, &child_t->rows.items[r]);
                         child_t->generation++;
                         db->total_generation++;
                         break;
@@ -8028,6 +8035,7 @@ static int fk_enforce_update(struct database *db, struct table *parent_t,
                             memset(&child_val->value, 0, sizeof(child_val->value));
                             child_val->is_null = 1;
                         }
+                        table_flat_update_row(child_t, r, &child_t->rows.items[r]);
                         child_t->generation++;
                         db->total_generation++;
                         break;
@@ -8406,6 +8414,7 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
             return -1;
         }
         da_push(&t->rows, copy);
+        table_flat_append_row(t, &t->rows.items[t->rows.count - 1]);
 
         /* update indexes */
         size_t new_row_id = t->rows.count - 1;
