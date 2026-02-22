@@ -852,44 +852,279 @@ static int send_data_rows(int fd, struct rows *result,
 
 /* ---- direct columnar→wire send (bypasses block_to_rows) ---- */
 
-/* Fast int32 → decimal string. Returns length written. buf must be >= 12 bytes. */
+/* Two-digit lookup table: "00" "01" ... "99" packed into 200 bytes.
+ * Each pair of digits at index i*2 gives the decimal representation of i. */
+static const char digit_pairs[201] =
+    "00010203040506070809"
+    "10111213141516171819"
+    "20212223242526272829"
+    "30313233343536373839"
+    "40414243444546474849"
+    "50515253545556575859"
+    "60616263646566676869"
+    "70717273747576777879"
+    "80818283848586878889"
+    "90919293949596979899";
+
+/* Write a 2-digit zero-padded number using the lookup table. */
+static inline void put_2d(char *p, int v)
+{
+    p[0] = digit_pairs[v * 2];
+    p[1] = digit_pairs[v * 2 + 1];
+}
+
+/* Write a 4-digit zero-padded year. Returns chars written (4 or 5 for negative). */
+static inline int put_year(char *p, int y)
+{
+    if (y < 0) {
+        *p++ = '-';
+        y = -y;
+        put_2d(p, y / 100);
+        put_2d(p + 2, y % 100);
+        return 5;
+    }
+    put_2d(p, y / 100);
+    put_2d(p + 2, y % 100);
+    return 4;
+}
+
+/* Fast date → "YYYY-MM-DD". Returns length (10 or 11 for BC). */
+static inline size_t fast_date_to_str(int32_t days, char *buf)
+{
+    int y, m, d;
+    days_to_ymd(days, &y, &m, &d);
+    char *p = buf;
+    p += put_year(p, y);
+    *p++ = '-';
+    put_2d(p, m); p += 2;
+    *p++ = '-';
+    put_2d(p, d); p += 2;
+    *p = '\0';
+    return (size_t)(p - buf);
+}
+
+/* Fast time → "HH:MM:SS". Returns 8. */
+static inline size_t fast_time_to_str(int64_t usec, char *buf)
+{
+    if (usec < 0) usec = 0;
+    int hh = (int)(usec / 3600000000LL);
+    usec %= 3600000000LL;
+    int mm = (int)(usec / 60000000LL);
+    usec %= 60000000LL;
+    int ss = (int)(usec / 1000000LL);
+    put_2d(buf, hh);
+    buf[2] = ':';
+    put_2d(buf + 3, mm);
+    buf[5] = ':';
+    put_2d(buf + 6, ss);
+    buf[8] = '\0';
+    return 8;
+}
+
+/* Fast timestamp → "YYYY-MM-DD HH:MM:SS". Returns 19 (or 20 for BC). */
+static inline size_t fast_timestamp_to_str(int64_t usec, char *buf)
+{
+    int32_t days;
+    int64_t time_usec;
+    if (usec >= 0) {
+        days = (int32_t)(usec / 86400000000LL);
+        time_usec = usec % 86400000000LL;
+    } else {
+        days = (int32_t)((usec - 86400000000LL + 1) / 86400000000LL);
+        time_usec = usec - (int64_t)days * 86400000000LL;
+    }
+    int y, mo, d;
+    days_to_ymd(days, &y, &mo, &d);
+    char *p = buf;
+    p += put_year(p, y);
+    *p++ = '-';
+    put_2d(p, mo); p += 2;
+    *p++ = '-';
+    put_2d(p, d); p += 2;
+    *p++ = ' ';
+    int hh = (int)(time_usec / 3600000000LL);
+    time_usec %= 3600000000LL;
+    int mm = (int)(time_usec / 60000000LL);
+    time_usec %= 60000000LL;
+    int ss = (int)(time_usec / 1000000LL);
+    put_2d(p, hh); p += 2;
+    *p++ = ':';
+    put_2d(p, mm); p += 2;
+    *p++ = ':';
+    put_2d(p, ss); p += 2;
+    *p = '\0';
+    return (size_t)(p - buf);
+}
+
+/* Fast timestamptz → "YYYY-MM-DD HH:MM:SS+00". Returns 22 (or 23 for BC). */
+static inline size_t fast_timestamptz_to_str(int64_t usec, char *buf)
+{
+    size_t n = fast_timestamp_to_str(usec, buf);
+    buf[n] = '+';
+    buf[n + 1] = '0';
+    buf[n + 2] = '0';
+    buf[n + 3] = '\0';
+    return n + 3;
+}
+
+/* Fast int32 → decimal string. Returns length written. buf must be >= 12 bytes.
+ * Uses two-digit lookup table to halve the number of divisions. */
 static inline size_t fast_i32_to_str(int32_t v, char *buf)
 {
     char tmp[12];
+    char *p = tmp + sizeof(tmp);
     int neg = 0;
     uint32_t uv;
     if (v < 0) { neg = 1; uv = (uint32_t)(-(int64_t)v); } else { uv = (uint32_t)v; }
-    int pos = 0;
-    do { tmp[pos++] = '0' + (char)(uv % 10); uv /= 10; } while (uv);
-    size_t len = (size_t)pos + (size_t)neg;
-    int out = 0;
-    if (neg) buf[out++] = '-';
-    while (pos > 0) buf[out++] = tmp[--pos];
-    buf[out] = '\0';
+    while (uv >= 100) {
+        uint32_t r = uv % 100;
+        uv /= 100;
+        p -= 2;
+        p[0] = digit_pairs[r * 2];
+        p[1] = digit_pairs[r * 2 + 1];
+    }
+    if (uv >= 10) {
+        p -= 2;
+        p[0] = digit_pairs[uv * 2];
+        p[1] = digit_pairs[uv * 2 + 1];
+    } else {
+        *--p = '0' + (char)uv;
+    }
+    size_t dlen = (size_t)(tmp + sizeof(tmp) - p);
+    size_t len = dlen + (size_t)neg;
+    char *out = buf;
+    if (neg) *out++ = '-';
+    memcpy(out, p, dlen);
+    buf[len] = '\0';
     return len;
 }
 
-/* Fast int64 → decimal string. Returns length written. buf must be >= 21 bytes. */
+/* Fast int64 → decimal string. Returns length written. buf must be >= 21 bytes.
+ * Uses two-digit lookup table to halve the number of divisions. */
 static inline size_t fast_i64_to_str(int64_t v, char *buf)
 {
     char tmp[21];
+    char *p = tmp + sizeof(tmp);
     int neg = 0;
     uint64_t uv;
-    if (v < 0) { neg = 1; uv = (uint64_t)(-v); } else { uv = (uint64_t)v; }
-    int pos = 0;
-    do { tmp[pos++] = '0' + (char)(uv % 10); uv /= 10; } while (uv);
-    size_t len = (size_t)pos + (size_t)neg;
-    int out = 0;
-    if (neg) buf[out++] = '-';
-    while (pos > 0) buf[out++] = tmp[--pos];
-    buf[out] = '\0';
+    if (v < 0) { neg = 1; uv = (uint64_t)(-(v + 1)) + 1; } else { uv = (uint64_t)v; }
+    while (uv >= 100) {
+        uint64_t r = uv % 100;
+        uv /= 100;
+        p -= 2;
+        p[0] = digit_pairs[r * 2];
+        p[1] = digit_pairs[r * 2 + 1];
+    }
+    if (uv >= 10) {
+        p -= 2;
+        p[0] = digit_pairs[uv * 2];
+        p[1] = digit_pairs[uv * 2 + 1];
+    } else {
+        *--p = '0' + (char)uv;
+    }
+    size_t dlen = (size_t)(tmp + sizeof(tmp) - p);
+    size_t len = dlen + (size_t)neg;
+    char *out = buf;
+    if (neg) *out++ = '-';
+    memcpy(out, p, dlen);
+    buf[len] = '\0';
     return len;
 }
 
-/* Format double using PostgreSQL-compatible precision (15 significant digits). */
+/* Format double using PostgreSQL-compatible %g format (6 significant digits,
+ * strip trailing zeros, use scientific notation for very large/small values).
+ * Fast paths avoid snprintf overhead for common cases. */
 static inline size_t fast_f64_to_str(double v, char *buf)
 {
-    return (size_t)snprintf(buf, 32, "%g", v);
+    /* Handle sign */
+    if (v != v) { memcpy(buf, "NaN", 3); buf[3] = '\0'; return 3; } /* NaN */
+    if (v == 0.0) {
+        /* Distinguish +0 and -0 like %g does: both produce "0" */
+        buf[0] = '0'; buf[1] = '\0'; return 1;
+    }
+    int neg = 0;
+    if (v < 0) { neg = 1; v = -v; }
+    /* Inf */
+    if (v > 1.7976931348623157e308) {
+        if (neg) { memcpy(buf, "-Infinity", 9); buf[9] = '\0'; return 9; }
+        memcpy(buf, "Infinity", 8); buf[8] = '\0'; return 8;
+    }
+    /* Fast path: exact integer in int64 range */
+    if (v >= 1.0 && v <= 9.22e18) {
+        int64_t iv = (int64_t)v;
+        if ((double)iv == v)
+            return fast_i64_to_str(neg ? -iv : iv, buf);
+    }
+    /* Fast path: fixed-point values in %g range (no scientific notation needed).
+     * %g uses scientific notation when exponent < -4 or >= 6 sig digits.
+     * For values in [1e-4, 1e6) with <= 6 significant digits, format directly. */
+    if (v >= 0.0001 && v < 1e15) {
+        /* Multiply to get 6 significant digits as integer.
+         * Find the scale: number of digits before decimal point. */
+        int scale;
+        if      (v >= 1e5)  scale = 0;
+        else if (v >= 1e4)  scale = 1;
+        else if (v >= 1e3)  scale = 2;
+        else if (v >= 1e2)  scale = 3;
+        else if (v >= 1e1)  scale = 4;
+        else if (v >= 1e0)  scale = 5;
+        else if (v >= 1e-1) scale = 6;
+        else if (v >= 1e-2) scale = 7;
+        else if (v >= 1e-3) scale = 8;
+        else                scale = 9;
+        /* Scale up to get 6 significant digits */
+        static const double pow10_tbl[] = {
+            1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0,
+            1000000.0, 10000000.0, 100000000.0, 1000000000.0
+        };
+        double scaled = v * pow10_tbl[scale];
+        int64_t digits = (int64_t)(scaled + 0.5);
+        /* Verify round-trip: if formatting these digits reproduces the original,
+         * we can use the fast path. Otherwise fall back to snprintf. */
+        double check = (double)digits / pow10_tbl[scale];
+        /* Allow tiny relative error (< 1 ULP at 6 sig digits) */
+        double relerr = (check - v) / v;
+        if (relerr < 0 ) relerr = -relerr;
+        if (relerr < 1e-9) {
+            /* Strip trailing zeros from digits */
+            while (digits > 0 && digits % 10 == 0 && scale > 0) {
+                digits /= 10;
+                scale--;
+            }
+            /* Format: integer part + decimal part */
+            char *p = buf;
+            if (neg) *p++ = '-';
+            if (scale == 0) {
+                /* No decimal point needed */
+                size_t ilen = fast_i64_to_str(digits, p);
+                return (size_t)(p - buf) + ilen;
+            }
+            /* Format digits, then insert decimal point */
+            char tmp[24];
+            size_t dlen = fast_i64_to_str(digits, tmp);
+            if ((int)dlen <= scale) {
+                /* Need leading "0." + zeros */
+                *p++ = '0';
+                *p++ = '.';
+                for (int z = 0; z < scale - (int)dlen; z++)
+                    *p++ = '0';
+                memcpy(p, tmp, dlen);
+                p += dlen;
+            } else {
+                /* Integer part + decimal part */
+                size_t ipart = dlen - (size_t)scale;
+                memcpy(p, tmp, ipart);
+                p += ipart;
+                *p++ = '.';
+                memcpy(p, tmp + ipart, (size_t)scale);
+                p += scale;
+            }
+            *p = '\0';
+            return (size_t)(p - buf);
+        }
+    }
+    /* Fallback: use snprintf for edge cases */
+    return (size_t)snprintf(buf, 32, "%g", neg ? -v : v);
 }
 
 /* Push a col_block cell value directly into a msgbuf as a pgwire text field. */
@@ -1071,23 +1306,19 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
                 dst += 4;
                 continue;
             }
-            char buf[68]; /* large enough for interval */
             size_t len;
             switch (cb->type) {
             case COLUMN_TYPE_INT:
-                len = fast_i32_to_str(cb->data.i32[ri], buf);
-                put_u32(dst, (uint32_t)len); dst += 4;
-                memcpy(dst, buf, len); dst += len;
+                len = fast_i32_to_str(cb->data.i32[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len); dst += 4 + len;
                 break;
             case COLUMN_TYPE_BIGINT:
-                len = fast_i64_to_str(cb->data.i64[ri], buf);
-                put_u32(dst, (uint32_t)len); dst += 4;
-                memcpy(dst, buf, len); dst += len;
+                len = fast_i64_to_str(cb->data.i64[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len); dst += 4 + len;
                 break;
             case COLUMN_TYPE_SMALLINT:
-                len = fast_i32_to_str((int32_t)cb->data.i16[ri], buf);
-                put_u32(dst, (uint32_t)len); dst += 4;
-                memcpy(dst, buf, len); dst += len;
+                len = fast_i32_to_str((int32_t)cb->data.i16[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len); dst += 4 + len;
                 break;
             case COLUMN_TYPE_BOOLEAN:
                 put_u32(dst, 1); dst += 4;
@@ -1095,40 +1326,33 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
                 break;
             case COLUMN_TYPE_FLOAT:
             case COLUMN_TYPE_NUMERIC:
-                len = fast_f64_to_str(cb->data.f64[ri], buf);
-                put_u32(dst, (uint32_t)len); dst += 4;
-                memcpy(dst, buf, len); dst += len;
+                len = fast_f64_to_str(cb->data.f64[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len); dst += 4 + len;
                 break;
             case COLUMN_TYPE_DATE:
-                date_to_str(cb->data.i32[ri], buf, sizeof(buf));
-                len = strlen(buf);
-                put_u32(dst, (uint32_t)len); dst += 4;
-                memcpy(dst, buf, len); dst += len;
+                len = fast_date_to_str(cb->data.i32[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len); dst += 4 + len;
                 break;
             case COLUMN_TYPE_TIME:
-                time_to_str(cb->data.i64[ri], buf, sizeof(buf));
-                len = strlen(buf);
-                put_u32(dst, (uint32_t)len); dst += 4;
-                memcpy(dst, buf, len); dst += len;
+                len = fast_time_to_str(cb->data.i64[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len); dst += 4 + len;
                 break;
             case COLUMN_TYPE_TIMESTAMP:
-                timestamp_to_str(cb->data.i64[ri], buf, sizeof(buf));
-                len = strlen(buf);
-                put_u32(dst, (uint32_t)len); dst += 4;
-                memcpy(dst, buf, len); dst += len;
+                len = fast_timestamp_to_str(cb->data.i64[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len); dst += 4 + len;
                 break;
             case COLUMN_TYPE_TIMESTAMPTZ:
-                timestamptz_to_str(cb->data.i64[ri], buf, sizeof(buf));
-                len = strlen(buf);
-                put_u32(dst, (uint32_t)len); dst += 4;
-                memcpy(dst, buf, len); dst += len;
+                len = fast_timestamptz_to_str(cb->data.i64[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len); dst += 4 + len;
                 break;
-            case COLUMN_TYPE_INTERVAL:
+            case COLUMN_TYPE_INTERVAL: {
+                char buf[68];
                 interval_to_str(cb->data.iv[ri], buf, sizeof(buf));
                 len = strlen(buf);
                 put_u32(dst, (uint32_t)len); dst += 4;
                 memcpy(dst, buf, len); dst += len;
                 break;
+            }
             case COLUMN_TYPE_TEXT: {
                 const char *s = cb->data.str[ri];
                 if (!s) {
@@ -1141,9 +1365,8 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
                 break;
             }
             case COLUMN_TYPE_UUID:
-                uuid_format(&cb->data.uuid[ri], buf);
-                put_u32(dst, 36); dst += 4;
-                memcpy(dst, buf, 36); dst += 36;
+                uuid_format(&cb->data.uuid[ri], (char *)(dst + 4));
+                put_u32(dst, 36); dst += 4 + 36;
                 break;
             case COLUMN_TYPE_ENUM:
                 __builtin_unreachable();
@@ -3080,7 +3303,6 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
             row_count++;
         }
         fclose(fp);
-        ct->scan_cache.generation = 0; /* invalidate: force rebuild on next scan */
         char tag[64];
         snprintf(tag, sizeof(tag), "COPY %zu", row_count);
         send_command_complete(fd, m, tag);
@@ -3923,9 +4145,6 @@ static int process_messages(struct client_state *c, struct database *db)
                         copy_in_process_line(c, db, c->copy_in_linebuf, c->copy_in_linelen);
                         c->copy_in_linelen = 0;
                     }
-                    /* Invalidate scan cache */
-                    if (c->copy_in_table)
-                        c->copy_in_table->scan_cache.generation = 0; /* invalidate */
                     char tag[128];
                     snprintf(tag, sizeof(tag), "COPY %zu", c->copy_in_row_count);
                     send_command_complete(c->fd, &c->send_buf, tag);

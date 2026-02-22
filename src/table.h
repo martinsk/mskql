@@ -8,14 +8,6 @@
 #include "index.h"
 #include "block.h"
 
-/* Cached columnar representation of a table for fast repeated scans.
- * Invalidated when table->generation changes.
- * Uses struct flat_table for the columnar data arrays. */
-struct scan_cache {
-    uint64_t         generation; /* generation when cache was built */
-    struct flat_table ft;        /* columnar data: ft.nrows == cached row count */
-};
-
 /* Cached hash join build result for a specific join key column.
  * Invalidated when table->generation changes.
  * Uses struct flat_table for the columnar data arrays. */
@@ -52,7 +44,6 @@ struct table {
     DYNAMIC_ARRAY(struct index) indexes;
     uint64_t generation;       /* bumped on every INSERT/UPDATE/DELETE for scan cache invalidation */
     struct flat_table flat;    /* primary columnar storage — written on every INSERT/UPDATE/DELETE */
-    struct scan_cache scan_cache; /* cached columnar representation */
     struct join_cache join_cache; /* cached hash join build for inner table */
     struct parquet_cache pq_cache; /* cached parquet columnar data */
 };
@@ -78,6 +69,10 @@ void table_flat_update_row(struct table *t, size_t row_idx, const struct row *ro
 
 /* Remove one row from t->flat by shifting rows [row_idx+1..nrows) left by one. */
 void table_flat_delete_row(struct table *t, size_t row_idx);
+
+/* Append multiple rows to t->flat in a single batch (pre-grows once).
+ * rows[0..count) must each have cells.count >= t->columns.count. */
+void table_flat_append_rows_bulk(struct table *t, struct row *rows, size_t count);
 
 /* Rebuild t->flat entirely from t->rows (used after schema changes like ALTER). */
 void table_flat_rebuild_from_rows(struct table *t);

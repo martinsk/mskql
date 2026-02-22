@@ -7855,8 +7855,6 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
             size_t ri = use_index_scan ? idx_row_ids[si2] : si2;
             if (ri < t->rows.count) {
                 table_flat_update_row(t, ri, &t->rows.items[ri]);
-                if (t->scan_cache.ft.col_data && t->scan_cache.ft.nrows == t->rows.count)
-                    scan_cache_update_row(t, ri);
             }
         }
     }
@@ -8110,6 +8108,21 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
         }
     }
 
+    /* Pre-grow flat_table to avoid per-row reallocs in table_flat_append_row */
+    if (ins->insert_rows_count > 1) {
+        if (t->flat.ncols == 0 && t->columns.count > 0)
+            table_flat_init_schema(t);
+        size_t needed = t->flat.nrows + ins->insert_rows_count;
+        if (needed > t->flat.cap) {
+            size_t new_cap = t->flat.cap ? t->flat.cap : 16;
+            while (new_cap < needed) new_cap *= 2;
+            flat_table_grow(&t->flat, new_cap);
+        }
+    }
+
+    /* Track start of newly inserted rows for deferred bulk flat append */
+    size_t rows_before = t->rows.count;
+
     /* Validate column count vs value count */
     if (ins->insert_rows_count > 0 && !ins->is_default_values) {
         struct row *first = &arena->rows.items[ins->insert_rows_start];
@@ -8330,19 +8343,35 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                 }
             }
         }
-        /* enforce UNIQUE constraints */
+        /* enforce UNIQUE constraints — use index lookup when available (O(log n) vs O(n)) */
         for (size_t i = 0; i < t->columns.count && i < copy.cells.count; i++) {
             if (t->columns.items[i].is_unique) {
                 struct cell *new_c = &copy.cells.items[i];
-                /* SQL standard: NULLs are not considered duplicates */
                 if (new_c->is_null || (column_type_is_text(new_c->type) && !new_c->value.as_text))
                     continue;
-                for (size_t ri = 0; ri < t->rows.count; ri++) {
-                    struct cell *existing = &t->rows.items[ri].cells.items[i];
-                    if (cell_compare(new_c, existing) == 0) {
-                        arena_set_error(arena, "23505", "UNIQUE constraint violated for column '%s'", t->columns.items[i].name);
-                        row_free(&copy);
-                        return -1;
+                int used_index = 0;
+                for (size_t ix = 0; ix < t->indexes.count; ix++) {
+                    struct index *idx = &t->indexes.items[ix];
+                    if (idx->ncols == 1 && idx->column_indices[0] == (int)i) {
+                        size_t *found_ids = NULL;
+                        size_t found_count = 0;
+                        if (index_lookup(idx, new_c, &found_ids, &found_count) == 0 && found_count > 0) {
+                            arena_set_error(arena, "23505", "UNIQUE constraint violated for column '%s'", t->columns.items[i].name);
+                            row_free(&copy);
+                            return -1;
+                        }
+                        used_index = 1;
+                        break;
+                    }
+                }
+                if (!used_index) {
+                    for (size_t ri = 0; ri < t->rows.count; ri++) {
+                        struct cell *existing = &t->rows.items[ri].cells.items[i];
+                        if (cell_compare(new_c, existing) == 0) {
+                            arena_set_error(arena, "23505", "UNIQUE constraint violated for column '%s'", t->columns.items[i].name);
+                            row_free(&copy);
+                            return -1;
+                        }
                     }
                 }
             }
@@ -8414,7 +8443,6 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
             return -1;
         }
         da_push(&t->rows, copy);
-        table_flat_append_row(t, &t->rows.items[t->rows.count - 1]);
 
         /* update indexes */
         size_t new_row_id = t->rows.count - 1;
@@ -8436,8 +8464,10 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
             emit_returning_row(t, &t->rows.items[t->rows.count - 1], ins->returning_columns, return_all, result, rb);
     }
 
-    /* Batch generation bump — single increment after all rows inserted */
-    if (ins->insert_rows_count > 0) {
+    /* Batch flat append — single bulk operation for all newly inserted rows */
+    size_t rows_added = t->rows.count - rows_before;
+    if (rows_added > 0) {
+        table_flat_append_rows_bulk(t, &t->rows.items[rows_before], rows_added);
         t->generation++;
         db->total_generation++;
     }

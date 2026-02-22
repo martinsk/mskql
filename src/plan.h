@@ -59,7 +59,23 @@ enum vec_op_kind {
     VEC_FUNC_ABS_I64,  /* ABS(col) → BIGINT */
     VEC_FUNC_ABS_F64,  /* ABS(col) → FLOAT/NUMERIC */
     VEC_FUNC_ROUND,    /* ROUND(col, N) → NUMERIC */
+    VEC_FUNC_CEIL,     /* CEIL(col) → FLOAT/NUMERIC */
+    VEC_FUNC_FLOOR,    /* FLOOR(col) → FLOAT/NUMERIC */
     VEC_FUNC_CAST_INT_TO_F64, /* col::numeric / col::float → NUMERIC */
+    VEC_FUNC_CAST_F64_TO_I32, /* col::int → INT (truncate) */
+    VEC_FUNC_CAST_F64_TO_I64, /* col::bigint → BIGINT (truncate) */
+    VEC_FUNC_COALESCE_LIT, /* COALESCE(col, literal) → same type */
+    VEC_FUNC_SQRT,         /* SQRT(col) → FLOAT */
+    VEC_FUNC_SIGN_I32,     /* SIGN(col) → INT */
+    VEC_FUNC_SIGN_I64,     /* SIGN(col) → BIGINT */
+    VEC_FUNC_SIGN_F64,     /* SIGN(col) → FLOAT/NUMERIC */
+    VEC_FUNC_MOD_I32,      /* MOD(col, lit) → INT */
+    VEC_FUNC_MOD_I64,      /* MOD(col, lit) → BIGINT */
+    VEC_FUNC_POWER,        /* POWER(col, lit) → FLOAT */
+    VEC_FUNC_TRIM,         /* TRIM(col) → TEXT */
+    VEC_FUNC_CONCAT_LIT,   /* col || literal → TEXT */
+    VEC_FUNC_SUBSTRING,    /* SUBSTRING(col, start[, len]) → TEXT */
+    VEC_FUNC_REPLACE,      /* REPLACE(col, lit, lit) → TEXT */
 };
 
 struct vec_project_op {
@@ -71,6 +87,11 @@ struct vec_project_op {
     double   lit_f64;          /* literal value for float ops */
     enum column_type out_type; /* output column type */
     int      func_precision;   /* decimal places for VEC_FUNC_ROUND */
+    const char *lit_text;      /* literal string for VEC_FUNC_CONCAT_LIT */
+    uint32_t    lit_text_len;  /* strlen of lit_text */
+    int64_t     right_lit_i64; /* second literal (e.g. SUBSTRING length, -1 = no limit) */
+    const char *lit_text2;     /* second literal string for VEC_FUNC_REPLACE */
+    uint32_t    lit_text2_len; /* strlen of lit_text2 */
 };
 
 /* Plan node: arena-allocated in query_arena.plan_nodes DA.
@@ -452,9 +473,6 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx);
 
 /* Generate EXPLAIN text for a plan tree. Writes into buf, returns bytes written. */
 int plan_explain(struct query_arena *arena, uint32_t node_idx, char *buf, int buflen);
-
-/* Patch a single row in the scan cache after UPDATE (avoids full rebuild). */
-void scan_cache_update_row(struct table *t, size_t row_idx);
 
 /* ---- Block utility functions ---- */
 

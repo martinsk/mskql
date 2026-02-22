@@ -260,7 +260,7 @@ static inline int block_cell_eq(const struct col_block *a, uint16_t ai,
 /* ---- Flat table: heap-allocated columnar storage for N rows, M columns ----
  *
  * Used as the unified representation for:
- *   - scan_cache  (table.h) — persistent columnar mirror of the row-store
+ *   - table.flat  (table.h) — primary columnar storage, maintained on every mutation
  *   - join_cache  (table.h) — hash join build side cached per inner table
  *   - hash_join_state build side (plan.h) — scratch build side during query
  *   - set_op_state, top_n_state, window_state (plan.h) — scratch columnar buffers

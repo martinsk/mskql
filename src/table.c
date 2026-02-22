@@ -15,7 +15,6 @@ void table_init(struct table *t, const char *name)
     da_init(&t->indexes);
     t->generation = 0;
     memset(&t->flat, 0, sizeof(t->flat));
-    memset(&t->scan_cache, 0, sizeof(t->scan_cache));
     memset(&t->join_cache, 0, sizeof(t->join_cache));
     memset(&t->pq_cache, 0, sizeof(t->pq_cache));
 }
@@ -30,7 +29,6 @@ void table_init_own(struct table *t, char *name)
     da_init(&t->indexes);
     t->generation = 0;
     memset(&t->flat, 0, sizeof(t->flat));
-    memset(&t->scan_cache, 0, sizeof(t->scan_cache));
     memset(&t->join_cache, 0, sizeof(t->join_cache));
     memset(&t->pq_cache, 0, sizeof(t->pq_cache));
 }
@@ -76,7 +74,6 @@ void table_deep_copy(struct table *dst, const struct table *src)
     da_init(&dst->indexes);
     dst->generation = src->generation;
     memset(&dst->flat, 0, sizeof(dst->flat));
-    memset(&dst->scan_cache, 0, sizeof(dst->scan_cache));
     memset(&dst->join_cache, 0, sizeof(dst->join_cache));
 
     /* deep-copy columns */
@@ -310,6 +307,148 @@ void table_flat_delete_row(struct table *t, size_t row_idx)
     t->flat.nrows--;
 }
 
+void table_flat_append_rows_bulk(struct table *t, struct row *rows, size_t count)
+{
+    if (count == 0) return;
+    /* Lazy init */
+    if (t->flat.ncols == 0 && t->columns.count > 0)
+        table_flat_init_schema(t);
+    uint16_t ncols = t->flat.ncols;
+    if (ncols == 0) return;
+
+    /* Pre-grow once */
+    size_t needed = t->flat.nrows + count;
+    if (needed > t->flat.cap) {
+        size_t new_cap = t->flat.cap ? t->flat.cap : 16;
+        while (new_cap < needed) new_cap *= 2;
+        flat_table_grow(&t->flat, new_cap);
+    }
+
+    /* Batch append per column — tight typed loops */
+    size_t base = t->flat.nrows;
+    for (uint16_t c = 0; c < ncols; c++) {
+        uint8_t *nulls = t->flat.col_nulls[c] + base;
+        enum column_type ct = t->flat.col_types[c];
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT: {
+            int16_t *dst = (int16_t *)t->flat.col_data[c] + base;
+            for (size_t r = 0; r < count; r++) {
+                const struct cell *cell = &rows[r].cells.items[c];
+                nulls[r] = cell->is_null;
+                if (!cell->is_null) dst[r] = cell->value.as_smallint;
+            }
+            break;
+        }
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_ENUM: {
+            int32_t *dst = (int32_t *)t->flat.col_data[c] + base;
+            for (size_t r = 0; r < count; r++) {
+                const struct cell *cell = &rows[r].cells.items[c];
+                nulls[r] = cell->is_null;
+                if (!cell->is_null) {
+                    switch (ct) {
+                    case COLUMN_TYPE_INT:     dst[r] = cell->value.as_int; break;
+                    case COLUMN_TYPE_BOOLEAN: dst[r] = cell->value.as_bool; break;
+                    case COLUMN_TYPE_DATE:    dst[r] = cell->value.as_date; break;
+                    case COLUMN_TYPE_ENUM:    dst[r] = cell->value.as_enum; break;
+                    case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_BIGINT:
+                    case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
+                    case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_FLOAT:
+                    case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_INTERVAL:
+                    case COLUMN_TYPE_TEXT: case COLUMN_TYPE_UUID:
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        case COLUMN_TYPE_BIGINT:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            int64_t *dst = (int64_t *)t->flat.col_data[c] + base;
+            for (size_t r = 0; r < count; r++) {
+                const struct cell *cell = &rows[r].cells.items[c];
+                nulls[r] = cell->is_null;
+                if (!cell->is_null) {
+                    switch (ct) {
+                    case COLUMN_TYPE_BIGINT:      dst[r] = cell->value.as_bigint; break;
+                    case COLUMN_TYPE_TIME:        dst[r] = cell->value.as_time; break;
+                    case COLUMN_TYPE_TIMESTAMP:
+                    case COLUMN_TYPE_TIMESTAMPTZ: dst[r] = cell->value.as_timestamp; break;
+                    case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT:
+                    case COLUMN_TYPE_BOOLEAN: case COLUMN_TYPE_DATE:
+                    case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
+                    case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_TEXT:
+                    case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC: {
+            double *dst = (double *)t->flat.col_data[c] + base;
+            for (size_t r = 0; r < count; r++) {
+                const struct cell *cell = &rows[r].cells.items[c];
+                nulls[r] = cell->is_null;
+                if (!cell->is_null) {
+                    switch (ct) {
+                    case COLUMN_TYPE_FLOAT:   dst[r] = cell->value.as_float; break;
+                    case COLUMN_TYPE_NUMERIC: dst[r] = cell->value.as_numeric; break;
+                    case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT:
+                    case COLUMN_TYPE_BOOLEAN: case COLUMN_TYPE_DATE:
+                    case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_TIME:
+                    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+                    case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_TEXT:
+                    case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        case COLUMN_TYPE_INTERVAL: {
+            struct interval *dst = (struct interval *)t->flat.col_data[c] + base;
+            for (size_t r = 0; r < count; r++) {
+                const struct cell *cell = &rows[r].cells.items[c];
+                nulls[r] = cell->is_null;
+                if (!cell->is_null) dst[r] = cell->value.as_interval;
+            }
+            break;
+        }
+        case COLUMN_TYPE_TEXT: {
+            const char **dst = (const char **)t->flat.col_data[c] + base;
+            uint32_t *lens = (t->flat.col_str_lens && t->flat.col_str_lens[c])
+                           ? t->flat.col_str_lens[c] + base : NULL;
+            for (size_t r = 0; r < count; r++) {
+                const struct cell *cell = &rows[r].cells.items[c];
+                nulls[r] = cell->is_null;
+                if (!cell->is_null) {
+                    dst[r] = cell->value.as_text;
+                    if (lens && cell->value.as_text)
+                        lens[r] = (uint32_t)strlen(cell->value.as_text);
+                }
+            }
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            struct uuid_val *dst = (struct uuid_val *)t->flat.col_data[c] + base;
+            for (size_t r = 0; r < count; r++) {
+                const struct cell *cell = &rows[r].cells.items[c];
+                nulls[r] = cell->is_null;
+                if (!cell->is_null) dst[r] = cell->value.as_uuid;
+            }
+            break;
+        }
+        }
+    }
+    t->flat.nrows += count;
+}
+
 void table_flat_rebuild_from_rows(struct table *t)
 {
     flat_table_free(&t->flat);
@@ -351,9 +490,6 @@ void table_free(struct table *t)
 
     /* free primary flat storage */
     flat_table_free(&t->flat);
-
-    /* free scan cache */
-    flat_table_free(&t->scan_cache.ft);
 
     /* free join cache */
     if (t->join_cache.valid) {
