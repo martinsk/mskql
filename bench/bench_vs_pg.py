@@ -679,7 +679,7 @@ def _mskql_foreign(table_name, parquet_file):
 
 
 def _duck_from_pq(table_name, parquet_file):
-    return f"CREATE TABLE {table_name} AS SELECT * FROM read_parquet('{_pq(parquet_file)}');"
+    return f"CREATE VIEW {table_name} AS SELECT * FROM read_parquet('{_pq(parquet_file)}');"
 
 
 def bench_pq_full_scan():
