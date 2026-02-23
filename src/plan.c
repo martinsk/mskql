@@ -156,7 +156,13 @@ static uint16_t vec_binop_block(const struct col_block *cba, int col_b,
             case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: break;
             }
             break;
-        default: break;
+        case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+        case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+        case OP_AND: case OP_OR: case OP_NOT:
+        case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+        case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+        case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+            break;
         }
     } else {
         /* col OP literal: apply operator with constant */
@@ -168,7 +174,13 @@ static uint16_t vec_binop_block(const struct col_block *cba, int col_b,
             if (lit != 0.0) { double inv = 1.0 / lit; for (uint16_t i = 0; i < count; i++) vals[i] *= inv; }
             else { memset(vals, 0, count * sizeof(double)); }
             break;
-        default: break;
+        case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+        case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+        case OP_AND: case OP_OR: case OP_NOT:
+        case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+        case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+        case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+            break;
         }
     }
     return count;
@@ -1039,17 +1051,15 @@ static uint16_t filter_eval_cond_columnar(struct query_arena *arena,
     if (cond_idx == IDX_NONE || cand_count == 0) return 0;
     struct condition *cond = &COND(arena, cond_idx);
 
-    /* ---- COND_AND: intersect left and right ---- */
-    if (cond->type == COND_AND) {
+    switch (cond->type) {
+    case COND_AND: {
         uint32_t *tmp = (uint32_t *)bump_alloc(scratch, cand_count * sizeof(uint32_t));
         uint16_t left_count = filter_eval_cond_columnar(arena, t, cond->left, blk,
                                                          cand, cand_count, tmp, scratch);
         return filter_eval_cond_columnar(arena, t, cond->right, blk,
                                           tmp, left_count, sel, scratch);
     }
-
-    /* ---- COND_OR: union left and right ---- */
-    if (cond->type == COND_OR) {
+    case COND_OR: {
         uint32_t *left_sel = (uint32_t *)bump_alloc(scratch, cand_count * sizeof(uint32_t));
         uint32_t *right_sel = (uint32_t *)bump_alloc(scratch, cand_count * sizeof(uint32_t));
         uint16_t left_count = filter_eval_cond_columnar(arena, t, cond->left, blk,
@@ -1068,9 +1078,13 @@ static uint16_t filter_eval_cond_columnar(struct query_arena *arena,
         while (ri < right_count) sel[out_count++] = right_sel[ri++];
         return out_count;
     }
+    case COND_NOT:
+    case COND_MULTI_IN:
+        return 0;
+    case COND_COMPARE:
+        break;
+    }
 
-    /* ---- Leaf COND_COMPARE ---- */
-    if (cond->type != COND_COMPARE) return 0;
     int fc = table_find_column_sv(t, cond->column);
     if (fc < 0 || fc >= blk->ncols) return 0;
 
@@ -1926,7 +1940,13 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (lit == 0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
                     for (uint16_t i = 0; i < count; i++) dst[i] = src[i] / lit;
                     break;
-                default: break;
+                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+                    break;
                 }
                 memcpy(ocb->nulls, lcb->nulls, count);
                 break;
@@ -1943,7 +1963,13 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (lit == 0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
                     for (uint16_t i = 0; i < count; i++) dst[i] = src[i] / lit;
                     break;
-                default: break;
+                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+                    break;
                 }
                 memcpy(ocb->nulls, lcb->nulls, count);
                 break;
@@ -1961,7 +1987,13 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (lit == 0.0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
                     for (uint16_t i = 0; i < count; i++) dst[i] = src[i] / lit;
                     break;
-                default: break;
+                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+                    break;
                 }
                 memcpy(ocb->nulls, lcb->nulls, count);
                 break;
@@ -1990,7 +2022,13 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         dst[i] = rs[i] ? ls[i] / rs[i] : 0;
                     }
                     break;
-                default: break;
+                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+                    break;
                 }
                 for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
                 break;
@@ -2009,7 +2047,13 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         dst[i] = rs[i] ? ls[i] / rs[i] : 0;
                     }
                     break;
-                default: break;
+                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+                    break;
                 }
                 for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
                 break;
@@ -2029,7 +2073,13 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         dst[i] = rs[i] ? ls[i] / rs[i] : 0.0;
                     }
                     break;
-                default: break;
+                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+                    break;
                 }
                 for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
                 break;
@@ -5848,14 +5898,14 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                     case FRAME_CURRENT_ROW: lo = cur_val; break;
                                     case FRAME_N_PRECEDING: lo = cur_val - fsv; break;
                                     case FRAME_N_FOLLOWING: lo = cur_val + fsv; break;
-                                    default: lo = -1e300; break;
+                                    case FRAME_UNBOUNDED_FOLLOWING: lo = -1e300; break;
                                 }
                                 switch (pn->window.win_frame_end[w]) {
                                     case FRAME_UNBOUNDED_FOLLOWING: hi = 1e300; break;
                                     case FRAME_CURRENT_ROW: hi = cur_val; break;
                                     case FRAME_N_FOLLOWING: hi = cur_val + fev; break;
                                     case FRAME_N_PRECEDING: hi = cur_val - fev; break;
-                                    default: hi = 1e300; break;
+                                    case FRAME_UNBOUNDED_PRECEDING: hi = 1e300; break;
                                 }
                                 /* scan all partition rows to find those in [lo, hi] */
                                 fs = psize; fe = 0;

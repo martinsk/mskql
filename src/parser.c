@@ -4144,14 +4144,19 @@ static int cond_has_agg(struct query_arena *a, uint32_t cond_idx)
 {
     if (cond_idx == IDX_NONE) return 0;
     struct condition *c = &COND(a, cond_idx);
-    if (c->type == COND_AND || c->type == COND_OR)
+    switch (c->type) {
+    case COND_AND:
+    case COND_OR:
         return cond_has_agg(a, c->left) || cond_has_agg(a, c->right);
-    if (c->type == COND_NOT)
+    case COND_NOT:
         return cond_has_agg(a, c->left);
-    if (c->type == COND_COMPARE) {
+    case COND_COMPARE:
         if (c->lhs_expr != IDX_NONE && expr_has_agg(a, c->lhs_expr)) return 1;
+        return 0;
+    case COND_MULTI_IN:
+        return 0;
     }
-    return 0;
+    __builtin_unreachable();
 }
 
 static int parse_agg_list(struct lexer *l, struct query_arena *a, struct query_select *s, struct token first)
