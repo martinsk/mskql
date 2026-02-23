@@ -73,6 +73,33 @@ t_right = pa.table({
 })
 pq.write_table(t_right, os.path.join(OUT, "join_right.parquet"))
 
+# 7. Analytics stress test fixtures (small datasets matching benchmark schemas)
+
+# mini_orders.parquet — 10 rows: id, customer_id, product_id, quantity, amount
+pq.write_table(pa.table({
+    "id":          pa.array(list(range(10)), type=pa.int32()),
+    "customer_id": pa.array([0, 1, 2, 0, 1, 2, 0, 1, 2, 0], type=pa.int32()),
+    "product_id":  pa.array([0, 1, 2, 0, 1, 2, 0, 1, 2, 0], type=pa.int32()),
+    "quantity":    pa.array([3, 1, 5, 2, 4, 1, 6, 2, 3, 1], type=pa.int32()),
+    "amount":      pa.array([100, 200, 50, 300, 150, 80, 600, 400, 90, 700], type=pa.int32()),
+}), os.path.join(OUT, "mini_orders.parquet"))
+
+# mini_events.parquet — 10 rows: id, user_id, event_type, amount, score
+pq.write_table(pa.table({
+    "id":         pa.array(list(range(10)), type=pa.int32()),
+    "user_id":    pa.array([0, 0, 0, 1, 1, 1, 2, 2, 2, 0], type=pa.int32()),
+    "event_type": pa.array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0], type=pa.int32()),
+    "amount":     pa.array([100, 200, 50, 300, 400, 60, 10, 20, 30, 150], type=pa.int32()),
+    "score":      pa.array([9000, 8500, 7000, 9500, 8000, 6000, 7500, 8200, 5000, 9100], type=pa.int32()),
+}), os.path.join(OUT, "mini_events.parquet"))
+
+# mini_regions.parquet — 4 rows: id, name, tax_rate
+pq.write_table(pa.table({
+    "id":       pa.array([0, 1, 2, 3], type=pa.int32()),
+    "name":     pa.array(["north", "south", "east", "west"], type=pa.string()),
+    "tax_rate": pa.array([10, 8, 12, 9], type=pa.int32()),
+}), os.path.join(OUT, "mini_regions.parquet"))
+
 print(f"Generated fixtures in {OUT}/")
 for f in sorted(os.listdir(OUT)):
     sz = os.path.getsize(os.path.join(OUT, f))

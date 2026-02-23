@@ -859,6 +859,162 @@ def bench_pq_analytical():
     return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
 
 
+def bench_analytics_stress():
+    """Complex analytics stress test mixing parquet + in-memory tables.
+
+    Exercises: 3-way joins, CTEs, HAVING, window functions, IN-subquery,
+    CAST, compound WHERE, UNION ALL, DISTINCT, LIKE, scalar functions,
+    generate_series bulk load, expression aggregates, multi-column ORDER BY.
+    """
+    # -- mskql setup: parquet foreign tables + in-memory tables --
+    mskql_setup = [
+        # parquet foreign tables
+        _mskql_foreign("as_orders", "orders.parquet"),
+        _mskql_foreign("as_events", "events.parquet"),
+        _mskql_foreign("as_regions", "ref_regions.parquet"),
+        # in-memory dimension tables
+        "DROP TABLE IF EXISTS as_customers;",
+        "CREATE TABLE as_customers (id INT, name TEXT, region TEXT, tier TEXT);",
+        "DROP TABLE IF EXISTS as_products;",
+        "CREATE TABLE as_products (id INT, name TEXT, category TEXT, price INT, weight INT);",
+        "DROP TABLE IF EXISTS as_returns;",
+        "CREATE TABLE as_returns (id INT, order_id INT, reason TEXT, refund_amount INT);",
+    ]
+    # customers: 2000 rows
+    for i in range(2000):
+        mskql_setup.append(
+            f"INSERT INTO as_customers VALUES ({i}, 'cust_{i}', "
+            f"'{['north', 'south', 'east', 'west'][i % 4]}', "
+            f"'{['basic', 'premium', 'enterprise'][i % 3]}');"
+        )
+    # products: 500 rows
+    for i in range(500):
+        mskql_setup.append(
+            f"INSERT INTO as_products VALUES ({i}, 'prod_{i}', "
+            f"'{['electronics', 'clothing', 'food', 'books', 'toys'][i % 5]}', "
+            f"{10 + (i * 17) % 490}, {1 + (i * 3) % 50});"
+        )
+    # returns: 10K rows via generate_series
+    mskql_setup.append(
+        "INSERT INTO as_returns SELECT n, n % 50000, "
+        "CASE WHEN n % 5 = 0 THEN 'defective' "
+        "WHEN n % 5 = 1 THEN 'wrong_size' "
+        "WHEN n % 5 = 2 THEN 'changed_mind' "
+        "WHEN n % 5 = 3 THEN 'damaged' "
+        "ELSE 'other' END, "
+        "10 + (n * 17) % 490 "
+        "FROM generate_series(0, 9999) AS g(n);"
+    )
+
+    # -- DuckDB setup: read_parquet + in-memory tables --
+    duck_setup = [
+        _duck_from_pq("as_orders", "orders.parquet"),
+        _duck_from_pq("as_events", "events.parquet"),
+        _duck_from_pq("as_regions", "ref_regions.parquet"),
+        "DROP TABLE IF EXISTS as_customers;",
+        "CREATE TABLE as_customers (id INT, name TEXT, region TEXT, tier TEXT);",
+        "DROP TABLE IF EXISTS as_products;",
+        "CREATE TABLE as_products (id INT, name TEXT, category TEXT, price INT, weight INT);",
+        "DROP TABLE IF EXISTS as_returns;",
+        "CREATE TABLE as_returns (id INT, order_id INT, reason TEXT, refund_amount INT);",
+    ]
+    for i in range(2000):
+        duck_setup.append(
+            f"INSERT INTO as_customers VALUES ({i}, 'cust_{i}', "
+            f"'{['north', 'south', 'east', 'west'][i % 4]}', "
+            f"'{['basic', 'premium', 'enterprise'][i % 3]}');"
+        )
+    for i in range(500):
+        duck_setup.append(
+            f"INSERT INTO as_products VALUES ({i}, 'prod_{i}', "
+            f"'{['electronics', 'clothing', 'food', 'books', 'toys'][i % 5]}', "
+            f"{10 + (i * 17) % 490}, {1 + (i * 3) % 50});"
+        )
+    duck_setup.append(
+        "INSERT INTO as_returns SELECT n, n % 50000, "
+        "CASE WHEN n % 5 = 0 THEN 'defective' "
+        "WHEN n % 5 = 1 THEN 'wrong_size' "
+        "WHEN n % 5 = 2 THEN 'changed_mind' "
+        "WHEN n % 5 = 3 THEN 'damaged' "
+        "ELSE 'other' END, "
+        "10 + (n * 17) % 490 "
+        "FROM generate_series(0, 9999);"
+    )
+
+    bench = [
+        # Q1: 3-way join + GROUP BY + expression agg + ORDER BY
+        "SELECT c.region, p.category, SUM(o.quantity * p.price) AS revenue, COUNT(*) "
+        "FROM as_orders o "
+        "JOIN as_customers c ON o.customer_id = c.id "
+        "JOIN as_products p ON o.product_id = p.id "
+        "GROUP BY c.region, p.category "
+        "ORDER BY revenue DESC;",
+
+        # Q2: CTE + HAVING + ORDER BY + LIMIT
+        "WITH user_totals AS ("
+        "SELECT user_id, SUM(amount) AS total, COUNT(*) AS cnt "
+        "FROM as_events WHERE event_type = 0 "
+        "GROUP BY user_id "
+        "HAVING SUM(amount) > 500"
+        ") SELECT * FROM user_totals ORDER BY total DESC LIMIT 50;",
+
+        # Q3: Window function over parquet
+        "SELECT event_type, user_id, score, "
+        "RANK() OVER (PARTITION BY event_type ORDER BY score DESC) "
+        "FROM as_events WHERE score > 8000 "
+        "ORDER BY event_type, score DESC;",
+
+        # Q4: IN-subquery + compound WHERE + CAST
+        "SELECT o.id, o.customer_id, o.amount, o.quantity "
+        "FROM as_orders o "
+        "WHERE o.customer_id IN (SELECT id FROM as_customers WHERE tier = 'premium') "
+        "AND o.amount > 500 "
+        "ORDER BY o.amount DESC LIMIT 100;",
+
+        # Q5: Mixed parquet + in-memory join + scalar functions + GROUP BY
+        "SELECT r.reason, COUNT(*), SUM(ABS(r.refund_amount - o.amount)), "
+        "ROUND(AVG(r.refund_amount)::numeric, 0) "
+        "FROM as_returns r "
+        "JOIN as_orders o ON r.order_id = o.id "
+        "GROUP BY r.reason ORDER BY r.reason;",
+
+        # Q6: UNION ALL of parquet agg + in-memory agg
+        "SELECT region, SUM(total) AS grand_total FROM ("
+        "SELECT c.region AS region, SUM(o.amount) AS total "
+        "FROM as_orders o JOIN as_customers c ON o.customer_id = c.id "
+        "GROUP BY c.region "
+        "UNION ALL "
+        "SELECT rg.name AS region, SUM(r.refund_amount) AS total "
+        "FROM as_returns r JOIN as_regions rg ON r.order_id % 4 = rg.id "
+        "GROUP BY rg.name"
+        ") sub GROUP BY region ORDER BY region;",
+
+        # Q7: DISTINCT + multi-column sort + LIKE
+        "SELECT DISTINCT c.name, c.region "
+        "FROM as_customers c "
+        "JOIN as_orders o ON c.id = o.customer_id "
+        "WHERE c.name LIKE 'cust_1%' AND o.amount > 500 "
+        "ORDER BY c.region, c.name;",
+
+        # Q8: Nested CTE with join + aggregate
+        "WITH order_totals AS ("
+        "SELECT o.customer_id, SUM(o.quantity * p.price) AS total "
+        "FROM as_orders o JOIN as_products p ON o.product_id = p.id "
+        "GROUP BY o.customer_id"
+        "), customer_ranked AS ("
+        "SELECT ot.customer_id, ot.total, c.region "
+        "FROM order_totals ot JOIN as_customers c ON ot.customer_id = c.id "
+        "WHERE ot.total > 1000"
+        ") SELECT region, COUNT(*) AS num_customers, SUM(total) AS revenue "
+        "FROM customer_ranked GROUP BY region ORDER BY revenue DESC;",
+    ]
+
+    # Repeat the batch 3 times for stable timing
+    bench = bench * 3
+
+    return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
+
+
 _BASE_BENCHMARKS = [
     ("insert_bulk",        bench_insert_bulk),
     ("select_full_scan",   bench_select_full_scan),
@@ -906,6 +1062,8 @@ _BASE_BENCHMARKS = [
     ("pq_subquery",        bench_pq_subquery),
     ("pq_lineitem_agg",    bench_pq_lineitem_agg),
     ("pq_analytical",      bench_pq_analytical),
+    # ── Complex analytics stress test (parquet + in-memory mix) ──
+    ("analytics_stress",   bench_analytics_stress),
 ]
 
 

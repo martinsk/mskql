@@ -87,6 +87,14 @@ pq.write_table(pa.table({
     "discount":    pa.array([(i * 7) % 30 for i in range(M)], type=pa.int32()),
 }), os.path.join(OUT, "lineitem.parquet"))
 
+# 8. ref_regions.parquet — tiny dimension table (4 rows) for analytics stress benchmark
+#    id INT, name TEXT, tax_rate INT
+pq.write_table(pa.table({
+    "id":       pa.array([0, 1, 2, 3], type=pa.int32()),
+    "name":     pa.array(["north", "south", "east", "west"], type=pa.string()),
+    "tax_rate": pa.array([10, 8, 12, 9], type=pa.int32()),
+}), os.path.join(OUT, "ref_regions.parquet"))
+
 print(f"Generated benchmark fixtures in {OUT}/")
 for f in sorted(os.listdir(OUT)):
     sz = os.path.getsize(os.path.join(OUT, f))
