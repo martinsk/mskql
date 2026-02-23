@@ -9,7 +9,9 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
+#ifndef MSKQL_WASM
 #include <regex.h>
+#endif
 
 /* forward declarations for cell helpers used by legacy eval functions */
 static void cell_release(struct cell *c);
@@ -539,6 +541,11 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
             }
             /* SIMILAR TO / NOT SIMILAR TO */
             if (cond->op == CMP_SIMILAR_TO || cond->op == CMP_NOT_SIMILAR_TO) {
+#ifdef MSKQL_WASM
+                /* POSIX regex not available in WASM freestanding build */
+                cond_result = 0;
+                goto cond_cleanup;
+#else
                 if (lhs_is_null) { cond_result = -1; goto cond_cleanup; }
                 if (!column_type_is_text(c->type) || !c->value.as_text)
                     goto cond_cleanup;
@@ -561,10 +568,16 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
                 }
                 cond_result = (cond->op == CMP_NOT_SIMILAR_TO) ? !match2 : match2;
                 goto cond_cleanup;
+#endif
             }
             /* ~ / !~ / ~* / !~* regex match using POSIX ERE */
             if (cond->op == CMP_REGEX_MATCH || cond->op == CMP_REGEX_NOT_MATCH ||
                 cond->op == CMP_REGEX_ICASE_MATCH || cond->op == CMP_REGEX_ICASE_NOT_MATCH) {
+#ifdef MSKQL_WASM
+                /* POSIX regex not available in WASM freestanding build */
+                cond_result = 0;
+                goto cond_cleanup;
+#else
                 if (!column_type_is_text(c->type) || !c->value.as_text)
                     goto cond_cleanup;
                 if (!cond->value.value.as_text) goto cond_cleanup;
@@ -583,6 +596,7 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
                 }
                 cond_result = is_not ? !match : match;
                 goto cond_cleanup;
+#endif
             }
             /* ANY/ALL/SOME: col op ANY(SELECT ...) or col op ANY(ARRAY[...]) */
             if (cond->is_any || cond->is_all) {
