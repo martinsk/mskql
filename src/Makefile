@@ -40,13 +40,15 @@ endif
 CARQUET_LDFLAGS += -lz -lzstd
 TARGET   = $(BUILDDIR)/mskql_debug
 BENCH    = $(BUILDDIR)/mskql_bench
+CLI_DBG  = $(BUILDDIR)/mskqlcli_debug
+CLI_REL  = $(BUILDDIR)/mskqlcli
 
 # ── Release flags (for benchmarks / production) ──────────────────
 RELEASE_CFLAGS = -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O3 -flto -DNDEBUG -g -MMD -MP -I$(CARQUET_INC)
 RELEASE_OBJS     = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(SRCS))
 RELEASE_LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(LIB_SRCS))
 
-all: $(CARQUET_LIB) $(TARGET)
+all: $(CARQUET_LIB) $(TARGET) $(CLI_DBG)
 
 $(CARQUET_DIR)/CMakeLists.txt:
 	@echo "Cloning Carquet..."
@@ -75,6 +77,16 @@ release: $(CARQUET_LIB) $(RELEASE_OBJS)
 
 bench: $(CARQUET_LIB) $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_bench.o
 	$(CC) $(RELEASE_CFLAGS) -o $(BENCH) $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_bench.o $(CARQUET_LIB) -lm $(CARQUET_LDFLAGS)
+
+$(CLI_DBG): mskqlcli.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(CLI_REL): mskqlcli.c | $(BUILDDIR)
+	$(CC) $(RELEASE_CFLAGS) -o $@ $<
+
+mskqlcli: $(CLI_REL)
+
+mskqlcli-debug: $(CLI_DBG)
 
 bench-throughput: | $(BUILDDIR)
 	$(CC) -Wall -Wextra -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -g -pthread -o $(BUILDDIR)/mskql_bench_tp ../bench/bench_throughput.c
@@ -132,4 +144,4 @@ $(WASM_TARGET): $(WASM_SRCS) | $(BUILDDIR)
 -include $(OBJS:.o=.d)
 -include $(RELEASE_OBJS:.o=.d)
 
-.PHONY: all clean carquet-clean release bench bench-throughput wasm
+.PHONY: all clean carquet-clean release bench bench-throughput wasm mskqlcli mskqlcli-debug

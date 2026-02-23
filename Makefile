@@ -3,11 +3,13 @@
 all:
 	$(MAKE) -C src
 	$(MAKE) -C src release
+	$(MAKE) -C src mskqlcli
 	$(MAKE) -C src bench
 	$(MAKE) -C src bench-throughput
 
 release:
 	$(MAKE) -C src release
+	$(MAKE) -C src mskqlcli
 
 clean:
 	$(MAKE) -C src clean
@@ -25,4 +27,4 @@ bench: release
 bench-throughput: release
 	$(MAKE) -C src bench-throughput
 
-.PHONY: all clean release test test-concurrent bench bench-throughput
+.PHONY: all clean release test test-concurrent bench bench-throughput mskqlcli

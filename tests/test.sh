@@ -33,6 +33,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BASE_PORT=${MSKQL_TEST_BASE_PORT:-15433}
 NO_LEAK_CHECK=${MSKQL_NO_LEAK_CHECK:-0}
 FIXTURES_DIR="$SCRIPT_DIR/fixtures"
+MSKQLCLI="$PROJECT_DIR/build/mskqlcli_debug"
 LSAN_SUPP="$SCRIPT_DIR/lsan_suppressions.txt"
 FAILURE_LOG="$SCRIPT_DIR/test-failures.log"
 
@@ -123,7 +124,7 @@ trap cleanup_all EXIT
 
 psql_cmd() {
     local port="$1"; shift
-    psql -h 127.0.0.1 -p "$port" -U test -d mskql --no-psqlrc -tA "$@"
+    "$MSKQLCLI" -h 127.0.0.1 -p "$port" -U test -d mskql -tA "$@"
 }
 
 start_server() {

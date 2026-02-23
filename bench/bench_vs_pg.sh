@@ -5,7 +5,7 @@
 # Prerequisites:
 #   - mskql server running on port 5433 (or set MSKQL_PORT)
 #   - PostgreSQL running on port 5432 (or set PG_PORT)
-#   - psql available in PATH
+#   - build/mskqlcli built (make -C src mskqlcli)
 #   - duckdb available in PATH (or set DUCKDB_BIN)
 #   - python3 available in PATH
 #

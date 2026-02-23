@@ -2,8 +2,8 @@
 """
 bench_vs_pg.py — generate SQL workloads and time them against mskql and PostgreSQL.
 
-Mirrors the workloads in bench/bench.c but runs them over the wire via psql
-so the comparison with PostgreSQL is apples-to-apples.
+Mirrors the workloads in bench/bench.c but runs them over the wire via mskqlcli
+(or psql as fallback) so the comparison with PostgreSQL is apples-to-apples.
 """
 
 import argparse
@@ -18,21 +18,40 @@ import time
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def run_psql(host, port, user, db, sql_file):
-    """Run a SQL file through psql. Returns (returncode, stdout)."""
+# mskqlcli binary path — set by main() after arg parsing
+_cli_bin = None
+
+
+def _find_cli_bin():
+    """Auto-detect mskqlcli binary."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = os.path.dirname(script_dir)
+    for candidate in [
+        os.path.join(project_dir, "build", "mskqlcli"),
+        os.path.join(project_dir, "build", "mskqlcli_debug"),
+    ]:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    # fall back to PATH
+    found = shutil.which("mskqlcli")
+    return found
+
+
+def run_cli(host, port, user, db, sql_file):
+    """Run a SQL file through mskqlcli. Returns (returncode, stdout)."""
     cmd = [
-        "psql", "-h", host, "-p", str(port), "-U", user, "-d", db,
-        "-X", "-q", "-A", "-t", "-f", sql_file,
+        _cli_bin, "-h", host, "-p", str(port), "-U", user, "-d", db,
+        "-q", "-A", "-t", "-f", sql_file,
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, check=False)
     return r.returncode, r.stdout
 
 
-def run_psql_cmd(host, port, user, db, sql):
-    """Run a single SQL command through psql."""
+def run_cli_cmd(host, port, user, db, sql):
+    """Run a single SQL command through mskqlcli."""
     cmd = [
-        "psql", "-h", host, "-p", str(port), "-U", user, "-d", db,
-        "-X", "-q", "-A", "-t", "-c", sql,
+        _cli_bin, "-h", host, "-p", str(port), "-U", user, "-d", db,
+        "-q", "-A", "-t", "-c", sql,
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, check=False)
     return r.returncode, r.stdout
@@ -46,10 +65,10 @@ def write_sql(path, lines):
             f.write("\n")
 
 
-def time_psql(host, port, user, db, sql_file):
-    """Time a psql -f invocation, return elapsed milliseconds."""
+def time_cli(host, port, user, db, sql_file):
+    """Time a mskqlcli -f invocation, return elapsed milliseconds."""
     t0 = time.monotonic()
-    rc, _ = run_psql(host, port, user, db, sql_file)
+    rc, _ = run_cli(host, port, user, db, sql_file)
     elapsed = (time.monotonic() - t0) * 1000.0
     if rc != 0:
         return -1.0
@@ -1103,11 +1122,23 @@ def main():
     p.add_argument("--pg-db", default="mskql_bench")
     p.add_argument("--pg-user", default=os.environ.get("USER", "postgres"))
     p.add_argument("--duckdb-bin", default="duckdb", help="path to DuckDB CLI")
+    p.add_argument("--mskqlcli", default=None, help="path to mskqlcli binary")
     p.add_argument("--filter", default=None, help="run only this benchmark")
     p.add_argument("--markdown", action="store_true", help="output markdown table")
     args = p.parse_args()
 
     host = "127.0.0.1"
+
+    # ── find mskqlcli binary ──
+    global _cli_bin
+    if args.mskqlcli:
+        _cli_bin = args.mskqlcli
+    else:
+        _cli_bin = _find_cli_bin()
+    if not _cli_bin:
+        print("ERROR: mskqlcli not found. Build with: make -C src mskqlcli")
+        print("       Or pass --mskqlcli /path/to/mskqlcli")
+        sys.exit(1)
 
     duckdb_bin = shutil.which(args.duckdb_bin)
     if not duckdb_bin:
@@ -1120,30 +1151,31 @@ def main():
     print(f"  mskql   : {host}:{args.mskql_port}")
     print(f"  postgres: {host}:{args.pg_port} (db: {args.pg_db})")
     print(f"  duckdb  : {duckdb_bin} (file-backed, in-process — no client/server overhead)")
+    print(f"  cli     : {_cli_bin}")
     print("=" * 90)
     print()
 
     # ── verify connectivity ──
-    rc, _ = run_psql_cmd(host, args.mskql_port, args.pg_user, "mskql", "SELECT 1")
+    rc, _ = run_cli_cmd(host, args.mskql_port, args.pg_user, "mskql", "SELECT 1")
     if rc != 0:
         print(f"ERROR: Cannot connect to mskql on port {args.mskql_port}")
         print("       Start it with: ./build/mskql")
         sys.exit(1)
 
-    rc, _ = run_psql_cmd(host, args.pg_port, args.pg_user, "postgres", "SELECT 1")
+    rc, _ = run_cli_cmd(host, args.pg_port, args.pg_user, "postgres", "SELECT 1")
     if rc != 0:
         print(f"ERROR: Cannot connect to PostgreSQL on port {args.pg_port}")
         sys.exit(1)
 
     # ── ensure pg benchmark database exists ──
-    rc, out = run_psql_cmd(
+    rc, out = run_cli_cmd(
         host, args.pg_port, args.pg_user, "postgres",
         f"SELECT 1 FROM pg_database WHERE datname = '{args.pg_db}'"
     )
     if "1" not in out:
         print(f"Creating PostgreSQL database '{args.pg_db}'...")
-        run_psql_cmd(host, args.pg_port, args.pg_user, "postgres",
-                     f"CREATE DATABASE {args.pg_db}")
+        run_cli_cmd(host, args.pg_port, args.pg_user, "postgres",
+                    f"CREATE DATABASE {args.pg_db}")
 
     results = []
     bench_count = sum(1 for n, _ in BENCHMARKS if not args.filter or args.filter == n)
@@ -1183,8 +1215,8 @@ def main():
         m_setup_f.close()
         m_bench_f.write("\n".join(mskql_spec[1]) + "\n")
         m_bench_f.close()
-        run_psql(host, args.mskql_port, args.pg_user, "mskql", m_setup_f.name)
-        mskql_ms = time_psql(host, args.mskql_port, args.pg_user, "mskql", m_bench_f.name)
+        run_cli(host, args.mskql_port, args.pg_user, "mskql", m_setup_f.name)
+        mskql_ms = time_cli(host, args.mskql_port, args.pg_user, "mskql", m_bench_f.name)
         os.unlink(m_setup_f.name)
         os.unlink(m_bench_f.name)
 
@@ -1200,8 +1232,8 @@ def main():
             p_setup_f.close()
             p_bench_f.write("\n".join(pg_spec[1]) + "\n")
             p_bench_f.close()
-            run_psql(host, args.pg_port, args.pg_user, args.pg_db, p_setup_f.name)
-            pg_ms = time_psql(host, args.pg_port, args.pg_user, args.pg_db, p_bench_f.name)
+            run_cli(host, args.pg_port, args.pg_user, args.pg_db, p_setup_f.name)
+            pg_ms = time_cli(host, args.pg_port, args.pg_user, args.pg_db, p_bench_f.name)
             os.unlink(p_setup_f.name)
             os.unlink(p_bench_f.name)
         else:
