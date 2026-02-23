@@ -19,7 +19,7 @@
 <hr class="title-rule">
 
 <p>
-    <strong>~39K lines of C. Zero dependencies. Four stages: wire protocol, parser,
+    <strong>~43.6K lines of C. Zero dependencies. Four stages: wire protocol, parser,
     executor, storage.</strong> Every query flows through the same pipeline.
     The block-oriented plan executor processes 1,024-row column blocks for
     cache-friendly, vectorized execution.
@@ -53,19 +53,22 @@
             <td><code>parser.c</code></td>
             <td>Hand-written recursive-descent parser producing a typed
                 <code>struct&nbsp;query</code> AST&mdash;no generators.
-                ~10,200 lines with proper operator precedence,
+                ~7,600 lines with proper operator precedence,
                 CTEs, window functions, set operations, and
                 <code>generate_series()</code> table functions</td>
         </tr>
         <tr>
             <td><strong>Query executor</strong></td>
             <td><code>query.c</code>, <code>database.c</code></td>
-            <td>Block-oriented plan executor (<code>plan.c</code>, ~10,250 lines)
-                handles most queries with vectorized operators: scan, filter,
-                project, sort (including Top-N via binary heap), hash join,
-                hash aggregation, index scan, window functions, set operations,
-                CTEs, Parquet foreign-table scans, correlated subquery
-                decorrelation, and <code>generate_series()</code>.
+            <td>Block-oriented plan executor (<code>plan.c</code>, ~11,500 lines)
+                handles most queries with vectorized operators: scan, filter
+                (branchless vectorized comparison loops for INT/BIGINT/FLOAT),
+                project, sort (radix sort for integers, composite multi-key radix,
+                Top-N via binary heap), hash join (with <code>flat_col</code>
+                dynamic columnar storage), hash aggregation, index scan,
+                window functions, set operations, CTEs, Parquet foreign-table
+                scans, correlated subquery decorrelation, and
+                <code>generate_series()</code>.
                 A scan cache with generation tracking skips redundant scans.
                 Direct columnar-to-wire serialization bypasses row materialization.
                 Complex queries (<code>ROLLUP</code>/<code>CUBE</code>)
@@ -74,9 +77,13 @@
         </tr>
         <tr>
             <td><strong>Storage</strong></td>
-            <td><code>table.c</code>, <code>row.c</code>, <code>index.c</code></td>
-            <td>Tables are arrays of rows; rows are arrays of typed cells. B-tree indexes
-                for equality lookups. Snapshot-and-restore for transaction rollback</td>
+            <td><code>table.c</code>, <code>row.c</code>, <code>index.c</code>, <code>datetime.c</code></td>
+            <td>Tables are arrays of rows; rows are arrays of typed cells.
+                Native integer storage for temporal types (DATE as int32,
+                TIMESTAMP/TIME as int64 microseconds, INTERVAL as 16-byte struct).
+                Binary UUID storage (two uint64). ENUM stored as int32 ordinal.
+                B-tree indexes (single and composite multi-column) for equality lookups.
+                Lazy copy-on-write snapshots for transaction rollback</td>
         </tr>
     </tbody>
 </table>
@@ -247,17 +254,18 @@
     Accumulating DataRow messages into a 64&nbsp;KB buffer and flushing with
     one <code>write()</code> call eliminates one system call per row. For a
     5,000-row result: 5 <code>write()</code> calls instead of 5,000. This
-    alone closed the full-scan performance gap from 4.65&times; slower than
-    PostgreSQL to 1.18&times;&mdash;nearly matching.
+    alone closed the full-scan performance gap with PostgreSQL.
+    Write coalescing (TCP_NODELAY + TCP_NOPUSH/CORK + 256&nbsp;KB buffer)
+    further reduces syscall overhead.
 </p>
 
 <p>
     <strong>Result cache.</strong>
     Repeated identical <code>SELECT</code>s skip parsing, planning, and
     execution entirely. The throughput benchmark&rsquo;s analytical CTE
-    workload runs at 74,069&nbsp;QPS (152&times; PostgreSQL) because the
+    workload runs at 94,525&nbsp;QPS (190&times; PostgreSQL) because the
     result is served from cached wire bytes in microseconds. On Parquet
-    workloads, the cache makes mskql faster than DuckDB on 8 of 9 repeated
+    workloads, the cache makes mskql faster than DuckDB on all 9 cached
     queries.
 </p>
 
@@ -267,7 +275,7 @@
     The first write to a table triggers a <code>table_deep_copy()</code> of
     that table only&mdash;O(N) for that table. <code>COMMIT</code> is free
     (discard the snapshot). <code>ROLLBACK</code> swaps the saved copy back.
-    This is why the transaction benchmark runs at 0.93&times; PostgreSQL
+    This is why the transaction benchmark runs at 0.86&times; PostgreSQL
     despite mskql having no WAL.
 </p>
 
@@ -326,11 +334,11 @@
 
 <p>
     <strong>Fast.</strong> The block-oriented executor with columnar scan caching
-    is faster than PostgreSQL on all 28 cached batch benchmarks and DuckDB on
-    37 of 84 workloads. Aggregate queries run 6&ndash;10&times; faster than both.
+    is faster than PostgreSQL on every cached batch benchmark and DuckDB on
+    39 of 84 workloads. Aggregate queries run 8&ndash;10&times; faster than both.
     Direct columnar-to-wire serialization avoids row materialization entirely.
-    The throughput benchmark sustains 94,729&nbsp;QPS on analytical
-    workloads&mdash;137&times; PostgreSQL.
+    The throughput benchmark sustains 94,525&nbsp;QPS on analytical
+    workloads&mdash;190&times; PostgreSQL.
 </p>
 <p>
     <strong>Simple.</strong> Zero external dependencies. One <code>.c</code> file per

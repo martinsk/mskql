@@ -32,15 +32,18 @@
     <tbody>
         <tr>
             <td><strong>DDL</strong></td>
-            <td><code>CREATE TABLE</code> (<code>IF NOT EXISTS</code>),
+            <td><code>CREATE TABLE</code> (<code>IF NOT EXISTS</code>, <code>LIKE</code>),
                 <code>DROP TABLE</code>,
-                <code>CREATE INDEX</code> (<code>IF NOT EXISTS</code>),
+                <code>CREATE INDEX</code> (<code>IF NOT EXISTS</code>, composite multi-column),
                 <code>DROP INDEX</code>,
                 <code>CREATE TYPE &hellip; AS ENUM</code>, <code>DROP TYPE</code>,
                 <code>CREATE SEQUENCE</code>, <code>DROP SEQUENCE</code>,
                 <code>CREATE VIEW</code>, <code>DROP VIEW</code>,
                 <code>ALTER TABLE</code> (<code>ADD</code>/<code>DROP</code>/<code>RENAME COLUMN</code>,
-                <code>ALTER COLUMN TYPE</code>)</td>
+                <code>ALTER COLUMN TYPE</code>,
+                <code>SET DEFAULT</code>/<code>DROP DEFAULT</code>,
+                <code>SET NOT NULL</code>/<code>DROP NOT NULL</code>),
+                composite <code>PRIMARY KEY(col1, col2)</code> / <code>UNIQUE(col1, col2)</code></td>
             <td>Schema changes are immediate; no background rewrite. Views are expanded at query time.</td>
         </tr>
         <tr>
@@ -50,7 +53,7 @@
                 <code>DELETE</code>,
                 <code>RETURNING</code>,
                 <code>ON CONFLICT DO NOTHING</code>,
-                <code>ON CONFLICT DO UPDATE</code>,
+                <code>ON CONFLICT DO UPDATE</code> (with <code>EXCLUDED.*</code> references),
                 <code>TRUNCATE TABLE</code>,
                 <code>COPY TO STDOUT</code> (tab/CSV/header),
                 <code>COPY FROM STDIN</code> (tab/CSV)</td>
@@ -123,8 +126,9 @@
         <tr>
             <td><strong>Result control</strong></td>
             <td><code>DISTINCT</code>, <code>DISTINCT ON</code>,
-                <code>ORDER BY</code> (multi-column, per-column <code>ASC</code>/<code>DESC</code>),
-                <code>LIMIT</code>, <code>OFFSET</code></td>
+                <code>ORDER BY</code> (multi-column, per-column <code>ASC</code>/<code>DESC</code>, positional),
+                <code>LIMIT</code>, <code>OFFSET</code>,
+                <code>FETCH FIRST N ROWS ONLY</code></td>
             <td><code>LIMIT</code> short-circuits the plan&mdash;stops pulling blocks once satisfied.</td>
         </tr>
         <tr>
@@ -151,8 +155,9 @@
                 <code>REPLACE()</code>, <code>LPAD()</code>/<code>RPAD()</code>,
                 <code>POSITION()</code>, <code>SPLIT_PART()</code>,
                 <code>LEFT()</code>/<code>RIGHT()</code>,
-                <code>REPEAT()</code>, <code>REVERSE()</code>, <code>INITCAP()</code></td>
-            <td>16 string functions. All run in the expression projector for batched evaluation.</td>
+                <code>REPEAT()</code>, <code>REVERSE()</code>, <code>INITCAP()</code>,
+                <code>LTRIM()</code>, <code>RTRIM()</code>, <code>SUBSTR()</code></td>
+            <td>19 string functions. All run in the expression projector for batched evaluation.</td>
         </tr>
         <tr>
             <td><strong>Math functions</strong></td>
@@ -205,7 +210,7 @@
                 correlated subqueries,
                 <code>EXISTS</code> / <code>NOT EXISTS</code> (correlated),
                 <code>IN (SELECT&hellip;)</code></td>
-            <td><code>IN</code> subqueries use hash semi-join (O(N+M)). Correlated subqueries: 145&times; faster than PG.</td>
+            <td><code>IN</code> subqueries use hash semi-join (O(N+M)). Correlated subqueries: 166&times; faster than PG.</td>
         </tr>
         <tr>
             <td><strong>Introspection</strong></td>
@@ -218,7 +223,12 @@
                 <code>pg_catalog.pg_type</code>,
                 <code>pg_catalog.pg_class</code>,
                 <code>pg_catalog.pg_namespace</code>,
-                <code>pg_catalog.pg_attribute</code></td>
+                <code>pg_catalog.pg_attribute</code>,
+                <code>pg_catalog.pg_index</code>,
+                <code>pg_catalog.pg_attrdef</code>,
+                <code>pg_catalog.pg_constraint</code>,
+                <code>pg_catalog.pg_am</code>,
+                <code>pg_catalog.pg_roles</code></td>
             <td><code>EXPLAIN</code> shows the plan tree. System catalogs enable tool compatibility (e.g. DBeaver, pgAdmin).</td>
         </tr>
     </tbody>
@@ -244,12 +254,12 @@
         <tr><td><code>TEXT</code></td><td>variable</td><td>Variable-length string. No length limit.</td></tr>
         <tr><td><code>VARCHAR(n)</code></td><td>variable</td><td>String with max length <em>n</em>. Stored as TEXT internally.</td></tr>
         <tr><td><code>BOOLEAN</code></td><td>1 byte</td><td><code>TRUE</code> / <code>FALSE</code>. Accepts <code>t</code>/<code>f</code>, <code>yes</code>/<code>no</code>, <code>1</code>/<code>0</code>.</td></tr>
-        <tr><td><code>DATE</code></td><td>variable</td><td>Calendar date (YYYY-MM-DD).</td></tr>
-        <tr><td><code>TIME</code></td><td>variable</td><td>Time of day (HH:MM:SS).</td></tr>
-        <tr><td><code>TIMESTAMP</code></td><td>variable</td><td>Date and time (YYYY-MM-DD HH:MM:SS). Supports arithmetic with intervals.</td></tr>
-        <tr><td><code>TIMESTAMPTZ</code></td><td>variable</td><td>Timestamp with time zone awareness.</td></tr>
-        <tr><td><code>INTERVAL</code></td><td>variable</td><td>Time span. Supports <code>'1 year 2 months 3 days'</code> syntax.</td></tr>
-        <tr><td><code>UUID</code></td><td>variable</td><td>128-bit identifier. Generated with <code>GEN_RANDOM_UUID()</code>.</td></tr>
+        <tr><td><code>DATE</code></td><td>4 bytes</td><td>Calendar date (YYYY-MM-DD). Stored as <code>int32_t</code> days from PostgreSQL epoch (2000-01-01).</td></tr>
+        <tr><td><code>TIME</code></td><td>8 bytes</td><td>Time of day (HH:MM:SS). Stored as <code>int64_t</code> microseconds since midnight.</td></tr>
+        <tr><td><code>TIMESTAMP</code></td><td>8 bytes</td><td>Date and time (YYYY-MM-DD HH:MM:SS). Stored as <code>int64_t</code> microseconds from PG epoch. Supports arithmetic with intervals.</td></tr>
+        <tr><td><code>TIMESTAMPTZ</code></td><td>8 bytes</td><td>Timestamp with time zone awareness. Same storage as <code>TIMESTAMP</code>.</td></tr>
+        <tr><td><code>INTERVAL</code></td><td>16 bytes</td><td>Time span (<code>months</code> int32 + <code>days</code> int32 + <code>usec</code> int64). Supports <code>'1 year 2 months 3 days'</code> syntax.</td></tr>
+        <tr><td><code>UUID</code></td><td>16 bytes</td><td>128-bit identifier stored as two <code>uint64</code>. Generated with <code>GEN_RANDOM_UUID()</code>.</td></tr>
         <tr><td><code>SMALLSERIAL</code> / <code>SERIAL</code> / <code>BIGSERIAL</code></td><td>2/4/8 bytes</td><td>Auto-incrementing integer backed by a sequence.</td></tr>
         <tr><td><code>ENUM</code></td><td>4 bytes</td><td>User-defined type with ordinal storage. Compared by declaration order.</td></tr>
     </tbody>

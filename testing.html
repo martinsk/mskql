@@ -15,13 +15,13 @@
 <p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
 
 <h1>Testing</h1>
-<span class="subtitle">1,240+ tests &middot; two layers of verification &middot; zero tolerance for leaks</span>
+<span class="subtitle">1,355+ tests &middot; two layers of verification &middot; zero tolerance for leaks</span>
 <hr class="title-rule">
 
 <p>
-    <strong>1,240+ tests. Every one runs under AddressSanitizer.</strong>
+    <strong>1,355+ tests. Every one runs under AddressSanitizer.</strong>
     A correct query that leaks 16&nbsp;bytes is a failure.
-    Tests run in parallel across all CPU cores, each in an isolated server instance.
+    Tests run in parallel across all CPU cores with persistent server instances.
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -62,16 +62,29 @@
 <h2 id="runner">Test runner architecture</h2>
 
 <p>
-    The test runner (<code>tests/test.sh</code>, 459&nbsp;lines) orchestrates
+    The test runner (<code>tests/test.sh</code>, 571&nbsp;lines) orchestrates
     everything. No test framework&mdash;just shell scripts and <code>diff</code>.
 </p>
 
-<h3>Per-test server isolation</h3>
+<h3>Persistent servers with database reset</h3>
 
 <p>
-    Each <code>.sql</code> test file starts a <em>fresh</em> server process.
-    No shared state between tests. This eliminates ordering dependencies and
-    makes every test independently reproducible.
+    Each worker starts <em>one</em> persistent server process and reuses it
+    for all tests in its partition. Between tests, <code>SELECT __reset_db()</code>
+    drops all tables, types, and sequences&mdash;returning the database to a
+    clean state without the overhead of process start/stop. If a reset fails
+    (e.g. server crash), the worker automatically restarts its server.
+    This eliminates ~1,300 server start/stop cycles, reducing wall-clock
+    time from ~87s to ~17s.
+</p>
+
+<h3>Batched psql sessions</h3>
+
+<p>
+    All setup SQL for a test is piped through a single <code>psql</code>
+    session, and all input SQL through another. Semicolons are normalized
+    (<code>sed 's/;*$/;/'</code>) to ensure correct batching. This reduces
+    psql invocations from ~3,300 to ~2,700 per full run.
 </p>
 
 <h3>ASAN / LeakSanitizer by default</h3>
@@ -81,9 +94,10 @@
     <code>-fsanitize=address -fno-omit-frame-pointer</code>. The test runner
     sets <code>ASAN_OPTIONS="detect_leaks=1:log_path=..."</code> and
     <code>LSAN_OPTIONS="suppressions=..."</code> per server
-    instance. After each test, <code>check_asan_logs()</code> scans the ASAN log for
-    <code>LeakSanitizer</code> or <code>ERROR: AddressSanitizer</code>&mdash;any
-    hit fails the test with the leak summary in the output.
+    instance. ASAN checking is done once per worker at shutdown (not per-test),
+    since the persistent server accumulates all leak data across its lifetime.
+    Any <code>LeakSanitizer</code> or <code>ERROR: AddressSanitizer</code> hit
+    fails the entire worker&rsquo;s test batch.
 </p>
 
 <h3>Suppressions for system false positives</h3>
@@ -110,8 +124,10 @@ leak:localtime</code></pre>
 <p>
     Tests run N-wide (auto-detected via <code>nproc</code> / <code>sysctl</code>).
     Each worker gets a unique port (<code>BASE_PORT + slot_index</code>).
-    A job-slot scheduler dispatches tests to free workers and collects results.
-    Wall-clock time is proportional to the slowest single test, not the sum.
+    Tests are round-robin distributed across worker manifest files;
+    each worker runs its batch sequentially on its persistent server.
+    The main process polls for result files every 100ms.
+    Wall-clock time is proportional to the slowest worker partition, not the sum.
 </p>
 
 <h3>Transaction-aware execution</h3>
@@ -223,9 +239,10 @@ SELECT id, name, age FROM t_aac ORDER BY id;
 <h2 id="coverage">What is tested</h2>
 
 <p>
-    The 1,240+ test cases cover DDL
-    (<code>IF&nbsp;NOT&nbsp;EXISTS</code>, <code>CHECK</code> constraints),
-    DML, joins,
+    The 1,355+ test cases cover DDL
+    (<code>IF&nbsp;NOT&nbsp;EXISTS</code>, <code>CHECK</code> constraints,
+    <code>CREATE&nbsp;TABLE&nbsp;LIKE</code>, composite indexes),
+    DML, joins (<code>NATURAL</code>, <code>USING</code>, multi-table),
     aggregation (including expression aggregates, positional <code>GROUP&nbsp;BY</code>,
     <code>STRING_AGG()</code>, and <code>ARRAY_AGG()</code>),
     window functions (including frames), set operations, CTEs,
@@ -234,6 +251,8 @@ SELECT id, name, age FROM t_aac ORDER BY id;
     foreign keys (<code>CASCADE</code>, <code>RESTRICT</code>,
     <code>SET&nbsp;NULL</code>, <code>SET&nbsp;DEFAULT</code>),
     sequences, views, <code>SMALLINT</code> type,
+    native temporal types (DATE, TIME, TIMESTAMP, INTERVAL),
+    binary UUID, Parquet foreign tables,
     <code>EXPLAIN</code>, system catalog queries
     (<code>information_schema</code>, <code>pg_catalog</code>),
     <code>SET</code>/<code>SHOW</code>/<code>DISCARD</code>,
@@ -244,7 +263,8 @@ SELECT id, name, age FROM t_aac ORDER BY id;
     <code>IS&nbsp;[NOT]&nbsp;DISTINCT&nbsp;FROM</code>,
     <code>ORDER&nbsp;BY</code> expressions, <code>INSERT...SELECT</code> with CTEs,
     <code>generate_series()</code>,
-    upserts, correlated subqueries,
+    upserts (<code>ON&nbsp;CONFLICT</code> with <code>EXCLUDED.*</code>),
+    correlated subqueries, multi-column radix sort,
     error message propagation,
     and various edge cases.
 </p>
@@ -255,7 +275,7 @@ SELECT id, name, age FROM t_aac ORDER BY id;
 
 <h2 id="running">Running the tests</h2>
 
-<pre><code class="language-bash">make test                          # full suite: build with ASAN, run all 1,240+ tests
+<pre><code class="language-bash">make test                          # full suite: build with ASAN, run all 1,355+ tests
 MSKQL_NO_LEAK_CHECK=1 make test   # skip leak checking (faster, less strict)</code></pre>
 
 <h2 id="so-what">Why this matters</h2>
@@ -263,7 +283,7 @@ MSKQL_NO_LEAK_CHECK=1 make test   # skip leak checking (faster, less strict)</co
 <p>
     Arena allocation eliminates use-after-free and leak classes by construction.
     AddressSanitizer catches the rest. The result: zero known memory bugs across
-    1,240+ adversarial test cases.
+    1,355+ adversarial test cases.
 </p>
 
 <h2 id="now-what">Explore further</h2>

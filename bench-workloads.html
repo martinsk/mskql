@@ -83,7 +83,7 @@
 
 <div class="workload" id="full_scan">
     <h3>Full table scan</h3>
-    <div class="workload-meta">5,000 rows &times; 3 columns &times; 200 iterations &ensp;|&ensp; <span class="faster">0.68&times;</span></div>
+    <div class="workload-meta">5,000 rows &times; 3 columns &times; 200 iterations &ensp;|&ensp; <span class="faster">0.67&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -121,7 +121,7 @@
 
 <div class="workload" id="filtered_scan">
     <h3>Filtered scan</h3>
-    <div class="workload-meta">5,000 rows &times; 500 iterations &ensp;|&ensp; <span class="faster">0.59&times;</span></div>
+    <div class="workload-meta">5,000 rows &times; 500 iterations &ensp;|&ensp; <span class="faster">0.58&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -155,7 +155,7 @@
 
 <div class="workload" id="index_lookup">
     <h3>Indexed point lookup</h3>
-    <div class="workload-meta">2,000 iterations &ensp;|&ensp; <span class="faster">0.98&times;</span></div>
+    <div class="workload-meta">2,000 iterations &ensp;|&ensp; <span class="faster">0.96&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -190,7 +190,7 @@
 
 <div class="workload" id="sort">
     <h3>Sort</h3>
-    <div class="workload-meta">5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.56&times;</span></div>
+    <div class="workload-meta">5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.55&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -224,7 +224,7 @@
 
 <div class="workload" id="multi_sort">
     <h3>Multi-column sort</h3>
-    <div class="workload-meta">5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.54&times;</span></div>
+    <div class="workload-meta">5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.53&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -258,7 +258,7 @@
 
 <div class="workload" id="distinct">
     <h3>Distinct</h3>
-    <div class="workload-meta">100 categories &times; 500 iterations &ensp;|&ensp; <span class="faster">0.14&times;</span></div>
+    <div class="workload-meta">100 categories &times; 500 iterations &ensp;|&ensp; <span class="faster">0.15&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -293,7 +293,7 @@
 
 <div class="workload" id="insert_bulk">
     <h3>Single-row inserts</h3>
-    <div class="workload-meta">10,000 inserts &ensp;|&ensp; <span class="faster">0.37&times;</span></div>
+    <div class="workload-meta">10,000 inserts &ensp;|&ensp; <span class="faster">0.35&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -325,7 +325,7 @@
 
 <div class="workload" id="update">
     <h3>Bulk update</h3>
-    <div class="workload-meta">1,000 of 5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.20&times;</span></div>
+    <div class="workload-meta">1,000 of 5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.23&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -360,7 +360,7 @@
 
 <div class="workload" id="delete">
     <h3>Insert + delete</h3>
-    <div class="workload-meta">2,000 rows, delete half &times; 50 iterations &ensp;|&ensp; <span class="faster">0.36&times;</span></div>
+    <div class="workload-meta">2,000 rows, delete half &times; 50 iterations &ensp;|&ensp; <span class="faster">0.32&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -390,7 +390,7 @@ DELETE FROM bench_data WHERE id % 2 = 0;
 
 <div class="workload" id="transaction">
     <h3>Transactional inserts</h3>
-    <div class="workload-meta">100 transactions, 50 inserts each &ensp;|&ensp; <span class="faster">0.93&times;</span></div>
+    <div class="workload-meta">100 transactions, 50 inserts each &ensp;|&ensp; <span class="faster">0.86&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -403,7 +403,7 @@ COMMIT;</code></pre>
     <div class="so-what">
         <span class="section-label">So what</span>
         <p>
-            Tests transaction overhead. The near-parity (0.93&times;) is
+            Tests transaction overhead. The near-parity (0.86&times;) is
             notable because PostgreSQL&rsquo;s transactions are backed by
             WAL with group commit, while mskql uses lazy copy-on-write
             snapshots with no durability.
@@ -528,7 +528,7 @@ FROM wide_bench GROUP BY region, product;</code></pre>
 
 <div class="workload" id="window_functions">
     <h3>Window function (ROW_NUMBER)</h3>
-    <div class="workload-meta">5,000 rows &times; 20 iterations &ensp;|&ensp; <span class="faster">0.57&times;</span></div>
+    <div class="workload-meta">5,000 rows &times; 20 iterations &ensp;|&ensp; <span class="faster">0.55&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -558,7 +558,7 @@ FROM bench_data;</code></pre>
 
 <div class="workload" id="window_rank">
     <h3>Window function (RANK)</h3>
-    <div class="workload-meta">50,000 rows &times; 5 iterations &ensp;|&ensp; <span class="faster">0.55&times;</span></div>
+    <div class="workload-meta">50,000 rows &times; 5 iterations &ensp;|&ensp; <span class="faster">0.50&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -590,7 +590,7 @@ FROM wide_bench;</code></pre>
 
 <div class="workload" id="join">
     <h3>Two-table join</h3>
-    <div class="workload-meta">500 + 2,000 rows &times; 50 iterations &ensp;|&ensp; <span class="faster">0.45&times;</span></div>
+    <div class="workload-meta">500 + 2,000 rows &times; 50 iterations &ensp;|&ensp; <span class="faster">0.44&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -623,7 +623,7 @@ JOIN orders o ON c.id = o.customer_id;</code></pre>
 
 <div class="workload" id="multi_join">
     <h3>Three-table join + group</h3>
-    <div class="workload-meta">50,000 rows &times; 5 iterations &ensp;|&ensp; <span class="faster">0.33&times;</span></div>
+    <div class="workload-meta">50,000 rows &times; 5 iterations &ensp;|&ensp; <span class="faster">0.32&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -657,7 +657,7 @@ GROUP BY r.name, p.name;</code></pre>
 
 <div class="workload" id="subquery">
     <h3>Subquery filter</h3>
-    <div class="workload-meta">IN subquery &times; 50 iterations &ensp;|&ensp; <span class="faster">0.44&times;</span></div>
+    <div class="workload-meta">IN subquery &times; 50 iterations &ensp;|&ensp; <span class="faster">0.43&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -689,7 +689,7 @@ WHERE customer_id IN (
 
 <div class="workload" id="subquery_complex">
     <h3>Subquery pipeline</h3>
-    <div class="workload-meta">filter + sort + limit, 50,000 rows &times; 20 iterations &ensp;|&ensp; <span class="faster">0.20&times;</span></div>
+    <div class="workload-meta">filter + sort + limit, 50,000 rows &times; 20 iterations &ensp;|&ensp; <span class="faster">0.19&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -722,7 +722,7 @@ WHERE customer_id IN (
 
 <div class="workload" id="cte">
     <h3>CTE filter chain</h3>
-    <div class="workload-meta">5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.44&times;</span></div>
+    <div class="workload-meta">5,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.43&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -755,7 +755,7 @@ GROUP BY category ORDER BY COUNT(*) DESC;</code></pre>
 
 <div class="workload" id="analytical_cte">
     <h3>CTE pipeline</h3>
-    <div class="workload-meta">agg &rarr; sort &rarr; limit, 50,000 rows &times; 20 iterations &ensp;|&ensp; <span class="faster">0.75&times;</span></div>
+    <div class="workload-meta">agg &rarr; sort &rarr; limit, 50,000 rows &times; 20 iterations &ensp;|&ensp; <span class="faster">0.73&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -788,7 +788,7 @@ SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
 
 <div class="workload" id="cte_star">
     <h3>CTE star-schema</h3>
-    <div class="workload-meta">join &rarr; agg &rarr; sort, 50,000 rows &times; 5 iterations &ensp;|&ensp; <span class="faster">0.40&times;</span></div>
+    <div class="workload-meta">join &rarr; agg &rarr; sort, 50,000 rows &times; 5 iterations &ensp;|&ensp; <span class="faster">0.26&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -816,8 +816,8 @@ ORDER BY total DESC;</code></pre>
         <span class="section-label">Now what</span>
         <p>
             The CTE materializes the join result, then the outer query
-            aggregates and sorts. In the throughput benchmark, this same
-            query runs at 74,069&nbsp;QPS (152&times; PostgreSQL) because
+            aggregates and sorts. In the throughput            this same
+            query runs at 94,525&nbsp;QPS (190&times; PostgreSQL) because
             the 4-row result is served from the result cache in microseconds.
         </p>
     </div>
@@ -859,7 +859,7 @@ SELECT id, category, value FROM bench_data_b;</code></pre>
 
 <div class="workload" id="generate_series">
     <h3>Generate series</h3>
-    <div class="workload-meta">10,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.32&times;</span></div>
+    <div class="workload-meta">10,000 rows &times; 200 iterations &ensp;|&ensp; <span class="faster">0.31&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -923,7 +923,7 @@ FROM bench_data;</code></pre>
 
 <div class="workload" id="large_sort">
     <h3>Large sort</h3>
-    <div class="workload-meta">50,000 rows &times; 10 iterations &ensp;|&ensp; <span class="faster">0.87&times;</span></div>
+    <div class="workload-meta">50,000 rows &times; 10 iterations &ensp;|&ensp; <span class="faster">0.65&times;</span></div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -933,9 +933,9 @@ FROM bench_data;</code></pre>
     <div class="so-what">
         <span class="section-label">So what</span>
         <p>
-            Tests sort performance at scale. The closer ratio (0.87&times;)
-            shows that sorting 50K rows is dominated by the O(N log N)
-            comparison cost, where both databases use similar algorithms.
+            Tests sort performance at scale. The 0.65&times; ratio
+            shows that sorting 50K rows benefits from mskql&rsquo;s
+            multi-column radix sort on contiguous columnar arrays.
         </p>
     </div>
 
@@ -964,7 +964,7 @@ FROM bench_data;</code></pre>
 
 <div class="workload" id="tp_point_read">
     <h3>Indexed point lookup</h3>
-    <div class="workload-meta">78,600 vs 23,461 QPS &ensp;|&ensp; <span class="faster">3.35&times;</span> &ensp;|&ensp; p50: 0.101 vs 0.254&thinsp;ms</div>
+    <div class="workload-meta">79,102 vs 23,461 QPS &ensp;|&ensp; <span class="faster">3.37&times;</span> &ensp;|&ensp; p50: 0.101 vs 0.254&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -978,7 +978,7 @@ FROM bench_data;</code></pre>
     <div class="so-what">
         <span class="section-label">So what</span>
         <p>
-            The most common OLTP operation. The 3.35&times; throughput
+            The most common OLTP operation. The 3.37&times; throughput
             advantage comes from mskql&rsquo;s lower per-query overhead:
             no planner, no MVCC snapshot, no buffer pool lookup.
         </p>
@@ -989,7 +989,7 @@ FROM bench_data;</code></pre>
         <p>
             Each query is parsed, the index is walked, and the single
             matching row is serialized. The arena is reset between queries.
-            At 78,600 QPS, each query completes in ~101 microseconds
+            At 79,102 QPS, each query completes in ~101 microseconds
             including network round-trip.
         </p>
     </div>
@@ -997,7 +997,7 @@ FROM bench_data;</code></pre>
 
 <div class="workload" id="tp_full_scan">
     <h3>Full table scan</h3>
-    <div class="workload-meta">121 vs 120 QPS &ensp;|&ensp; <span class="faster">1.00&times;</span> &ensp;|&ensp; p50: 66.0 vs 65.8&thinsp;ms</div>
+    <div class="workload-meta">122 vs 120 QPS &ensp;|&ensp; <span class="faster">1.02&times;</span> &ensp;|&ensp; p50: 66.0 vs 65.8&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1085,7 +1085,7 @@ FROM bench_data;</code></pre>
 
 <div class="workload" id="tp_mixed_rw">
     <h3>Mixed read/write</h3>
-    <div class="workload-meta">45,252 vs 58,001 QPS &ensp;|&ensp; <span style="color: var(--accent); font-weight: 600;">0.78&times;</span> &ensp;|&ensp; p50: 0.155 vs 0.127&thinsp;ms</div>
+    <div class="workload-meta">54,812 vs 58,001 QPS &ensp;|&ensp; <span style="color: var(--accent); font-weight: 600;">0.94&times;</span> &ensp;|&ensp; p50: 0.145 vs 0.127&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1111,7 +1111,7 @@ UPDATE tp_data SET value = $1 WHERE id = $2;</code></pre>
             This is a fundamental architectural limitation: mskql processes
             one query at a time. Adding MVCC or a concurrent executor would
             close this gap but would add significant complexity to the
-            ~39K-line codebase.
+            ~43.6K-line codebase.
         </p>
     </div>
 </div>
@@ -1121,7 +1121,7 @@ UPDATE tp_data SET value = $1 WHERE id = $2;</code></pre>
 
 <div class="workload" id="tp_aggregate">
     <h3>Group + sum</h3>
-    <div class="workload-meta">60,541 vs 10,042 QPS &ensp;|&ensp; <span class="faster">6.03&times;</span> &ensp;|&ensp; p50: 0.128 vs 0.652&thinsp;ms</div>
+    <div class="workload-meta">94,525 vs 13,929 QPS &ensp;|&ensp; <span class="faster">6.79&times;</span> &ensp;|&ensp; p50: 0.084 vs 0.652&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1132,7 +1132,7 @@ FROM tp_data GROUP BY category;</code></pre>
     <div class="so-what">
         <span class="section-label">So what</span>
         <p>
-            6&times; throughput advantage on aggregation. The result cache
+            Nearly 7&times; throughput advantage on aggregation. The result cache
             serves the 100-row result from cached wire bytes after the
             first execution, skipping all computation.
         </p>
@@ -1152,7 +1152,7 @@ FROM tp_data GROUP BY category;</code></pre>
 
 <div class="workload" id="tp_wide_agg">
     <h3>Wide aggregate</h3>
-    <div class="workload-meta">5,386 vs 786 QPS &ensp;|&ensp; <span class="faster">6.85&times;</span> &ensp;|&ensp; p50: 1.471 vs 10.8&thinsp;ms</div>
+    <div class="workload-meta">8,412 vs 1,036 QPS &ensp;|&ensp; <span class="faster">8.12&times;</span> &ensp;|&ensp; p50: 0.952 vs 10.8&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1165,7 +1165,7 @@ FROM wide_bench GROUP BY region, product;</code></pre>
     <div class="so-what">
         <span class="section-label">So what</span>
         <p>
-            Nearly 7&times; throughput on a wider aggregation (50K rows,
+            Over 8&times; throughput on a wider aggregation (50K rows,
             7 columns). The advantage holds at scale because the columnar
             executor and result cache both benefit from larger datasets.
         </p>
@@ -1246,7 +1246,7 @@ FROM customers c JOIN orders o ON c.id = o.customer_id;</code></pre>
 
 <div class="workload" id="tp_multi_join">
     <h3>Three-table join + group</h3>
-    <div class="workload-meta">23,560 vs 370 QPS &ensp;|&ensp; <span class="faster">63.6&times;</span> &ensp;|&ensp; p50: 0.354 vs 22.3&thinsp;ms</div>
+    <div class="workload-meta">36,171 vs 462 QPS &ensp;|&ensp; <span class="faster">78.3&times;</span> &ensp;|&ensp; p50: 0.221 vs 22.3&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1260,7 +1260,7 @@ GROUP BY r.name, p.name;</code></pre>
     <div class="so-what">
         <span class="section-label">So what</span>
         <p>
-            <strong>64&times; throughput.</strong> The second-largest gap in
+            <strong>78&times; throughput.</strong> The second-largest gap in
             the entire benchmark suite. The small result set (region &times;
             product combinations) fits entirely in the result cache.
         </p>
@@ -1372,7 +1372,7 @@ SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
 
 <div class="workload" id="tp_cte_star">
     <h3>CTE star-schema</h3>
-    <div class="workload-meta">74,069 vs 485 QPS &ensp;|&ensp; <span class="faster">152.5&times;</span> &ensp;|&ensp; p50: 0.109 vs 18.4&thinsp;ms</div>
+    <div class="workload-meta">94,525 vs 496 QPS &ensp;|&ensp; <span class="faster">190&times;</span> &ensp;|&ensp; p50: 0.085 vs 18.4&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1389,9 +1389,9 @@ FROM joined GROUP BY region ORDER BY total DESC;</code></pre>
     <div class="so-what">
         <span class="section-label">So what</span>
         <p>
-            <strong>152&times; throughput&mdash;the largest gap in the entire
+            <strong>190&times; throughput&mdash;the largest gap in the entire
             benchmark suite.</strong> The 4-row result (one per region) is
-            served from the result cache in 109 microseconds. PostgreSQL
+            served from the result cache in 85 microseconds. PostgreSQL
             re-executes the full plan (planner + 2 hash joins + aggregation
             + sort) every time, taking 18.4&nbsp;ms.
         </p>

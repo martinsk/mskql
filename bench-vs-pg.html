@@ -168,11 +168,11 @@
 
 <p>
     <strong>84 batch workloads. 15 concurrent throughput workloads. Three databases on the same machine.</strong>
-    On all 28 cached batch workloads and 13 of 15 throughput tests, mskql is faster than PostgreSQL.
-    Against DuckDB, mskql wins 37 of 84 workloads&mdash;aggregates 6&times;, expression aggregates 7&times;,
-    correlated subqueries 145&times; faster than PG.
-    DuckDB wins full scans (4.4&times;) and sorts (4.8&times;).
-    PostgreSQL wins mixed read/write (0.96&times;).
+    mskql is faster than PostgreSQL on every cached batch workload and 13 of 15 throughput tests.
+    Against DuckDB, mskql wins 39 of 84 workloads&mdash;aggregates 8&times;, expression aggregates 10&times;,
+    correlated subqueries 166&times; faster than PG.
+    DuckDB wins full scans (4.3&times;) and sorts (4.7&times;).
+    PostgreSQL wins mixed read/write (0.94&times;).
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -235,81 +235,81 @@
     <div class="summary-row">
         <div class="summary-name"><strong>Correlated subquery</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:2%"></div><span class="summary-bar-val">24ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">3,498ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:3%"></div><span class="summary-bar-val">38ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:1%"></div><span class="summary-bar-val">22ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">3,665ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:1%"></div><span class="summary-bar-val">38ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Expression aggregate</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:11%"></div><span class="summary-bar-val">35ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">331ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:72%"></div><span class="summary-bar-val">239ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:10%"></div><span class="summary-bar-val">33ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">323ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:77%"></div><span class="summary-bar-val">249ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Group + sum</strong></div>
         <div class="summary-bars">
             <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:12%"></div><span class="summary-bar-val">35ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">290ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:73%"></div><span class="summary-bar-val">212ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">284ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:70%"></div><span class="summary-bar-val">199ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Bulk update</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:5%"></div><span class="summary-bar-val">51ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:24%"></div><span class="summary-bar-val">248ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:100%"></div><span class="summary-bar-val">1,053ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:23%"></div><span class="summary-bar-val">55ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">237ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:36%"></div><span class="summary-bar-val">85ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Analytical CTE</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:28%"></div><span class="summary-bar-val">22ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:26%"></div><span class="summary-bar-val">20ms</span></div>
             <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">78ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:45%"></div><span class="summary-bar-val">35ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:41%"></div><span class="summary-bar-val">32ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Insert + delete</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:13%"></div><span class="summary-bar-val">2,603ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:43%"></div><span class="summary-bar-val">8,937ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:100%"></div><span class="summary-bar-val">20,710ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:17%"></div><span class="summary-bar-val">2,654ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:52%"></div><span class="summary-bar-val">8,265ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:100%"></div><span class="summary-bar-val">15,972ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Two-table join</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:45%"></div><span class="summary-bar-val">29ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">64ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:45%"></div><span class="summary-bar-val">29ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:45%"></div><span class="summary-bar-val">28ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">63ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:56%"></div><span class="summary-bar-val">35ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Full table scan</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:67%"></div><span class="summary-bar-val">306ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">460ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:15%"></div><span class="summary-bar-val">69ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:67%"></div><span class="summary-bar-val">294ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">439ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:15%"></div><span class="summary-bar-val">68ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Large sort</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:67%"></div><span class="summary-bar-val">246ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">365ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:14%"></div><span class="summary-bar-val">51ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:65%"></div><span class="summary-bar-val">234ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">359ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:14%"></div><span class="summary-bar-val">50ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Window (RANK, 50K)</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:56%"></div><span class="summary-bar-val">131ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">236ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:15%"></div><span class="summary-bar-val">36ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:50%"></div><span class="summary-bar-val">113ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">227ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:19%"></div><span class="summary-bar-val">43ms</span></div>
         </div>
     </div>
 </div>
@@ -348,204 +348,204 @@
         <tr class="group-label"><td colspan="7">reads &amp; scans</td></tr>
         <tr>
             <td><strong>Full table scan</strong> <span class="bench-detail">(5K rows &times;200)</span></td>
-            <td class="num">306</td><td class="num">460</td><td class="num">69</td>
-            <td class="num"><span class="faster">0.66&times;</span></td>
-            <td class="num"><span class="slower">4.43&times;</span></td>
+            <td class="num">294</td><td class="num">439</td><td class="num">68</td>
+            <td class="num"><span class="faster">0.67&times;</span></td>
+            <td class="num"><span class="slower">4.32&times;</span></td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:67%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:15%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Filtered scan</strong> <span class="bench-detail">(5K rows &times;500)</span></td>
-            <td class="num">371</td><td class="num">637</td><td class="num">102</td>
+            <td class="num">358</td><td class="num">618</td><td class="num">98</td>
             <td class="num"><span class="faster">0.58&times;</span></td>
-            <td class="num"><span class="slower">3.64&times;</span></td>
+            <td class="num"><span class="slower">3.65&times;</span></td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:58%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:16%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Indexed point lookup</strong> <span class="bench-detail">(&times;2K)</span></td>
-            <td class="num">107</td><td class="num">110</td><td class="num">95</td>
-            <td class="num"><span class="faster">0.97&times;</span></td>
+            <td class="num">104</td><td class="num">108</td><td class="num">92</td>
+            <td class="num"><span class="faster">0.96&times;</span></td>
             <td class="num"><span class="slower">1.13&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:97%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:86%"></div></div></div></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:96%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:85%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Sort</strong> <span class="bench-detail">(5K rows &times;200)</span></td>
-            <td class="num">208</td><td class="num">372</td><td class="num">58</td>
-            <td class="num"><span class="faster">0.56&times;</span></td>
-            <td class="num"><span class="slower">3.59&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:56%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:16%"></div></div></div></td>
+            <td class="num">199</td><td class="num">361</td><td class="num">55</td>
+            <td class="num"><span class="faster">0.55&times;</span></td>
+            <td class="num"><span class="slower">3.62&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:55%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:15%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Multi-column sort</strong> <span class="bench-detail">(5K rows &times;200)</span></td>
-            <td class="num">285</td><td class="num">527</td><td class="num">69</td>
-            <td class="num"><span class="faster">0.54&times;</span></td>
-            <td class="num"><span class="slower">4.13&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:54%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:13%"></div></div></div></td>
+            <td class="num">271</td><td class="num">510</td><td class="num">66</td>
+            <td class="num"><span class="faster">0.53&times;</span></td>
+            <td class="num"><span class="slower">4.11&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:53%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:13%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Distinct</strong> <span class="bench-detail">(100 categories &times;500)</span></td>
-            <td class="num">41</td><td class="num">271</td><td class="num">227</td>
+            <td class="num">39</td><td class="num">265</td><td class="num">221</td>
             <td class="num"><span class="faster">0.15&times;</span></td>
             <td class="num"><span class="faster">0.18&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:15%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:84%"></div></div></div></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:15%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:83%"></div></div></div></td>
         </tr>
         <tr class="group-label"><td colspan="7">writes</td></tr>
         <tr>
             <td><strong>Single-row inserts</strong> <span class="bench-detail">(10K)</span></td>
-            <td class="num">320</td><td class="num">870</td><td class="num">1,512</td>
-            <td class="num"><span class="faster">0.37&times;</span></td>
-            <td class="num"><span class="faster">0.21&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:21%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:58%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
+            <td class="num">298</td><td class="num">851</td><td class="num">1,794</td>
+            <td class="num"><span class="faster">0.35&times;</span></td>
+            <td class="num"><span class="faster">0.17&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:17%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:47%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Bulk insert</strong> <span class="bench-detail">(5K rows)</span></td>
-            <td class="num">291</td><td class="num">881</td><td class="num">2,204</td>
-            <td class="num"><span class="faster">0.33&times;</span></td>
-            <td class="num"><span class="faster">0.13&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:13%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:40%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
+            <td class="num">298</td><td class="num">851</td><td class="num">1,794</td>
+            <td class="num"><span class="faster">0.35&times;</span></td>
+            <td class="num"><span class="faster">0.17&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:17%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:47%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Bulk update</strong> <span class="bench-detail">(1K of 5K rows &times;200)</span></td>
-            <td class="num">51</td><td class="num">248</td><td class="num">1,053</td>
-            <td class="num"><span class="faster">0.21&times;</span></td>
-            <td class="num"><span class="faster">0.05&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:5%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:24%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
+            <td class="num">55</td><td class="num">237</td><td class="num">85</td>
+            <td class="num"><span class="faster">0.23&times;</span></td>
+            <td class="num"><span class="faster">0.65&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:23%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:36%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Insert + delete</strong> <span class="bench-detail">(2K rows, delete half &times;50)</span></td>
-            <td class="num">2,603</td><td class="num">8,937</td><td class="num">20,710</td>
-            <td class="num"><span class="faster">0.29&times;</span></td>
-            <td class="num"><span class="faster">0.13&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:13%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:43%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
+            <td class="num">2,654</td><td class="num">8,265</td><td class="num">15,972</td>
+            <td class="num"><span class="faster">0.32&times;</span></td>
+            <td class="num"><span class="faster">0.17&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:17%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:52%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Transactional inserts</strong> <span class="bench-detail">(100 txns, 50 each)</span></td>
-            <td class="num">178</td><td class="num">192</td><td class="num">1,220</td>
-            <td class="num"><span class="faster">0.93&times;</span></td>
-            <td class="num"><span class="faster">0.15&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:15%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:16%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
+            <td class="num">165</td><td class="num">192</td><td class="num">1,183</td>
+            <td class="num"><span class="faster">0.86&times;</span></td>
+            <td class="num"><span class="faster">0.14&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:14%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:16%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
         <tr class="group-label"><td colspan="7">aggregation &amp; analytics</td></tr>
         <tr>
             <td><strong>Group + sum</strong> <span class="bench-detail">(5K rows &times;500)</span></td>
-            <td class="num">35</td><td class="num">290</td><td class="num">212</td>
+            <td class="num">35</td><td class="num">284</td><td class="num">199</td>
             <td class="num"><span class="faster">0.12&times;</span></td>
-            <td class="num"><span class="faster">0.16&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:12%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:73%"></div></div></div></td>
+            <td class="num"><span class="faster">0.18&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:12%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:70%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Expression aggregate</strong> <span class="bench-detail">(SUM(price&times;qty) &times;500)</span></td>
-            <td class="num">35</td><td class="num">331</td><td class="num">239</td>
+            <td class="num">33</td><td class="num">323</td><td class="num">249</td>
             <td class="num"><span class="faster">0.10&times;</span></td>
-            <td class="num"><span class="faster">0.14&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:11%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:72%"></div></div></div></td>
+            <td class="num"><span class="faster">0.13&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:10%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:77%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Wide aggregate</strong> <span class="bench-detail">(7 cols, 50K rows &times;20)</span></td>
-            <td class="num">24</td><td class="num">167</td><td class="num">131</td>
+            <td class="num">22</td><td class="num">161</td><td class="num">125</td>
             <td class="num"><span class="faster">0.14&times;</span></td>
             <td class="num"><span class="faster">0.18&times;</span></td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:14%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:78%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Window function</strong> <span class="bench-detail">(ROW_NUMBER, 5K &times;20)</span></td>
-            <td class="num">54</td><td class="num">95</td><td class="num">29</td>
-            <td class="num"><span class="faster">0.57&times;</span></td>
-            <td class="num"><span class="slower">1.86&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:57%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:31%"></div></div></div></td>
+            <td class="num">51</td><td class="num">92</td><td class="num">27</td>
+            <td class="num"><span class="faster">0.55&times;</span></td>
+            <td class="num"><span class="slower">1.89&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:55%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:29%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Window function</strong> <span class="bench-detail">(RANK, 50K rows &times;5)</span></td>
-            <td class="num">131</td><td class="num">236</td><td class="num">36</td>
-            <td class="num"><span class="faster">0.55&times;</span></td>
-            <td class="num"><span class="slower">3.64&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:56%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:15%"></div></div></div></td>
+            <td class="num">113</td><td class="num">227</td><td class="num">43</td>
+            <td class="num"><span class="faster">0.50&times;</span></td>
+            <td class="num"><span class="slower">2.63&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:50%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:19%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Correlated subquery</strong></td>
-            <td class="num">24</td><td class="num">3,498</td><td class="num">38</td>
+            <td class="num">22</td><td class="num">3,665</td><td class="num">38</td>
             <td class="num"><span class="faster">0.01&times;</span></td>
-            <td class="num"><span class="faster">0.64&times;</span></td>
+            <td class="num"><span class="faster">0.58&times;</span></td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:1%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:1%"></div></div></div></td>
         </tr>
         <tr class="group-label"><td colspan="7">joins, subqueries &amp; complex queries</td></tr>
         <tr>
             <td><strong>Two-table join</strong> <span class="bench-detail">(500 + 2K rows &times;50)</span></td>
-            <td class="num">29</td><td class="num">64</td><td class="num">29</td>
-            <td class="num"><span class="faster">0.45&times;</span></td>
-            <td class="num"><span class="faster">1.00&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:45%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:45%"></div></div></div></td>
+            <td class="num">28</td><td class="num">63</td><td class="num">35</td>
+            <td class="num"><span class="faster">0.44&times;</span></td>
+            <td class="num"><span class="faster">0.80&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:44%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:56%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Three-table join + group</strong> <span class="bench-detail">(50K rows &times;5)</span></td>
-            <td class="num">36</td><td class="num">108</td><td class="num">35</td>
-            <td class="num"><span class="faster">0.33&times;</span></td>
+            <td class="num">34</td><td class="num">105</td><td class="num">33</td>
+            <td class="num"><span class="faster">0.32&times;</span></td>
             <td class="num"><span class="slower">1.03&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:33%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:32%"></div></div></div></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:32%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:31%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Subquery filter</strong> <span class="bench-detail">(IN subquery &times;50)</span></td>
-            <td class="num">44</td><td class="num">101</td><td class="num">32</td>
-            <td class="num"><span class="faster">0.44&times;</span></td>
-            <td class="num"><span class="slower">1.38&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:44%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:32%"></div></div></div></td>
+            <td class="num">42</td><td class="num">98</td><td class="num">30</td>
+            <td class="num"><span class="faster">0.43&times;</span></td>
+            <td class="num"><span class="slower">1.40&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:43%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:31%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Subquery pipeline</strong> <span class="bench-detail">(filter + sort + limit, 50K &times;20)</span></td>
-            <td class="num">28</td><td class="num">141</td><td class="num">22</td>
-            <td class="num"><span class="faster">0.20&times;</span></td>
-            <td class="num"><span class="slower">1.27&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:20%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:16%"></div></div></div></td>
+            <td class="num">26</td><td class="num">137</td><td class="num">21</td>
+            <td class="num"><span class="faster">0.19&times;</span></td>
+            <td class="num"><span class="slower">1.24&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:19%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:15%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>CTE filter chain</strong> <span class="bench-detail">(5K rows &times;200)</span></td>
-            <td class="num">54</td><td class="num">121</td><td class="num">39</td>
-            <td class="num"><span class="faster">0.45&times;</span></td>
+            <td class="num">51</td><td class="num">118</td><td class="num">37</td>
+            <td class="num"><span class="faster">0.43&times;</span></td>
             <td class="num"><span class="slower">1.38&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:45%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:32%"></div></div></div></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:43%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:31%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>CTE pipeline</strong> <span class="bench-detail">(agg &rarr; sort &rarr; limit, 50K &times;20)</span></td>
-            <td class="num">61</td><td class="num">81</td><td class="num">22</td>
-            <td class="num"><span class="faster">0.75&times;</span></td>
-            <td class="num"><span class="slower">2.77&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:75%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:27%"></div></div></div></td>
+            <td class="num">58</td><td class="num">79</td><td class="num">21</td>
+            <td class="num"><span class="faster">0.73&times;</span></td>
+            <td class="num"><span class="slower">2.76&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:73%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:27%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Analytical CTE</strong> <span class="bench-detail">(join&rarr;agg&rarr;sort, 50K &times;5)</span></td>
-            <td class="num">22</td><td class="num">78</td><td class="num">35</td>
-            <td class="num"><span class="faster">0.28&times;</span></td>
-            <td class="num"><span class="faster">0.61&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:28%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:45%"></div></div></div></td>
+            <td class="num">20</td><td class="num">78</td><td class="num">32</td>
+            <td class="num"><span class="faster">0.26&times;</span></td>
+            <td class="num"><span class="faster">0.63&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:26%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:41%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Union</strong> <span class="bench-detail">(two 2K-row tables &times;50)</span></td>
-            <td class="num">57</td><td class="num">103</td><td class="num">24</td>
-            <td class="num"><span class="faster">0.55&times;</span></td>
-            <td class="num"><span class="slower">2.38&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:55%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:23%"></div></div></div></td>
+            <td class="num">54</td><td class="num">100</td><td class="num">23</td>
+            <td class="num"><span class="faster">0.54&times;</span></td>
+            <td class="num"><span class="slower">2.35&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:54%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:23%"></div></div></div></td>
         </tr>
         <tr class="group-label"><td colspan="7">functions &amp; generation</td></tr>
         <tr>
             <td><strong>Generate series</strong> <span class="bench-detail">(10K rows &times;200)</span></td>
-            <td class="num">219</td><td class="num">688</td><td class="num">40</td>
-            <td class="num"><span class="faster">0.32&times;</span></td>
-            <td class="num"><span class="slower">5.48&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:32%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:6%"></div></div></div></td>
+            <td class="num">211</td><td class="num">672</td><td class="num">38</td>
+            <td class="num"><span class="faster">0.31&times;</span></td>
+            <td class="num"><span class="slower">5.55&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:31%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:6%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Scalar functions</strong> <span class="bench-detail">(4 functions, 5K rows &times;200)</span></td>
-            <td class="num">390</td><td class="num">980</td><td class="num">74</td>
+            <td class="num">378</td><td class="num">955</td><td class="num">71</td>
             <td class="num"><span class="faster">0.40&times;</span></td>
-            <td class="num"><span class="slower">5.27&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:40%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:8%"></div></div></div></td>
+            <td class="num"><span class="slower">5.32&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:40%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:7%"></div></div></div></td>
         </tr>
         <tr class="group-label"><td colspan="7">large dataset (50K rows)</td></tr>
         <tr>
             <td><strong>Large sort</strong> <span class="bench-detail">(50K rows &times;10)</span></td>
-            <td class="num">246</td><td class="num">365</td><td class="num">51</td>
-            <td class="num"><span class="faster">0.67&times;</span></td>
-            <td class="num"><span class="slower">4.83&times;</span></td>
-            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:67%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:14%"></div></div></div></td>
+            <td class="num">234</td><td class="num">359</td><td class="num">50</td>
+            <td class="num"><span class="faster">0.65&times;</span></td>
+            <td class="num"><span class="slower">4.68&times;</span></td>
+            <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:65%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:14%"></div></div></div></td>
         </tr>
     </tbody>
 </table>
@@ -553,8 +553,8 @@
 
 <p>
     <strong>All 28 cached workloads faster than PostgreSQL.</strong> Closest: index lookups
-    (0.97&times;), transactions (0.93&times;). Against DuckDB: mskql wins aggregates,
-    distinct, writes, analytical CTE, correlated subquery. DuckDB wins scans, sorts,
+    (0.96&times;), transactions (0.86&times;). Against DuckDB: mskql wins aggregates,
+    distinct, writes, analytical CTE, correlated subquery, joins. DuckDB wins scans, sorts,
     window functions, generate_series, scalar functions.
     See <a href="bench-workloads.html">workload details</a> for the exact SQL.
 </p>
@@ -592,73 +592,73 @@
     <tbody>
         <tr>
             <td><strong>pq_full_scan</strong> <span class="bench-detail">(50K rows)</span></td>
-            <td class="num">449</td><td class="num">32</td>
-            <td class="num"><span class="slower">14.0&times;</span></td>
-            <td class="num"><span class="slower">14.0&times;</span></td>
+            <td class="num">485</td><td class="num">31</td>
+            <td class="num"><span class="slower">15.6&times;</span></td>
+            <td class="num"><span class="slower">15.6&times;</span></td>
             <td>Row-by-row Parquet read; no columnar pushdown yet</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:7%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>pq_where</strong> <span class="bench-detail">(filtered scan, 50K rows)</span></td>
-            <td class="num">22</td><td class="num">44</td>
-            <td class="num"><span class="faster">0.50&times;</span></td>
-            <td class="num"><span class="slower">2.18&times;</span></td>
+            <td class="num">20</td><td class="num">42</td>
+            <td class="num"><span class="faster">0.48&times;</span></td>
+            <td class="num"><span class="slower">2.24&times;</span></td>
             <td>Result cache bypasses Parquet I/O on repeat</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:50%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>pq_aggregate</strong> <span class="bench-detail">(GROUP BY, 50K rows)</span></td>
-            <td class="num">28</td><td class="num">76</td>
-            <td class="num"><span class="faster">0.37&times;</span></td>
-            <td class="num"><span class="slower">1.42&times;</span></td>
+            <td class="num">26</td><td class="num">73</td>
+            <td class="num"><span class="faster">0.36&times;</span></td>
+            <td class="num"><span class="slower">1.46&times;</span></td>
             <td>Columnar hash aggregation on cached data</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:37%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>pq_order_by</strong> <span class="bench-detail">(sort, 50K rows)</span></td>
-            <td class="num">371</td><td class="num">29</td>
-            <td class="num"><span class="slower">12.8&times;</span></td>
-            <td class="num"><span class="slower">12.8&times;</span></td>
+            <td class="num">365</td><td class="num">28</td>
+            <td class="num"><span class="slower">13.0&times;</span></td>
+            <td class="num"><span class="slower">13.0&times;</span></td>
             <td>Sort requires full materialization; DuckDB sorts columnar natively</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:8%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>pq_wide_agg</strong> <span class="bench-detail">(7 cols, 50K rows)</span></td>
-            <td class="num">27</td><td class="num">42</td>
-            <td class="num"><span class="faster">0.65&times;</span></td>
-            <td class="num"><span class="slower">1.95&times;</span></td>
+            <td class="num">25</td><td class="num">40</td>
+            <td class="num"><span class="faster">0.63&times;</span></td>
+            <td class="num"><span class="slower">2.00&times;</span></td>
             <td>Multi-column agg stays in L1 cache</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:64%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>pq_join_two</strong> <span class="bench-detail">(50K + 2K rows)</span></td>
-            <td class="num">28</td><td class="num">35</td>
-            <td class="num"><span class="faster">0.80&times;</span></td>
-            <td class="num"><span class="slower">3.14&times;</span></td>
+            <td class="num">23</td><td class="num">33</td>
+            <td class="num"><span class="faster">0.70&times;</span></td>
+            <td class="num"><span class="slower">3.30&times;</span></td>
             <td>Hash join on cached Parquet data</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:80%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>pq_join_three</strong> <span class="bench-detail">(3 Parquet files)</span></td>
-            <td class="num">30</td><td class="num">38</td>
-            <td class="num"><span class="faster">0.79&times;</span></td>
-            <td class="num"><span class="slower">3.42&times;</span></td>
+            <td class="num">27</td><td class="num">36</td>
+            <td class="num"><span class="faster">0.75&times;</span></td>
+            <td class="num"><span class="slower">3.56&times;</span></td>
             <td>Three-way join across Parquet files</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:79%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>pq_subquery</strong> <span class="bench-detail">(IN subquery, 2 files)</span></td>
-            <td class="num">21</td><td class="num">44</td>
-            <td class="num"><span class="faster">0.49&times;</span></td>
-            <td class="num"><span class="slower">2.05&times;</span></td>
+            <td class="num">18</td><td class="num">41</td>
+            <td class="num"><span class="faster">0.44&times;</span></td>
+            <td class="num"><span class="slower">2.22&times;</span></td>
             <td>Hash semi-join on cached result</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:48%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>pq_analytical</strong> <span class="bench-detail">(CTE + join + agg, 3 files)</span></td>
-            <td class="num">29</td><td class="num">41</td>
-            <td class="num"><span class="faster">0.71&times;</span></td>
-            <td class="num"><span class="slower">2.93&times;</span></td>
+            <td class="num">26</td><td class="num">39</td>
+            <td class="num"><span class="faster">0.67&times;</span></td>
+            <td class="num"><span class="slower">3.08&times;</span></td>
             <td>Full analytical pipeline on Parquet</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:71%"></div></div><div class="bar-row"><span class="bar-label">Duck</span><div class="bar bar-duck" style="width:100%"></div></div></div></td>
         </tr>
@@ -705,15 +705,15 @@
         <tr class="group-label"><td colspan="6">simple reads &amp; writes</td></tr>
         <tr>
             <td><strong>Indexed point lookup</strong></td>
-            <td class="num">78,600</td><td class="num">23,461</td>
-            <td class="num"><span class="tp-higher">3.35&times;</span></td>
+            <td class="num">79,102</td><td class="num">23,461</td>
+            <td class="num"><span class="tp-higher">3.37&times;</span></td>
             <td>mskql 0.101ms p50 vs PG 0.254ms</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:30%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Full table scan</strong> <span class="bench-detail">(5K rows)</span></td>
-            <td class="num">121</td><td class="num">120</td>
-            <td class="num"><span class="tp-higher">1.00&times;</span></td>
+            <td class="num">122</td><td class="num">120</td>
+            <td class="num"><span class="tp-higher">1.02&times;</span></td>
             <td>Network-bound: both ~66ms p50</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:99%"></div></div></div></td>
         </tr>
@@ -733,23 +733,23 @@
         </tr>
         <tr>
             <td><strong>Mixed read/write</strong> <span class="bench-detail">(80/20)</span></td>
-            <td class="num">55,680</td><td class="num">58,001</td>
-            <td class="num"><span class="tp-lower">0.96&times;</span></td>
+            <td class="num">54,812</td><td class="num">58,001</td>
+            <td class="num"><span class="tp-lower">0.94&times;</span></td>
             <td>PG&rsquo;s MVCC wins on concurrent writes</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:96%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:100%"></div></div></div></td>
         </tr>
         <tr class="group-label"><td colspan="6">aggregation &amp; analytics</td></tr>
         <tr>
             <td><strong>Group + sum</strong> <span class="bench-detail">(5K rows)</span></td>
-            <td class="num">95,044</td><td class="num">13,929</td>
-            <td class="num"><span class="tp-higher">6.82&times;</span></td>
+            <td class="num">94,525</td><td class="num">13,929</td>
+            <td class="num"><span class="tp-higher">6.79&times;</span></td>
             <td>Result cache: 0.084ms p50</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:15%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Wide aggregate</strong> <span class="bench-detail">(50K rows)</span></td>
-            <td class="num">8,373</td><td class="num">1,036</td>
-            <td class="num"><span class="tp-higher">8.08&times;</span></td>
+            <td class="num">8,412</td><td class="num">1,036</td>
+            <td class="num"><span class="tp-higher">8.12&times;</span></td>
             <td>Result cache: 0.952ms p50</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:12%"></div></div></div></td>
         </tr>
@@ -770,15 +770,15 @@
         </tr>
         <tr>
             <td><strong>Multi-join</strong> <span class="bench-detail">(3 tables)</span></td>
-            <td class="num">36,273</td><td class="num">462</td>
-            <td class="num"><span class="tp-higher">78.5&times;</span></td>
+            <td class="num">36,171</td><td class="num">462</td>
+            <td class="num"><span class="tp-higher">78.3&times;</span></td>
             <td>Result cache: 0.221ms p50</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:1%"></div></div></div></td>
         </tr>
         <tr>
             <td><strong>Mixed analytical</strong> <span class="bench-detail">(CTE&rarr;join&rarr;agg&rarr;sort)</span></td>
-            <td class="num">94,729</td><td class="num">689</td>
-            <td class="num"><span class="tp-higher">137&times;</span></td>
+            <td class="num">94,525</td><td class="num">496</td>
+            <td class="num"><span class="tp-higher">190&times;</span></td>
             <td>Result cache: 0.085ms p50</td>
             <td class="bar-cell"><div class="bar-pair"><div class="bar-row"><span class="bar-label">mskql</span><div class="bar bar-mskql" style="width:100%"></div></div><div class="bar-row"><span class="bar-label">PG</span><div class="bar bar-pg" style="width:1%"></div></div></div></td>
         </tr>
@@ -816,40 +816,40 @@
 <h3>Where mskql wins</h3>
 
 <p>
-    <strong>vs PostgreSQL: all 28 cached batch workloads.</strong>
-    Correlated subquery: 24ms vs 3,498ms (145&times;). Expression aggregate: 35ms vs 331ms (10&times;).
-    Throughput: mixed_analytical at 94,729 QPS vs 689 (137&times;). multi_join at 36,273 vs 462 (78&times;).
+    <strong>vs PostgreSQL: every cached batch workload.</strong>
+    Correlated subquery: 22ms vs 3,665ms (166&times;). Expression aggregate: 33ms vs 323ms (10&times;).
+    Throughput: mixed_analytical at 94,525 QPS vs 496 (190&times;). multi_join at 36,171 vs 462 (78&times;).
     The result cache and zero-allocation executor dominate on repeated analytical queries.
 </p>
 
 <p>
-    <strong>vs DuckDB: aggregates, writes, correlated subqueries, analytical CTEs.</strong>
-    Expression aggregate: 35ms vs 239ms (7&times;). Aggregate: 35ms vs 212ms (6&times;).
-    Insert+delete: 2,603ms vs 20,710ms (8&times;). Bulk update: 51ms vs 1,053ms (21&times;).
-    Analytical CTE: 22ms vs 35ms (1.6&times;). Correlated subquery: 24ms vs 38ms (1.6&times;).
+    <strong>vs DuckDB: aggregates, writes, correlated subqueries, analytical CTEs, joins.</strong>
+    Expression aggregate: 33ms vs 249ms (8&times;). Aggregate: 35ms vs 199ms (6&times;).
+    Insert+delete: 2,654ms vs 15,972ms (6&times;). Bulk update: 55ms vs 85ms (1.5&times;).
+    Analytical CTE: 20ms vs 32ms (1.6&times;). Correlated subquery: 22ms vs 38ms (1.7&times;).
 </p>
 
 <p>
     <strong>Parquet (cached): 7 of 9 workloads.</strong>
-    pq_aggregate: 28ms vs 76ms (2.7&times;). pq_subquery: 21ms vs 44ms (2&times;).
+    pq_aggregate: 26ms vs 73ms (2.8&times;). pq_subquery: 18ms vs 41ms (2.3&times;).
     The result cache makes repeated Parquet queries faster than DuckDB&rsquo;s native reader.
 </p>
 
 <h3>Where DuckDB wins</h3>
 
 <p>
-    <strong>Full scans: 4.4&times; faster.</strong> DuckDB&rsquo;s columnar storage reads
+    <strong>Full scans: 4.3&times; faster.</strong> DuckDB&rsquo;s columnar storage reads
     contiguous column data with SIMD vectorization. The mskql row store converts to
     columnar via the scan cache&mdash;fast, but not as fast as native columnar.
 </p>
 
 <p>
-    <strong>Sorts: 4.8&times; faster.</strong> DuckDB&rsquo;s sort is SIMD-optimized for
-    columnar data. The mskql plan executor sorts via qsort on column blocks.
+    <strong>Sorts: 4.7&times; faster.</strong> DuckDB&rsquo;s sort is SIMD-optimized for
+    columnar data. The mskql plan executor sorts via multi-column radix sort on column blocks.
 </p>
 
 <p>
-    <strong>Window functions: 1.9&ndash;3.6&times; faster.</strong> DuckDB&rsquo;s window
+    <strong>Window functions: 1.9&ndash;2.6&times; faster.</strong> DuckDB&rsquo;s window
     function implementation is heavily optimized for columnar processing.
 </p>
 
@@ -861,7 +861,7 @@
 <h3>Where PostgreSQL wins</h3>
 
 <p>
-    <strong>Mixed read/write throughput: 0.96&times;.</strong>
+    <strong>Mixed read/write throughput: 0.94&times;.</strong>
     PostgreSQL&rsquo;s MVCC allows concurrent readers and writers without blocking.
     The mskql single-threaded executor serializes all queries.
 </p>

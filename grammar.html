@@ -129,6 +129,7 @@
 &ensp;&ensp;  [ <span class="kw">ORDER BY</span> <span class="nt">order_list</span> ]<br>
 &ensp;&ensp;  [ <span class="kw">LIMIT</span> <span class="nt">expr</span> ]<br>
 &ensp;&ensp;  [ <span class="kw">OFFSET</span> <span class="nt">expr</span> ]<br>
+&ensp;&ensp;  [ <span class="kw">FETCH FIRST</span> <span class="nt">n</span> <span class="kw">ROWS ONLY</span> ]<br>
 </div>
 
 <h3>WITH clause (CTEs)</h3>
@@ -312,7 +313,12 @@
 
 <div class="grammar">
 <span class="nt">create_table_stmt</span> <span class="op">::=</span><br>
-&ensp;&ensp;  <span class="kw">CREATE TABLE</span> <span class="nt">table_name</span> <span class="kw">(</span> <span class="nt">column_def</span> { <span class="kw">,</span> <span class="nt">column_def</span> } <span class="kw">)</span><br>
+&ensp;&ensp;  <span class="kw">CREATE TABLE</span> [ <span class="kw">IF NOT EXISTS</span> ] <span class="nt">table_name</span> <span class="kw">(</span> <span class="nt">column_def</span> { <span class="kw">,</span> <span class="nt">column_def</span> } [ <span class="kw">,</span> <span class="nt">table_constraint</span> ] <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">CREATE TABLE</span> [ <span class="kw">IF NOT EXISTS</span> ] <span class="nt">table_name</span> <span class="kw">(</span> <span class="kw">LIKE</span> <span class="nt">source_table</span> <span class="kw">)</span><br>
+<br>
+<span class="nt">table_constraint</span> <span class="op">::=</span><br>
+&ensp;&ensp;  <span class="kw">PRIMARY KEY</span> <span class="kw">(</span> <span class="nt">column_name</span> { <span class="kw">,</span> <span class="nt">column_name</span> } <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">UNIQUE</span> <span class="kw">(</span> <span class="nt">column_name</span> { <span class="kw">,</span> <span class="nt">column_name</span> } <span class="kw">)</span><br>
 <br>
 <span class="nt">column_def</span> <span class="op">::=</span><br>
 &ensp;&ensp;  <span class="nt">column_name</span> <span class="nt">data_type</span> { <span class="nt">column_constraint</span> }<br>
@@ -335,6 +341,10 @@
 &ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">DROP COLUMN</span> <span class="nt">column_name</span><br>
 &ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">RENAME COLUMN</span> <span class="nt">old</span> <span class="kw">TO</span> <span class="nt">new</span><br>
 &ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">ALTER COLUMN</span> <span class="nt">column_name</span> <span class="kw">TYPE</span> <span class="nt">data_type</span><br>
+&ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">ALTER COLUMN</span> <span class="nt">column_name</span> <span class="kw">SET DEFAULT</span> <span class="nt">expr</span><br>
+&ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">ALTER COLUMN</span> <span class="nt">column_name</span> <span class="kw">DROP DEFAULT</span><br>
+&ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">ALTER COLUMN</span> <span class="nt">column_name</span> <span class="kw">SET NOT NULL</span><br>
+&ensp;&ensp;| <span class="kw">ALTER TABLE</span> <span class="nt">table_name</span> <span class="kw">ALTER COLUMN</span> <span class="nt">column_name</span> <span class="kw">DROP NOT NULL</span><br>
 </div>
 
 <h3>Other DDL</h3>
@@ -344,7 +354,7 @@
   <span class="kw">DROP TABLE</span> <span class="nt">table_name</span><br>
 <br>
 <span class="nt">create_index_stmt</span> <span class="op">::=</span>
-  <span class="kw">CREATE INDEX</span> <span class="nt">name</span> <span class="kw">ON</span> <span class="nt">table_name</span> <span class="kw">(</span> <span class="nt">column_name</span> <span class="kw">)</span><br>
+  <span class="kw">CREATE INDEX</span> [ <span class="kw">IF NOT EXISTS</span> ] <span class="nt">name</span> <span class="kw">ON</span> <span class="nt">table_name</span> <span class="kw">(</span> <span class="nt">column_name</span> { <span class="kw">,</span> <span class="nt">column_name</span> } <span class="kw">)</span><br>
 <br>
 <span class="nt">drop_index_stmt</span> <span class="op">::=</span>
   <span class="kw">DROP INDEX</span> <span class="nt">name</span><br>
@@ -419,7 +429,7 @@
 &ensp;&ensp;| <span class="kw">UUID</span><br>
 &ensp;&ensp;| <span class="kw">SERIAL</span><br>
 &ensp;&ensp;| <span class="kw">BIGSERIAL</span><br>
-&ensp;&ensp;| <span class="kw">SMALLINT</span> <span class="badge badge-no">(not yet supported)</span><br>
+&ensp;&ensp;| <span class="kw">SMALLINT</span><br>
 &ensp;&ensp;| <span class="kw">BYTEA</span> <span class="badge badge-no">(not yet supported)</span><br>
 &ensp;&ensp;| <span class="kw">JSON</span> | <span class="kw">JSONB</span> <span class="badge badge-no">(not yet supported)</span><br>
 &ensp;&ensp;| <span class="kw">ARRAY</span> <span class="badge badge-no">(not yet supported)</span><br>
@@ -489,6 +499,8 @@
 &ensp;&ensp;| <span class="kw">REPEAT</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">n</span> <span class="kw">)</span><br>
 &ensp;&ensp;| <span class="kw">REVERSE</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
 &ensp;&ensp;| <span class="kw">INITCAP</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">LTRIM</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">RTRIM</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
+&ensp;&ensp;| <span class="kw">SUBSTR</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">,</span> <span class="nt">start</span> [ <span class="kw">,</span> <span class="nt">length</span> ] <span class="kw">)</span><br>
 &ensp;&ensp;| <span class="kw">ABS</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
 &ensp;&ensp;| <span class="kw">CEIL</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span> / <span class="kw">FLOOR</span> <span class="kw">(</span> <span class="nt">expr</span> <span class="kw">)</span><br>
 &ensp;&ensp;| <span class="kw">ROUND</span> <span class="kw">(</span> <span class="nt">expr</span> [ <span class="kw">,</span> <span class="nt">n</span> ] <span class="kw">)</span><br>
@@ -553,12 +565,12 @@
 <h2>12. Not Yet Supported</h2>
 
 <p>
-    <strong>Types:</strong> <code>CHAR(n)</code>, <code>SMALLINT</code>, <code>BYTEA</code>,
+    <strong>Types:</strong> <code>CHAR(n)</code>, <code>BYTEA</code>,
     <code>JSON</code>/<code>JSONB</code>, <code>ARRAY</code>, composite types, range types.
     <strong>Expressions:</strong> <code>SIMILAR TO</code>, POSIX regex (<code>~</code>),
     <code>ARRAY[...]</code> constructor.
     <strong>DDL:</strong> <code>CREATE TABLE ... AS SELECT</code>,
-    <code>CREATE MATERIALIZED VIEW</code>, table-level constraints,
+    <code>CREATE MATERIALIZED VIEW</code>,
     <code>CASCADE</code>/<code>RESTRICT</code> on DROP.
     <strong>Transactions:</strong> <code>SAVEPOINT</code>, isolation levels.
     <strong>Window:</strong> <code>RANGE BETWEEN</code>, <code>GROUPS BETWEEN</code>,
