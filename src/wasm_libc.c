@@ -45,6 +45,12 @@ double js_sin(double);
 __attribute__((import_module("env"), import_name("js_cos")))
 double js_cos(double);
 
+/* regex import — returns 1 if pattern matches str, 0 otherwise.
+ * flags: 1 = case-insensitive */
+__attribute__((import_module("env"), import_name("js_regex_test")))
+int js_regex_test(const char *pattern, int pattern_len,
+                  const char *str, int str_len, int flags);
+
 __attribute__((import_module("env"), import_name("js_abort")))
 _Noreturn void js_abort(void);
 
@@ -874,6 +880,14 @@ time_t time(time_t *t) {
     time_t val = (time_t)now;
     if (t) *t = val;
     return val;
+}
+
+int clock_gettime(int clk, struct timespec *ts) {
+    (void)clk;
+    double now = js_time();
+    ts->tv_sec = (long long)now;
+    ts->tv_nsec = (long)((now - (double)ts->tv_sec) * 1e9);
+    return 0;
 }
 
 struct tm *localtime(const time_t *timep) {

@@ -109,6 +109,16 @@ static const char *resolve_col_name(struct query *q, struct database *db,
                 case FUNC_CURRENT_SCHEMAS: case FUNC_PG_IS_IN_RECOVERY:
                 case FUNC_AGG_SUM: case FUNC_AGG_COUNT: case FUNC_AGG_AVG:
                 case FUNC_AGG_MIN: case FUNC_AGG_MAX:
+                case FUNC_EXP: case FUNC_LN:
+                case FUNC_ASCII: case FUNC_CHR: case FUNC_FORMAT:
+                case FUNC_MD5: case FUNC_QUOTE_IDENT: case FUNC_STRPOS:
+                case FUNC_REGEXP_REPLACE:
+                case FUNC_CURRENT_TIME: case FUNC_LOCALTIME:
+                case FUNC_MAKE_DATE: case FUNC_TRUNC:
+                case FUNC_TO_DATE: case FUNC_TO_TIMESTAMP:
+                case FUNC_TRANSLATE: case FUNC_SETVAL:
+                case FUNC_AGG_BOOL_AND: case FUNC_AGG_BOOL_OR:
+                case FUNC_AGG_STDDEV: case FUNC_AGG_VARIANCE:
                     break;
                 }
             }
@@ -182,12 +192,18 @@ static const char *resolve_col_name(struct query *q, struct database *db,
             return tmp;
         }
         switch (ae->func) {
-        case AGG_SUM:   return "sum";
-        case AGG_COUNT: return "count";
-        case AGG_AVG:   return "avg";
-        case AGG_MIN:   return "min";
-        case AGG_MAX:   return "max";
-        case AGG_NONE:  return "?";
+        case AGG_SUM:        return "sum";
+        case AGG_COUNT:      return "count";
+        case AGG_AVG:        return "avg";
+        case AGG_MIN:        return "min";
+        case AGG_MAX:        return "max";
+        case AGG_STRING_AGG: return "string_agg";
+        case AGG_ARRAY_AGG:  return "array_agg";
+        case AGG_BOOL_AND:   return "bool_and";
+        case AGG_BOOL_OR:    return "bool_or";
+        case AGG_STDDEV:     return "stddev";
+        case AGG_VARIANCE:   return "variance";
+        case AGG_NONE:       return "?";
         }
     }
 
@@ -216,6 +232,10 @@ static int format_cell(char *buf, int buf_len, int pos, struct cell *cell) {
         break;
     case COLUMN_TYPE_BIGINT:
         snprintf(tmp, sizeof(tmp), "%lld", cell->value.as_bigint);
+        text = tmp;
+        break;
+    case COLUMN_TYPE_SMALLINT:
+        snprintf(tmp, sizeof(tmp), "%d", (int)cell->value.as_int);
         text = tmp;
         break;
     case COLUMN_TYPE_NUMERIC:

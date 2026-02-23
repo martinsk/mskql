@@ -4042,6 +4042,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             db->total_generation++;
             return 0;
         }
+#else
+        case QUERY_TYPE_CREATE_FOREIGN_TABLE:
+            return -1;
 #endif
     }
     return -1;

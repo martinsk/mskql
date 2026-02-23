@@ -541,11 +541,6 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
             }
             /* SIMILAR TO / NOT SIMILAR TO */
             if (cond->op == CMP_SIMILAR_TO || cond->op == CMP_NOT_SIMILAR_TO) {
-#ifdef MSKQL_WASM
-                /* POSIX regex not available in WASM freestanding build */
-                cond_result = 0;
-                goto cond_cleanup;
-#else
                 if (lhs_is_null) { cond_result = -1; goto cond_cleanup; }
                 if (!column_type_is_text(c->type) || !c->value.as_text)
                     goto cond_cleanup;
@@ -560,24 +555,23 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
                     else { regpat[ri2++] = *p; }
                 }
                 regpat[ri2++] = '$'; regpat[ri2] = '\0';
-                regex_t re2;
                 int match2 = 0;
+#ifdef MSKQL_WASM
+                match2 = js_regex_test(regpat, (int)ri2,
+                                       str, (int)strlen(str), 0);
+#else
+                regex_t re2;
                 if (regcomp(&re2, regpat, REG_EXTENDED) == 0) {
                     match2 = (regexec(&re2, str, 0, NULL, 0) == 0);
                     regfree(&re2);
                 }
+#endif
                 cond_result = (cond->op == CMP_NOT_SIMILAR_TO) ? !match2 : match2;
                 goto cond_cleanup;
-#endif
             }
             /* ~ / !~ / ~* / !~* regex match using POSIX ERE */
             if (cond->op == CMP_REGEX_MATCH || cond->op == CMP_REGEX_NOT_MATCH ||
                 cond->op == CMP_REGEX_ICASE_MATCH || cond->op == CMP_REGEX_ICASE_NOT_MATCH) {
-#ifdef MSKQL_WASM
-                /* POSIX regex not available in WASM freestanding build */
-                cond_result = 0;
-                goto cond_cleanup;
-#else
                 if (!column_type_is_text(c->type) || !c->value.as_text)
                     goto cond_cleanup;
                 if (!cond->value.value.as_text) goto cond_cleanup;
@@ -587,16 +581,20 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
                              cond->op == CMP_REGEX_ICASE_NOT_MATCH);
                 int is_not = (cond->op == CMP_REGEX_NOT_MATCH ||
                               cond->op == CMP_REGEX_ICASE_NOT_MATCH);
+                int match = 0;
+#ifdef MSKQL_WASM
+                match = js_regex_test(pat, (int)strlen(pat),
+                                      str, (int)strlen(str), icase ? 1 : 0);
+#else
                 regex_t re;
                 int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
-                int match = 0;
                 if (regcomp(&re, pat, flags) == 0) {
                     match = (regexec(&re, str, 0, NULL, 0) == 0);
                     regfree(&re);
                 }
+#endif
                 cond_result = is_not ? !match : match;
                 goto cond_cleanup;
-#endif
             }
             /* ANY/ALL/SOME: col op ANY(SELECT ...) or col op ANY(ARRAY[...]) */
             if (cond->is_any || cond->is_all) {
@@ -1725,12 +1723,17 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
                       e->binary.op == OP_REGEX_ICASE_NOT_MATCH);
         int match = 0;
         if (str && pat) {
+#ifdef MSKQL_WASM
+            match = js_regex_test(pat, (int)strlen(pat),
+                                  str, (int)strlen(str), icase ? 1 : 0);
+#else
             regex_t re;
             int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
             if (regcomp(&re, pat, flags) == 0) {
                 match = (regexec(&re, str, 0, NULL, 0) == 0);
                 regfree(&re);
             }
+#endif
         }
         if (!rb) { free(str); free(pat); }
         cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
@@ -4244,11 +4247,17 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             }
             regpat[ri++] = '$';
             regpat[ri] = '\0';
+#ifdef MSKQL_WASM
+            match = js_regex_test(regpat, (int)ri,
+                                  vs ? vs : "", vs ? (int)strlen(vs) : 0,
+                                  e->like.case_insensitive ? 1 : 0);
+#else
             regex_t re;
             int rflags = REG_EXTENDED | (e->like.case_insensitive ? REG_ICASE : 0);
             match = (regcomp(&re, regpat, rflags) == 0 &&
                      regexec(&re, vs ? vs : "", 0, NULL, 0) == 0);
             regfree(&re);
+#endif
         } else {
             match = like_match_esc(ps ? ps : "", vs ? vs : "",
                                    e->like.case_insensitive,

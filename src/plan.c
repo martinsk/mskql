@@ -7368,6 +7368,8 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     case PLAN_GENERATE_SERIES: return gen_series_next(ctx, node_idx, out);
 #ifndef MSKQL_WASM
     case PLAN_PARQUET_SCAN:    return parquet_scan_next(ctx, node_idx, out);
+#else
+    case PLAN_PARQUET_SCAN:    return -1;
 #endif
     case PLAN_EXPR_PROJECT:    return expr_project_next(ctx, node_idx, out);
     case PLAN_VEC_PROJECT:     return vec_project_next(ctx, node_idx, out);

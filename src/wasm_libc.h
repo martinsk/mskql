@@ -155,10 +155,22 @@ struct tm {
     int tm_isdst;
 };
 
+struct timespec {
+    long long tv_sec;
+    long      tv_nsec;
+};
+
+#define CLOCK_REALTIME 0
+
 time_t     time(time_t *t);
 struct tm *localtime(const time_t *timep);
 time_t     mktime(struct tm *tm);
 double     difftime(time_t t1, time_t t0);
+int        clock_gettime(int clk, struct timespec *ts);
+
+/* ── regex (bridged to JS) ─────────────────────────────────────── */
+int js_regex_test(const char *pattern, int pattern_len,
+                  const char *str, int str_len, int flags);
 
 /* ── random ─────────────────────────────────────────────────────── */
 #define RAND_MAX 0x7fffffff
