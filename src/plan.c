@@ -2239,29 +2239,38 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             for (uint16_t i = 0; i < count; i++) dst[i] = pow(src[i], lit);
         } else if (vop->kind == VEC_FUNC_TRIM) {
             memcpy(ocb->nulls, lcb->nulls, count);
+            if (!ocb->str_lens)
+                ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                        BLOCK_CAPACITY, sizeof(uint32_t));
             for (uint16_t i = 0; i < count; i++) {
                 if (lcb->nulls[i] || !lcb->data.str[i]) {
                     ocb->data.str[i] = NULL;
+                    ocb->str_lens[i] = 0;
                     continue;
                 }
                 const char *s = lcb->data.str[i];
-                while (*s == ' ') s++;
-                const char *end = s + strlen(s);
+                size_t orig_len = lcb->str_lens ? lcb->str_lens[i] : strlen(s);
+                while (*s == ' ') { s++; orig_len--; }
+                const char *end = s + orig_len;
                 while (end > s && end[-1] == ' ') end--;
                 size_t len = (size_t)(end - s);
                 char *trimmed = (char *)bump_alloc(&ctx->arena->scratch, len + 1);
                 memcpy(trimmed, s, len);
                 trimmed[len] = '\0';
                 ocb->data.str[i] = trimmed;
+                ocb->str_lens[i] = (uint32_t)len;
             }
-            ocb->str_lens = NULL;
         } else if (vop->kind == VEC_FUNC_CONCAT_LIT) {
             memcpy(ocb->nulls, lcb->nulls, count);
             const char *lit = vop->lit_text;
             uint32_t lit_len = vop->lit_text_len;
+            if (!ocb->str_lens)
+                ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                        BLOCK_CAPACITY, sizeof(uint32_t));
             for (uint16_t i = 0; i < count; i++) {
                 if (lcb->nulls[i] || !lcb->data.str[i]) {
                     ocb->data.str[i] = NULL;
+                    ocb->str_lens[i] = 0;
                     continue;
                 }
                 const char *s = lcb->data.str[i];
@@ -2272,15 +2281,19 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 memcpy(cat + slen, lit, lit_len);
                 cat[total] = '\0';
                 ocb->data.str[i] = cat;
+                ocb->str_lens[i] = (uint32_t)total;
             }
-            ocb->str_lens = NULL;
         } else if (vop->kind == VEC_FUNC_SUBSTRING) {
             memcpy(ocb->nulls, lcb->nulls, count);
             int64_t start1 = vop->lit_i64;       /* 1-based start */
             int64_t maxlen = vop->right_lit_i64;  /* -1 = no limit */
+            if (!ocb->str_lens)
+                ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                        BLOCK_CAPACITY, sizeof(uint32_t));
             for (uint16_t i = 0; i < count; i++) {
                 if (lcb->nulls[i] || !lcb->data.str[i]) {
                     ocb->data.str[i] = NULL;
+                    ocb->str_lens[i] = 0;
                     continue;
                 }
                 const char *s = lcb->data.str[i];
@@ -2291,6 +2304,7 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     char *empty = (char *)bump_alloc(&ctx->arena->scratch, 1);
                     empty[0] = '\0';
                     ocb->data.str[i] = empty;
+                    ocb->str_lens[i] = 0;
                     continue;
                 }
                 size_t avail = slen - (size_t)off;
@@ -2300,17 +2314,21 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 memcpy(sub, s + off, take);
                 sub[take] = '\0';
                 ocb->data.str[i] = sub;
+                ocb->str_lens[i] = (uint32_t)take;
             }
-            ocb->str_lens = NULL;
         } else if (vop->kind == VEC_FUNC_REPLACE) {
             memcpy(ocb->nulls, lcb->nulls, count);
             const char *needle = vop->lit_text;
             uint32_t nlen = vop->lit_text_len;
             const char *repl = vop->lit_text2;
             uint32_t rlen = vop->lit_text2_len;
+            if (!ocb->str_lens)
+                ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                        BLOCK_CAPACITY, sizeof(uint32_t));
             for (uint16_t i = 0; i < count; i++) {
                 if (lcb->nulls[i] || !lcb->data.str[i]) {
                     ocb->data.str[i] = NULL;
+                    ocb->str_lens[i] = 0;
                     continue;
                 }
                 const char *s = lcb->data.str[i];
@@ -2320,6 +2338,7 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     memcpy(copy, s, slen);
                     copy[slen] = '\0';
                     ocb->data.str[i] = copy;
+                    ocb->str_lens[i] = (uint32_t)slen;
                     continue;
                 }
                 /* Count occurrences to pre-allocate */
@@ -2344,8 +2363,8 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 while (p < end) *wp++ = *p++;
                 *wp = '\0';
                 ocb->data.str[i] = out;
+                ocb->str_lens[i] = (uint32_t)out_len;
             }
-            ocb->str_lens = NULL;
         }
     }
 
@@ -4304,6 +4323,146 @@ static void radix_sort_u64(uint32_t *indices, uint32_t count,
     }
 }
 
+/* ---- Multi-column composite-key radix sort ----
+ * Packs up to 64 bits of integer sort keys into a single uint64_t per row,
+ * then radix-sorts in O(n). Falls back to pdqsort for unsupported types. */
+
+/* Compute the bit width of a column type's sort key encoding. Returns 0 for unsupported. */
+static int sort_key_bits(enum column_type t)
+{
+    switch (t) {
+    case COLUMN_TYPE_BOOLEAN:
+    case COLUMN_TYPE_SMALLINT:    return 16;
+    case COLUMN_TYPE_INT:
+    case COLUMN_TYPE_DATE:        return 32;
+    case COLUMN_TYPE_BIGINT:
+    case COLUMN_TYPE_TIME:
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ: return 64;
+    case COLUMN_TYPE_FLOAT:
+    case COLUMN_TYPE_NUMERIC:
+    case COLUMN_TYPE_TEXT:
+    case COLUMN_TYPE_ENUM:
+    case COLUMN_TYPE_INTERVAL:
+    case COLUMN_TYPE_UUID:        return 0;
+    }
+    return 0;
+}
+
+/* Build composite sort keys for multi-column radix sort.
+ * Returns 0 on success, -1 if keys don't fit in 64 bits or types unsupported.
+ * out[i] = composite key for row i, any_null[i] = 1 if any sort key is NULL. */
+static int build_composite_keys(uint64_t *out, uint8_t *any_null,
+                                 uint32_t total,
+                                 uint16_t nsort_cols,
+                                 void **flat_keys, uint8_t **flat_nulls,
+                                 enum column_type *key_types,
+                                 int *sort_descs)
+{
+    /* Check total bit width fits in 64 bits */
+    int total_bits = 0;
+    int bits[32];
+    for (uint16_t k = 0; k < nsort_cols; k++) {
+        bits[k] = sort_key_bits(key_types[k]);
+        if (bits[k] == 0) return -1;
+        total_bits += bits[k];
+    }
+    if (total_bits > 64) return -1;
+
+    /* Bail out if any NULLs exist — partial-NULL rows need per-column NULL
+     * ordering that composite keys can't express. The common case (no NULLs
+     * in sort keys) is the fast path. */
+    for (uint16_t k = 0; k < nsort_cols; k++) {
+        const uint8_t *nulls = flat_nulls[k];
+        for (uint32_t i = 0; i < total; i++)
+            if (nulls[i]) return -1;
+    }
+
+    memset(out, 0, total * sizeof(uint64_t));
+
+    /* Encode keys MSB-first: primary key in highest bits */
+    int shift = total_bits;
+    for (uint16_t k = 0; k < nsort_cols; k++) {
+        shift -= bits[k];
+        int desc = sort_descs[k];
+
+        switch (bits[k]) {
+        case 16: {
+            const int16_t *vals = (const int16_t *)flat_keys[k];
+            for (uint32_t i = 0; i < total; i++) {
+                if (any_null[i]) continue;
+                uint16_t u = (uint16_t)vals[i] ^ 0x8000u;
+                if (desc) u = ~u;
+                out[i] |= (uint64_t)u << shift;
+            }
+            break;
+        }
+        case 32: {
+            const int32_t *vals = (const int32_t *)flat_keys[k];
+            for (uint32_t i = 0; i < total; i++) {
+                if (any_null[i]) continue;
+                uint32_t u = (uint32_t)vals[i] ^ 0x80000000u;
+                if (desc) u = ~u;
+                out[i] |= (uint64_t)u << shift;
+            }
+            break;
+        }
+        case 64: {
+            const int64_t *vals = (const int64_t *)flat_keys[k];
+            for (uint32_t i = 0; i < total; i++) {
+                if (any_null[i]) continue;
+                uint64_t u = (uint64_t)vals[i] ^ 0x8000000000000000ULL;
+                if (desc) u = ~u;
+                out[i] |= u; /* shift is 0 for 64-bit single key */
+            }
+            break;
+        }
+        }
+    }
+    return 0;
+}
+
+/* Radix sort using pre-built composite uint64 keys.
+ * Caller guarantees no NULLs in sort keys (build_composite_keys bails on NULLs). */
+static void radix_sort_composite(uint32_t *indices, uint32_t count,
+                                  const uint64_t *composite_keys,
+                                  struct bump_alloc *scratch)
+{
+    if (count < 2) return;
+
+    /* Build sort keys array indexed by position in indices[] */
+    uint64_t *sort_keys = (uint64_t *)bump_alloc(scratch, count * sizeof(uint64_t));
+    for (uint32_t i = 0; i < count; i++)
+        sort_keys[i] = composite_keys[indices[i]];
+
+    uint32_t *buf = (uint32_t *)bump_alloc(scratch, count * sizeof(uint32_t));
+    uint64_t *key_buf = (uint64_t *)bump_alloc(scratch, count * sizeof(uint64_t));
+
+    /* 8-pass radix sort, 8 bits per pass */
+    for (int pass = 0; pass < 8; pass++) {
+        int s = pass * 8;
+        uint32_t counts[256] = {0};
+        for (uint32_t i = 0; i < count; i++)
+            counts[(sort_keys[i] >> s) & 0xFF]++;
+        uint32_t offsets[256];
+        offsets[0] = 0;
+        for (int b = 1; b < 256; b++)
+            offsets[b] = offsets[b - 1] + counts[b - 1];
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t byte = (sort_keys[i] >> s) & 0xFF;
+            uint32_t pos = offsets[byte]++;
+            buf[pos] = indices[i];
+            key_buf[pos] = sort_keys[i];
+        }
+        uint32_t *t1 = indices; indices = buf; buf = t1;
+        uint64_t *t2 = sort_keys; sort_keys = key_buf; key_buf = t2;
+    }
+
+    /* After even number of passes (8), result is in the original indices array.
+     * Radix sort swaps pointers each pass: after 8 passes, indices points to
+     * the original buffer (since 8 is even). No copy needed. */
+}
+
 /* ---- Sort ---- */
 
 struct block_sort_ctx {
@@ -4561,6 +4720,19 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                    (const int64_t *)_bsort_ctx.flat_col_data[sci],
                                    _bsort_ctx.flat_col_nulls[sci],
                                    desc, nulls_first_flag, &ctx->arena->scratch);
+                    used_radix = 1;
+                }
+            }
+            /* Multi-key composite radix sort: pack integer keys into uint64 */
+            if (!used_radix && nsk >= 2) {
+                uint64_t *composite = (uint64_t *)bump_alloc(&ctx->arena->scratch,
+                                                              total * sizeof(uint64_t));
+                uint8_t *any_null = (uint8_t *)bump_alloc(&ctx->arena->scratch, total);
+                if (build_composite_keys(composite, any_null, total, nsk,
+                                          _bsort_ctx.flat_keys, _bsort_ctx.flat_nulls,
+                                          _bsort_ctx.key_types, _bsort_ctx.sort_descs) == 0) {
+                    radix_sort_composite(st->sorted_indices, total, composite,
+                                          &ctx->arena->scratch);
                     used_radix = 1;
                 }
             }
