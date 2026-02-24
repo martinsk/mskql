@@ -102,7 +102,7 @@ def duckdb_fixup(lines):
 
 # ── no-cache variant helper ──────────────────────────────────────────────────
 # Benchmarks that are inherently write-heavy or already vary parameters per query.
-CACHE_RESISTANT = {"insert_bulk", "update", "delete", "transaction", "index_lookup", "composite_index_lookup"}
+CACHE_RESISTANT = {"insert_bulk", "update", "delete", "transaction", "index_lookup", "composite_index_lookup", "vector_insert"}
 
 
 def nocache_lines(bench_lines):
@@ -1034,6 +1034,79 @@ def bench_analytics_stress():
     return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
 
 
+# ── Vector benchmarks (mskql vs PG+pgvector, no DuckDB) ──────────────────
+
+def bench_vector_insert():
+    """INSERT 5000 rows with VECTOR(4) column."""
+    setup = [
+        "DROP TABLE IF EXISTS t_vec;",
+        "CREATE TABLE t_vec (id INT, label TEXT, v VECTOR(4));",
+    ]
+    pg_setup = [
+        "CREATE EXTENSION IF NOT EXISTS vector;",
+    ] + setup
+    bench = []
+    for i in range(5000):
+        bench.append(
+            f"INSERT INTO t_vec VALUES ({i}, 'item_{i}', "
+            f"'[{i % 100}.1, {i % 50}.2, {i % 30}.3, {i % 20}.4]');"
+        )
+    return {"mskql": (setup, bench), "duck": None, "pg": (pg_setup, bench)}
+
+
+def bench_vector_scan():
+    """SELECT * with VECTOR(4) column, 5000 rows."""
+    setup = [
+        "DROP TABLE IF EXISTS t_vec;",
+        "CREATE TABLE t_vec (id INT, v VECTOR(4));",
+    ]
+    for i in range(5000):
+        setup.append(
+            f"INSERT INTO t_vec VALUES ({i}, "
+            f"'[{i % 100}.1, {i % 50}.2, {i % 30}.3, {i % 20}.4]');"
+        )
+    pg_setup = ["CREATE EXTENSION IF NOT EXISTS vector;"] + setup
+    bench = ["SELECT * FROM t_vec;"] * 100
+    return {"mskql": (setup, bench), "duck": None, "pg": (pg_setup, bench)}
+
+
+def bench_vector_wide():
+    """VECTOR(128) — scan + sort + limit, 2000 rows."""
+    setup = [
+        "DROP TABLE IF EXISTS t_wide;",
+        "CREATE TABLE t_wide (id INT, score FLOAT, v VECTOR(128));",
+    ]
+    for i in range(2000):
+        dims = ",".join(f"{((i * 128 + d) % 10000) / 100.0:.2f}" for d in range(128))
+        setup.append(
+            f"INSERT INTO t_wide VALUES ({i}, {(i * 31337) % 1000}.{i % 10}, "
+            f"'[{dims}]');"
+        )
+    pg_setup = ["CREATE EXTENSION IF NOT EXISTS vector;"] + setup
+    bench = [
+        "SELECT id, score, v FROM t_wide ORDER BY score DESC LIMIT 100;"
+    ] * 20
+    return {"mskql": (setup, bench), "duck": None, "pg": (pg_setup, bench)}
+
+
+def bench_vector_filter():
+    """WHERE filter on table with VECTOR(128), 2000 rows."""
+    setup = [
+        "DROP TABLE IF EXISTS t_vfilt;",
+        "CREATE TABLE t_vfilt (id INT, category INT, v VECTOR(128));",
+    ]
+    for i in range(2000):
+        dims = ",".join(f"{((i + d) % 100) / 10.0:.2f}" for d in range(128))
+        setup.append(
+            f"INSERT INTO t_vfilt VALUES ({i}, {i % 10}, '[{dims}]');"
+        )
+    pg_setup = ["CREATE EXTENSION IF NOT EXISTS vector;"] + setup
+    bench = [
+        "SELECT id, v FROM t_vfilt WHERE category = 5;"
+    ] * 50
+    return {"mskql": (setup, bench), "duck": None, "pg": (pg_setup, bench)}
+
+
 _BASE_BENCHMARKS = [
     ("insert_bulk",        bench_insert_bulk),
     ("select_full_scan",   bench_select_full_scan),
@@ -1083,6 +1156,11 @@ _BASE_BENCHMARKS = [
     ("pq_analytical",      bench_pq_analytical),
     # ── Complex analytics stress test (parquet + in-memory mix) ──
     ("analytics_stress",   bench_analytics_stress),
+    # ── Vector benchmarks (mskql vs PG+pgvector, no DuckDB) ──
+    ("vector_insert",      bench_vector_insert),
+    ("vector_scan",        bench_vector_scan),
+    ("vector_wide",        bench_vector_wide),
+    ("vector_filter",      bench_vector_filter),
 ]
 
 
@@ -1240,25 +1318,28 @@ def main():
             pg_ms = -2.0  # sentinel: not applicable
 
         # ── duckdb ──
-        duck_db = tempfile.mktemp(suffix=".duckdb", prefix=f"bench_{name}_")
-        d_setup_lines = duck_spec[0] if is_parquet else duckdb_fixup(duck_spec[0])
-        d_bench_lines = duck_spec[1] if is_parquet else duckdb_fixup(duck_spec[1])
-        d_setup_f = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".sql", prefix=f"duck_setup_{name}_", delete=False
-        )
-        d_bench_f = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".sql", prefix=f"duck_run_{name}_", delete=False
-        )
-        d_setup_f.write("\n".join(d_setup_lines) + "\n")
-        d_setup_f.close()
-        d_bench_f.write("\n".join(d_bench_lines) + "\n")
-        d_bench_f.close()
-        run_duckdb(duckdb_bin, duck_db, d_setup_f.name)
-        duck_ms = time_duckdb(duckdb_bin, duck_db, d_bench_f.name)
-        os.unlink(d_setup_f.name)
-        os.unlink(d_bench_f.name)
-        if os.path.exists(duck_db):
-            os.unlink(duck_db)
+        if duck_spec is not None:
+            duck_db = tempfile.mktemp(suffix=".duckdb", prefix=f"bench_{name}_")
+            d_setup_lines = duck_spec[0] if is_parquet else duckdb_fixup(duck_spec[0])
+            d_bench_lines = duck_spec[1] if is_parquet else duckdb_fixup(duck_spec[1])
+            d_setup_f = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".sql", prefix=f"duck_setup_{name}_", delete=False
+            )
+            d_bench_f = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".sql", prefix=f"duck_run_{name}_", delete=False
+            )
+            d_setup_f.write("\n".join(d_setup_lines) + "\n")
+            d_setup_f.close()
+            d_bench_f.write("\n".join(d_bench_lines) + "\n")
+            d_bench_f.close()
+            run_duckdb(duckdb_bin, duck_db, d_setup_f.name)
+            duck_ms = time_duckdb(duckdb_bin, duck_db, d_bench_f.name)
+            os.unlink(d_setup_f.name)
+            os.unlink(d_bench_f.name)
+            if os.path.exists(duck_db):
+                os.unlink(duck_db)
+        else:
+            duck_ms = -2.0  # sentinel: not applicable
 
         results.append((name, mskql_ms, pg_ms, duck_ms))
         tag = f" mskql={mskql_ms:.0f}ms" if mskql_ms >= 0 else " ERROR"
@@ -1288,7 +1369,7 @@ def main():
     for name, mskql_ms, pg_ms, duck_ms in results:
         mskql_str = f"{mskql_ms:.1f}" if mskql_ms >= 0 else "ERROR"
         pg_str = "-" if pg_ms == -2.0 else (f"{pg_ms:.1f}" if pg_ms >= 0 else "ERROR")
-        duck_str = f"{duck_ms:.1f}" if duck_ms >= 0 else "ERROR"
+        duck_str = "-" if duck_ms == -2.0 else (f"{duck_ms:.1f}" if duck_ms >= 0 else "ERROR")
         ms_pg_str = f"{mskql_ms / pg_ms:.2f}x" if pg_ms > 0 and mskql_ms >= 0 else "-"
         ms_duck_str = f"{mskql_ms / duck_ms:.2f}x" if duck_ms > 0 and mskql_ms >= 0 else "n/a"
 
@@ -1327,7 +1408,7 @@ def main():
         for name, m_ms, p_ms, d_ms in results:
             m_str = f"{m_ms:.1f}" if m_ms >= 0 else "ERROR"
             p_str = "-" if p_ms == -2.0 else (f"{p_ms:.1f}" if p_ms >= 0 else "ERROR")
-            d_str = f"{d_ms:.1f}" if d_ms >= 0 else "ERROR"
+            d_str = "-" if d_ms == -2.0 else (f"{d_ms:.1f}" if d_ms >= 0 else "ERROR")
             mp = f"{m_ms / p_ms:.2f}x" if p_ms > 0 and m_ms >= 0 else "-"
             md = f"{m_ms / d_ms:.2f}x" if d_ms > 0 and m_ms >= 0 else "n/a"
             times = {"mskql": m_ms, "duck": d_ms}

@@ -24,6 +24,7 @@ union cell_value {
     struct interval as_interval;
     struct uuid_val as_uuid;
     int32_t as_enum;            /* 0-based ordinal into enum_type.values */
+    float *as_vector;           /* heap-allocated float[dim], dim from column schema */
 };
 
 struct cell {

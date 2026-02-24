@@ -280,6 +280,7 @@ static uint32_t cell_hash(const struct cell *c)
             case COLUMN_TYPE_INTERVAL:  dv = 0.0; break;
             case COLUMN_TYPE_ENUM:      dv = (double)c->value.as_enum; break;
             case COLUMN_TYPE_UUID:      dv = 0.0; break;
+            case COLUMN_TYPE_VECTOR:    dv = 0.0; break;
             }
             uint8_t *p = (uint8_t *)&dv;
             for (int i = 0; i < (int)sizeof(double); i++) { h ^= p[i]; h *= FNV_PRIME; }
@@ -307,6 +308,9 @@ static uint32_t cell_hash(const struct cell *c)
             for (int i = 0; i < (int)sizeof(uh); i++) { h ^= p[i]; h *= FNV_PRIME; }
             break;
         }
+        case COLUMN_TYPE_VECTOR:
+            /* vectors are not join keys — hash as 0 */
+            break;
     }
     return h;
 }

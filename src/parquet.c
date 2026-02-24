@@ -240,6 +240,9 @@ int parquet_materialize(struct table *t)
                     cell.value.as_text = s;
                     break;
                 }
+                case COLUMN_TYPE_VECTOR:
+                    cell.is_null = 1;
+                    break;
                 }
                 da_push(&row.cells, cell);
             }

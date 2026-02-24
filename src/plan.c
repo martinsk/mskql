@@ -39,6 +39,10 @@ static inline void cell_to_cb_at(struct col_block *cb, uint16_t i, const struct 
         cb->data.i32[i] = cell->value.as_enum; break;
     case COLUMN_TYPE_UUID:
         cb->data.uuid[i] = cell->value.as_uuid; break;
+    case COLUMN_TYPE_VECTOR:
+        if (cell->value.as_vector)
+            memcpy(&cb->data.vec[i * cb->vec_dim], cell->value.as_vector, cb->vec_dim * sizeof(float));
+        break;
     }
 }
 
@@ -64,7 +68,7 @@ static uint16_t vec_binop_block(const struct col_block *cba, int col_b,
     case COLUMN_TYPE_SMALLINT:
         for (uint16_t i = 0; i < count; i++) vals[i] = (double)cba->data.i16[i];
         break;
-    case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID:
+    case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: case COLUMN_TYPE_VECTOR:
         memset(vals, 0, count * sizeof(double));
         break;
     }
@@ -92,7 +96,7 @@ static uint16_t vec_binop_block(const struct col_block *cba, int col_b,
             case COLUMN_TYPE_SMALLINT:
                 for (uint16_t i = 0; i < count; i++) vals[i] *= (double)cbb->data.i16[i];
                 break;
-            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: break;
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: case COLUMN_TYPE_VECTOR: break;
             }
             break;
         case OP_ADD:
@@ -109,7 +113,7 @@ static uint16_t vec_binop_block(const struct col_block *cba, int col_b,
             case COLUMN_TYPE_SMALLINT:
                 for (uint16_t i = 0; i < count; i++) vals[i] += (double)cbb->data.i16[i];
                 break;
-            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: break;
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: case COLUMN_TYPE_VECTOR: break;
             }
             break;
         case OP_SUB:
@@ -126,7 +130,7 @@ static uint16_t vec_binop_block(const struct col_block *cba, int col_b,
             case COLUMN_TYPE_SMALLINT:
                 for (uint16_t i = 0; i < count; i++) vals[i] -= (double)cbb->data.i16[i];
                 break;
-            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: break;
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: case COLUMN_TYPE_VECTOR: break;
             }
             break;
         case OP_DIV:
@@ -153,7 +157,7 @@ static uint16_t vec_binop_block(const struct col_block *cba, int col_b,
                     vals[i] = d != 0.0 ? vals[i] / d : 0.0;
                 }
                 break;
-            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: break;
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: case COLUMN_TYPE_VECTOR: break;
             }
             break;
         case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
@@ -209,6 +213,8 @@ static inline void cb_to_cell_at(const struct col_block *cb, uint16_t i, struct 
         cell->value.as_enum = cb->data.i32[i]; break;
     case COLUMN_TYPE_UUID:
         cell->value.as_uuid = cb->data.uuid[i]; break;
+    case COLUMN_TYPE_VECTOR:
+        cell->value.as_vector = &cb->data.vec[i * cb->vec_dim]; break;
     }
 }
 
@@ -246,6 +252,8 @@ static struct row flat_row_at(const struct flat_table *ft, size_t idx,
         case COLUMN_TYPE_TEXT:      cell->value.as_text = ((char **)ft->col_data[c])[idx]; break;
         case COLUMN_TYPE_ENUM:      cell->value.as_enum = ((int32_t *)ft->col_data[c])[idx]; break;
         case COLUMN_TYPE_UUID:      cell->value.as_uuid = ((struct uuid_val *)ft->col_data[c])[idx]; break;
+        case COLUMN_TYPE_VECTOR:
+            cell->value.as_vector = &((float *)ft->col_data[c])[idx * ft->col_vec_dims[c]]; break;
         }
     }
     return r;
@@ -255,7 +263,8 @@ static struct row flat_row_at(const struct flat_table *ft, size_t idx,
  * col_map[i] = which table column to read for output column i.
  * Returns number of rows copied. */
 static uint16_t flat_table_read(const struct flat_table *ft, size_t *cursor,
-                                struct row_block *out, int *col_map, uint16_t ncols)
+                                struct row_block *out, int *col_map, uint16_t ncols,
+                                struct bump_alloc *scratch)
 {
     size_t start = *cursor;
     size_t end = ft->nrows;
@@ -305,11 +314,29 @@ static uint16_t flat_table_read(const struct flat_table *ft, size_t *cursor,
             memcpy(cb->data.i32, (int32_t *)ft->col_data[tc] + start, nrows * sizeof(int32_t)); break;
         case COLUMN_TYPE_UUID:
             memcpy(cb->data.uuid, (struct uuid_val *)ft->col_data[tc] + start, nrows * sizeof(struct uuid_val)); break;
+        case COLUMN_TYPE_VECTOR: {
+            uint16_t dim = ft->col_vec_dims[tc];
+            cb->vec_dim = dim;
+            cb->data.vec = (float *)bump_alloc(scratch, BLOCK_CAPACITY * dim * sizeof(float));
+            memcpy(cb->data.vec, (float *)ft->col_data[tc] + start * dim, nrows * dim * sizeof(float)); break;
+        }
         }
     }
 
     *cursor = end;
     return nrows;
+}
+
+/* Helper: ensure a VECTOR col_block has its data.vec buffer allocated.
+ * Must be called before writing to cb->data.vec via cb_copy_value etc. */
+static inline void cb_ensure_vec(struct col_block *cb, const struct col_block *src,
+                                 struct bump_alloc *scratch)
+{
+    if (cb->type == COLUMN_TYPE_VECTOR && !cb->data.vec && src->vec_dim > 0) {
+        cb->vec_dim = src->vec_dim;
+        cb->data.vec = (float *)bump_alloc(scratch,
+                        BLOCK_CAPACITY * src->vec_dim * sizeof(float));
+    }
 }
 
 /* Helper: copy a col_block value at index src_i to dst col_block at dst_i. */
@@ -318,7 +345,7 @@ static inline void cb_copy_value(struct col_block *dst, uint32_t dst_i,
 {
     dst->nulls[dst_i] = src->nulls[src_i];
     memcpy(cb_data_ptr(dst, dst_i), cb_data_ptr(src, (uint32_t)src_i),
-           col_type_elem_size(src->type));
+           cb_elem_size(src));
 }
 
 /* Helper: bulk copy count values from src col_block to dst col_block. */
@@ -326,7 +353,7 @@ static inline void cb_bulk_copy(struct col_block *dst,
                                 const struct col_block *src, uint32_t count)
 {
     memcpy(dst->nulls, src->nulls, count);
-    memcpy(cb_data_ptr(dst, 0), cb_data_ptr(src, 0), count * col_type_elem_size(src->type));
+    memcpy(cb_data_ptr(dst, 0), cb_data_ptr(src, 0), count * cb_elem_size(src));
 }
 
 /* Helper: get output column count for a plan node. */
@@ -430,6 +457,18 @@ void block_to_rows(const struct row_block *blk, struct rows *result, struct bump
                 cb_to_cell_at(cb, ri, &cell);
                 if (column_type_is_text(cb->type) && cell.value.as_text)
                     cell.value.as_text = rb ? bump_strdup(rb, cell.value.as_text) : strdup(cell.value.as_text);
+                if (cb->type == COLUMN_TYPE_VECTOR && cell.value.as_vector && cb->vec_dim > 0) {
+                    size_t vbytes = (size_t)cb->vec_dim * sizeof(float);
+                    if (rb) {
+                        float *copy = (float *)bump_alloc(rb, vbytes);
+                        memcpy(copy, cell.value.as_vector, vbytes);
+                        cell.value.as_vector = copy;
+                    } else {
+                        float *copy = (float *)malloc(vbytes);
+                        memcpy(copy, cell.value.as_vector, vbytes);
+                        cell.value.as_vector = copy;
+                    }
+                }
             }
             da_push(&dst.cells, cell);
         }
@@ -483,7 +522,8 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     if (!t->flat.col_data || t->flat.nrows == 0) return -1;
 
     uint16_t n = flat_table_read(&t->flat, &st->cursor, out,
-                                 pn->seq_scan.col_map, pn->seq_scan.ncols);
+                                 pn->seq_scan.col_map, pn->seq_scan.ncols,
+                                 &ctx->arena->scratch);
     if (n == 0) return -1;
     return 0;
 }
@@ -564,6 +604,13 @@ static int index_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     cb->data.iv[nrows] = ((struct interval *)ft->col_data[tc])[rid]; break;
                 case COLUMN_TYPE_UUID:
                     cb->data.uuid[nrows] = ((struct uuid_val *)ft->col_data[tc])[rid]; break;
+                case COLUMN_TYPE_VECTOR: {
+                    uint16_t dim = ft->col_vec_dims[tc];
+                    cb->vec_dim = dim;
+                    if (!cb->data.vec)
+                        cb->data.vec = (float *)bump_alloc(&ctx->arena->scratch, BLOCK_CAPACITY * dim * sizeof(float));
+                    memcpy(&cb->data.vec[nrows * dim], &((float *)ft->col_data[tc])[rid * dim], dim * sizeof(float)); break;
+                }
                 }
             }
         }
@@ -592,7 +639,7 @@ static void coerce_cmp_to_temporal(struct cell *c, enum column_type ct)
     case COLUMN_TYPE_INTERVAL:    c->type = ct; c->value.as_interval = interval_from_str(s); break;
     case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_BIGINT:
     case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_BOOLEAN:
-    case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID: break;
+    case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID: case COLUMN_TYPE_VECTOR: break;
     }
 }
 
@@ -761,6 +808,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
             FLEAF_LOOP(!nulls[r] && uuid_compare(vals[r], lo) >= 0 && uuid_compare(vals[r], hi) <= 0);
             break;
         }
+        case COLUMN_TYPE_VECTOR:
+            break;
         }
         break;
     }
@@ -860,6 +909,7 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
         case COLUMN_TYPE_SMALLINT:
         case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_NUMERIC:
+        case COLUMN_TYPE_VECTOR:
             break;
         }
         break;
@@ -1008,6 +1058,8 @@ static uint16_t filter_eval_leaf(struct col_block *cb, int op,
                 case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH: case CMP_REGEX_ICASE_MATCH: case CMP_REGEX_ICASE_NOT_MATCH:
                 case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE: break;
             }
+            break;
+        case COLUMN_TYPE_VECTOR:
             break;
         }
         }
@@ -1328,6 +1380,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 FILTER_LOOP(!nulls[r] && uuid_compare(vals[r], lo) >= 0 && uuid_compare(vals[r], hi) <= 0);
                 break;
             }
+            case COLUMN_TYPE_VECTOR:
+                break;
             }
             goto done;
         }
@@ -1480,6 +1534,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
                 break;
             }
+            case COLUMN_TYPE_VECTOR:
+                break;
             }
             goto done;
         }
@@ -1645,6 +1701,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
                 goto done;
             }
+            case COLUMN_TYPE_VECTOR:
+                goto fallback;
             }
             break;
         }
@@ -1792,6 +1850,25 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 if (column_type_is_text(ocb->type))
                     ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
                                                             BLOCK_CAPACITY, sizeof(uint32_t));
+                /* Allocate vec buffer for VECTOR output columns */
+                if (ocb->type == COLUMN_TYPE_VECTOR && result.value.as_vector) {
+                    /* Infer vec_dim from the table's column definition */
+                    struct table *tbl = pn->expr_project.table;
+                    uint16_t dim = 0;
+                    if (tbl) {
+                        for (uint16_t ti = 0; ti < tbl->columns.count; ti++) {
+                            if (tbl->columns.items[ti].type == COLUMN_TYPE_VECTOR) {
+                                dim = tbl->columns.items[ti].vector_dim;
+                                break;
+                            }
+                        }
+                    }
+                    if (dim > 0) {
+                        ocb->vec_dim = dim;
+                        ocb->data.vec = (float *)bump_alloc(&ctx->arena->scratch,
+                                         BLOCK_CAPACITY * dim * sizeof(float));
+                    }
+                }
             }
 
             if (result.is_null) {
@@ -1812,7 +1889,7 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     case STORE_I32: dv = (double)result.value.as_int; break;
                     case STORE_I64: dv = (double)result.value.as_bigint; break;
                     case STORE_F64: dv = result.value.as_float; break;
-                    case STORE_STR: case STORE_IV: case STORE_UUID:
+                    case STORE_STR: case STORE_IV: case STORE_UUID: case STORE_VEC:
                         have_numeric = 0; break;
                     }
                     switch (column_type_storage(ocb->type)) {
@@ -1836,6 +1913,10 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         cell_to_cb_at(ocb, r, &result);
                         break;
                     case STORE_UUID:
+                        ocb->type = result.type;
+                        cell_to_cb_at(ocb, r, &result);
+                        break;
+                    case STORE_VEC:
                         ocb->type = result.type;
                         cell_to_cb_at(ocb, r, &result);
                         break;
@@ -1894,6 +1975,17 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case STORE_STR: for (uint16_t i = 0; i < count; i++) dst->data.str[i] = src->data.str[input.sel[i]]; break;
             case STORE_IV:  for (uint16_t i = 0; i < count; i++) dst->data.iv[i]  = src->data.iv[input.sel[i]]; break;
             case STORE_UUID: for (uint16_t i = 0; i < count; i++) memcpy(dst->data.uuid + i * 16, src->data.uuid + input.sel[i] * 16, 16); break;
+            case STORE_VEC:
+                if (src->data.vec && src->vec_dim > 0) {
+                    uint16_t dim = src->vec_dim;
+                    dst->vec_dim = dim;
+                    dst->data.vec = src->data.vec;
+                    float *tmp = (float *)bump_alloc(&ctx->arena->scratch, count * dim * sizeof(float));
+                    for (uint16_t i = 0; i < count; i++)
+                        memcpy(&tmp[i * dim], &src->data.vec[input.sel[i] * dim], dim * sizeof(float));
+                    dst->data.vec = tmp;
+                }
+                break;
             }
         }
         input = compact;
@@ -1920,6 +2012,12 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case STORE_STR: memcpy(ocb->data.str, icb->data.str, count * sizeof(char *)); break;
             case STORE_IV:  memcpy(ocb->data.iv, icb->data.iv, count * sizeof(struct interval)); break;
             case STORE_UUID: memcpy(ocb->data.uuid, icb->data.uuid, count * 16); break;
+            case STORE_VEC:
+                if (icb->data.vec && icb->vec_dim > 0) {
+                    ocb->vec_dim = icb->vec_dim;
+                    ocb->data.vec = icb->data.vec;
+                }
+                break;
             }
             continue;
         }
@@ -2003,6 +2101,7 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
             case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
             case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+            case COLUMN_TYPE_VECTOR:
                 break;
             }
         } else if (vop->kind == VEC_COL_OP_COL) {
@@ -2089,6 +2188,7 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
             case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
             case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+            case COLUMN_TYPE_VECTOR:
                 break;
             }
         } else if (vop->kind == VEC_FUNC_UPPER || vop->kind == VEC_FUNC_LOWER) {
@@ -2240,8 +2340,8 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
                 break;
             }
-            case STORE_STR: case STORE_IV: case STORE_UUID:
-                /* TEXT/INTERVAL/UUID coalesce not yet vectorized — shouldn't reach here */
+            case STORE_STR: case STORE_IV: case STORE_UUID: case STORE_VEC:
+                /* TEXT/INTERVAL/UUID/VEC coalesce not yet vectorized — shouldn't reach here */
                 break;
             }
         } else if (vop->kind == VEC_FUNC_SQRT) {
@@ -2586,6 +2686,7 @@ static int flat_col_eq(const struct flat_col *a, uint32_t ai,
         return uuid_equal(((const struct uuid_val *)a->data)[ai], b->data.uuid[bi]);
     case COLUMN_TYPE_INT:
     case COLUMN_TYPE_BOOLEAN:  return ((int32_t *)a->data)[ai] == b->data.i32[bi];
+    case COLUMN_TYPE_VECTOR:   return 0;
     }
 }
 
@@ -2877,6 +2978,7 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             if (join_type == 1 || join_type == 3) {
                 for (uint16_t c = 0; c < outer_ncols; c++) {
                     out->cols[c].type = outer_block.cols[c].type;
+                    cb_ensure_vec(&out->cols[c], &outer_block.cols[c], &ctx->arena->scratch);
                     cb_copy_value(&out->cols[c], out_count, &outer_block.cols[c], oi);
                 }
                 for (uint16_t c = 0; c < st->build_ncols; c++) {
@@ -2901,6 +3003,7 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 /* Match: emit combined row [outer cols | inner cols] */
                 for (uint16_t c = 0; c < outer_ncols; c++) {
                     out->cols[c].type = outer_block.cols[c].type;
+                    cb_ensure_vec(&out->cols[c], &outer_block.cols[c], &ctx->arena->scratch);
                     cb_copy_value(&out->cols[c], out_count, &outer_block.cols[c], oi);
                 }
                 for (uint16_t c = 0; c < st->build_ncols; c++) {
@@ -2920,6 +3023,7 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         if (!found && (join_type == 1 || join_type == 3) && out_count < BLOCK_CAPACITY) {
             for (uint16_t c = 0; c < outer_ncols; c++) {
                 out->cols[c].type = outer_block.cols[c].type;
+                cb_ensure_vec(&out->cols[c], &outer_block.cols[c], &ctx->arena->scratch);
                 cb_copy_value(&out->cols[c], out_count, &outer_block.cols[c], oi);
             }
             for (uint16_t c = 0; c < st->build_ncols; c++) {
@@ -3027,6 +3131,8 @@ static uint64_t distinct_hash_cell(struct col_block *cb, uint16_t ri)
             h ^= cb->data.uuid[ri].hi; h *= 1099511628211ULL;
             h ^= cb->data.uuid[ri].lo; h *= 1099511628211ULL;
             break;
+        case COLUMN_TYPE_VECTOR:
+            break;
     }
     h *= 1099511628211ULL;
     return h;
@@ -3126,6 +3232,7 @@ static inline void agg_accumulate_cb(const struct col_block *acb, uint16_t ri,
         break;
     }
     case STORE_UUID:
+    case STORE_VEC:
         break;
     }
 }
@@ -3178,6 +3285,9 @@ static inline void agg_emit_minmax(struct col_block *dst, uint16_t out_idx,
         break;
     }
     case STORE_UUID:
+        dst->nulls[out_idx] = 1;
+        break;
+    case STORE_VEC:
         dst->nulls[out_idx] = 1;
         break;
     }
@@ -3383,6 +3493,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 dst->str_lens = (uint32_t *)bump_calloc(
                                     &ctx->arena->scratch, st->group_cap, sizeof(uint32_t));
                         }
+                        cb_ensure_vec(dst, src, &ctx->arena->scratch);
                         cb_copy_value(dst, group_idx, src, ri);
                         if (dst->str_lens && !src->nulls[ri] && src->data.str[ri])
                             dst->str_lens[group_idx] = src->str_lens
@@ -3447,6 +3558,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
                                 case COLUMN_TYPE_DATE: case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
                                 case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
+                                case COLUMN_TYPE_VECTOR:
                                     numbuf[0] = '\0'; break;
                                 }
                                 val_str = numbuf;
@@ -3464,6 +3576,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                 case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
                                 case COLUMN_TYPE_DATE: case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
                                 case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
+                                case COLUMN_TYPE_VECTOR:
                                     numbuf[0] = '\0'; break;
                                 }
                                 val_str = numbuf;
@@ -3549,7 +3662,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                     iv = interval_to_usec_approx(cv.value.as_interval); break;
                                 case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
                                 case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM:
-                                case COLUMN_TYPE_UUID: break;
+                                case COLUMN_TYPE_UUID: case COLUMN_TYPE_VECTOR: break;
                             }
                             st->i64_sums[idx] += iv;
                             double v = (double)iv;
@@ -3591,6 +3704,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         case STORE_STR:  break;
                         case STORE_IV:   break;
                         case STORE_UUID: break;
+                        case STORE_VEC:  break;
                         }
                         st->sumsq[idx] += dv_sq * dv_sq;
                     }
@@ -3616,6 +3730,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             /* Group key columns first */
             for (uint16_t k = 0; k < ngrp; k++) {
                 out->cols[k].type = st->group_keys[k].type;
+                cb_ensure_vec(&out->cols[k], &st->group_keys[k], &ctx->arena->scratch);
                 cb_copy_value(&out->cols[k], out_count, &st->group_keys[k], (uint16_t)g);
             }
         }
@@ -3763,6 +3878,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             uint16_t grp_offset = (uint16_t)agg_n;
             for (uint16_t k = 0; k < ngrp; k++) {
                 out->cols[grp_offset + k].type = st->group_keys[k].type;
+                cb_ensure_vec(&out->cols[grp_offset + k], &st->group_keys[k], &ctx->arena->scratch);
                 cb_copy_value(&out->cols[grp_offset + k], out_count,
                               &st->group_keys[k], (uint16_t)g);
             }
@@ -3924,7 +4040,7 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                     iv = interval_to_usec_approx(cv.value.as_interval); break;
                                 case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
                                 case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM:
-                                case COLUMN_TYPE_UUID: break;
+                                case COLUMN_TYPE_UUID: case COLUMN_TYPE_VECTOR: break;
                             }
                             st->i64_sums[a] += iv;
                             double v = (double)iv;
@@ -3961,6 +4077,7 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             case STORE_STR:  break;
                             case STORE_IV:   break;
                             case STORE_UUID: break;
+                            case STORE_VEC:  break;
                             }
                             st->sumsq[a] += dv_sq2 * dv_sq2;
                         }
@@ -4394,7 +4511,8 @@ static int sort_key_bits(enum column_type t)
     case COLUMN_TYPE_TEXT:
     case COLUMN_TYPE_ENUM:
     case COLUMN_TYPE_INTERVAL:
-    case COLUMN_TYPE_UUID:        return 0;
+    case COLUMN_TYPE_UUID:
+    case COLUMN_TYPE_VECTOR:      return 0;
     }
     return 0;
 }
@@ -4638,6 +4756,7 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 for (uint16_t c = 0; c < child_ncols; c++) {
                     compact.cols[c].type = blk->cols[c].type;
                     compact.cols[c].count = active;
+                    cb_ensure_vec(&compact.cols[c], &blk->cols[c], &ctx->arena->scratch);
                     for (uint16_t i = 0; i < active; i++) {
                         uint16_t ri = (uint16_t)blk->sel[i];
                         cb_copy_value(&compact.cols[c], i, &blk->cols[c], ri);
@@ -4683,7 +4802,9 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 kt = st->collected[0].cols[ci].type;
             _bsort_ctx.flat_col_types[ci] = kt;
 
-            size_t elem_sz = col_type_elem_size(kt);
+            size_t elem_sz = (st->nblocks > 0)
+                             ? cb_elem_size(&st->collected[0].cols[ci])
+                             : col_type_elem_size(kt);
 
             _bsort_ctx.flat_col_data[ci] = bump_alloc(&ctx->arena->scratch,
                                                        (total ? total : 1) * elem_sz);
@@ -4882,6 +5003,19 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 ocb->data.iv[r] = s[idx[r]];
             break;
         }
+        case COLUMN_TYPE_VECTOR: {
+            uint16_t dim = 0;
+            if (st->nblocks > 0) dim = st->collected[0].cols[c].vec_dim;
+            if (dim > 0) {
+                const float *s = (const float *)src_data;
+                ocb->vec_dim = dim;
+                ocb->data.vec = (float *)bump_alloc(&ctx->arena->scratch,
+                                                     out_count * dim * sizeof(float));
+                for (uint16_t r = 0; r < out_count; r++)
+                    memcpy(&ocb->data.vec[r * dim], &s[idx[r] * dim], dim * sizeof(float));
+            }
+            break;
+        }
         }
     }
 
@@ -4994,7 +5128,7 @@ static void top_n_grow_flat(struct top_n_state *st, uint32_t new_cap,
                              struct bump_alloc *scratch)
 {
     for (uint16_t c = 0; c < st->ncols; c++) {
-        size_t elem_sz = col_type_elem_size(st->flat_types[c]);
+        size_t elem_sz = st->flat_elem_sizes[c];
         void *new_data = bump_alloc(scratch, new_cap * elem_sz);
         uint8_t *new_nulls = (uint8_t *)bump_alloc(scratch, new_cap);
         if (st->total_rows > 0) {
@@ -5033,6 +5167,8 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                                   child_ncols * sizeof(uint8_t *));
         st->flat_types = (enum column_type *)bump_alloc(&ctx->arena->scratch,
                                                          child_ncols * sizeof(enum column_type));
+        st->flat_elem_sizes = (size_t *)bump_alloc(&ctx->arena->scratch,
+                                                    child_ncols * sizeof(size_t));
         /* Types will be set from first block */
         int types_set = 0;
 
@@ -5056,6 +5192,7 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 for (uint16_t c = 0; c < child_ncols; c++) {
                     compact.cols[c].type = input.cols[c].type;
                     compact.cols[c].count = count;
+                    cb_ensure_vec(&compact.cols[c], &input.cols[c], &ctx->arena->scratch);
                     for (uint16_t i = 0; i < count; i++) {
                         uint16_t ri = (uint16_t)input.sel[i];
                         cb_copy_value(&compact.cols[c], i, &input.cols[c], ri);
@@ -5066,11 +5203,13 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
             /* Set types from first block */
             if (!types_set) {
-                for (uint16_t c = 0; c < child_ncols; c++)
+                for (uint16_t c = 0; c < child_ncols; c++) {
                     st->flat_types[c] = input.cols[c].type;
+                    st->flat_elem_sizes[c] = cb_elem_size(&input.cols[c]);
+                }
                 /* Now allocate flat arrays */
                 for (uint16_t c = 0; c < child_ncols; c++) {
-                    size_t elem_sz = col_type_elem_size(st->flat_types[c]);
+                    size_t elem_sz = st->flat_elem_sizes[c];
                     st->flat_data[c] = bump_alloc(&ctx->arena->scratch, init_cap * elem_sz);
                     st->flat_nulls[c] = (uint8_t *)bump_alloc(&ctx->arena->scratch, init_cap);
                 }
@@ -5087,7 +5226,7 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         top_n_grow_flat(st, st->flat_cap * 2, &ctx->arena->scratch);
 
                     for (uint16_t c = 0; c < child_ncols; c++) {
-                        size_t elem_sz = col_type_elem_size(st->flat_types[c]);
+                        size_t elem_sz = st->flat_elem_sizes[c];
                         memcpy((uint8_t *)st->flat_data[c] + fi * elem_sz,
                                (uint8_t *)cb_data_ptr(&input.cols[c], 0) + r * elem_sz,
                                elem_sz);
@@ -5105,7 +5244,7 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         top_n_grow_flat(st, st->flat_cap * 2, &ctx->arena->scratch);
 
                     for (uint16_t c = 0; c < child_ncols; c++) {
-                        size_t elem_sz = col_type_elem_size(st->flat_types[c]);
+                        size_t elem_sz = st->flat_elem_sizes[c];
                         memcpy((uint8_t *)st->flat_data[c] + fi * elem_sz,
                                (uint8_t *)cb_data_ptr(&input.cols[c], 0) + r * elem_sz,
                                elem_sz);
@@ -5248,6 +5387,8 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             for (uint16_t r = 0; r < out_count; r++) ocb->data.iv[r] = s[idx[r]];
             break;
         }
+        case COLUMN_TYPE_VECTOR:
+            break;
         }
     }
 
@@ -5455,6 +5596,7 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 for (uint16_t c = 0; c < child_ncols; c++) {
                     compact.cols[c].type = blk->cols[c].type;
                     compact.cols[c].count = active;
+                    cb_ensure_vec(&compact.cols[c], &blk->cols[c], &ctx->arena->scratch);
                     for (uint16_t i = 0; i < active; i++)
                         cb_copy_value(&compact.cols[c], i, &blk->cols[c], (uint16_t)blk->sel[i]);
                 }
@@ -5473,11 +5615,14 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         st->flat_data = (void **)bump_alloc(&ctx->arena->scratch, child_ncols * sizeof(void *));
         st->flat_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch, child_ncols * sizeof(uint8_t *));
         st->flat_types = (enum column_type *)bump_alloc(&ctx->arena->scratch, child_ncols * sizeof(enum column_type));
+        st->flat_elem_sizes = (size_t *)bump_alloc(&ctx->arena->scratch, child_ncols * sizeof(size_t));
 
         for (uint16_t ci = 0; ci < child_ncols; ci++) {
             enum column_type kt = nblocks > 0 ? collected[0].cols[ci].type : COLUMN_TYPE_INT;
             st->flat_types[ci] = kt;
-            size_t esz = col_type_elem_size(kt);
+            size_t esz = (nblocks > 0) ? cb_elem_size(&collected[0].cols[ci])
+                                       : col_type_elem_size(kt);
+            st->flat_elem_sizes[ci] = esz;
 
             st->flat_data[ci] = bump_alloc(&ctx->arena->scratch, total * esz);
             st->flat_nulls[ci] = (uint8_t *)bump_alloc(&ctx->arena->scratch, total);
@@ -6081,6 +6226,8 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 ocb->data.iv[r] = s[idx[r]];
             break;
         }
+        case COLUMN_TYPE_VECTOR:
+            break;
         }
     }
 
@@ -6170,6 +6317,8 @@ static inline uint32_t semi_hash_flat(enum column_type type, const void *data, u
             uint64_t uh = uuid_hash(u);
             return (uint32_t)(uh ^ (uh >> 32));
         }
+        case COLUMN_TYPE_VECTOR:
+            return 0;
     }
     return 0;
 }
@@ -6211,6 +6360,8 @@ static inline int semi_eq_cb_flat(const struct col_block *cb, uint16_t oi,
             return cb->data.i32[oi] == ((const int32_t *)data)[fi];
         case COLUMN_TYPE_UUID:
             return uuid_equal(cb->data.uuid[oi], ((const struct uuid_val *)data)[fi]);
+        case COLUMN_TYPE_VECTOR:
+            return 0;
     }
     return 0;
 }
@@ -6242,6 +6393,8 @@ static size_t semi_elem_size(enum column_type type)
             return sizeof(int32_t);
         case COLUMN_TYPE_UUID:
             return sizeof(struct uuid_val);
+        case COLUMN_TYPE_VECTOR:
+            return sizeof(float);
     }
     return sizeof(char *);
 }
@@ -6336,6 +6489,8 @@ static void hash_semi_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
                 case COLUMN_TYPE_UUID:
                     ((struct uuid_val *)st->key_data)[di] = src_key->data.uuid[ri];
                     break;
+                case COLUMN_TYPE_VECTOR:
+                    break;
             }
             st->build_count++;
         }
@@ -6412,6 +6567,7 @@ static int hash_semi_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             if (found) {
                 for (uint16_t c = 0; c < outer_ncols; c++) {
                     out->cols[c].type = outer_block.cols[c].type;
+                    cb_ensure_vec(&out->cols[c], &outer_block.cols[c], &ctx->arena->scratch);
                     cb_copy_value(&out->cols[c], out_count, &outer_block.cols[c], oi);
                 }
                 out_count++;
@@ -6968,6 +7124,8 @@ static uint16_t pq_cache_read(struct parquet_cache *pc, size_t *cursor,
             memcpy(cb->data.iv, (struct interval *)pc->col_data[tc] + start, nrows * sizeof(struct interval)); break;
         case COLUMN_TYPE_UUID:
             memcpy(cb->data.uuid, (struct uuid_val *)pc->col_data[tc] + start, nrows * sizeof(struct uuid_val)); break;
+        case COLUMN_TYPE_VECTOR:
+            break;
         }
     }
 
@@ -7219,6 +7377,8 @@ static int pq_cache_build(struct table *tbl)
                 }
                 break;
             }
+            case COLUMN_TYPE_VECTOR:
+                break;
             }
         }
 
@@ -7454,6 +7614,8 @@ static int cell_value_to_str(const struct cell *c, char *buf, int buflen)
         char ubuf[37]; uuid_format(&c->value.as_uuid, ubuf);
         return snprintf(buf, buflen, "'%s'", ubuf);
     }
+    case COLUMN_TYPE_VECTOR:
+        return snprintf(buf, buflen, "'[...]'");
     }
     __builtin_unreachable();
 }
@@ -8492,7 +8654,29 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     if (s->has_recursive_cte)   return PLAN_RES_NOTIMPL;
     if (s->has_distinct_on)     return PLAN_RES_NOTIMPL;
     if (s->insert_rows_count > 0) return PLAN_RES_NOTIMPL;
-    if (s->has_expr_aggs)       return PLAN_RES_NOTIMPL; /* COALESCE(SUM(...),0) etc. */
+    /* NOTE: has_expr_aggs is NOT bailed here for expression-*inside*-aggregate
+     * patterns like SUM(col * col) — those are handled by try_vectorize_agg_exprs
+     * + agg_col_idxs=-2.  However, expression-*wrapping*-aggregate patterns like
+     * COALESCE(SUM(...), 0) are not supported by the join plan executor, so bail
+     * only for those.  Detect by checking if any parsed column's top-level
+     * expression is not itself an aggregate call but contains one. */
+    if (s->has_expr_aggs && s->parsed_columns_count > 0) {
+        for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
+            struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
+            if (sc->expr_idx == IDX_NONE) continue;
+            struct expr *e = &EXPR(arena, sc->expr_idx);
+            /* Top-level is an aggregate call — expression is inside, that's fine */
+            if (e->type == EXPR_FUNC_CALL &&
+                (e->func_call.func == FUNC_AGG_SUM || e->func_call.func == FUNC_AGG_COUNT ||
+                 e->func_call.func == FUNC_AGG_AVG || e->func_call.func == FUNC_AGG_MIN ||
+                 e->func_call.func == FUNC_AGG_MAX))
+                continue;
+            /* Top-level is a column ref or literal — no aggregate, fine */
+            if (!expr_has_agg(arena, sc->expr_idx)) continue;
+            /* Top-level wraps an aggregate (e.g. COALESCE(SUM(...),0)) — bail */
+            return PLAN_RES_NOTIMPL;
+        }
+    }
     /* HAVING without GROUP BY is handled in build_simple_agg */
     if (s->group_by_rollup || s->group_by_cube) return PLAN_RES_NOTIMPL;
     /* Bail if GROUP BY query has extra complex columns (subqueries, COALESCE, etc.) */
@@ -10193,7 +10377,8 @@ static int try_vectorize_agg_expr(uint32_t expr_idx, struct query_arena *arena,
         case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_BOOLEAN:
         case COLUMN_TYPE_DATE: case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
-        case COLUMN_TYPE_UUID: return 0;
+        case COLUMN_TYPE_UUID:
+        case COLUMN_TYPE_VECTOR: return 0;
         }
         col_b = -1; /* sentinel: use literal */
     } else {

@@ -366,6 +366,7 @@ struct window_state {
     void    **flat_data;        /* bump: [ncols] */
     uint8_t **flat_nulls;       /* bump: [ncols] */
     enum column_type *flat_types; /* bump: [ncols] */
+    size_t   *flat_elem_sizes;  /* bump: [ncols] — per-row element size (VECTOR-aware) */
     uint16_t  input_ncols;
     /* sorted index + partition boundaries */
     uint32_t *sorted;           /* bump: [total_rows] */
@@ -420,6 +421,7 @@ struct top_n_state {
     void    **flat_data;       /* bump: [ncols] typed arrays */
     uint8_t **flat_nulls;      /* bump: [ncols] null bitmaps */
     enum column_type *flat_types; /* bump: [ncols] */
+    size_t   *flat_elem_sizes; /* bump: [ncols] — per-row element size (VECTOR-aware) */
     uint16_t  ncols;
     uint32_t  heap_size;       /* current entries in heap */
     uint32_t  heap_cap;        /* = limit + offset */

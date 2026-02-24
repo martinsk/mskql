@@ -50,7 +50,8 @@ void table_add_column(struct table *t, struct column *col)
         .fk_column = col->fk_column ? strdup(col->fk_column) : NULL,
         .fk_on_delete = col->fk_on_delete,
         .fk_on_update = col->fk_on_update,
-        .check_expr_sql = col->check_expr_sql ? strdup(col->check_expr_sql) : NULL
+        .check_expr_sql = col->check_expr_sql ? strdup(col->check_expr_sql) : NULL,
+        .vector_dim = col->vector_dim
     };
     if (col->has_default && col->default_value) {
         c.default_value = calloc(1, sizeof(struct cell));
@@ -94,7 +95,8 @@ void table_deep_copy(struct table *dst, const struct table *src)
             .fk_column = sc->fk_column ? strdup(sc->fk_column) : NULL,
             .fk_on_delete = sc->fk_on_delete,
             .fk_on_update = sc->fk_on_update,
-            .check_expr_sql = sc->check_expr_sql ? strdup(sc->check_expr_sql) : NULL
+            .check_expr_sql = sc->check_expr_sql ? strdup(sc->check_expr_sql) : NULL,
+            .vector_dim = sc->vector_dim
         };
         if (sc->has_default && sc->default_value) {
             c.default_value = calloc(1, sizeof(struct cell));
@@ -117,7 +119,11 @@ void table_deep_copy(struct table *dst, const struct table *src)
             struct cell c = { .type = sc->type, .is_null = sc->is_null };
             if (column_type_is_text(sc->type) && sc->value.as_text)
                 c.value.as_text = strdup(sc->value.as_text);
-            else
+            else if (sc->type == COLUMN_TYPE_VECTOR && sc->value.as_vector && !sc->is_null) {
+                uint16_t dim = src->columns.items[j].vector_dim;
+                c.value.as_vector = (float *)malloc(dim * sizeof(float));
+                memcpy(c.value.as_vector, sc->value.as_vector, dim * sizeof(float));
+            } else
                 c.value = sc->value;
             da_push(&r.cells, c);
         }
@@ -203,8 +209,10 @@ void table_flat_init_schema(struct table *t)
     uint16_t ncols = (uint16_t)t->columns.count;
     if (ncols == 0) return;
     flat_table_init(&t->flat, ncols, 16);
-    for (uint16_t c = 0; c < ncols; c++)
+    for (uint16_t c = 0; c < ncols; c++) {
         t->flat.col_types[c] = t->columns.items[c].type;
+        t->flat.col_vec_dims[c] = t->columns.items[c].vector_dim;
+    }
     flat_table_alloc_cols(&t->flat);
 }
 
@@ -251,6 +259,12 @@ void table_flat_append_row(struct table *t, const struct row *row)
             break;
         case COLUMN_TYPE_ENUM:      ((int32_t *)t->flat.col_data[c])[r] = cell->value.as_enum; break;
         case COLUMN_TYPE_UUID:      ((struct uuid_val *)t->flat.col_data[c])[r] = cell->value.as_uuid; break;
+        case COLUMN_TYPE_VECTOR: {
+            uint16_t dim = t->flat.col_vec_dims[c];
+            if (cell->value.as_vector)
+                memcpy(&((float *)t->flat.col_data[c])[r * dim], cell->value.as_vector, dim * sizeof(float));
+            break;
+        }
         }
     }
     t->flat.nrows++;
@@ -284,6 +298,12 @@ void table_flat_update_row(struct table *t, size_t row_idx, const struct row *ro
             break;
         case COLUMN_TYPE_ENUM:      ((int32_t *)t->flat.col_data[c])[row_idx] = cell->value.as_enum; break;
         case COLUMN_TYPE_UUID:      ((struct uuid_val *)t->flat.col_data[c])[row_idx] = cell->value.as_uuid; break;
+        case COLUMN_TYPE_VECTOR: {
+            uint16_t dim = t->flat.col_vec_dims[c];
+            if (cell->value.as_vector)
+                memcpy(&((float *)t->flat.col_data[c])[row_idx * dim], cell->value.as_vector, dim * sizeof(float));
+            break;
+        }
         }
     }
 }
@@ -296,8 +316,10 @@ void table_flat_delete_row(struct table *t, size_t row_idx)
     if (tail > 0) {
         for (uint16_t c = 0; c < ncols; c++) {
             size_t esz = col_type_elem_size(t->flat.col_types[c]);
+            size_t mul = (t->flat.col_types[c] == COLUMN_TYPE_VECTOR) ? t->flat.col_vec_dims[c] : 1;
+            size_t row_sz = esz * mul;
             uint8_t *data = (uint8_t *)t->flat.col_data[c];
-            memmove(data + row_idx * esz, data + (row_idx + 1) * esz, tail * esz);
+            memmove(data + row_idx * row_sz, data + (row_idx + 1) * row_sz, tail * row_sz);
             memmove(t->flat.col_nulls[c] + row_idx, t->flat.col_nulls[c] + row_idx + 1, tail);
             if (t->flat.col_str_lens && t->flat.col_str_lens[c])
                 memmove(t->flat.col_str_lens[c] + row_idx, t->flat.col_str_lens[c] + row_idx + 1,
@@ -358,6 +380,7 @@ void table_flat_append_rows_bulk(struct table *t, struct row *rows, size_t count
                     case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_FLOAT:
                     case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_INTERVAL:
                     case COLUMN_TYPE_TEXT: case COLUMN_TYPE_UUID:
+                    case COLUMN_TYPE_VECTOR:
                         break;
                     }
                 }
@@ -383,6 +406,7 @@ void table_flat_append_rows_bulk(struct table *t, struct row *rows, size_t count
                     case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC:
                     case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_TEXT:
                     case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+                    case COLUMN_TYPE_VECTOR:
                         break;
                     }
                 }
@@ -405,6 +429,7 @@ void table_flat_append_rows_bulk(struct table *t, struct row *rows, size_t count
                     case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
                     case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_TEXT:
                     case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+                    case COLUMN_TYPE_VECTOR:
                         break;
                     }
                 }
@@ -441,6 +466,17 @@ void table_flat_append_rows_bulk(struct table *t, struct row *rows, size_t count
                 const struct cell *cell = &rows[r].cells.items[c];
                 nulls[r] = cell->is_null;
                 if (!cell->is_null) dst[r] = cell->value.as_uuid;
+            }
+            break;
+        }
+        case COLUMN_TYPE_VECTOR: {
+            uint16_t dim = t->flat.col_vec_dims[c];
+            float *dst = (float *)t->flat.col_data[c] + base * dim;
+            for (size_t r = 0; r < count; r++) {
+                const struct cell *cell = &rows[r].cells.items[c];
+                nulls[r] = cell->is_null;
+                if (!cell->is_null && cell->value.as_vector)
+                    memcpy(dst + r * dim, cell->value.as_vector, dim * sizeof(float));
             }
             break;
         }

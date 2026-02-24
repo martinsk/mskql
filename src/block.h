@@ -20,6 +20,7 @@
 struct col_block {
     enum column_type type;
     uint16_t         count;                    /* 0..BLOCK_CAPACITY */
+    uint16_t         vec_dim;                  /* VECTOR only: dimension per element */
     uint8_t          nulls[BLOCK_CAPACITY];    /* 0=not-null, 1=null */
     uint32_t        *str_lens;                 /* TEXT only: bump-alloc'd lengths, or NULL */
     union {
@@ -30,6 +31,7 @@ struct col_block {
         char            *str[BLOCK_CAPACITY];         /* TEXT, ENUM — pointers into table or bump slab */
         struct interval  iv[BLOCK_CAPACITY];           /* INTERVAL */
         struct uuid_val  uuid[BLOCK_CAPACITY];          /* UUID — 16-byte binary */
+        float           *vec;                          /* VECTOR — bump-alloc'd float[dim * BLOCK_CAPACITY] */
     } data;
 };
 
@@ -57,7 +59,8 @@ struct block_hash_table {
 
 /* ---- inline helpers ---- */
 
-/* Element size for a column type's data storage. */
+/* Element size for a column type's data storage.
+ * For VECTOR, returns sizeof(float) — caller must multiply by dim for per-row size. */
 static inline size_t col_type_elem_size(enum column_type ct)
 {
     switch (column_type_storage(ct)) {
@@ -68,8 +71,17 @@ static inline size_t col_type_elem_size(enum column_type ct)
     case STORE_STR:   return sizeof(char *);
     case STORE_IV:    return sizeof(struct interval);
     case STORE_UUID:  return sizeof(struct uuid_val);
+    case STORE_VEC:   return sizeof(float);
     }
     __builtin_unreachable();
+}
+
+/* Per-row element size for a col_block, accounting for VECTOR dimension. */
+static inline size_t cb_elem_size(const struct col_block *cb)
+{
+    if (cb->type == COLUMN_TYPE_VECTOR)
+        return (size_t)cb->vec_dim * sizeof(float);
+    return col_type_elem_size(cb->type);
 }
 
 /* Pointer to the data element at index i in a col_block (cast to void*). */
@@ -83,6 +95,7 @@ static inline void *cb_data_ptr(const struct col_block *cb, uint32_t i)
     case STORE_STR:   return (void *)&cb->data.str[i];
     case STORE_IV:    return (void *)&cb->data.iv[i];
     case STORE_UUID:  return (void *)&cb->data.uuid[i];
+    case STORE_VEC:   return (void *)&cb->data.vec[i * cb->vec_dim];
     }
     __builtin_unreachable();
 }
@@ -213,6 +226,14 @@ static inline uint32_t block_hash_cell(const struct col_block *cb, uint16_t i)
             }
             return h;
         }
+        case COLUMN_TYPE_VECTOR: {
+            uint32_t h = FNV_OFFSET;
+            uint8_t *p = (uint8_t *)&cb->data.vec[i * cb->vec_dim];
+            for (int j = 0; j < (int)(cb->vec_dim * sizeof(float)); j++) {
+                h ^= p[j]; h *= FNV_PRIME;
+            }
+            return h;
+        }
     }
     __builtin_unreachable();
 }
@@ -253,6 +274,11 @@ static inline int block_cell_eq(const struct col_block *a, uint16_t ai,
             return a->data.iv[ai].months == b->data.iv[bi].months &&
                    a->data.iv[ai].days == b->data.iv[bi].days &&
                    a->data.iv[ai].usec == b->data.iv[bi].usec;
+        case COLUMN_TYPE_VECTOR:
+            return a->vec_dim == b->vec_dim &&
+                   memcmp(&a->data.vec[ai * a->vec_dim],
+                          &b->data.vec[bi * b->vec_dim],
+                          a->vec_dim * sizeof(float)) == 0;
     }
     __builtin_unreachable();
 }
@@ -277,6 +303,7 @@ struct flat_table {
     uint8_t         **col_nulls;     /* [ncols] heap-allocated null bitmaps */
     enum column_type *col_types;     /* [ncols] */
     uint32_t        **col_str_lens;  /* [ncols] non-NULL only for TEXT cols */
+    uint16_t         *col_vec_dims;  /* [ncols] VECTOR dims (0 for non-vector cols) */
 };
 
 /* Allocate the per-column pointer arrays for a flat_table.
@@ -291,6 +318,7 @@ static inline void flat_table_init(struct flat_table *ft, uint16_t ncols, size_t
     ft->col_nulls    = (uint8_t **)calloc(ncols, sizeof(uint8_t *));
     ft->col_types    = (enum column_type *)calloc(ncols, sizeof(enum column_type));
     ft->col_str_lens = (uint32_t **)calloc(ncols, sizeof(uint32_t *));
+    ft->col_vec_dims = (uint16_t *)calloc(ncols, sizeof(uint16_t));
 }
 
 /* Allocate typed data arrays after col_types[] have been set.
@@ -298,7 +326,9 @@ static inline void flat_table_init(struct flat_table *ft, uint16_t ncols, size_t
 static inline void flat_table_alloc_cols(struct flat_table *ft)
 {
     for (uint16_t c = 0; c < ft->ncols; c++) {
-        ft->col_data[c]  = calloc(ft->cap ? ft->cap : 1, col_type_elem_size(ft->col_types[c]));
+        size_t esz = col_type_elem_size(ft->col_types[c]);
+        size_t mul = (ft->col_types[c] == COLUMN_TYPE_VECTOR) ? ft->col_vec_dims[c] : 1;
+        ft->col_data[c]  = calloc(ft->cap ? ft->cap : 1, esz * mul);
         ft->col_nulls[c] = (uint8_t *)calloc(ft->cap ? ft->cap : 1, 1);
     }
 }
@@ -316,10 +346,12 @@ static inline void flat_table_free(struct flat_table *ft)
     free(ft->col_nulls);
     free(ft->col_types);
     free(ft->col_str_lens);
+    free(ft->col_vec_dims);
     ft->col_data = NULL;
     ft->col_nulls = NULL;
     ft->col_types = NULL;
     ft->col_str_lens = NULL;
+    ft->col_vec_dims = NULL;
     ft->ncols = 0;
     ft->nrows = 0;
     ft->cap   = 0;
@@ -332,9 +364,11 @@ static inline void flat_table_grow(struct flat_table *ft, size_t new_cap)
 {
     for (uint16_t c = 0; c < ft->ncols; c++) {
         size_t esz = col_type_elem_size(ft->col_types[c]);
-        void *nd = realloc(ft->col_data[c], new_cap * esz);
+        size_t mul = (ft->col_types[c] == COLUMN_TYPE_VECTOR) ? ft->col_vec_dims[c] : 1;
+        size_t row_sz = esz * mul;
+        void *nd = realloc(ft->col_data[c], new_cap * row_sz);
         if (nd) {
-            memset((char *)nd + ft->cap * esz, 0, (new_cap - ft->cap) * esz);
+            memset((char *)nd + ft->cap * row_sz, 0, (new_cap - ft->cap) * row_sz);
             ft->col_data[c] = nd;
         }
         uint8_t *nn = (uint8_t *)realloc(ft->col_nulls[c], new_cap);
@@ -391,6 +425,13 @@ static inline uint32_t flat_table_hash_cell(const struct flat_table *ft, uint16_
         for (int j = 0; j < (int)sizeof(struct interval); j++) { h ^= p[j]; h *= FNV_PRIME; }
         return h;
     }
+    case COLUMN_TYPE_VECTOR: {
+        uint16_t dim = ft->col_vec_dims[c];
+        uint32_t h = FNV_OFFSET;
+        uint8_t *p = (uint8_t *)&((float *)ft->col_data[c])[r * dim];
+        for (int j = 0; j < (int)(dim * sizeof(float)); j++) { h ^= p[j]; h *= FNV_PRIME; }
+        return h;
+    }
     }
     __builtin_unreachable();
 }
@@ -435,6 +476,12 @@ static inline int flat_table_eq_cell(const struct flat_table *ft, uint16_t c,
         struct interval ia = ((struct interval *)ft->col_data[c])[ra];
         struct interval ib = ((struct interval *)ft->col_data[c])[rb];
         return ia.months == ib.months && ia.days == ib.days && ia.usec == ib.usec;
+    }
+    case COLUMN_TYPE_VECTOR: {
+        uint16_t dim = ft->col_vec_dims[c];
+        return memcmp(&((float *)ft->col_data[c])[ra * dim],
+                      &((float *)ft->col_data[c])[rb * dim],
+                      dim * sizeof(float)) == 0;
     }
     }
     __builtin_unreachable();

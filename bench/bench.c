@@ -1019,6 +1019,157 @@ static double bench_mixed_analytical(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Benchmark: vector_insert (INSERT 5000 rows with VECTOR(4))         */
+/* ------------------------------------------------------------------ */
+
+static double bench_vector_insert(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t_vec (id INT, label TEXT, v VECTOR(4))");
+
+    const int N = 5000;
+    g_niter = N;
+    char sql[256];
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t_vec VALUES (%d, 'item_%d', '[%d.1, %d.2, %d.3, %d.4]')",
+                 i, i, i % 100, i % 50, i % 30, i % 20);
+        exec(&db, sql);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: vector_scan (SELECT * with VECTOR(4) column, 5000 rows) */
+/* ------------------------------------------------------------------ */
+
+static double bench_vector_scan(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t_vec (id INT, v VECTOR(4))");
+
+    char sql[256];
+    for (int i = 0; i < 5000; i++) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t_vec VALUES (%d, '[%d.1, %d.2, %d.3, %d.4]')",
+                 i, i % 100, i % 50, i % 30, i % 20);
+        exec(&db, sql);
+    }
+
+    const int N = 100;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db, "SELECT * FROM t_vec", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: vector_wide (VECTOR(128) — scan + sort, 2000 rows)      */
+/* ------------------------------------------------------------------ */
+
+static double bench_vector_wide(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t_wide (id INT, score FLOAT, v VECTOR(128))");
+
+    /* Build a 128-dim vector literal */
+    char vec_buf[128 * 8 + 4]; /* "[0.01,0.02,...,1.28]" */
+    char sql[128 * 8 + 256];
+    for (int i = 0; i < 2000; i++) {
+        char *p = vec_buf;
+        *p++ = '[';
+        for (int d = 0; d < 128; d++) {
+            if (d > 0) *p++ = ',';
+            p += snprintf(p, 16, "%.2f", (double)((i * 128 + d) % 10000) / 100.0);
+        }
+        *p++ = ']';
+        *p = '\0';
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t_wide VALUES (%d, %d.%d, '%s')",
+                 i, (i * 31337) % 1000, i % 10, vec_buf);
+        exec(&db, sql);
+    }
+
+    const int N = 20;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT id, score, v FROM t_wide ORDER BY score DESC LIMIT 100", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark: vector_filter (WHERE on table with VECTOR(128), 2000 rows) */
+/* ------------------------------------------------------------------ */
+
+static double bench_vector_filter(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t_vfilt (id INT, category INT, v VECTOR(128))");
+
+    char vec_buf[128 * 8 + 4];
+    char sql[128 * 8 + 256];
+    for (int i = 0; i < 2000; i++) {
+        char *p = vec_buf;
+        *p++ = '[';
+        for (int d = 0; d < 128; d++) {
+            if (d > 0) *p++ = ',';
+            p += snprintf(p, 16, "%.2f", (double)((i + d) % 100) / 10.0);
+        }
+        *p++ = ']';
+        *p = '\0';
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t_vfilt VALUES (%d, %d, '%s')",
+                 i, i % 10, vec_buf);
+        exec(&db, sql);
+    }
+
+    const int N = 50;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        struct rows r = {0};
+        db_exec_sql(&db,
+            "SELECT id, v FROM t_vfilt WHERE category = 5", &r);
+        rows_free(&r);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Registry                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -1055,6 +1206,10 @@ static struct bench_entry benchmarks[] = {
     { "subquery_complex",     bench_subquery_complex },
     { "window_rank",          bench_window_rank },
     { "mixed_analytical",     bench_mixed_analytical },
+    { "vector_insert",        bench_vector_insert },
+    { "vector_scan",          bench_vector_scan },
+    { "vector_wide",          bench_vector_wide },
+    { "vector_filter",        bench_vector_filter },
 };
 
 static int nbench = (int)(sizeof(benchmarks) / sizeof(benchmarks[0]));

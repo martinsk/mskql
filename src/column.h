@@ -18,7 +18,8 @@ enum column_type {
     COLUMN_TYPE_TIMESTAMP,
     COLUMN_TYPE_TIMESTAMPTZ,
     COLUMN_TYPE_INTERVAL,
-    COLUMN_TYPE_UUID
+    COLUMN_TYPE_UUID,
+    COLUMN_TYPE_VECTOR
 };
 
 /* returns 1 if the column type stores its value as a heap-allocated char* */
@@ -46,6 +47,7 @@ static inline int column_type_is_temporal(enum column_type t)
     case COLUMN_TYPE_BIGINT:
     case COLUMN_TYPE_NUMERIC:
     case COLUMN_TYPE_UUID:
+    case COLUMN_TYPE_VECTOR:
         return 0;
     }
     __builtin_unreachable();
@@ -63,7 +65,8 @@ enum storage_class {
     STORE_F64,   /* FLOAT, NUMERIC */
     STORE_STR,   /* TEXT */
     STORE_IV,    /* INTERVAL */
-    STORE_UUID   /* UUID */
+    STORE_UUID,  /* UUID */
+    STORE_VEC    /* VECTOR — float[dim] per element */
 };
 
 static inline enum storage_class column_type_storage(enum column_type t)
@@ -79,6 +82,7 @@ static inline enum storage_class column_type_storage(enum column_type t)
     case COLUMN_TYPE_TEXT:                               return STORE_STR;
     case COLUMN_TYPE_INTERVAL:                          return STORE_IV;
     case COLUMN_TYPE_UUID:                              return STORE_UUID;
+    case COLUMN_TYPE_VECTOR:                            return STORE_VEC;
     }
     __builtin_unreachable();
 }
@@ -107,6 +111,7 @@ static const struct pg_type_info pg_type_table[] = {
     /* [COLUMN_TYPE_TIMESTAMPTZ] */ { 1184, "timestamptz", "timestamp with time zone",    8 },
     /* [COLUMN_TYPE_INTERVAL]    */ { 1186, "interval",    "interval",                   16 },
     /* [COLUMN_TYPE_UUID]        */ { 2950, "uuid",        "uuid",                       16 },
+    /* [COLUMN_TYPE_VECTOR]      */ { 16385, "vector",     "vector",                     -1 },
 };
 
 static inline const struct pg_type_info *pg_type_lookup(enum column_type t)
@@ -164,6 +169,8 @@ struct column {
     enum fk_action fk_on_update;
     /* CHECK constraint */
     char *check_expr_sql;       /* raw SQL text of CHECK body, or NULL */
+    /* VECTOR dimension (0 for non-vector columns) */
+    uint16_t vector_dim;
 };
 
 void column_free(struct column *col);

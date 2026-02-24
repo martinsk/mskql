@@ -2,6 +2,7 @@
 #include "database.h"
 #include "parser.h"
 #include "plan.h"
+#include "vector.h"
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
@@ -169,6 +170,9 @@ static int cell_to_sql_literal(const struct cell *cv, char *buf, size_t bufsize)
         snprintf(buf, bufsize, "'%s'", ubuf);
         return 0;
     }
+    case COLUMN_TYPE_VECTOR:
+        snprintf(buf, bufsize, "'[...]'");
+        return 0;
     }
     return -1;
 }
@@ -1542,6 +1546,7 @@ static double cell_to_double_val(const struct cell *c)
     case COLUMN_TYPE_TEXT:  break;
     case COLUMN_TYPE_ENUM:  return (double)c->value.as_enum;
     case COLUMN_TYPE_UUID:  break;
+    case COLUMN_TYPE_VECTOR: break;
     }
     return 0.0;
 }
@@ -1579,6 +1584,7 @@ static const char *cell_format_buf(const struct cell *c, char *buf, size_t bufsz
     case COLUMN_TYPE_TEXT:     buf[0] = '\0'; break;
     case COLUMN_TYPE_ENUM:     snprintf(buf, bufsz, "%d", c->value.as_enum); break;
     case COLUMN_TYPE_UUID:     uuid_format(&c->value.as_uuid, buf); break;
+    case COLUMN_TYPE_VECTOR:    buf[0] = '\0'; break;
     }
     return buf;
 }
@@ -3719,6 +3725,7 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
+        case COLUMN_TYPE_VECTOR:
             break;
         }
         return r;
@@ -3745,6 +3752,7 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
+        case COLUMN_TYPE_VECTOR:
             buf[0] = '\0'; break;
         }
         cell_release_rb(&src, rb);
@@ -3810,6 +3818,7 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
+        case COLUMN_TYPE_VECTOR:
             break;
         }
         cell_release_rb(&src, rb);
@@ -3872,6 +3881,7 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
         case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_BOOLEAN:
         case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_UUID:
+        case COLUMN_TYPE_VECTOR:
             break;
         }
         cell_release_rb(&src, rb);
@@ -3890,6 +3900,7 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
         case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_BOOLEAN:
         case COLUMN_TYPE_BIGINT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_UUID:
+        case COLUMN_TYPE_VECTOR:
             buf[0] = '\0'; break;
         }
         struct cell r = {0};
@@ -3979,6 +3990,10 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
             if (!rb) free(txt);
         }
         break;
+    case COLUMN_TYPE_VECTOR:
+        /* vector cast not supported via fallback */
+        if (!rb && txt) free(txt);
+        break;
     }
     return r;
 }
@@ -4039,6 +4054,7 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
             case COLUMN_TYPE_TIMESTAMPTZ:
             case COLUMN_TYPE_INTERVAL:
             case COLUMN_TYPE_UUID:
+            case COLUMN_TYPE_VECTOR:
                 arena_set_error(arena, "42883",
                     "operator does not exist: - %s",
                     column_type_name(operand.type));
@@ -4631,6 +4647,9 @@ static const char *cell_to_text_buf(const struct cell *cv, char *tmp, size_t tmp
     case COLUMN_TYPE_UUID:
         uuid_format(&cv->value.as_uuid, tmp);
         return tmp;
+    case COLUMN_TYPE_VECTOR:
+        snprintf(tmp, tmp_size, "[...]");
+        return tmp;
     }
     __builtin_unreachable();
 }
@@ -4859,7 +4878,8 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                             case COLUMN_TYPE_TIME:
                             case COLUMN_TYPE_TIMESTAMP:
                             case COLUMN_TYPE_TIMESTAMPTZ:
-                            case COLUMN_TYPE_INTERVAL:  break;
+                            case COLUMN_TYPE_INTERVAL:
+                            case COLUMN_TYPE_VECTOR:  break;
                         }
                         dcount++;
                     }
@@ -5207,6 +5227,7 @@ static double cell_to_double(const struct cell *c)
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_INTERVAL:
         case COLUMN_TYPE_UUID:
+        case COLUMN_TYPE_VECTOR:
             return 0.0;
     }
     return 0.0;
@@ -8324,6 +8345,24 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                 case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_BOOLEAN:
                 case COLUMN_TYPE_TEXT:
                     break;
+                case COLUMN_TYPE_VECTOR: {
+                    uint16_t dim = t->columns.items[i].vector_dim;
+                    float *vec = (float *)malloc(dim * sizeof(float));
+                    if (vector_parse(s, vec, dim) == 0) {
+                        free((char *)s);
+                        c->type = ct;
+                        c->value.as_vector = vec;
+                    } else {
+                        arena_set_error(arena, "22P02",
+                            "invalid input syntax for type vector: \"%s\"", s);
+                        free(vec);
+                        free((char *)s);
+                        c->is_null = 1;
+                        row_free(&copy);
+                        return -1;
+                    }
+                    break;
+                }
                 }
             }
         }

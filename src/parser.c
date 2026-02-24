@@ -83,7 +83,7 @@ static int is_keyword(sv word)
         "INT", "INTEGER", "INT4", "SERIAL", "FLOAT", "FLOAT8", "DOUBLE", "REAL", "TEXT",
         "VARCHAR", "CHAR", "CHARACTER", "BOOLEAN", "BOOL",
         "BIGINT", "INT8", "BIGSERIAL", "NUMERIC", "DECIMAL",
-        "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "UUID",
+        "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "UUID", "VECTOR",
         "DISTINCT", "IN", "BETWEEN", "LIKE", "ILIKE",
         "LEFT", "RIGHT", "FULL", "OUTER", "COALESCE", "CASE",
         "WHEN", "THEN", "ELSE", "END", "TRUE", "FALSE",
@@ -6067,6 +6067,8 @@ static enum column_type parse_column_type(sv type_name)
         return COLUMN_TYPE_INTERVAL;
     if (sv_eq_ignorecase_cstr(type_name, "UUID"))
         return COLUMN_TYPE_UUID;
+    if (sv_eq_ignorecase_cstr(type_name, "VECTOR"))
+        return COLUMN_TYPE_VECTOR;
     return COLUMN_TYPE_ENUM;
 }
 
@@ -6349,15 +6351,34 @@ static int parse_create_table(struct lexer *l, struct query *out)
         if (col.type == COLUMN_TYPE_ENUM) {
             col.enum_type_name = bump_strndup(&out->arena.bump, tok.value.data, tok.value.len);
         }
-        /* skip optional (n) or (p,s) after type name (e.g. VARCHAR(255), NUMERIC(10,2)) */
+        /* parse optional (n) or (p,s) after type name (e.g. VARCHAR(255), NUMERIC(10,2)) */
+        /* VECTOR(N) is required — extract dimension */
         {
             struct token peek = lexer_peek(l);
             if (peek.type == TOK_LPAREN) {
                 lexer_next(l); /* consume ( */
-                for (;;) {
+                if (col.type == COLUMN_TYPE_VECTOR) {
                     tok = lexer_next(l);
-                    if (tok.type == TOK_RPAREN || tok.type == TOK_EOF) break;
+                    if (tok.type != TOK_NUMBER) {
+                        arena_set_error(&out->arena, "42601", "VECTOR requires a dimension: VECTOR(N)");
+                        return -1;
+                    }
+                    long dim = strtol(tok.value.data, NULL, 10);
+                    if (dim < 1 || dim > 16000) {
+                        arena_set_error(&out->arena, "22023", "VECTOR dimension must be between 1 and 16000");
+                        return -1;
+                    }
+                    col.vector_dim = (uint16_t)dim;
+                    tok = lexer_next(l); /* consume ) */
+                } else {
+                    for (;;) {
+                        tok = lexer_next(l);
+                        if (tok.type == TOK_RPAREN || tok.type == TOK_EOF) break;
+                    }
                 }
+            } else if (col.type == COLUMN_TYPE_VECTOR) {
+                arena_set_error(&out->arena, "42601", "VECTOR requires a dimension: VECTOR(N)");
+                return -1;
             }
         }
         /* parse optional column constraints */

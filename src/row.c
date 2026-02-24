@@ -11,6 +11,8 @@ void cell_free_text(struct cell *c)
 {
     if (column_type_is_text(c->type) && c->value.as_text)
         free(c->value.as_text);
+    if (c->type == COLUMN_TYPE_VECTOR && c->value.as_vector)
+        free(c->value.as_vector);
 }
 
 void cell_copy(struct cell *dst, const struct cell *src)
@@ -20,6 +22,11 @@ void cell_copy(struct cell *dst, const struct cell *src)
     dst->numeric_scale = src->numeric_scale;
     if (column_type_is_text(src->type) && src->value.as_text) {
         dst->value.as_text = strdup(src->value.as_text);
+    } else if (src->type == COLUMN_TYPE_VECTOR && src->value.as_vector && !src->is_null) {
+        /* vector_dim not available here — caller must ensure copy is valid.
+         * We cannot determine dim from cell alone; this path is used for
+         * row-store copies where the column schema provides dim. */
+        dst->value = src->value;
     } else {
         dst->value = src->value;
     }
@@ -102,7 +109,8 @@ int cell_compare(const struct cell *a, const struct cell *b)
             case COLUMN_TYPE_INTERVAL:    coerced.type = a->type; coerced.value.as_interval = interval_from_str(s); break;
             case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_BIGINT:
             case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_BOOLEAN:
-            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID: break;
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+            case COLUMN_TYPE_VECTOR: break;
             }
             return cell_compare(a, &coerced);
         }
@@ -117,7 +125,8 @@ int cell_compare(const struct cell *a, const struct cell *b)
             case COLUMN_TYPE_INTERVAL:    coerced.type = b->type; coerced.value.as_interval = interval_from_str(s); break;
             case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_INT: case COLUMN_TYPE_BIGINT:
             case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: case COLUMN_TYPE_BOOLEAN:
-            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID: break;
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+            case COLUMN_TYPE_VECTOR: break;
             }
             return cell_compare(&coerced, b);
         }
@@ -193,6 +202,8 @@ int cell_compare(const struct cell *a, const struct cell *b)
             return 0;
         case COLUMN_TYPE_UUID:
             return uuid_compare(a->value.as_uuid, b->value.as_uuid);
+        case COLUMN_TYPE_VECTOR:
+            return 0; /* vectors have no natural ordering */
     }
     return -2;
 }
@@ -255,6 +266,9 @@ int cell_equal(const struct cell *a, const struct cell *b)
             return a->value.as_enum == b->value.as_enum;
         case COLUMN_TYPE_UUID:
             return uuid_equal(a->value.as_uuid, b->value.as_uuid);
+        case COLUMN_TYPE_VECTOR:
+            /* cannot compare without dim — treat as not equal */
+            return 0;
     }
     return 0;
 }
@@ -307,6 +321,9 @@ void row_free(struct row *row)
         struct cell *c = &row->cells.items[i];
         if (column_type_is_text(c->type) && c->value.as_text) {
             free(c->value.as_text);
+        }
+        if (c->type == COLUMN_TYPE_VECTOR && c->value.as_vector) {
+            free(c->value.as_vector);
         }
     }
     da_free(&row->cells);

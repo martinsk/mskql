@@ -2,6 +2,7 @@
 #include "parser.h"
 #include "plan.h"
 #include "catalog.h"
+#include "vector.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -315,6 +316,22 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c,
             uuid_format(&c->value.as_uuid, buf);
             txt = buf; len = 36;
             break;
+        case COLUMN_TYPE_VECTOR: {
+            uint16_t dim = 0;
+            if (t && col_idx < t->columns.count)
+                dim = t->columns.items[col_idx].vector_dim;
+            if (dim > 0 && c->value.as_vector) {
+                size_t bufsz = (size_t)dim * 20 + 3;
+                char *vbuf = (char *)malloc(bufsz);
+                len = (size_t)vector_format(c->value.as_vector, dim, vbuf, bufsz);
+                msgbuf_push_u32(m, (uint32_t)len);
+                msgbuf_push(m, vbuf, len);
+                free(vbuf);
+                return;
+            }
+            msgbuf_push_u32(m, (uint32_t)-1);
+            return;
+        }
     }
     msgbuf_push_u32(m, (uint32_t)len);
     msgbuf_push(m, txt, len);
@@ -1204,6 +1221,20 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
         uuid_format(&cb->data.uuid[ri], buf);
         txt = buf; len = 36;
         break;
+    case COLUMN_TYPE_VECTOR: {
+        uint16_t dim = cb->vec_dim;
+        if (dim > 0 && cb->data.vec) {
+            size_t bufsz = (size_t)dim * 20 + 3;
+            char *vbuf = (char *)malloc(bufsz);
+            len = (size_t)vector_format(&cb->data.vec[ri * dim], dim, vbuf, bufsz);
+            msgbuf_push_u32(m, (uint32_t)len);
+            msgbuf_push(m, vbuf, len);
+            free(vbuf);
+            return;
+        }
+        msgbuf_push_u32(m, (uint32_t)-1);
+        return;
+    }
     }
     msgbuf_push_u32(m, (uint32_t)len);
     msgbuf_push(m, txt, len);
@@ -1220,7 +1251,7 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
     uint16_t active = block->sel ? block->sel_count : block->count;
     if (active == 0) return 0;
 
-    /* ENUM needs db/table context for ordinal→string lookup — bail out */
+    /* ENUM needs db/table context — bail out */
     for (uint16_t c = 0; c < ncols; c++) {
         if (block->cols[c].type == COLUMN_TYPE_ENUM)
             return 0;
@@ -1285,8 +1316,17 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
     }
     #undef MAX_TEXT_COLS_CACHED
 
+    /* Estimate VECTOR column sizes: "[0.1,0.2,...,0.N]" ≤ dim*20+3 per cell */
+    size_t vec_total_bytes = 0;
+    for (uint16_t c = 0; c < ncols; c++) {
+        if (block->cols[c].type == COLUMN_TYPE_VECTOR) {
+            uint16_t dim = block->cols[c].vec_dim;
+            vec_total_bytes += (size_t)active * (dim * 20 + 3 + 4);
+        }
+    }
+
     size_t max_fixed_per_col = 68; /* interval is the widest fixed-size type */
-    size_t est = (size_t)active * (7 + fixed_cols * max_fixed_per_col) + text_total_bytes;
+    size_t est = (size_t)active * (7 + fixed_cols * max_fixed_per_col) + text_total_bytes + vec_total_bytes;
     msgbuf_ensure(wire, est);
 
     uint8_t *dst = wire->data + wire->len;
@@ -1368,6 +1408,18 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
                 uuid_format(&cb->data.uuid[ri], (char *)(dst + 4));
                 put_u32(dst, 36); dst += 4 + 36;
                 break;
+            case COLUMN_TYPE_VECTOR: {
+                uint16_t dim = cb->vec_dim;
+                if (dim > 0 && cb->data.vec) {
+                    char vbuf[dim * 20 + 3];
+                    size_t vlen = (size_t)vector_format(&cb->data.vec[ri * dim], dim, vbuf, sizeof(vbuf));
+                    put_u32(dst, (uint32_t)vlen); dst += 4;
+                    memcpy(dst, vbuf, vlen); dst += vlen;
+                } else {
+                    put_u32(dst, (uint32_t)-1); dst += 4;
+                }
+                break;
+            }
             case COLUMN_TYPE_ENUM:
                 __builtin_unreachable();
             }
