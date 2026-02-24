@@ -63,7 +63,7 @@
 <hr class="title-rule">
 
 <p>
-    <strong>84 batch workloads and 15 throughput workloads.</strong> Each entry
+    <strong>93 batch workloads and 15 throughput workloads.</strong> Each entry
     below shows the exact SQL, explains what database capability it exercises,
     and describes how mskql&rsquo;s architecture produces the measured result.
     For the summary numbers, see <a href="bench-vs-pg.html">Benchmarks</a>.
@@ -1111,7 +1111,7 @@ UPDATE tp_data SET value = $1 WHERE id = $2;</code></pre>
             This is a fundamental architectural limitation: mskql processes
             one query at a time. Adding MVCC or a concurrent executor would
             close this gap but would add significant complexity to the
-            ~43.6K-line codebase.
+            ~45.1K-line codebase.
         </p>
     </div>
 </div>

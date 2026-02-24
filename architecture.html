@@ -19,7 +19,7 @@
 <hr class="title-rule">
 
 <p>
-    <strong>~43.6K lines of C. Zero dependencies. Four stages: wire protocol, parser,
+    <strong>~45.1K lines of C. Zero dependencies. Four stages: wire protocol, parser,
     executor, storage.</strong> Every query flows through the same pipeline.
     The block-oriented plan executor processes 1,024-row column blocks for
     cache-friendly, vectorized execution.
@@ -82,6 +82,7 @@
                 Native integer storage for temporal types (DATE as int32,
                 TIMESTAMP/TIME as int64 microseconds, INTERVAL as 16-byte struct).
                 Binary UUID storage (two uint64). ENUM stored as int32 ordinal.
+                VECTOR(n) stored as contiguous <code>float[]</code> arrays (n&nbsp;&times;&nbsp;4&nbsp;bytes per row).
                 B-tree indexes (single and composite multi-column) for equality lookups.
                 Lazy copy-on-write snapshots for transaction rollback</td>
         </tr>
@@ -335,7 +336,7 @@
 <p>
     <strong>Fast.</strong> The block-oriented executor with columnar scan caching
     is faster than PostgreSQL on every cached batch benchmark and DuckDB on
-    39 of 84 workloads. Aggregate queries run 8&ndash;10&times; faster than both.
+    61 of 93 workloads. Aggregate queries run 8&ndash;10&times; faster than both.
     Direct columnar-to-wire serialization avoids row materialization entirely.
     The throughput benchmark sustains 94,525&nbsp;QPS on analytical
     workloads&mdash;190&times; PostgreSQL.

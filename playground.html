@@ -296,6 +296,7 @@
         <option value="upsert">Upsert (ON CONFLICT)</option>
         <option value="datetime">Date/Time Arithmetic</option>
         <option value="string_agg">STRING_AGG &amp; ARRAY_AGG</option>
+        <option value="vectors">Vectors</option>
     </select>
     <button class="run-btn" id="run-btn" disabled>&#9654; Run</button>
     <button id="reset-btn" disabled>Reset DB</button>
@@ -479,7 +480,21 @@ SELECT item,
        COUNT(*) AS tag_count
 FROM tags
 GROUP BY item
-ORDER BY item;`
+ORDER BY item;`,
+
+        vectors: `CREATE TABLE items (
+    id    INT PRIMARY KEY,
+    name  TEXT,
+    embed VECTOR(3)
+);
+
+INSERT INTO items VALUES
+    (1, 'cat',    '[0.1, 0.9, 0.3]'),
+    (2, 'dog',    '[0.2, 0.8, 0.4]'),
+    (3, 'fish',   '[0.9, 0.1, 0.7]'),
+    (4, 'parrot', '[0.3, 0.7, 0.5]');
+
+SELECT name, embed FROM items WHERE id > 1 ORDER BY name;`
     };
 
     examplesEl.addEventListener('change', function() {

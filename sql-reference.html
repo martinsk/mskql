@@ -261,6 +261,7 @@
         <tr><td><code>INTERVAL</code></td><td>16 bytes</td><td>Time span (<code>months</code> int32 + <code>days</code> int32 + <code>usec</code> int64). Supports <code>'1 year 2 months 3 days'</code> syntax.</td></tr>
         <tr><td><code>UUID</code></td><td>16 bytes</td><td>128-bit identifier stored as two <code>uint64</code>. Generated with <code>GEN_RANDOM_UUID()</code>.</td></tr>
         <tr><td><code>SMALLSERIAL</code> / <code>SERIAL</code> / <code>BIGSERIAL</code></td><td>2/4/8 bytes</td><td>Auto-incrementing integer backed by a sequence.</td></tr>
+        <tr><td><code>VECTOR(n)</code></td><td>n &times; 4 bytes</td><td>Fixed-dimension float array. pgvector-compatible <code>[1.0, 2.0, 3.0]</code> literal syntax. Stored as contiguous <code>float[]</code> in columnar blocks.</td></tr>
         <tr><td><code>ENUM</code></td><td>4 bytes</td><td>User-defined type with ordinal storage. Compared by declaration order.</td></tr>
     </tbody>
 </table>

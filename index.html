@@ -260,7 +260,7 @@
 <!-- ═══════════════════════════════════════════════════════════ -->
 
 <h1>mskql</h1>
-<span class="subtitle">An in-memory SQL engine written in C&mdash;faster than PostgreSQL and DuckDB on 39 of 84 benchmarks, built entirely by&nbsp;AI</span>
+<span class="subtitle">An in-memory SQL engine written in C&mdash;faster than PostgreSQL and DuckDB on 61 of 93 benchmarks, built entirely by&nbsp;AI</span>
 <p class="byline">
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
@@ -272,9 +272,9 @@
 
 <p>
     This project distills the core ideas of a database engine&mdash;wire protocol, parser,
-    query executor, storage&mdash;into ~43,600 lines of C with zero external
+    query executor, storage&mdash;into ~45,100 lines of C with zero external
     dependencies. One <code>.c</code> file per subsystem. Three AI agents built it
-    in iterative rounds: no human wrote any C code or SQL test. 1,355+ test cases,
+    in iterative rounds: no human wrote any C code or SQL test. 1,375+ test cases,
     every one memory-checked. Query Parquet files with standard SQL.
     Connect with <code>psql</code> on port&nbsp;5433
     or <a href="#try-it">try it in the browser</a> via WebAssembly.
@@ -288,6 +288,7 @@
 <a href="#wire-compat">Wire protocol</a>
 <a href="#performance">Performance</a>
 <a href="#parquet">Parquet</a>
+<a href="#vectors">Vectors</a>
 <a href="#ai-built">AI-built</a>
 <a href="#try-it">Playground</a>
 <span class="toc-sep"></span>
@@ -319,9 +320,9 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 <h2 id="performance">Performance: mskql vs PostgreSQL vs DuckDB</h2>
 
 <p>
-    84 batch workloads and 15 concurrent throughput workloads, measured on the same
+    93 batch workloads and 15 concurrent throughput workloads, measured on the same
     machine. mskql is faster than PostgreSQL on every cached batch workload and 13 of 15 throughput tests.
-    Against DuckDB, mskql wins 39 of 84 workloads&mdash;aggregates
+    Against DuckDB, mskql wins 61 of 93 workloads&mdash;aggregates
     8&times;, expression aggregates 10&times;, correlated subqueries 166&times; faster than PG.
     DuckDB wins full scans (4.3&times;) and sorts (4.7&times;).
 </p>
@@ -437,7 +438,7 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 </div>
 
 <p>
-    &#8594;&ensp;<a href="bench-vs-pg.html"><strong>All 84 batch + 15 throughput results</strong></a>
+    &#8594;&ensp;<a href="bench-vs-pg.html"><strong>All 93 batch + 15 throughput results</strong></a>
     &ensp;&middot;&ensp;
     <a href="dev/bench/index.html"><strong>Historical charts</strong></a>
 </p>
@@ -472,6 +473,44 @@ GROUP BY event_type;</code></pre>
     &#8594;&ensp;<a href="bench-vs-pg.html#parquet"><strong>All 18 Parquet benchmark results</strong></a>
 </p>
 
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Vector similarity search                                   -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="vectors">Native vector columns</h2>
+
+<p>
+    <code>VECTOR(n)</code> is a first-class column type&mdash;fixed-dimension float arrays
+    stored as contiguous <code>float[]</code> in columnar blocks (n&nbsp;&times;&nbsp;4&nbsp;bytes per row).
+    Uses pgvector-compatible <code>[1.0, 2.0, 3.0]</code> literal syntax.
+    Insert, scan, filter, and sort tables with vector columns through standard SQL.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE items (
+    id    INT PRIMARY KEY,
+    name  TEXT,
+    embed VECTOR(3)
+);
+
+INSERT INTO items VALUES
+    (1, 'cat',    '[0.1, 0.9, 0.3]'),
+    (2, 'dog',    '[0.2, 0.8, 0.4]'),
+    (3, 'fish',   '[0.9, 0.1, 0.7]'),
+    (4, 'parrot', '[0.3, 0.7, 0.5]');
+
+SELECT name, embed FROM items WHERE id > 1 ORDER BY name;</code></pre>
+
+<p>
+    7 vector benchmarks against PostgreSQL&nbsp;+&nbsp;pgvector on the same machine.
+    mskql wins all 7: insert 3&times;, scan 1.8&times;, wide scan 2.7&times;,
+    filter 3.5&times; faster. Even without the result cache (<code>_nc</code> variants),
+    mskql is faster on every vector workload.
+</p>
+
+<p>
+    &#8594;&ensp;<a href="bench-vs-pg.html#vector"><strong>All 7 vector benchmark results</strong></a>
+</p>
+
 <h2 id="ai-built">Built entirely by AI agents</h2>
 
 <div class="ai-split" style="display:flex; gap:2rem; align-items:flex-start; margin:1rem 0 1.4rem 0;">
@@ -479,7 +518,7 @@ GROUP BY event_type;</code></pre>
 <p style="margin-bottom:0.8rem;">
     Three agents in iterative rounds. <strong>Challenger</strong> writes adversarial
     SQL tests. <strong>Reviewer</strong> flags code-quality issues.
-    <strong>Writer</strong> fixes until all 1,355+ tests pass.
+    <strong>Writer</strong> fixes until all 1,375+ tests pass.
     No human wrote any C code or SQL test cases.
 </p>
 <p style="margin-bottom:0;">
@@ -509,7 +548,7 @@ GROUP BY event_type;</code></pre>
   <path d="M244,40 L214,40" stroke="#a00" stroke-width="1.2" fill="none" marker-end="url(#ah)"/>
   <path d="M288,52 C288,72 170,78 52,72 C30,71 18,66 18,52"
         stroke="#ccc" stroke-width="1" fill="none" stroke-dasharray="3,2"/>
-  <text x="170" y="90" text-anchor="middle" font-size="8.5" fill="#555" font-style="italic">iterate until all 1,355+ tests pass</text>
+  <text x="170" y="90" text-anchor="middle" font-size="8.5" fill="#555" font-style="italic">iterate until all 1,375+ tests pass</text>
 </svg>
 </div>
 </div>
@@ -537,6 +576,7 @@ GROUP BY event_type;</code></pre>
         <option value="cte">Common Table Expressions</option>
         <option value="upsert">Upsert (ON CONFLICT)</option>
         <option value="datetime">Date/Time Arithmetic</option>
+        <option value="vectors">Vectors</option>
     </select>
     <button class="run-btn" id="run-btn" disabled>&#9654; Run</button>
     <button id="reset-btn" disabled>Reset DB</button>
@@ -583,7 +623,7 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
     </div>
     <div class="cta-card">
         <h3>Read the source</h3>
-        <p>~43,600 lines of C11. Every subsystem in a single file.</p>
+        <p>~45,100 lines of C11. Every subsystem in a single file.</p>
         <a href="https://github.com/martinsk/mskql" class="cta-link">GitHub &rarr;</a>
     </div>
 </div>
@@ -604,11 +644,11 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
     DML, joins, aggregation, window functions, CTEs, subqueries, 30+ built-in functions.
     &ensp;<a href="grammar.html">Grammar</a>
     <br>
-    <a href="testing.html"><strong>Testing</strong></a>&ensp;&mdash;&ensp;1,355+ test cases,
+    <a href="testing.html"><strong>Testing</strong></a>&ensp;&mdash;&ensp;1,375+ test cases,
     every one under a memory-safety checker. Parallel execution across all cores.
     <br>
     <a href="bench-vs-pg.html"><strong>Benchmarks</strong></a>&ensp;&mdash;&ensp;mskql
-    vs PostgreSQL and DuckDB on 84 batch workloads and 15 throughput workloads.
+    vs PostgreSQL and DuckDB on 93 batch workloads and 15 throughput workloads.
     &ensp;<a href="dev/bench/index.html">Historical charts</a>
 </p>
 
@@ -677,7 +717,9 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
 
         upsert: "CREATE TABLE kv (key TEXT PRIMARY KEY, value INT);\n\nINSERT INTO kv VALUES ('a', 1), ('b', 2), ('c', 3);\n\nINSERT INTO kv VALUES ('b', 20), ('d', 4)\nON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;\n\nSELECT * FROM kv ORDER BY key;",
 
-        datetime: "SELECT\n    '2024-01-15'::date + 30 AS plus_30_days,\n    '2024-06-15 10:30:00'::timestamp - '2024-01-01 00:00:00'::timestamp AS diff,\n    EXTRACT(MONTH FROM '2024-03-15'::date) AS month,\n    DATE_TRUNC('month', '2024-03-15'::date) AS trunc_month;"
+        datetime: "SELECT\n    '2024-01-15'::date + 30 AS plus_30_days,\n    '2024-06-15 10:30:00'::timestamp - '2024-01-01 00:00:00'::timestamp AS diff,\n    EXTRACT(MONTH FROM '2024-03-15'::date) AS month,\n    DATE_TRUNC('month', '2024-03-15'::date) AS trunc_month;",
+
+        vectors: "CREATE TABLE items (\n    id    INT PRIMARY KEY,\n    name  TEXT,\n    embed VECTOR(3)\n);\n\nINSERT INTO items VALUES\n    (1, 'cat',    '[0.1, 0.9, 0.3]'),\n    (2, 'dog',    '[0.2, 0.8, 0.4]'),\n    (3, 'fish',   '[0.9, 0.1, 0.7]'),\n    (4, 'parrot', '[0.3, 0.7, 0.5]');\n\nSELECT name, embed FROM items WHERE id > 1 ORDER BY name;"
     };
 
     examplesEl.addEventListener('change', function() {
