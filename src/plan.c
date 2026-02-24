@@ -266,6 +266,7 @@ static uint16_t flat_table_read(const struct flat_table *ft, size_t *cursor,
                                 struct row_block *out, int *col_map, uint16_t ncols,
                                 struct bump_alloc *scratch)
 {
+    (void)scratch;
     size_t start = *cursor;
     size_t end = ft->nrows;
     if (end - start > BLOCK_CAPACITY)
@@ -317,8 +318,8 @@ static uint16_t flat_table_read(const struct flat_table *ft, size_t *cursor,
         case COLUMN_TYPE_VECTOR: {
             uint16_t dim = ft->col_vec_dims[tc];
             cb->vec_dim = dim;
-            cb->data.vec = (float *)bump_alloc(scratch, BLOCK_CAPACITY * dim * sizeof(float));
-            memcpy(cb->data.vec, (float *)ft->col_data[tc] + start * dim, nrows * dim * sizeof(float)); break;
+            cb->data.vec = (float *)ft->col_data[tc] + start * dim;
+            break;
         }
         }
     }

@@ -321,12 +321,13 @@ static void msgbuf_push_cell(struct msgbuf *m, const struct cell *c,
             if (t && col_idx < t->columns.count)
                 dim = t->columns.items[col_idx].vector_dim;
             if (dim > 0 && c->value.as_vector) {
-                size_t bufsz = (size_t)dim * 20 + 3;
-                char *vbuf = (char *)malloc(bufsz);
-                len = (size_t)vector_format(c->value.as_vector, dim, vbuf, bufsz);
+                size_t bufsz = (size_t)dim * 16 + 3;
+                char vbuf_stack[2048];
+                char *vbuf = (bufsz <= sizeof(vbuf_stack)) ? vbuf_stack : (char *)malloc(bufsz);
+                len = (size_t)vector_format_fast(c->value.as_vector, dim, vbuf, bufsz);
                 msgbuf_push_u32(m, (uint32_t)len);
                 msgbuf_push(m, vbuf, len);
-                free(vbuf);
+                if (vbuf != vbuf_stack) free(vbuf);
                 return;
             }
             msgbuf_push_u32(m, (uint32_t)-1);
@@ -1224,12 +1225,13 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
     case COLUMN_TYPE_VECTOR: {
         uint16_t dim = cb->vec_dim;
         if (dim > 0 && cb->data.vec) {
-            size_t bufsz = (size_t)dim * 20 + 3;
-            char *vbuf = (char *)malloc(bufsz);
-            len = (size_t)vector_format(&cb->data.vec[ri * dim], dim, vbuf, bufsz);
+            size_t bufsz = (size_t)dim * 16 + 3;
+            char vbuf_stack[2048];
+            char *vbuf = (bufsz <= sizeof(vbuf_stack)) ? vbuf_stack : (char *)malloc(bufsz);
+            len = (size_t)vector_format_fast(&cb->data.vec[ri * dim], dim, vbuf, bufsz);
             msgbuf_push_u32(m, (uint32_t)len);
             msgbuf_push(m, vbuf, len);
-            free(vbuf);
+            if (vbuf != vbuf_stack) free(vbuf);
             return;
         }
         msgbuf_push_u32(m, (uint32_t)-1);
@@ -1316,12 +1318,12 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
     }
     #undef MAX_TEXT_COLS_CACHED
 
-    /* Estimate VECTOR column sizes: "[0.1,0.2,...,0.N]" ≤ dim*20+3 per cell */
+    /* Estimate VECTOR column sizes: "[0.1,0.2,...,0.N]" ≤ dim*16+3 per cell */
     size_t vec_total_bytes = 0;
     for (uint16_t c = 0; c < ncols; c++) {
         if (block->cols[c].type == COLUMN_TYPE_VECTOR) {
             uint16_t dim = block->cols[c].vec_dim;
-            vec_total_bytes += (size_t)active * (dim * 20 + 3 + 4);
+            vec_total_bytes += (size_t)active * (dim * 16 + 3 + 4);
         }
     }
 
@@ -1411,10 +1413,15 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
             case COLUMN_TYPE_VECTOR: {
                 uint16_t dim = cb->vec_dim;
                 if (dim > 0 && cb->data.vec) {
-                    char vbuf[dim * 20 + 3];
-                    size_t vlen = (size_t)vector_format(&cb->data.vec[ri * dim], dim, vbuf, sizeof(vbuf));
-                    put_u32(dst, (uint32_t)vlen); dst += 4;
-                    memcpy(dst, vbuf, vlen); dst += vlen;
+                    uint8_t *len_pos = dst; dst += 4; /* backpatch length */
+                    const float *vp = &cb->data.vec[ri * dim];
+                    *dst++ = '[';
+                    for (uint16_t d = 0; d < dim; d++) {
+                        if (d > 0) *dst++ = ',';
+                        dst += fast_f32_to_str(vp[d], (char *)dst);
+                    }
+                    *dst++ = ']';
+                    put_u32(len_pos, (uint32_t)(dst - len_pos - 4));
                 } else {
                     put_u32(dst, (uint32_t)-1); dst += 4;
                 }
