@@ -79,7 +79,7 @@ int db_table_exec_query(struct database *db, sv table_name,
         return -1;
     }
     /* Read-only enforcement for foreign tables */
-    if (t->parquet_path &&
+    if (!table_is_writable(t->kind) &&
         (q->query_type == QUERY_TYPE_INSERT || q->query_type == QUERY_TYPE_UPDATE ||
          q->query_type == QUERY_TYPE_DELETE || q->query_type == QUERY_TYPE_TRUNCATE)) {
         arena_set_error(&q->arena, "42809",
@@ -94,7 +94,7 @@ int db_table_exec_query(struct database *db, sv table_name,
     }
 #ifndef MSKQL_WASM
     /* Materialize Parquet data for legacy executor fallback */
-    if (t->parquet_path && t->rows.count == 0)
+    if (t->kind == TABLE_PARQUET && t->rows.count == 0)
         parquet_materialize(t);
 #endif
     return query_exec(t, q, result, db, rb);
@@ -2778,12 +2778,12 @@ static int db_exec_select(struct database *db, struct query *q, struct rows *res
     char *view_sql_copy = NULL;
     if (s->table.len > 0 && !from_sub_table) {
         struct table *maybe_view = db_find_table_sv(db, s->table);
-        if (maybe_view && maybe_view->view_sql) {
+        if (maybe_view && maybe_view->kind == TABLE_VIEW) {
             snprintf(view_temp_name, sizeof(view_temp_name),
                      "_view_%.*s", (int)s->table.len, s->table.data);
             /* Copy view_sql before materialize_subquery, which may
              * da_push(&db->tables) and invalidate maybe_view. */
-            view_sql_copy = strdup(maybe_view->view_sql);
+            view_sql_copy = strdup(maybe_view->view.sql);
             view_temp = materialize_subquery(db, view_sql_copy, view_temp_name);
             if (view_temp) {
                 /* rewrite table reference to point to the temp table */
@@ -3278,10 +3278,10 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             /* check for existing view/table */
             struct table *existing = db_find_table_sv(db, cv->name);
             if (existing) {
-                if (cv->or_replace && existing->view_sql) {
+                if (cv->or_replace && existing->kind == TABLE_VIEW) {
                     /* DROP the existing view so we can recreate it */
                     for (size_t i = 0; i < db->tables.count; i++) {
-                        if (db->tables.items[i].view_sql &&
+                        if (db->tables.items[i].kind == TABLE_VIEW &&
                             sv_eq_cstr(cv->name, db->tables.items[i].name)) {
                             table_free(&db->tables.items[i]);
                             for (size_t j = i; j + 1 < db->tables.count; j++)
@@ -3299,9 +3299,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             char vname[512];
             snprintf(vname, sizeof(vname), "%.*s", (int)cv->name.len, cv->name.data);
             table_init(&vt, vname);
-            /* store view SQL in a special field — we'll use a convention:
-             * a table with 0 columns and view_sql != NULL is a view */
-            vt.view_sql = strdup(sql);
+            vt.kind = TABLE_VIEW;
+            vt.view.sql = strdup(sql);
             da_push(&db->tables, vt);
             db->total_generation++;
             return 0;
@@ -3309,7 +3308,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
         case QUERY_TYPE_DROP_VIEW: {
             sv vn = q->drop_view.name;
             for (size_t i = 0; i < db->tables.count; i++) {
-                if (sv_eq_cstr(vn, db->tables.items[i].name) && db->tables.items[i].view_sql) {
+                if (sv_eq_cstr(vn, db->tables.items[i].name) && db->tables.items[i].kind == TABLE_VIEW) {
                     table_free(&db->tables.items[i]);
                     for (size_t j = i; j + 1 < db->tables.count; j++)
                         db->tables.items[j] = db->tables.items[j + 1];
@@ -4091,7 +4090,8 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
 
             struct table t;
             table_init_own(&t, sv_to_cstr(ft->table_name));
-            t.parquet_path = path;
+            t.kind = TABLE_PARQUET;
+            t.parquet.path = path;
 
             for (uint16_t i = 0; i < info.ncols; i++) {
                 struct column col = {0};

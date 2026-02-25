@@ -212,7 +212,7 @@ static void build_pg_class(struct database *db)
         if (ut->name[0] == '_' && ut->name[1] == '_') continue;
         if (catalog_is_catalog_table(ut->name)) continue;
 
-        char relkind = ut->view_sql ? 'v' : 'r';
+        char relkind = (ut->kind == TABLE_VIEW) ? 'v' : 'r';
         char rk[2] = { relkind, '\0' };
         int has_idx = (ut->indexes.count > 0) ? 1 : 0;
 
@@ -629,7 +629,7 @@ static void build_information_schema_tables(struct database *db)
         struct table *ut = &db->tables.items[i];
         if (ut->name[0] == '_' && ut->name[1] == '_') continue;
         if (catalog_is_catalog_table(ut->name)) continue;
-        const char *ttype = ut->view_sql ? "VIEW" : "BASE TABLE";
+        const char *ttype = (ut->kind == TABLE_VIEW) ? "VIEW" : "BASE TABLE";
         struct cell r[] = {
             text_cell(db->name),
             text_cell("public"),

@@ -34,19 +34,46 @@ struct parquet_cache {
     int      valid;
 };
 
+enum table_kind {
+    TABLE_MEMORY,   /* in-memory row-store + columnar flat storage */
+    TABLE_VIEW,     /* virtual — stores SELECT SQL, no data */
+    TABLE_PARQUET,  /* read-only Parquet foreign table */
+};
+
+static inline int table_is_writable(enum table_kind kind)
+{
+    switch (kind) {
+    case TABLE_MEMORY:  return 1;
+    case TABLE_VIEW:    return 0;
+    case TABLE_PARQUET: return 0;
+    }
+    __builtin_unreachable();
+}
+
 struct table {
+    enum table_kind kind;
     // TODO: STRINGVIEW OPPORTUNITY: name is strdup'd from sv-originated strings in most
     // paths (db_exec CREATE TABLE). Could be sv if the schema had a persistent backing store.
     char *name;
-    char *view_sql;  /* non-NULL if this is a view (stores the SELECT body) */
-    char *parquet_path; /* non-NULL if this is a Parquet foreign table (read-only) */
-    DYNAMIC_ARRAY(struct column) columns;
+    DYNAMIC_ARRAY(struct column) columns; /* schema — shared by all non-view kinds */
+    uint64_t generation;       /* bumped on every INSERT/UPDATE/DELETE for scan cache invalidation */
+
+    /* Row/columnar storage — used by TABLE_MEMORY natively and by TABLE_PARQUET
+     * after legacy-executor materialization (parquet_materialize). */
     DYNAMIC_ARRAY(struct row) rows;
     DYNAMIC_ARRAY(struct index) indexes;
-    uint64_t generation;       /* bumped on every INSERT/UPDATE/DELETE for scan cache invalidation */
-    struct flat_table flat;    /* primary columnar storage — written on every INSERT/UPDATE/DELETE */
-    struct join_cache join_cache; /* cached hash join build for inner table */
-    struct parquet_cache pq_cache; /* cached parquet columnar data */
+    struct flat_table flat;    /* primary columnar storage */
+    struct join_cache join_cache;
+
+    union {
+        struct {
+            char *sql;  /* the SELECT body */
+        } view;
+        struct {
+            char *path;
+            struct parquet_cache pq_cache;
+        } parquet;
+    };
 };
 
 void table_init(struct table *t, const char *name);
@@ -55,7 +82,7 @@ void table_add_column(struct table *t, struct column *col);
 void table_free(struct table *t);
 void table_deep_copy(struct table *dst, const struct table *src);
 
-/* Initialize t->flat columnar arrays from t->columns schema.
+/* Initialize t->memory.flat columnar arrays from t->columns schema.
  * Must be called after all columns have been added via table_add_column.
  * Safe to call multiple times — frees existing flat before reinitializing. */
 void table_flat_init_schema(struct table *t);

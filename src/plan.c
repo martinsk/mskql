@@ -7435,11 +7435,11 @@ static uint16_t pq_cache_read(struct parquet_cache *pc, size_t *cursor,
  * All type conversions (epoch offsets, float→double, null expansion) happen here once. */
 static int pq_cache_build(struct table *tbl)
 {
-    struct parquet_cache *pc = &tbl->pq_cache;
+    struct parquet_cache *pc = &tbl->parquet.pq_cache;
     if (pc->valid) return 0; /* already built */
 
-    const char *path = tbl->parquet_path;
-    if (!path) return -1;
+    if (tbl->kind != TABLE_PARQUET) return -1;
+    const char *path = tbl->parquet.path;
 
     carquet_error_t err = CARQUET_ERROR_INIT;
     carquet_reader_options_t opts;
@@ -7722,7 +7722,7 @@ static int parquet_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     struct table *tbl = pn->parquet_scan.table;
 
     /* Build cache on first access (or use existing cache) */
-    if (!tbl->pq_cache.valid) {
+    if (!tbl->parquet.pq_cache.valid) {
         if (pq_cache_build(tbl) != 0) {
             st->done = 1;
             return 1;
@@ -7730,7 +7730,7 @@ static int parquet_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     }
 
     /* Serve from cache */
-    uint16_t n = pq_cache_read(&tbl->pq_cache, &st->cache_cursor,
+    uint16_t n = pq_cache_read(&tbl->parquet.pq_cache, &st->cache_cursor,
                                 out, pn->parquet_scan.col_map,
                                 pn->parquet_scan.ncols);
     if (n == 0) {
@@ -8387,7 +8387,7 @@ static uint32_t build_seq_scan(struct table *tbl, struct query_arena *arena)
     for (uint16_t i = 0; i < ncols; i++) col_map[i] = (int)i;
 
 #ifndef MSKQL_WASM
-    if (tbl->parquet_path) {
+    if (tbl->kind == TABLE_PARQUET) {
         uint32_t scan_idx = plan_alloc_node(arena, PLAN_PARQUET_SCAN);
         PLAN_NODE(arena, scan_idx).parquet_scan.table = tbl;
         PLAN_NODE(arena, scan_idx).parquet_scan.ncols = ncols;
@@ -9134,7 +9134,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
 
         struct table *tn = db_find_table_sv(db, ji->join_table);
         if (!tn) return PLAN_RES_ERR;
-        if (tn->view_sql) return PLAN_RES_NOTIMPL;
+        if (tn->kind == TABLE_VIEW) return PLAN_RES_NOTIMPL;
         if (table_has_mixed_types(tn)) return PLAN_RES_NOTIMPL;
 
         tables[ntables] = tn;
@@ -9550,7 +9550,7 @@ static struct plan_result build_set_op(struct table *t, struct query_select *s,
     }
 
     struct table *t2 = db_find_table_sv(db, rs->table);
-    if (!t2 || t2->view_sql) { query_free(&rhs_q); return PLAN_RES_ERR; }
+    if (!t2 || t2->kind == TABLE_VIEW) { query_free(&rhs_q); return PLAN_RES_ERR; }
 
     /* Resolve LHS columns */
     int select_all_lhs = sv_eq_cstr(s->columns, "*");
@@ -11039,7 +11039,7 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
 
         /* Build narrowed seq_scan */
 #ifndef MSKQL_WASM
-        if (t->parquet_path) {
+        if (t->kind == TABLE_PARQUET) {
             scan_idx = plan_alloc_node(arena, PLAN_PARQUET_SCAN);
             PLAN_NODE(arena, scan_idx).parquet_scan.table = t;
             PLAN_NODE(arena, scan_idx).parquet_scan.ncols = needed_count;
@@ -11325,7 +11325,7 @@ static struct plan_result build_semi_join(struct table *t, struct query_select *
     /* Find inner table */
     struct table *semi_inner_t = db_find_table_sv(db, isq->table);
     if (!semi_inner_t) { query_free(out_sq); return PLAN_RES_ERR; }
-    if (semi_inner_t->view_sql) { query_free(out_sq); return PLAN_RES_NOTIMPL; }
+    if (semi_inner_t->kind == TABLE_VIEW) { query_free(out_sq); return PLAN_RES_NOTIMPL; }
 
     /* Resolve inner SELECT column — must be a single column ref */
     int semi_inner_key = -1;

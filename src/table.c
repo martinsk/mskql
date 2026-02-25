@@ -7,30 +7,28 @@
 
 void table_init(struct table *t, const char *name)
 {
+    memset(t, 0, sizeof(*t));
+    t->kind = TABLE_MEMORY;
     t->name = strdup(name);
-    t->view_sql = NULL;
-    t->parquet_path = NULL;
     da_init(&t->columns);
+    t->generation = 0;
     da_init(&t->rows);
     da_init(&t->indexes);
-    t->generation = 0;
     memset(&t->flat, 0, sizeof(t->flat));
     memset(&t->join_cache, 0, sizeof(t->join_cache));
-    memset(&t->pq_cache, 0, sizeof(t->pq_cache));
 }
 
 void table_init_own(struct table *t, char *name)
 {
+    memset(t, 0, sizeof(*t));
+    t->kind = TABLE_MEMORY;
     t->name = name;
-    t->view_sql = NULL;
-    t->parquet_path = NULL;
     da_init(&t->columns);
+    t->generation = 0;
     da_init(&t->rows);
     da_init(&t->indexes);
-    t->generation = 0;
     memset(&t->flat, 0, sizeof(t->flat));
     memset(&t->join_cache, 0, sizeof(t->join_cache));
-    memset(&t->pq_cache, 0, sizeof(t->pq_cache));
 }
 
 void table_add_column(struct table *t, struct column *col)
@@ -67,15 +65,11 @@ void table_add_column(struct table *t, struct column *col)
 
 void table_deep_copy(struct table *dst, const struct table *src)
 {
+    memset(dst, 0, sizeof(*dst));
+    dst->kind = src->kind;
     dst->name = strdup(src->name);
-    dst->view_sql = src->view_sql ? strdup(src->view_sql) : NULL;
-    dst->parquet_path = src->parquet_path ? strdup(src->parquet_path) : NULL;
     da_init(&dst->columns);
-    da_init(&dst->rows);
-    da_init(&dst->indexes);
     dst->generation = src->generation;
-    memset(&dst->flat, 0, sizeof(dst->flat));
-    memset(&dst->join_cache, 0, sizeof(dst->join_cache));
 
     /* deep-copy columns */
     for (size_t i = 0; i < src->columns.count; i++) {
@@ -110,7 +104,12 @@ void table_deep_copy(struct table *dst, const struct table *src)
         da_push(&dst->columns, c);
     }
 
-    /* deep-copy rows */
+    /* deep-copy shared row/columnar storage (used by TABLE_MEMORY natively,
+     * and by TABLE_PARQUET after legacy-executor materialization). */
+    da_init(&dst->rows);
+    da_init(&dst->indexes);
+    memset(&dst->flat, 0, sizeof(dst->flat));
+    memset(&dst->join_cache, 0, sizeof(dst->join_cache));
     for (size_t i = 0; i < src->rows.count; i++) {
         struct row r = {0};
         da_init(&r.cells);
@@ -129,8 +128,20 @@ void table_deep_copy(struct table *dst, const struct table *src)
         }
         da_push(&dst->rows, r);
     }
-
     /* skip indexes — they will be rebuilt if needed */
+
+    /* deep-copy kind-specific union fields */
+    switch (src->kind) {
+    case TABLE_MEMORY:
+        break;
+    case TABLE_VIEW:
+        dst->view.sql = src->view.sql ? strdup(src->view.sql) : NULL;
+        break;
+    case TABLE_PARQUET:
+        dst->parquet.path = src->parquet.path ? strdup(src->parquet.path) : NULL;
+        memset(&dst->parquet.pq_cache, 0, sizeof(dst->parquet.pq_cache));
+        break;
+    }
 }
 
 int table_find_column_sv(struct table *t, sv name)
@@ -497,8 +508,6 @@ void table_flat_rebuild_from_rows(struct table *t)
 void table_free(struct table *t)
 {
     free(t->name);
-    free(t->view_sql);
-    free(t->parquet_path);
     for (size_t i = 0; i < t->columns.count; i++) {
         free(t->columns.items[i].name);
         free(t->columns.items[i].enum_type_name);
@@ -514,20 +523,15 @@ void table_free(struct table *t)
     }
     da_free(&t->columns);
 
-    for (size_t i = 0; i < t->rows.count; i++) {
+    /* Free shared row/columnar storage (used by TABLE_MEMORY natively,
+     * and by TABLE_PARQUET after legacy-executor materialization). */
+    for (size_t i = 0; i < t->rows.count; i++)
         row_free(&t->rows.items[i]);
-    }
     da_free(&t->rows);
-
-    for (size_t i = 0; i < t->indexes.count; i++) {
+    for (size_t i = 0; i < t->indexes.count; i++)
         index_free(&t->indexes.items[i]);
-    }
     da_free(&t->indexes);
-
-    /* free primary flat storage */
     flat_table_free(&t->flat);
-
-    /* free join cache */
     if (t->join_cache.valid) {
         flat_table_free(&t->join_cache.ft);
         free(t->join_cache.hashes);
@@ -535,23 +539,33 @@ void table_free(struct table *t)
         free(t->join_cache.buckets);
     }
 
-    /* free parquet cache */
-    if (t->pq_cache.valid) {
-        for (uint16_t i = 0; i < t->pq_cache.ncols; i++) {
-            if (t->pq_cache.col_types[i] == COLUMN_TYPE_TEXT ||
-                t->pq_cache.col_types[i] == COLUMN_TYPE_UUID) {
-                char **strs = (char **)t->pq_cache.col_data[i];
-                for (size_t r = 0; r < t->pq_cache.nrows; r++)
-                    free(strs[r]);
+    /* Free kind-specific union fields */
+    switch (t->kind) {
+    case TABLE_MEMORY:
+        break;
+    case TABLE_VIEW:
+        free(t->view.sql);
+        break;
+    case TABLE_PARQUET:
+        free(t->parquet.path);
+        if (t->parquet.pq_cache.valid) {
+            for (uint16_t i = 0; i < t->parquet.pq_cache.ncols; i++) {
+                if (t->parquet.pq_cache.col_types[i] == COLUMN_TYPE_TEXT ||
+                    t->parquet.pq_cache.col_types[i] == COLUMN_TYPE_UUID) {
+                    char **strs = (char **)t->parquet.pq_cache.col_data[i];
+                    for (size_t r = 0; r < t->parquet.pq_cache.nrows; r++)
+                        free(strs[r]);
+                }
+                free(t->parquet.pq_cache.col_data[i]);
+                free(t->parquet.pq_cache.col_nulls[i]);
+                if (t->parquet.pq_cache.col_str_lens)
+                    free(t->parquet.pq_cache.col_str_lens[i]);
             }
-            free(t->pq_cache.col_data[i]);
-            free(t->pq_cache.col_nulls[i]);
-            if (t->pq_cache.col_str_lens)
-                free(t->pq_cache.col_str_lens[i]);
+            free(t->parquet.pq_cache.col_data);
+            free(t->parquet.pq_cache.col_nulls);
+            free(t->parquet.pq_cache.col_types);
+            free(t->parquet.pq_cache.col_str_lens);
         }
-        free(t->pq_cache.col_data);
-        free(t->pq_cache.col_nulls);
-        free(t->pq_cache.col_types);
-        free(t->pq_cache.col_str_lens);
+        break;
     }
 }

@@ -103,12 +103,12 @@ void parquet_info_free(struct parquet_table_info *info)
 
 int parquet_materialize(struct table *t)
 {
-    if (!t || !t->parquet_path) return -1;
+    if (!t || t->kind != TABLE_PARQUET) return -1;
     /* Idempotent: skip if rows already loaded */
     if (t->rows.count > 0) return 0;
 
     carquet_error_t err = CARQUET_ERROR_INIT;
-    carquet_reader_t *reader = carquet_reader_open(t->parquet_path, NULL, &err);
+    carquet_reader_t *reader = carquet_reader_open(t->parquet.path, NULL, &err);
     if (!reader) return -1;
 
     carquet_batch_reader_config_t cfg;

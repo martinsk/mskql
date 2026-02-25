@@ -201,7 +201,7 @@ struct plan_node {
             struct table *table;      /* source table (for eval_expr column lookups) */
         } expr_project;
         struct {
-            struct table *table;      /* foreign table (has parquet_path) */
+            struct table *table;      /* foreign table (kind == TABLE_PARQUET) */
             uint16_t     ncols;       /* number of columns to read */
             int         *col_map;     /* bump-allocated: col_map[i] = parquet column index */
         } parquet_scan;

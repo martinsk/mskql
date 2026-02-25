@@ -2268,7 +2268,7 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
     struct table *outer_t = NULL;
     if (s->table.len > 0)
         outer_t = db_find_table_sv(db, s->table);
-    if (!outer_t || outer_t->view_sql) return -1;
+    if (!outer_t || outer_t->kind == TABLE_VIEW) return -1;
 
     /* Scan parsed columns for exactly one EXPR_SUBQUERY */
     int subq_col_idx = -1;
@@ -2343,7 +2343,7 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
     inner_tbl_name[tbl_end - tbl_start] = '\0';
 
     struct table *inner_t = db_find_table(db, inner_tbl_name);
-    if (!inner_t || inner_t->view_sql) return -1;
+    if (!inner_t || inner_t->kind == TABLE_VIEW) return -1;
 
     /* Find WHERE clause to extract correlation: inner.ref = outer.key */
     const char *where_pos = strstr(sq_upper, "WHERE ");
@@ -2852,9 +2852,8 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         if (from_sub_temp) { s->from_subquery_sql = saved_from_sub_sql; s->table = saved_table; remove_temp_table(db, from_sub_temp); from_sub_temp = NULL; }
         goto cte_restore_bail;
     }
-    /* Views are stored as tables with 0 columns and view_sql set —
-     * bail to legacy path which handles view expansion. */
-    if (t && t->view_sql) {
+    /* Views bail to legacy path which handles view expansion. */
+    if (t && t->kind == TABLE_VIEW) {
         if (from_sub_temp) { s->from_subquery_sql = saved_from_sub_sql; s->table = saved_table; remove_temp_table(db, from_sub_temp); from_sub_temp = NULL; }
         goto cte_restore_bail;
     }
