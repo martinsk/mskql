@@ -161,6 +161,8 @@ struct plan_node {
             int      *agg_vec_op;     /* bump: OP_ADD/SUB/MUL/DIV for vectorized binop aggs */
             double   *agg_vec_lit;    /* bump: literal value when col_b == -1 */
             struct table *table;     /* source table — needed for eval_expr on expression aggregates */
+            enum column_type *agg_col_types; /* bump: original table column type per aggregate (for emit after projection) */
+            int       int_fast_path; /* 1 = all group keys and agg cols are integer-family (STORE_I32/I64) */
         } hash_agg;
         struct {
             uint32_t agg_start;

@@ -546,9 +546,12 @@ void table_free(struct table *t)
             }
             free(t->pq_cache.col_data[i]);
             free(t->pq_cache.col_nulls[i]);
+            if (t->pq_cache.col_str_lens)
+                free(t->pq_cache.col_str_lens[i]);
         }
         free(t->pq_cache.col_data);
         free(t->pq_cache.col_nulls);
         free(t->pq_cache.col_types);
+        free(t->pq_cache.col_str_lens);
     }
 }

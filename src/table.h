@@ -30,6 +30,7 @@ struct parquet_cache {
     void   **col_data;           /* [ncols] heap-allocated typed arrays */
     uint8_t **col_nulls;         /* [ncols] heap-allocated null bitmaps (1 byte per row) */
     enum column_type *col_types; /* [ncols] */
+    uint32_t **col_str_lens;     /* [ncols] TEXT only: strlen of each entry, or NULL */
     int      valid;
 };
 

@@ -1242,6 +1242,82 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
     msgbuf_push(m, txt, len);
 }
 
+/* ---- Specialized all-INT serializer ----
+ * When every column is INT (no BOOLEAN), skip the per-cell type switch
+ * entirely.  Writes DataRow messages for the whole block. */
+static uint16_t serialize_all_int_block(struct msgbuf *wire,
+                                        const struct row_block *block,
+                                        uint16_t ncols, uint16_t active,
+                                        const uint16_t *ri_buf)
+{
+    /* 7-byte header + ncols * (4 len + 12 max digits) per row */
+    size_t est = (size_t)active * (7 + (size_t)ncols * 16);
+    msgbuf_ensure(wire, est);
+    uint8_t *dst = wire->data + wire->len;
+
+    for (uint16_t r = 0; r < active; r++) {
+        uint16_t ri = ri_buf[r];
+        uint8_t *row_start = dst;
+        dst[0] = 'D';
+        dst += 5;
+        put_u16(dst, ncols);
+        dst += 2;
+        for (uint16_t c = 0; c < ncols; c++) {
+            const struct col_block *cb = &block->cols[c];
+            if (cb->nulls[ri]) {
+                put_u32(dst, (uint32_t)-1);
+                dst += 4;
+            } else {
+                size_t len = fast_i32_to_str(cb->data.i32[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len);
+                dst += 4 + len;
+            }
+        }
+        put_u32(row_start + 1, (uint32_t)(dst - row_start - 1));
+    }
+    wire->len = (size_t)(dst - wire->data);
+    return active;
+}
+
+/* ---- Specialized INT/BIGINT serializer ----
+ * When every column is INT or BIGINT, skip the full type switch. */
+static uint16_t serialize_int_bigint_block(struct msgbuf *wire,
+                                           const struct row_block *block,
+                                           uint16_t ncols, uint16_t active,
+                                           const uint16_t *ri_buf)
+{
+    size_t est = (size_t)active * (7 + (size_t)ncols * 25);
+    msgbuf_ensure(wire, est);
+    uint8_t *dst = wire->data + wire->len;
+
+    for (uint16_t r = 0; r < active; r++) {
+        uint16_t ri = ri_buf[r];
+        uint8_t *row_start = dst;
+        dst[0] = 'D';
+        dst += 5;
+        put_u16(dst, ncols);
+        dst += 2;
+        for (uint16_t c = 0; c < ncols; c++) {
+            const struct col_block *cb = &block->cols[c];
+            if (cb->nulls[ri]) {
+                put_u32(dst, (uint32_t)-1);
+                dst += 4;
+            } else if (cb->type == COLUMN_TYPE_BIGINT) {
+                size_t len = fast_i64_to_str(cb->data.i64[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len);
+                dst += 4 + len;
+            } else {
+                size_t len = fast_i32_to_str(cb->data.i32[ri], (char *)(dst + 4));
+                put_u32(dst, (uint32_t)len);
+                dst += 4 + len;
+            }
+        }
+        put_u32(row_start + 1, (uint32_t)(dst - row_start - 1));
+    }
+    wire->len = (size_t)(dst - wire->data);
+    return active;
+}
+
 /* Vectorized block serialization for all column types (except ENUM which needs db context).
  * Writes all DataRow messages for a block directly into the wire buffer
  * with a single msgbuf_ensure and no per-cell function calls.
@@ -1253,11 +1329,19 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
     uint16_t active = block->sel ? block->sel_count : block->count;
     if (active == 0) return 0;
 
-    /* ENUM needs db/table context — bail out */
+    /* ENUM needs db/table context — bail out.
+     * Detect all-INT and all-INT/BIGINT layouts for specialized fast paths.
+     * BOOLEAN is excluded: it needs 't'/'f' formatting, not integer. */
+    int has_enum = 0, all_i32 = 1, all_int_bigint = 1;
     for (uint16_t c = 0; c < ncols; c++) {
-        if (block->cols[c].type == COLUMN_TYPE_ENUM)
-            return 0;
+        enum column_type ct = block->cols[c].type;
+        if (ct == COLUMN_TYPE_ENUM) { has_enum = 1; break; }
+        if (ct != COLUMN_TYPE_INT)
+            all_i32 = 0;
+        if (ct != COLUMN_TYPE_INT && ct != COLUMN_TYPE_BIGINT)
+            all_int_bigint = 0;
     }
+    if (has_enum) return 0;
 
     /* Build flat row-index array once to avoid repeated sel branch in inner loop */
     uint16_t ri_buf[BLOCK_CAPACITY];
@@ -1268,6 +1352,13 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
         for (uint16_t r = 0; r < active; r++)
             ri_buf[r] = r;
     }
+
+    /* Fast path: all columns are INT/BOOLEAN → no type switch needed */
+    if (all_i32)
+        return serialize_all_int_block(wire, block, ncols, active, ri_buf);
+    /* Fast path: all columns are INT/BIGINT/BOOLEAN → simpler dispatch */
+    if (all_int_bigint)
+        return serialize_int_bigint_block(wire, block, ncols, active, ri_buf);
 
     /* Pre-compute text string lengths for TEXT columns into per-column arrays.
      * This avoids calling strlen twice (once for estimation, once for serialization).
