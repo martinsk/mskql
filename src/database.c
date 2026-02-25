@@ -46,6 +46,7 @@ int db_create_table(struct database *db, const char *name, struct column *cols)
     table_init(&t, name);
     table_add_column(&t, cols);
     da_push(&db->tables, t);
+    db->total_generation++;
     return 0;
 }
 
@@ -1637,6 +1638,7 @@ static void snapshot_restore(struct database *db, struct db_snapshot *snap)
         /* Table was saved but not found in current db — it was dropped */
         if (!db_find_table(db, snap->table_names[i])) {
             da_push(&db->tables, snap->saved_tables[i]);
+            db->total_generation++;
             memset(&snap->saved_tables[i], 0, sizeof(struct table));
             snap->saved_valid[i] = 0;
             table_flat_rebuild_from_rows(&db->tables.items[db->tables.count - 1]);
@@ -1875,6 +1877,7 @@ struct table *materialize_subquery(struct database *db, const char *sql,
     query_free(&sq);
     free(gs_rewritten);
     da_push(&db->tables, ct);
+    db->total_generation++;
     return &db->tables.items[db->tables.count - 1];
 }
 
@@ -1888,6 +1891,7 @@ void remove_temp_table(struct database *db, struct table *t)
             for (size_t j = i; j + 1 < db->tables.count; j++)
                 db->tables.items[j] = db->tables.items[j + 1];
             db->tables.count--;
+            db->total_generation++;
             return;
         }
     }
@@ -2762,6 +2766,7 @@ static int db_exec_select(struct database *db, struct query *q, struct rows *res
             }
         }
         da_push(&db->tables, gt);
+        db->total_generation++;
         gs_temp = &db->tables.items[db->tables.count - 1];
         /* rewrite table reference to point to the temp table */
         s->table = sv_from(gs_temp->name, strlen(gs_temp->name));
@@ -2967,6 +2972,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                     da_push(&t.columns, col);
                 }
                 da_push(&db->tables, t);
+                db->total_generation++;
                 return 0;
             }
             /* CREATE TABLE ... AS SELECT */
@@ -3078,6 +3084,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                     table_flat_append_row(&t, &t.rows.items[t.rows.count - 1]);
                 }
                 da_push(&db->tables, t);
+                db->total_generation++;
                 /* store row count in result for command tag */
                 if (result) {
                     struct row r = {0};
@@ -3146,6 +3153,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 da_push(&t.indexes, uq_idx);
             }
             da_push(&db->tables, t);
+            db->total_generation++;
             return 0;
         }
         case QUERY_TYPE_DROP: {
@@ -3295,6 +3303,7 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
              * a table with 0 columns and view_sql != NULL is a view */
             vt.view_sql = strdup(sql);
             da_push(&db->tables, vt);
+            db->total_generation++;
             return 0;
         }
         case QUERY_TYPE_DROP_VIEW: {
@@ -3464,6 +3473,56 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
             }
             struct index idx;
             index_init_sv(&idx, ci->index_name, col_names, col_indices, ncols);
+
+            /* ---- HNSW index path ---- */
+            if (ci->using_method.len > 0 && sv_eq_ignorecase_cstr(ci->using_method, "hnsw")) {
+                if (ncols != 1) {
+                    arena_set_error(&q->arena, "42601", "HNSW index must have exactly one column");
+                    index_free(&idx);
+                    return -1;
+                }
+                int ci0 = col_indices[0];
+                if (t->columns.items[ci0].type != COLUMN_TYPE_VECTOR) {
+                    arena_set_error(&q->arena, "42601", "HNSW index column must be of type VECTOR");
+                    index_free(&idx);
+                    return -1;
+                }
+                enum hnsw_dist_type dist = HNSW_L2;
+                if (ci->ops_class.len > 0) {
+                    if (sv_eq_ignorecase_cstr(ci->ops_class, "vector_l2_ops"))
+                        dist = HNSW_L2;
+                    else if (sv_eq_ignorecase_cstr(ci->ops_class, "vector_cosine_ops"))
+                        dist = HNSW_COSINE;
+                    else if (sv_eq_ignorecase_cstr(ci->ops_class, "vector_ip_ops"))
+                        dist = HNSW_IP;
+                    else {
+                        arena_set_error(&q->arena, "42601", "unknown operator class '%.*s'",
+                                        (int)ci->ops_class.len, ci->ops_class.data);
+                        index_free(&idx);
+                        return -1;
+                    }
+                }
+                uint16_t dim = t->columns.items[ci0].vector_dim;
+                struct hnsw_index *hnsw = (struct hnsw_index *)malloc(sizeof(struct hnsw_index));
+                hnsw_init(hnsw, dim, 16, 200, dist);
+                hnsw->col_idx = ci0;
+                idx.type = INDEX_HNSW;
+                free(idx.root);
+                idx.root = NULL;
+                idx.hnsw = hnsw;
+                /* backfill existing rows */
+                for (size_t i = 0; i < t->rows.count; i++) {
+                    if ((size_t)ci0 < t->rows.items[i].cells.count &&
+                        !t->rows.items[i].cells.items[ci0].is_null &&
+                        t->rows.items[i].cells.items[ci0].value.as_vector) {
+                        hnsw_insert(hnsw, t->rows.items[i].cells.items[ci0].value.as_vector, i);
+                    }
+                }
+                da_push(&t->indexes, idx);
+                return 0;
+            }
+
+            /* ---- B-tree index path (default) ---- */
             /* backfill existing rows */
             for (size_t i = 0; i < t->rows.count; i++) {
                 struct cell composite[MAX_INDEX_COLS];

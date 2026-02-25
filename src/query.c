@@ -3656,6 +3656,75 @@ static struct cell eval_func_call(enum expr_func fn, uint32_t nargs, uint32_t ar
         break;
     }
 
+    case FUNC_L2_DISTANCE:
+    case FUNC_COSINE_DISTANCE:
+    case FUNC_INNER_PRODUCT: {
+        if (nargs < 2) return cell_make_null();
+        struct cell a = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
+        struct cell b = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
+        if (cell_is_null(&a) || cell_is_null(&b)) {
+            cell_release_rb(&a, rb);
+            cell_release_rb(&b, rb);
+            return cell_make_null();
+        }
+        /* resolve vector pointers and dimension */
+        const float *va = NULL, *vb = NULL;
+        uint16_t dim = 0;
+        float parsed_a[2048], parsed_b[2048];
+        if (a.type == COLUMN_TYPE_VECTOR && a.value.as_vector) {
+            va = a.value.as_vector;
+            if (t) {
+                for (size_t ci = 0; ci < t->columns.count; ci++) {
+                    if (t->columns.items[ci].type == COLUMN_TYPE_VECTOR &&
+                        t->columns.items[ci].vector_dim > 0) {
+                        dim = t->columns.items[ci].vector_dim;
+                        break;
+                    }
+                }
+            }
+        } else if (column_type_is_text(a.type) && a.value.as_text) {
+            /* count dimension from text literal */
+            const char *s = a.value.as_text;
+            uint16_t cnt = 0;
+            if (*s == '[') { s++; cnt = 1; while (*s) { if (*s == ',') cnt++; s++; } }
+            dim = cnt;
+            if (dim > 0 && dim <= 2048)
+                vector_parse(a.value.as_text, parsed_a, dim);
+            va = parsed_a;
+        }
+        if (b.type == COLUMN_TYPE_VECTOR && b.value.as_vector) {
+            vb = b.value.as_vector;
+            if (dim == 0 && t) {
+                for (size_t ci = 0; ci < t->columns.count; ci++) {
+                    if (t->columns.items[ci].type == COLUMN_TYPE_VECTOR &&
+                        t->columns.items[ci].vector_dim > 0) {
+                        dim = t->columns.items[ci].vector_dim;
+                        break;
+                    }
+                }
+            }
+        } else if (column_type_is_text(b.type) && b.value.as_text) {
+            if (dim == 0) {
+                const char *s = b.value.as_text;
+                uint16_t cnt = 0;
+                if (*s == '[') { s++; cnt = 1; while (*s) { if (*s == ',') cnt++; s++; } }
+                dim = cnt;
+            }
+            if (dim > 0 && dim <= 2048)
+                vector_parse(b.value.as_text, parsed_b, dim);
+            vb = parsed_b;
+        }
+        float result = 0.0f;
+        if (va && vb && dim > 0) {
+            if (fn == FUNC_L2_DISTANCE)          result = vector_l2_distance(va, vb, dim);
+            else if (fn == FUNC_COSINE_DISTANCE) result = vector_cosine_distance(va, vb, dim);
+            else                                 result = vector_inner_product(va, vb, dim);
+        }
+        cell_release_rb(&a, rb);
+        cell_release_rb(&b, rb);
+        return cell_make_float((double)result);
+    }
+
     } /* end switch */
     return cell_make_null();
 }
@@ -7568,16 +7637,29 @@ static void rebuild_indexes(struct table *t)
         index_reset(ix);
         /* re-insert all rows */
         for (size_t r = 0; r < t->rows.count; r++) {
-            struct cell composite[MAX_INDEX_COLS];
-            int ok = 1;
-            for (int c = 0; c < ix->ncols; c++) {
-                int ci = ix->column_indices[c];
-                if ((size_t)ci < t->rows.items[r].cells.count)
-                    composite[c] = t->rows.items[r].cells.items[ci];
-                else
-                    ok = 0;
+            switch (ix->type) {
+            case INDEX_BTREE: {
+                struct cell composite[MAX_INDEX_COLS];
+                int ok = 1;
+                for (int c = 0; c < ix->ncols; c++) {
+                    int ci = ix->column_indices[c];
+                    if ((size_t)ci < t->rows.items[r].cells.count)
+                        composite[c] = t->rows.items[r].cells.items[ci];
+                    else
+                        ok = 0;
+                }
+                if (ok) index_insert(ix, composite, r);
+                break;
             }
-            if (ok) index_insert(ix, composite, r);
+            case INDEX_HNSW: {
+                int ci = ix->hnsw->col_idx;
+                if ((size_t)ci < t->rows.items[r].cells.count &&
+                    !t->rows.items[r].cells.items[ci].is_null &&
+                    t->rows.items[r].cells.items[ci].value.as_vector)
+                    hnsw_insert(ix->hnsw, t->rows.items[r].cells.items[ci].value.as_vector, r);
+                break;
+            }
+            }
         }
     }
 }
@@ -7853,26 +7935,51 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                 }
             }
             if (!affected) continue;
-            /* build old composite key from current row */
-            struct cell old_key[MAX_INDEX_COLS];
-            for (int c = 0; c < idx->ncols; c++)
-                old_key[c] = t->rows.items[i].cells.items[idx->column_indices[c]];
-            index_remove(idx, old_key, i);
-            /* build new composite key: use new_vals where updated, old values otherwise */
-            struct cell new_key[MAX_INDEX_COLS];
-            for (int c = 0; c < idx->ncols; c++) {
-                int found = 0;
+            switch (idx->type) {
+            case INDEX_BTREE: {
+                /* build old composite key from current row */
+                struct cell old_key[MAX_INDEX_COLS];
+                for (int c = 0; c < idx->ncols; c++)
+                    old_key[c] = t->rows.items[i].cells.items[idx->column_indices[c]];
+                index_remove(idx, old_key, i);
+                /* build new composite key: use new_vals where updated, old values otherwise */
+                struct cell new_key[MAX_INDEX_COLS];
+                for (int c = 0; c < idx->ncols; c++) {
+                    int found = 0;
+                    for (uint32_t sc = 0; sc < nsc; sc++) {
+                        if (col_idxs[sc] == idx->column_indices[c]) {
+                            new_key[c] = new_vals[sc];
+                            found = 1;
+                            break;
+                        }
+                    }
+                    if (!found)
+                        new_key[c] = t->rows.items[i].cells.items[idx->column_indices[c]];
+                }
+                index_insert(idx, new_key, i);
+                break;
+            }
+            case INDEX_HNSW: {
+                int hci = idx->hnsw->col_idx;
+                hnsw_remove(idx->hnsw, i);
+                /* find new vector value */
+                const float *new_vec = NULL;
                 for (uint32_t sc = 0; sc < nsc; sc++) {
-                    if (col_idxs[sc] == idx->column_indices[c]) {
-                        new_key[c] = new_vals[sc];
-                        found = 1;
+                    if (col_idxs[sc] == hci && !new_vals[sc].is_null &&
+                        new_vals[sc].value.as_vector) {
+                        new_vec = new_vals[sc].value.as_vector;
                         break;
                     }
                 }
-                if (!found)
-                    new_key[c] = t->rows.items[i].cells.items[idx->column_indices[c]];
+                if (!new_vec && (size_t)hci < t->rows.items[i].cells.count &&
+                    !t->rows.items[i].cells.items[hci].is_null &&
+                    t->rows.items[i].cells.items[hci].value.as_vector)
+                    new_vec = t->rows.items[i].cells.items[hci].value.as_vector;
+                if (new_vec)
+                    hnsw_insert(idx->hnsw, new_vec, i);
+                break;
             }
-            index_insert(idx, new_key, i);
+            }
         }
         /* now apply all new values */
         for (size_t sc = 0; sc < nsc; sc++) {
@@ -8510,16 +8617,29 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
         size_t new_row_id = t->rows.count - 1;
         for (size_t ix = 0; ix < t->indexes.count; ix++) {
             struct index *idx = &t->indexes.items[ix];
-            struct cell composite[MAX_INDEX_COLS];
-            int ok = 1;
-            for (int c = 0; c < idx->ncols; c++) {
-                int ci = idx->column_indices[c];
-                if (ci >= 0 && (size_t)ci < t->rows.items[new_row_id].cells.count)
-                    composite[c] = t->rows.items[new_row_id].cells.items[ci];
-                else
-                    ok = 0;
+            switch (idx->type) {
+            case INDEX_BTREE: {
+                struct cell composite[MAX_INDEX_COLS];
+                int ok = 1;
+                for (int c = 0; c < idx->ncols; c++) {
+                    int ci2 = idx->column_indices[c];
+                    if (ci2 >= 0 && (size_t)ci2 < t->rows.items[new_row_id].cells.count)
+                        composite[c] = t->rows.items[new_row_id].cells.items[ci2];
+                    else
+                        ok = 0;
+                }
+                if (ok) index_insert(idx, composite, new_row_id);
+                break;
             }
-            if (ok) index_insert(idx, composite, new_row_id);
+            case INDEX_HNSW: {
+                int hci = idx->hnsw->col_idx;
+                if (hci >= 0 && (size_t)hci < t->rows.items[new_row_id].cells.count &&
+                    !t->rows.items[new_row_id].cells.items[hci].is_null &&
+                    t->rows.items[new_row_id].cells.items[hci].value.as_vector)
+                    hnsw_insert(idx->hnsw, t->rows.items[new_row_id].cells.items[hci].value.as_vector, new_row_id);
+                break;
+            }
+            }
         }
 
         if (has_returning && result)

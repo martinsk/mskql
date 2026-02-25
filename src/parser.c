@@ -965,7 +965,11 @@ static int is_expr_func_keyword(sv name)
            sv_eq_ignorecase_cstr(name, "BOOL_AND") ||
            sv_eq_ignorecase_cstr(name, "BOOL_OR") ||
            sv_eq_ignorecase_cstr(name, "STDDEV") ||
-           sv_eq_ignorecase_cstr(name, "VARIANCE");
+           sv_eq_ignorecase_cstr(name, "VARIANCE") ||
+           /* vector distance functions */
+           sv_eq_ignorecase_cstr(name, "L2_DISTANCE") ||
+           sv_eq_ignorecase_cstr(name, "COSINE_DISTANCE") ||
+           sv_eq_ignorecase_cstr(name, "INNER_PRODUCT");
 }
 
 static enum expr_func expr_func_from_name(sv name)
@@ -1055,6 +1059,10 @@ static enum expr_func expr_func_from_name(sv name)
     if (sv_eq_ignorecase_cstr(name, "BOOL_OR"))  return FUNC_AGG_BOOL_OR;
     if (sv_eq_ignorecase_cstr(name, "STDDEV"))   return FUNC_AGG_STDDEV;
     if (sv_eq_ignorecase_cstr(name, "VARIANCE")) return FUNC_AGG_VARIANCE;
+    /* vector distance functions */
+    if (sv_eq_ignorecase_cstr(name, "L2_DISTANCE"))      return FUNC_L2_DISTANCE;
+    if (sv_eq_ignorecase_cstr(name, "COSINE_DISTANCE"))  return FUNC_COSINE_DISTANCE;
+    if (sv_eq_ignorecase_cstr(name, "INNER_PRODUCT"))    return FUNC_INNER_PRODUCT;
     __builtin_unreachable(); /* is_expr_func_keyword gates this call */
 }
 
@@ -6683,6 +6691,21 @@ static int parse_create(struct lexer *l, struct query *out)
             return -1;
         }
         ci->table = tok.value;
+        ci->using_method = (sv){0};
+        ci->ops_class = (sv){0};
+
+        /* optional USING method (e.g. USING hnsw, USING btree) */
+        tok = lexer_peek(l);
+        if ((tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) &&
+            sv_eq_ignorecase_cstr(tok.value, "USING")) {
+            lexer_next(l); /* consume USING */
+            tok = lexer_next(l);
+            if (tok.type != TOK_IDENTIFIER && tok.type != TOK_KEYWORD) {
+                arena_set_error(&out->arena, "42601", "expected index method after USING");
+                return -1;
+            }
+            ci->using_method = tok.value;
+        }
 
         tok = lexer_next(l);
         if (tok.type != TOK_LPAREN) {
@@ -6700,6 +6723,15 @@ static int parse_create(struct lexer *l, struct query *out)
             }
             da_push(&out->arena.svs, tok.value);
             ci->index_columns_count++;
+            /* optional operator class (e.g. vector_l2_ops) */
+            tok = lexer_peek(l);
+            if ((tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) &&
+                (sv_eq_ignorecase_cstr(tok.value, "vector_l2_ops") ||
+                 sv_eq_ignorecase_cstr(tok.value, "vector_cosine_ops") ||
+                 sv_eq_ignorecase_cstr(tok.value, "vector_ip_ops"))) {
+                ci->ops_class = tok.value;
+                lexer_next(l); /* consume ops class */
+            }
             tok = lexer_next(l);
             if (tok.type == TOK_RPAREN) break;
             if (tok.type != TOK_COMMA) {

@@ -351,7 +351,11 @@ enum expr_func {
     FUNC_AGG_BOOL_AND,
     FUNC_AGG_BOOL_OR,
     FUNC_AGG_STDDEV,
-    FUNC_AGG_VARIANCE
+    FUNC_AGG_VARIANCE,
+    /* vector distance functions */
+    FUNC_L2_DISTANCE,
+    FUNC_COSINE_DISTANCE,
+    FUNC_INNER_PRODUCT
 };
 
 struct case_when_branch {
@@ -748,6 +752,8 @@ struct query_create_index {
     uint32_t index_columns_start; /* index into arena.svs (consecutive column names) */
     uint32_t index_columns_count;
     int if_not_exists;
+    sv using_method;  /* "hnsw", "btree", or empty (default btree) */
+    sv ops_class;     /* "vector_l2_ops", "vector_cosine_ops", "vector_ip_ops", or empty */
 };
 
 struct query_drop_index {

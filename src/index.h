@@ -4,10 +4,16 @@
 #include "dynamic_array.h"
 #include "row.h"
 #include "stringview.h"
+#include "hnsw.h"
 #include <stdlib.h>
 
 #define BTREE_ORDER 64
 #define MAX_INDEX_COLS 8
+
+enum index_type {
+    INDEX_BTREE,
+    INDEX_HNSW
+};
 
 struct btree_entry {
     struct cell keys[MAX_INDEX_COLS];
@@ -27,7 +33,9 @@ struct index {
     int   is_unique;  /* 1 if created from PRIMARY KEY or UNIQUE constraint */
     char *column_names[MAX_INDEX_COLS];
     int   column_indices[MAX_INDEX_COLS];
-    struct btree_node *root;
+    enum index_type type;
+    struct btree_node *root;          /* INDEX_BTREE only */
+    struct hnsw_index *hnsw;          /* INDEX_HNSW only (heap-allocated) */
 };
 
 void index_init(struct index *idx, const char *name,

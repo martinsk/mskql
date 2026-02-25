@@ -28,6 +28,7 @@ enum plan_op {
     PLAN_PARQUET_SCAN,   /* read Parquet file directly into col_blocks */
     PLAN_VEC_PROJECT,    /* vectorized columnar expression eval (no per-row overhead) */
     PLAN_TOP_N,          /* fused SORT + LIMIT: heap-based top-N selection */
+    PLAN_HNSW_SCAN,      /* HNSW approximate nearest neighbor scan */
 };
 
 /* ---- Plan builder result ---- */
@@ -214,6 +215,18 @@ struct plan_node {
             size_t   limit;            /* N = number of rows to keep */
             size_t   offset;           /* skip first M rows from sorted result */
         } top_n;
+        struct {
+            struct table *table;
+            struct hnsw_index *hnsw;  /* pointer to the HNSW index */
+            float *query_vec;         /* bump-allocated query vector */
+            uint16_t dim;             /* vector dimension */
+            uint32_t k;               /* number of neighbors to return */
+            uint32_t ef_search;       /* beam width for search */
+            uint16_t ncols;           /* number of output columns */
+            int     *col_map;         /* bump-allocated: col_map[i] = table column index */
+            int      dist_col;        /* output column index for distance (-1 = none) */
+            enum hnsw_dist_type dist; /* distance type for computing output distance */
+        } hnsw_scan;
         struct {
             uint16_t out_ncols;       /* total output columns (passthrough + window) */
             uint16_t n_pass;          /* number of passthrough columns */

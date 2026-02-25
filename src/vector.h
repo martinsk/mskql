@@ -197,4 +197,40 @@ static inline int vector_format_fast(const float *vec, uint16_t dim, char *buf, 
     return (int)(p - buf); /* bytes written excluding NUL */
 }
 
+/* ---- Vector distance functions ---- */
+
+/* Squared L2 (Euclidean) distance: sum((a[i] - b[i])^2) */
+static inline float vector_l2_distance(const float *a, const float *b, uint16_t dim)
+{
+    float sum = 0.0f;
+    for (uint16_t i = 0; i < dim; i++) {
+        float d = a[i] - b[i];
+        sum += d * d;
+    }
+    return sum;
+}
+
+/* Cosine distance: 1 - (a·b) / (|a| * |b|) */
+static inline float vector_cosine_distance(const float *a, const float *b, uint16_t dim)
+{
+    float dot = 0.0f, na = 0.0f, nb = 0.0f;
+    for (uint16_t i = 0; i < dim; i++) {
+        dot += a[i] * b[i];
+        na  += a[i] * a[i];
+        nb  += b[i] * b[i];
+    }
+    float denom = sqrtf(na) * sqrtf(nb);
+    if (denom == 0.0f) return 1.0f;
+    return 1.0f - dot / denom;
+}
+
+/* Negative inner product: -(a·b)  (lower = more similar) */
+static inline float vector_inner_product(const float *a, const float *b, uint16_t dim)
+{
+    float dot = 0.0f;
+    for (uint16_t i = 0; i < dim; i++)
+        dot += a[i] * b[i];
+    return -dot;
+}
+
 #endif

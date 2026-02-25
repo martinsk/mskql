@@ -148,7 +148,9 @@ void index_init(struct index *idx, const char *name,
         idx->column_names[i] = strdup(col_names[i]);
         idx->column_indices[i] = col_indices[i];
     }
+    idx->type = INDEX_BTREE;
     idx->root = node_alloc(1);
+    idx->hnsw = NULL;
 }
 
 void index_init_sv(struct index *idx, sv name,
@@ -161,7 +163,9 @@ void index_init_sv(struct index *idx, sv name,
         idx->column_names[i] = sv_to_cstr(col_names[i]);
         idx->column_indices[i] = col_indices[i];
     }
+    idx->type = INDEX_BTREE;
     idx->root = node_alloc(1);
+    idx->hnsw = NULL;
 }
 
 void index_insert(struct index *idx, const struct cell *keys, size_t row_id)
@@ -205,8 +209,24 @@ void index_remove(struct index *idx, const struct cell *keys, size_t row_id)
 
 void index_reset(struct index *idx)
 {
-    node_free(idx->root, idx->ncols);
-    idx->root = node_alloc(1);
+    switch (idx->type) {
+    case INDEX_BTREE:
+        node_free(idx->root, idx->ncols);
+        idx->root = node_alloc(1);
+        break;
+    case INDEX_HNSW:
+        if (idx->hnsw) {
+            uint16_t dim = idx->hnsw->dim;
+            uint16_t M = idx->hnsw->M;
+            uint16_t ef = idx->hnsw->ef_construction;
+            enum hnsw_dist_type dist = idx->hnsw->dist;
+            int col_idx = idx->hnsw->col_idx;
+            hnsw_free(idx->hnsw);
+            hnsw_init(idx->hnsw, dim, M, ef, dist);
+            idx->hnsw->col_idx = col_idx;
+        }
+        break;
+    }
 }
 
 void index_free(struct index *idx)
@@ -214,6 +234,17 @@ void index_free(struct index *idx)
     free(idx->name);
     for (int i = 0; i < idx->ncols; i++)
         free(idx->column_names[i]);
-    node_free(idx->root, idx->ncols);
-    idx->root = NULL;
+    switch (idx->type) {
+    case INDEX_BTREE:
+        node_free(idx->root, idx->ncols);
+        idx->root = NULL;
+        break;
+    case INDEX_HNSW:
+        if (idx->hnsw) {
+            hnsw_free(idx->hnsw);
+            free(idx->hnsw);
+            idx->hnsw = NULL;
+        }
+        break;
+    }
 }

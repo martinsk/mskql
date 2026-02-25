@@ -2,6 +2,7 @@
 #include "query.h"
 #include "parser.h"
 #include "arena_helpers.h"
+#include "vector.h"
 #ifndef MSKQL_WASM
 #include "parquet.h"
 #include <carquet/carquet.h>
@@ -388,6 +389,8 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
         return plan_node_ncols(arena, pn->left);
     case PLAN_SIMPLE_AGG:
         return pn->simple_agg.agg_count;
+    case PLAN_HNSW_SCAN:
+        return pn->hnsw_scan.ncols;
     case PLAN_NESTED_LOOP:
         /* not yet implemented — fall through to child */
         return plan_node_ncols(arena, pn->left);
@@ -1201,6 +1204,7 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 walk = wn->left;
                 break;
             case PLAN_INDEX_SCAN:
+            case PLAN_HNSW_SCAN:
             case PLAN_HASH_JOIN:
             case PLAN_NESTED_LOOP:
             case PLAN_HASH_AGG:
@@ -7504,6 +7508,105 @@ static int gen_series_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* ---- HNSW Scan executor ---- */
+
+static int hnsw_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                          struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct scan_state *st = (struct scan_state *)ctx->node_states[node_idx];
+    if (!st) {
+        st = (struct scan_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        st->cursor = 0;
+        ctx->node_states[node_idx] = st;
+    }
+
+    /* Only emit one block — all results come from hnsw_search */
+    if (st->cursor > 0) return -1;
+    st->cursor = 1;
+
+    struct table *t = pn->hnsw_scan.table;
+    struct hnsw_index *hnsw = pn->hnsw_scan.hnsw;
+    const float *query = pn->hnsw_scan.query_vec;
+    uint32_t k = pn->hnsw_scan.k;
+    uint32_t ef = pn->hnsw_scan.ef_search;
+
+    /* perform HNSW search */
+    size_t *row_ids = (size_t *)bump_alloc(&ctx->arena->scratch, k * sizeof(size_t));
+    float *dists = (float *)bump_alloc(&ctx->arena->scratch, k * sizeof(float));
+    uint32_t result_count = 0;
+    hnsw_search(hnsw, query, k, ef, row_ids, dists, &result_count);
+    if (result_count == 0) return -1;
+
+    /* build row_block from results */
+    row_block_reset(out);
+    uint16_t ncols = pn->hnsw_scan.ncols;
+    int *col_map = pn->hnsw_scan.col_map;
+    int dist_col = pn->hnsw_scan.dist_col;
+    uint16_t nrows = 0;
+
+    const struct flat_table *ft = &t->flat;
+    if (!ft->col_data || ft->nrows == 0) return -1;
+
+    for (uint32_t i = 0; i < result_count; i++) {
+        size_t rid = row_ids[i];
+        if (rid >= ft->nrows) continue;
+        for (uint16_t c = 0; c < ncols; c++) {
+            struct col_block *cb = &out->cols[c];
+            if (c == (uint16_t)dist_col) {
+                /* distance output column */
+                if (nrows == 0) cb->type = COLUMN_TYPE_FLOAT;
+                cb->nulls[nrows] = 0;
+                cb->data.f64[nrows] = (double)dists[i];
+                continue;
+            }
+            int tc = col_map[c];
+            if (nrows == 0) cb->type = ft->col_types[tc];
+            if (ft->col_nulls[tc][rid]) {
+                cb->nulls[nrows] = 1;
+            } else {
+                cb->nulls[nrows] = 0;
+                switch (ft->col_types[tc]) {
+                case COLUMN_TYPE_SMALLINT:
+                    cb->data.i16[nrows] = ((int16_t *)ft->col_data[tc])[rid]; break;
+                case COLUMN_TYPE_INT:
+                case COLUMN_TYPE_BOOLEAN:
+                case COLUMN_TYPE_DATE:
+                case COLUMN_TYPE_ENUM:
+                    cb->data.i32[nrows] = ((int32_t *)ft->col_data[tc])[rid]; break;
+                case COLUMN_TYPE_BIGINT:
+                case COLUMN_TYPE_TIME:
+                case COLUMN_TYPE_TIMESTAMP:
+                case COLUMN_TYPE_TIMESTAMPTZ:
+                    cb->data.i64[nrows] = ((int64_t *)ft->col_data[tc])[rid]; break;
+                case COLUMN_TYPE_FLOAT:
+                case COLUMN_TYPE_NUMERIC:
+                    cb->data.f64[nrows] = ((double *)ft->col_data[tc])[rid]; break;
+                case COLUMN_TYPE_TEXT:
+                    cb->data.str[nrows] = ((char **)ft->col_data[tc])[rid]; break;
+                case COLUMN_TYPE_INTERVAL:
+                    cb->data.iv[nrows] = ((struct interval *)ft->col_data[tc])[rid]; break;
+                case COLUMN_TYPE_UUID:
+                    cb->data.uuid[nrows] = ((struct uuid_val *)ft->col_data[tc])[rid]; break;
+                case COLUMN_TYPE_VECTOR: {
+                    uint16_t dim = ft->col_vec_dims[tc];
+                    cb->vec_dim = dim;
+                    if (!cb->data.vec)
+                        cb->data.vec = (float *)bump_alloc(&ctx->arena->scratch,
+                                                           BLOCK_CAPACITY * dim * sizeof(float));
+                    memcpy(&cb->data.vec[nrows * dim],
+                           &((float *)ft->col_data[tc])[rid * dim], dim * sizeof(float));
+                    break;
+                }
+                }
+            }
+        }
+        nrows++;
+    }
+    out->count = nrows;
+    return 0;
+}
+
 /* ---- Dispatcher ---- */
 
 int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -7535,6 +7638,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     case PLAN_EXPR_PROJECT:    return expr_project_next(ctx, node_idx, out);
     case PLAN_VEC_PROJECT:     return vec_project_next(ctx, node_idx, out);
     case PLAN_SIMPLE_AGG:       return simple_agg_next(ctx, node_idx, out);
+    case PLAN_HNSW_SCAN:        return hnsw_scan_next(ctx, node_idx, out);
     case PLAN_NESTED_LOOP:
         /* not yet implemented */
         return -1;
@@ -7879,6 +7983,13 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
         n = snprintf(buf + written, buflen - written, "Foreign Scan on %s\n",
                      pn->parquet_scan.table ? pn->parquet_scan.table->name : "?");
         if (n > 0) written += n;
+        break;
+    case PLAN_HNSW_SCAN:
+        n = snprintf(buf + written, buflen - written, "HNSW Scan on %s (k=%u)",
+                     pn->hnsw_scan.table ? pn->hnsw_scan.table->name : "?",
+                     pn->hnsw_scan.k);
+        if (n > 0) written += n;
+        buf[written++] = '\n';
         break;
     case PLAN_NESTED_LOOP:
         n = explain_binary(arena, pn, "Nested Loop", buf + written, buflen - written, depth);
@@ -10966,6 +11077,125 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                 }
             }
             if (sort_cols_buf[k] < 0) return PLAN_RES_ERR;
+        }
+    }
+
+    /* ---- HNSW scan detection: ORDER BY distance_func(col, vec_literal) LIMIT k ---- */
+    if (s->has_order_by && s->order_by_count == 1 && s->has_limit && !s->where.has_where &&
+        !s->has_distinct) {
+        struct order_by_item *obi = &arena->order_items.items[s->order_by_start];
+        if (obi->expr_idx != IDX_NONE) {
+            struct expr *oe = &EXPR(arena, obi->expr_idx);
+            if (oe->type == EXPR_FUNC_CALL &&
+                (oe->func_call.func == FUNC_L2_DISTANCE ||
+                 oe->func_call.func == FUNC_COSINE_DISTANCE ||
+                 oe->func_call.func == FUNC_INNER_PRODUCT) &&
+                oe->func_call.args_count == 2) {
+                /* Identify which arg is the column and which is the literal */
+                uint32_t arg0_idx = arena->arg_indices.items[oe->func_call.args_start];
+                uint32_t arg1_idx = arena->arg_indices.items[oe->func_call.args_start + 1];
+                struct expr *a0 = &EXPR(arena, arg0_idx);
+                struct expr *a1 = &EXPR(arena, arg1_idx);
+                int col_arg = -1; /* 0 or 1 */
+                sv vec_col_name = {0};
+                const char *query_text = NULL;
+                if (a0->type == EXPR_COLUMN_REF && a1->type == EXPR_LITERAL &&
+                    column_type_is_text(a1->literal.type) && a1->literal.value.as_text) {
+                    col_arg = 0;
+                    vec_col_name = a0->column_ref.column;
+                    query_text = a1->literal.value.as_text;
+                } else if (a1->type == EXPR_COLUMN_REF && a0->type == EXPR_LITERAL &&
+                           column_type_is_text(a0->literal.type) && a0->literal.value.as_text) {
+                    col_arg = 1;
+                    vec_col_name = a1->column_ref.column;
+                    query_text = a0->literal.value.as_text;
+                }
+                if (col_arg >= 0) {
+                    int vec_ci = table_find_column_sv(t, vec_col_name);
+                    if (vec_ci >= 0 && t->columns.items[vec_ci].type == COLUMN_TYPE_VECTOR) {
+                        /* find HNSW index on this column */
+                        struct hnsw_index *hnsw = NULL;
+                        for (size_t ix = 0; ix < t->indexes.count; ix++) {
+                            struct index *idx = &t->indexes.items[ix];
+                            if (idx->type == INDEX_HNSW && idx->hnsw &&
+                                idx->hnsw->col_idx == vec_ci) {
+                                hnsw = idx->hnsw;
+                                break;
+                            }
+                        }
+                        if (hnsw) {
+                            uint16_t dim = hnsw->dim;
+                            float *qvec = (float *)bump_alloc(&arena->scratch, dim * sizeof(float));
+                            if (vector_parse(query_text, qvec, dim) == 0) {
+                                uint32_t k_val = (uint32_t)s->limit_count;
+                                uint16_t scan_ncols;
+                                int *col_map;
+                                int dist_col = -1;
+
+                                /* Determine output columns */
+                                if (need_project || need_expr_project) {
+                                    scan_ncols = proj_ncols;
+                                    col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
+                                    for (uint16_t pc = 0; pc < proj_ncols; pc++) {
+                                        uint32_t ei;
+                                        if (need_expr_project)
+                                            ei = expr_proj_indices[pc];
+                                        else {
+                                            struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
+                                            ei = sc->expr_idx;
+                                        }
+                                        if (ei != IDX_NONE) {
+                                            struct expr *pe = &EXPR(arena, ei);
+                                            if (pe->type == EXPR_COLUMN_REF) {
+                                                col_map[pc] = table_find_column_sv(t, pe->column_ref.column);
+                                            } else if (pe->type == EXPR_FUNC_CALL &&
+                                                       (pe->func_call.func == FUNC_L2_DISTANCE ||
+                                                        pe->func_call.func == FUNC_COSINE_DISTANCE ||
+                                                        pe->func_call.func == FUNC_INNER_PRODUCT)) {
+                                                /* this is the distance expression — mark as dist_col */
+                                                dist_col = (int)pc;
+                                                col_map[pc] = -1;
+                                            } else {
+                                                col_map[pc] = -1;
+                                            }
+                                        } else {
+                                            col_map[pc] = -1;
+                                        }
+                                    }
+                                } else {
+                                    scan_ncols = (uint16_t)t->columns.count;
+                                    col_map = (int *)bump_alloc(&arena->scratch, scan_ncols * sizeof(int));
+                                    for (uint16_t ci2 = 0; ci2 < scan_ncols; ci2++)
+                                        col_map[ci2] = (int)ci2;
+                                }
+
+                                /* Check all col_map entries are valid (except dist_col) */
+                                int hnsw_ok = 1;
+                                for (uint16_t ci2 = 0; ci2 < scan_ncols; ci2++) {
+                                    if ((int)ci2 == dist_col) continue;
+                                    if (col_map[ci2] < 0) { hnsw_ok = 0; break; }
+                                }
+
+                                if (hnsw_ok) {
+                                    uint32_t hnsw_node = plan_alloc_node(arena, PLAN_HNSW_SCAN);
+                                    PLAN_NODE(arena, hnsw_node).hnsw_scan.table = t;
+                                    PLAN_NODE(arena, hnsw_node).hnsw_scan.hnsw = hnsw;
+                                    PLAN_NODE(arena, hnsw_node).hnsw_scan.query_vec = qvec;
+                                    PLAN_NODE(arena, hnsw_node).hnsw_scan.dim = dim;
+                                    PLAN_NODE(arena, hnsw_node).hnsw_scan.k = k_val;
+                                    PLAN_NODE(arena, hnsw_node).hnsw_scan.ef_search = k_val < 200 ? 200 : k_val;
+                                    PLAN_NODE(arena, hnsw_node).hnsw_scan.ncols = scan_ncols;
+                                    PLAN_NODE(arena, hnsw_node).hnsw_scan.col_map = col_map;
+                                    PLAN_NODE(arena, hnsw_node).hnsw_scan.dist_col = dist_col;
+                                    PLAN_NODE(arena, hnsw_node).hnsw_scan.dist = hnsw->dist;
+                                    PLAN_NODE(arena, hnsw_node).est_rows = (double)k_val;
+                                    return PLAN_RES_OK(hnsw_node);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
