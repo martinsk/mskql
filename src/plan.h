@@ -140,8 +140,10 @@ struct plan_node {
             int join_type;           /* 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL */
         } hash_join;
         struct {
-            uint32_t cond_idx;       /* join condition */
-            int      join_type;
+            uint32_t cond_idx;       /* join condition (IDX_NONE for CROSS JOIN) */
+            int      join_type;      /* 4=CROSS */
+            uint16_t left_ncols;     /* columns from left child */
+            uint16_t right_ncols;    /* columns from right child */
         } nested_loop;
         struct {
             int     *sort_cols;      /* bump-allocated: column indices to sort by */
@@ -163,6 +165,8 @@ struct plan_node {
             struct table *table;     /* source table — needed for eval_expr on expression aggregates */
             enum column_type *agg_col_types; /* bump: original table column type per aggregate (for emit after projection) */
             int       int_fast_path; /* 1 = all group keys and agg cols are integer-family (STORE_I32/I64) */
+            int      *agg_order_col; /* bump: ORDER BY column index per aggregate (-1 = none) */
+            int      *agg_order_desc; /* bump: 1=DESC per aggregate */
         } hash_agg;
         struct {
             uint32_t agg_start;
@@ -173,6 +177,8 @@ struct plan_node {
             int      *agg_vec_op;     /* bump: OP_ADD/SUB/MUL/DIV */
             double   *agg_vec_lit;    /* bump: literal value when col_b == -1 */
             struct table *table;       /* for eval_expr on expression aggs */
+            int      *agg_order_col; /* bump: ORDER BY column index per aggregate (-1 = none) */
+            int      *agg_order_desc; /* bump: 1=DESC per aggregate */
         } simple_agg;
         struct {
             size_t offset;
@@ -253,6 +259,7 @@ struct plan_node {
             int     *win_frame_exclude; /* bump: enum frame_exclude per win expr */
             int     *win_has_filter;  /* bump: 1 if FILTER clause present */
             uint32_t *win_filter_expr; /* bump: expr index for FILTER condition */
+            struct table *table;      /* source table — for eval_expr in FILTER */
             int      sort_part_col;   /* global partition col for sort (-1 = none) */
             int      sort_ord_col;    /* global order col for sort (-1 = none) */
             int      sort_ord_desc;   /* global order direction */
@@ -306,6 +313,21 @@ struct hash_join_state {
     uint32_t          right_emit_cursor; /* cursor for emitting unmatched inner rows */
 };
 
+/* Nested-loop join state — materializes both sides, emits cross product */
+struct nested_loop_state {
+    struct flat_col *left_cols;
+    struct flat_col *right_cols;
+    uint16_t left_ncols;
+    uint16_t right_ncols;
+    uint32_t left_count;
+    uint32_t right_count;
+    uint32_t left_cap;
+    uint32_t right_cap;
+    int      materialized;
+    uint32_t left_cursor;   /* current left row */
+    uint32_t right_cursor;  /* current right row */
+};
+
 /* Open-addressing hash set for COUNT(DISTINCT) */
 struct distinct_set {
     uint64_t *slots;   /* bump-allocated hash slots (0 = empty) */
@@ -325,6 +347,16 @@ struct simple_agg_state {
     int      *minmax_init;
     struct distinct_set *distinct_sets; /* bump: [agg_count], only used for DISTINCT aggs */
     double   *sumsq;       /* bump: [agg_count] — sum of squares for STDDEV */
+    /* STRING_AGG / ARRAY_AGG accumulators */
+    char    **str_accum;    /* bump: [agg_count] concatenated strings */
+    size_t   *str_accum_len; /* bump: [agg_count] current length */
+    size_t   *str_accum_cap; /* bump: [agg_count] allocated capacity */
+    /* STRING_AGG ORDER BY: deferred value collection per aggregate */
+    char   ***str_ord_vals;  /* bump: [agg_count] -> array of strings */
+    double  **str_ord_keys;  /* bump: [agg_count] -> array of numeric sort keys */
+    char   ***str_ord_skeys; /* bump: [agg_count] -> array of text sort keys */
+    uint32_t *str_ord_count; /* bump: [agg_count] current count */
+    uint32_t *str_ord_cap;   /* bump: [agg_count] allocated capacity */
     int       input_done;
     int       emit_done;
     struct row tmp_row;
@@ -348,6 +380,12 @@ struct hash_agg_state {
     char   **str_accum;    /* bump: [agg_count * group_cap] concatenated strings */
     size_t  *str_accum_len; /* bump: [agg_count * group_cap] current length */
     size_t  *str_accum_cap; /* bump: [agg_count * group_cap] allocated capacity */
+    /* STRING_AGG ORDER BY: deferred value collection per group per aggregate */
+    char   ***str_ord_vals;  /* bump: [agg_count * group_cap] -> arrays of strings */
+    double  **str_ord_keys;  /* bump: [agg_count * group_cap] -> arrays of numeric sort keys */
+    char   ***str_ord_skeys; /* bump: [agg_count * group_cap] -> arrays of text sort keys */
+    uint32_t *str_ord_count; /* bump: [agg_count * group_cap] */
+    uint32_t *str_ord_cap;   /* bump: [agg_count * group_cap] */
     /* STDDEV accumulator */
     double  *sumsq;        /* bump: [agg_count * group_cap] sum of squares */
     /* group key values stored in col_blocks */
@@ -396,6 +434,9 @@ struct window_state {
     int      *win_is_i64;       /* bump: [n_win] — 1 if result is int64 */
     char    **win_str;          /* bump: [n_win * total_rows] — text results */
     int      *win_is_str;       /* bump: [n_win] — 1 if result is text */
+    /* FILTER support: lazy row reconstruction for eval_expr */
+    struct row tmp_row;
+    int        tmp_row_inited;
 };
 
 struct hash_semi_join_state {
