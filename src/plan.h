@@ -359,8 +359,6 @@ struct simple_agg_state {
     uint32_t *str_ord_cap;   /* bump: [agg_count] allocated capacity */
     int       input_done;
     int       emit_done;
-    struct row tmp_row;
-    int       tmp_row_inited;
 };
 
 struct hash_agg_state {
@@ -394,9 +392,6 @@ struct hash_agg_state {
     uint32_t  group_cap;
     int       input_done;
     uint32_t  emit_cursor;
-    /* temp row for expression-based aggregates */
-    struct row tmp_row;
-    int       tmp_row_inited;
 };
 
 struct sort_state {
@@ -434,9 +429,6 @@ struct window_state {
     int      *win_is_i64;       /* bump: [n_win] — 1 if result is int64 */
     char    **win_str;          /* bump: [n_win * total_rows] — text results */
     int      *win_is_str;       /* bump: [n_win] — 1 if result is text */
-    /* FILTER support: lazy row reconstruction for eval_expr */
-    struct row tmp_row;
-    int        tmp_row_inited;
 };
 
 struct hash_semi_join_state {

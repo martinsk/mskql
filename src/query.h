@@ -470,6 +470,49 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
                       struct table *t, struct row *row,
                       struct database *db, struct bump_alloc *rb);
 
+/* Lightweight reference to a single row in columnar storage.
+ * Used by eval_expr_col/eval_condition_col to read column values without
+ * reconstructing a persistent struct row. */
+struct col_row_ref {
+    struct col_block *cols;  /* columnar block array */
+    uint16_t          ncols; /* number of columns */
+    uint16_t          ri;    /* row index within the block */
+};
+
+/* Columnar variants: build a temporary struct row from col_row_ref,
+ * then delegate to eval_expr / eval_condition.  The temporary row is
+ * bump-allocated from rb/scratch — no individual free needed. */
+struct cell eval_expr_col(uint32_t expr_idx, struct query_arena *arena,
+                          struct table *t, const struct col_row_ref *ref,
+                          struct database *db, struct bump_alloc *rb);
+
+int eval_condition_col(uint32_t cond_idx, struct query_arena *arena,
+                       const struct col_row_ref *ref, struct table *t,
+                       struct database *db, struct bump_alloc *scratch);
+
+/* Lightweight reference to a single row in flat_table storage.
+ * Used by eval_expr_flat/eval_condition_flat to read column values without
+ * reconstructing a persistent struct row. */
+struct flat_row_ref {
+    void            **col_data;      /* flat_table col_data array */
+    uint8_t         **col_nulls;     /* flat_table col_nulls array */
+    enum column_type *col_types;     /* flat_table col_types array */
+    uint16_t         *col_vec_dims;  /* flat_table col_vec_dims (may be NULL) */
+    uint16_t          ncols;
+    size_t            ri;            /* row index within the flat_table */
+};
+
+/* Flat-table variants: build a temporary struct row from flat_row_ref,
+ * then delegate to eval_expr / eval_condition.  The temporary row is
+ * bump-allocated from rb/scratch — no individual free needed. */
+struct cell eval_expr_flat(uint32_t expr_idx, struct query_arena *arena,
+                           struct table *t, const struct flat_row_ref *ref,
+                           struct database *db, struct bump_alloc *rb);
+
+int eval_condition_flat(uint32_t cond_idx, struct query_arena *arena,
+                        const struct flat_row_ref *ref, struct table *t,
+                        struct database *db, struct bump_alloc *scratch);
+
 struct set_clause {
     sv column;
     struct cell value;     /* literal value (used when expr_idx is IDX_NONE) */

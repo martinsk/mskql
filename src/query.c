@@ -4391,6 +4391,134 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
     __builtin_unreachable();
 }
 
+/* ---- Columnar variants of eval_expr / eval_condition ----
+ * Build a temporary struct row from a col_row_ref (bump-allocated cells),
+ * then delegate to the row-based functions.  The temporary row lives on the
+ * bump allocator — no individual free needed. */
+
+static void col_row_ref_to_row(const struct col_row_ref *ref,
+                               struct row *tmp, struct bump_alloc *scratch)
+{
+    uint16_t nc = ref->ncols;
+    uint16_t ri = ref->ri;
+    tmp->cells.count    = nc;
+    tmp->cells.capacity = nc;
+    tmp->cells.items    = (struct cell *)bump_alloc(scratch, nc * sizeof(struct cell));
+    for (uint16_t c = 0; c < nc; c++) {
+        struct col_block *cb = &ref->cols[c];
+        struct cell *cell = &tmp->cells.items[c];
+        memset(cell, 0, sizeof(*cell));
+        cell->type = cb->type;
+        if (cb->nulls[ri]) {
+            cell->is_null = 1;
+            continue;
+        }
+        switch (cb->type) {
+        case COLUMN_TYPE_SMALLINT:  cell->value.as_smallint = cb->data.i16[ri]; break;
+        case COLUMN_TYPE_INT:       cell->value.as_int = cb->data.i32[ri]; break;
+        case COLUMN_TYPE_BOOLEAN:   cell->value.as_bool = cb->data.i32[ri]; break;
+        case COLUMN_TYPE_DATE:      cell->value.as_date = cb->data.i32[ri]; break;
+        case COLUMN_TYPE_BIGINT:    cell->value.as_bigint = cb->data.i64[ri]; break;
+        case COLUMN_TYPE_TIME:      cell->value.as_time = cb->data.i64[ri]; break;
+        case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+            cell->value.as_timestamp = cb->data.i64[ri]; break;
+        case COLUMN_TYPE_FLOAT:     cell->value.as_float = cb->data.f64[ri]; break;
+        case COLUMN_TYPE_NUMERIC:   cell->value.as_numeric = cb->data.f64[ri]; break;
+        case COLUMN_TYPE_INTERVAL:  cell->value.as_interval = cb->data.iv[ri]; break;
+        case COLUMN_TYPE_TEXT:      cell->value.as_text = cb->data.str[ri]; break;
+        case COLUMN_TYPE_ENUM:      cell->value.as_enum = cb->data.i32[ri]; break;
+        case COLUMN_TYPE_UUID:      cell->value.as_uuid = cb->data.uuid[ri]; break;
+        case COLUMN_TYPE_VECTOR:
+            cell->value.as_vector = &cb->data.vec[ri * cb->vec_dim]; break;
+        }
+    }
+}
+
+struct cell eval_expr_col(uint32_t expr_idx, struct query_arena *arena,
+                          struct table *t, const struct col_row_ref *ref,
+                          struct database *db, struct bump_alloc *rb)
+{
+    if (!ref) return eval_expr(expr_idx, arena, t, NULL, db, rb);
+    struct row tmp = {0};
+    col_row_ref_to_row(ref, &tmp, rb ? rb : &arena->scratch);
+    return eval_expr(expr_idx, arena, t, &tmp, db, rb);
+}
+
+int eval_condition_col(uint32_t cond_idx, struct query_arena *arena,
+                       const struct col_row_ref *ref, struct table *t,
+                       struct database *db, struct bump_alloc *scratch)
+{
+    if (!ref) return eval_condition(cond_idx, arena, NULL, t, db);
+    struct row tmp = {0};
+    col_row_ref_to_row(ref, &tmp, scratch ? scratch : &arena->scratch);
+    return eval_condition(cond_idx, arena, &tmp, t, db);
+}
+
+/* ---- Flat-table variants of eval_expr / eval_condition ----
+ * Build a temporary struct row from a flat_row_ref (bump-allocated cells),
+ * then delegate to the row-based functions.  The temporary row lives on the
+ * bump allocator — no individual free needed. */
+
+static void flat_row_ref_to_row(const struct flat_row_ref *ref,
+                                struct row *tmp, struct bump_alloc *scratch)
+{
+    uint16_t nc = ref->ncols;
+    size_t ri = ref->ri;
+    tmp->cells.count    = nc;
+    tmp->cells.capacity = nc;
+    tmp->cells.items    = (struct cell *)bump_alloc(scratch, nc * sizeof(struct cell));
+    for (uint16_t c = 0; c < nc; c++) {
+        struct cell *cell = &tmp->cells.items[c];
+        memset(cell, 0, sizeof(*cell));
+        cell->type = ref->col_types[c];
+        if (ref->col_nulls[c][ri]) {
+            cell->is_null = 1;
+            continue;
+        }
+        switch (ref->col_types[c]) {
+        case COLUMN_TYPE_SMALLINT:  cell->value.as_smallint = ((int16_t *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_INT:       cell->value.as_int = ((int32_t *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_BOOLEAN:   cell->value.as_bool = ((int32_t *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_DATE:      cell->value.as_date = ((int32_t *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_BIGINT:    cell->value.as_bigint = ((int64_t *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_TIME:      cell->value.as_time = ((int64_t *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+            cell->value.as_timestamp = ((int64_t *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_FLOAT:     cell->value.as_float = ((double *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_NUMERIC:   cell->value.as_numeric = ((double *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_INTERVAL:  cell->value.as_interval = ((struct interval *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_TEXT:      cell->value.as_text = ((char **)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_ENUM:      cell->value.as_enum = ((int32_t *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_UUID:      cell->value.as_uuid = ((struct uuid_val *)ref->col_data[c])[ri]; break;
+        case COLUMN_TYPE_VECTOR: {
+            uint16_t dim = ref->col_vec_dims ? ref->col_vec_dims[c] : 0;
+            cell->value.as_vector = dim ? &((float *)ref->col_data[c])[ri * dim] : NULL;
+            break;
+        }
+        }
+    }
+}
+
+struct cell eval_expr_flat(uint32_t expr_idx, struct query_arena *arena,
+                           struct table *t, const struct flat_row_ref *ref,
+                           struct database *db, struct bump_alloc *rb)
+{
+    if (!ref) return eval_expr(expr_idx, arena, t, NULL, db, rb);
+    struct row tmp = {0};
+    flat_row_ref_to_row(ref, &tmp, rb ? rb : &arena->scratch);
+    return eval_expr(expr_idx, arena, t, &tmp, db, rb);
+}
+
+int eval_condition_flat(uint32_t cond_idx, struct query_arena *arena,
+                        const struct flat_row_ref *ref, struct table *t,
+                        struct database *db, struct bump_alloc *scratch)
+{
+    if (!ref) return eval_condition(cond_idx, arena, NULL, t, db);
+    struct row tmp = {0};
+    flat_row_ref_to_row(ref, &tmp, scratch ? scratch : &arena->scratch);
+    return eval_condition(cond_idx, arena, &tmp, t, db);
+}
+
 /* JPL ownership: emit_row receives cells with owned text from eval_expr,
  * eval_scalar_func, and resolve_arg.  It pushes them into the result row
  * without copying — ownership transfers from the producer to the result row.

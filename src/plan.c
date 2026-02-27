@@ -219,47 +219,6 @@ static inline void cb_to_cell_at(const struct col_block *cb, uint16_t i, struct 
     }
 }
 
-/* Build a temporary struct row from flat_table at the given row index.
- * Cells are bump-allocated from scratch — no individual free needed.
- * Used by filter_next fallback to call eval_condition without t->rows. */
-static struct row flat_row_at(const struct flat_table *ft, size_t idx,
-                              uint16_t ncols, struct bump_alloc *scratch)
-{
-    struct row r = {0};
-    r.cells.items = (struct cell *)bump_alloc(scratch, ncols * sizeof(struct cell));
-    r.cells.count = ncols;
-    r.cells.capacity = ncols;
-    for (uint16_t c = 0; c < ncols; c++) {
-        struct cell *cell = &r.cells.items[c];
-        memset(cell, 0, sizeof(*cell));
-        cell->type = ft->col_types[c];
-        if (ft->col_nulls[c][idx]) {
-            cell->is_null = 1;
-            continue;
-        }
-        switch (ft->col_types[c]) {
-        case COLUMN_TYPE_SMALLINT:  cell->value.as_smallint = ((int16_t *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_INT:       cell->value.as_int = ((int32_t *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_BOOLEAN:   cell->value.as_bool = ((int32_t *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_DATE:      cell->value.as_date = ((int32_t *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_BIGINT:    cell->value.as_bigint = ((int64_t *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_TIME:      cell->value.as_time = ((int64_t *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ:
-            cell->value.as_timestamp = ((int64_t *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_FLOAT:     cell->value.as_float = ((double *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_NUMERIC:   cell->value.as_numeric = ((double *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_INTERVAL:  cell->value.as_interval = ((struct interval *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_TEXT:      cell->value.as_text = ((char **)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_ENUM:      cell->value.as_enum = ((int32_t *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_UUID:      cell->value.as_uuid = ((struct uuid_val *)ft->col_data[c])[idx]; break;
-        case COLUMN_TYPE_VECTOR:
-            cell->value.as_vector = &((float *)ft->col_data[c])[idx * ft->col_vec_dims[c]]; break;
-        }
-    }
-    return r;
-}
-
 /* Copy a slice of a flat_table into a row_block.
  * col_map[i] = which table column to read for output column i.
  * Returns number of rows copied. */
@@ -440,6 +399,8 @@ uint32_t plan_alloc_node(struct query_arena *arena, enum plan_op op)
 
 /* ---- Block utility functions ---- */
 
+// TODO(phase3): eliminate block_to_rows once all downstream consumers
+// (subquery materialization, legacy query_select_exec) work with col_blocks directly.
 /* Convert a row_block back to struct rows for final output.
  * When rb is non-NULL, text is bump-allocated (bulk-freed).
  * Otherwise text is strdup'd (caller owns the result rows). */
@@ -1740,14 +1701,22 @@ fallback:
             struct scan_state *sst = (struct scan_state *)ctx->node_states[pn->left];
             size_t base = sst ? (sst->cursor - out->count) : 0;
             uint16_t ncols = (uint16_t)t->columns.count;
+            struct flat_row_ref fref = {
+                .col_data    = t->flat.col_data,
+                .col_nulls   = t->flat.col_nulls,
+                .col_types   = t->flat.col_types,
+                .col_vec_dims = t->flat.col_vec_dims,
+                .ncols       = ncols,
+                .ri          = 0,
+            };
             for (uint16_t _c = 0; _c < cand_count; _c++) {
                 uint16_t i = (uint16_t)cand[_c];
                 size_t row_idx = base + i;
                 if (row_idx >= t->flat.nrows) continue;
-                struct row tmp = flat_row_at(&t->flat, row_idx, ncols,
-                                             &ctx->arena->scratch);
-                if (eval_condition(pn->filter.cond_idx, ctx->arena,
-                                   &tmp, t, ctx->db))
+                fref.ri = row_idx;
+                if (eval_condition_flat(pn->filter.cond_idx, ctx->arena,
+                                        &fref, t, ctx->db,
+                                        &ctx->arena->scratch))
                     sel[sel_count++] = i;
             }
         }
@@ -1790,12 +1759,6 @@ static int project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
-/* Forward declaration — defined in "Shared aggregate helpers" section below */
-static inline void agg_reconstruct_row(struct col_block *cols, uint16_t ncols,
-                                        uint16_t ri, struct row *tmp_row,
-                                        int *tmp_row_inited,
-                                        struct bump_alloc *scratch);
-
 /* ---- Expression projection: evaluate arbitrary expressions per row ---- */
 
 static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -1818,32 +1781,20 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     uint16_t active = row_block_active_count(&input);
     if (active == 0) return -1;
 
-    /* Build a temporary row struct for eval_expr.
-     * We reuse the same cells array for each row — just update values. */
-    struct row tmp_row = {0};
-    tmp_row.cells.count = child_ncols;
-    struct cell *tmp_cells = (struct cell *)bump_alloc(&ctx->arena->scratch,
-                                                       child_ncols * sizeof(struct cell));
-    tmp_row.cells.items = tmp_cells;
-
     /* Initialize output col_blocks */
     out->count = active;
     out->sel = NULL;
     out->sel_count = 0;
 
     /* Process each active row */
-    int tmp_inited = 1; /* cells already allocated above */
     for (uint16_t r = 0; r < active; r++) {
         uint16_t ri = row_block_row_idx(&input, r);
-
-        /* Reconstruct row from col_blocks */
-        agg_reconstruct_row(input.cols, child_ncols, ri,
-                            &tmp_row, &tmp_inited, &ctx->arena->scratch);
+        struct col_row_ref ref = { .cols = input.cols, .ncols = child_ncols, .ri = ri };
 
         /* Evaluate each output expression */
         for (uint16_t c = 0; c < out_ncols; c++) {
-            struct cell result = eval_expr(expr_indices[c], ctx->arena, t, &tmp_row,
-                                           ctx->db, &ctx->arena->scratch);
+            struct cell result = eval_expr_col(expr_indices[c], ctx->arena, t, &ref,
+                                               ctx->db, &ctx->arena->scratch);
             if (ctx->arena->errmsg[0]) return -1;
             struct col_block *ocb = &out->cols[c];
 
@@ -3144,33 +3095,6 @@ static uint64_t distinct_hash_cell(struct col_block *cb, uint16_t ri)
 
 /* ---- Shared aggregate helpers ---- */
 
-/* Reconstruct a row from col_blocks at row index ri into tmp_row.
- * Lazily allocates tmp_row cells on first call (tmp_row_inited tracks this). */
-static inline void agg_reconstruct_row(struct col_block *cols, uint16_t ncols,
-                                        uint16_t ri, struct row *tmp_row,
-                                        int *tmp_row_inited,
-                                        struct bump_alloc *scratch)
-{
-    if (!*tmp_row_inited) {
-        tmp_row->cells.count = ncols;
-        tmp_row->cells.items = (struct cell *)bump_alloc(
-            scratch, ncols * sizeof(struct cell));
-        *tmp_row_inited = 1;
-    }
-    for (uint16_t c = 0; c < ncols; c++) {
-        struct col_block *cb = &cols[c];
-        struct cell *cell = &tmp_row->cells.items[c];
-        cell->type = cb->type;
-        if (cb->nulls[ri]) {
-            cell->is_null = 1;
-            memset(&cell->value, 0, sizeof(cell->value));
-        } else {
-            cell->is_null = 0;
-            cb_to_cell_at(cb, ri, cell);
-        }
-    }
-}
-
 /* Accumulate a non-null col_block value into aggregate accumulators.
  * Dispatches on storage class (7 cases) instead of column_type (14 cases). */
 static inline void agg_accumulate_cb(const struct col_block *acb, uint16_t ri,
@@ -3778,11 +3702,10 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     /* FILTER (WHERE ...): evaluate per-aggregate filter condition */
                     struct agg_expr *ae_filt = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
                     if (ae_filt->filter_cond != IDX_NONE) {
-                        agg_reconstruct_row(input.cols, child_ncols, ri,
-                                            &st->tmp_row, &st->tmp_row_inited,
-                                            &ctx->arena->scratch);
-                        if (!eval_condition(ae_filt->filter_cond, ctx->arena,
-                                            &st->tmp_row, pn->hash_agg.table, NULL))
+                        struct col_row_ref fref = { .cols = input.cols, .ncols = child_ncols, .ri = ri };
+                        if (!eval_condition_col(ae_filt->filter_cond, ctx->arena,
+                                               &fref, pn->hash_agg.table, NULL,
+                                               &ctx->arena->scratch))
                             continue;
                     }
 
@@ -3801,12 +3724,10 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         char numbuf[64];
                         if (ac == -2) {
                             /* expression-based: eval expr to get text */
-                            agg_reconstruct_row(input.cols, child_ncols, ri,
-                                                &st->tmp_row, &st->tmp_row_inited,
-                                                &ctx->arena->scratch);
-                            struct cell cv = eval_expr(ae_str->expr_idx, ctx->arena,
-                                                       pn->hash_agg.table, &st->tmp_row,
-                                                       ctx->db, &ctx->arena->scratch);
+                            struct col_row_ref sref = { .cols = input.cols, .ncols = child_ncols, .ri = ri };
+                            struct cell cv = eval_expr_col(ae_str->expr_idx, ctx->arena,
+                                                           pn->hash_agg.table, &sref,
+                                                           ctx->db, &ctx->arena->scratch);
                             if (cv.is_null) continue;
                             if (column_type_is_text(cv.type)) val_str = cv.value.as_text;
                             else {
@@ -3940,14 +3861,12 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     }
 
                     if (ac == -2) {
-                        /* Expression-based aggregate (non-STRING_AGG): reconstruct temp row, eval expr */
+                        /* Expression-based aggregate (non-STRING_AGG): eval expr via col_row_ref */
                         struct agg_expr *ae = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
-                        agg_reconstruct_row(input.cols, child_ncols, ri,
-                                            &st->tmp_row, &st->tmp_row_inited,
-                                            &ctx->arena->scratch);
-                        struct cell cv = eval_expr(ae->expr_idx, ctx->arena,
-                                                   pn->hash_agg.table, &st->tmp_row,
-                                                   ctx->db, &ctx->arena->scratch);
+                        struct col_row_ref eref = { .cols = input.cols, .ncols = child_ncols, .ri = ri };
+                        struct cell cv = eval_expr_col(ae->expr_idx, ctx->arena,
+                                                       pn->hash_agg.table, &eref,
+                                                       ctx->db, &ctx->arena->scratch);
                         if (cv.is_null) continue;
                         st->nonnull[idx]++;
                         if (cv.type == COLUMN_TYPE_FLOAT || cv.type == COLUMN_TYPE_NUMERIC) {
@@ -4342,11 +4261,10 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     /* FILTER (WHERE ...): evaluate per-aggregate filter condition */
                     struct agg_expr *ae_filt = &ctx->arena->aggregates.items[pn->simple_agg.agg_start + a];
                     if (ae_filt->filter_cond != IDX_NONE) {
-                        agg_reconstruct_row(input.cols, child_ncols, ri,
-                                            &st->tmp_row, &st->tmp_row_inited,
-                                            &ctx->arena->scratch);
-                        if (!eval_condition(ae_filt->filter_cond, ctx->arena,
-                                            &st->tmp_row, pn->simple_agg.table, NULL))
+                        struct col_row_ref fref = { .cols = input.cols, .ncols = child_ncols, .ri = ri };
+                        if (!eval_condition_col(ae_filt->filter_cond, ctx->arena,
+                                               &fref, pn->simple_agg.table, NULL,
+                                               &ctx->arena->scratch))
                             continue;
                     }
 
@@ -4356,12 +4274,10 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         int val_is_null = 0;
                         char numbuf[64];
                         if (ac == -2) {
-                            agg_reconstruct_row(input.cols, child_ncols, ri,
-                                                &st->tmp_row, &st->tmp_row_inited,
-                                                &ctx->arena->scratch);
-                            struct cell cv = eval_expr(ae_filt->expr_idx, ctx->arena,
-                                                       pn->simple_agg.table, &st->tmp_row,
-                                                       ctx->db, &ctx->arena->scratch);
+                            struct col_row_ref sref = { .cols = input.cols, .ncols = child_ncols, .ri = ri };
+                            struct cell cv = eval_expr_col(ae_filt->expr_idx, ctx->arena,
+                                                           pn->simple_agg.table, &sref,
+                                                           ctx->db, &ctx->arena->scratch);
                             if (cv.is_null) {
                                 if (ae_filt->func == AGG_ARRAY_AGG) { val_str = "NULL"; val_is_null = 1; }
                                 else continue;
@@ -4519,14 +4435,12 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     }
 
                     if (ac == -2) {
-                        /* Expression-based aggregate */
+                        /* Expression-based aggregate: eval expr via col_row_ref */
                         struct agg_expr *ae = &ctx->arena->aggregates.items[pn->simple_agg.agg_start + a];
-                        agg_reconstruct_row(input.cols, child_ncols, ri,
-                                            &st->tmp_row, &st->tmp_row_inited,
-                                            &ctx->arena->scratch);
-                        struct cell cv = eval_expr(ae->expr_idx, ctx->arena,
-                                                   pn->simple_agg.table, &st->tmp_row,
-                                                   ctx->db, &ctx->arena->scratch);
+                        struct col_row_ref eref = { .cols = input.cols, .ncols = child_ncols, .ri = ri };
+                        struct cell cv = eval_expr_col(ae->expr_idx, ctx->arena,
+                                                       pn->simple_agg.table, &eref,
+                                                       ctx->db, &ctx->arena->scratch);
                         if (cv.is_null) continue;
                         /* COUNT(DISTINCT expr): hash the result and deduplicate */
                         if (st->distinct_sets[a].cap > 0) {
@@ -6187,41 +6101,6 @@ static inline int flat_col_ord_cmp(void *data, enum column_type ct, uint8_t *nul
     }
 }
 
-/* Reconstruct a struct row from flat window data at the given row index.
- * Lazily allocates cells on first call. Used by FILTER evaluation. */
-static void window_reconstruct_row(struct window_state *st, uint32_t ri,
-                                    struct bump_alloc *scratch)
-{
-    if (!st->tmp_row_inited) {
-        st->tmp_row.cells.count = st->input_ncols;
-        st->tmp_row.cells.items = (struct cell *)bump_alloc(
-            scratch, st->input_ncols * sizeof(struct cell));
-        st->tmp_row_inited = 1;
-    }
-    for (uint16_t c = 0; c < st->input_ncols; c++) {
-        struct cell *cell = &st->tmp_row.cells.items[c];
-        cell->type = st->flat_types[c];
-        if (st->flat_nulls[c][ri]) {
-            cell->is_null = 1;
-            memset(&cell->value, 0, sizeof(cell->value));
-        } else {
-            cell->is_null = 0;
-            size_t esz = st->flat_elem_sizes[c];
-            const uint8_t *src = (const uint8_t *)st->flat_data[c] + ri * esz;
-            switch (column_type_storage(st->flat_types[c])) {
-            case STORE_I32: cell->value.as_int = *(const int32_t *)src; break;
-            case STORE_I64: cell->value.as_bigint = *(const int64_t *)src; break;
-            case STORE_I16: cell->value.as_smallint = *(const int16_t *)src; break;
-            case STORE_F64: cell->value.as_float = *(const double *)src; break;
-            case STORE_STR: cell->value.as_text = *(char *const *)src; break;
-            case STORE_IV:  cell->value.as_interval = *(const struct interval *)src; break;
-            case STORE_UUID: cell->value.as_uuid = *(const struct uuid_val *)src; break;
-            case STORE_VEC: cell->value.as_text = NULL; break;
-            }
-        }
-    }
-}
-
 /* Check if a row passes the FILTER (WHERE expr) for a window function.
  * Returns 1 if the row passes (should be included in accumulation), 0 if not. */
 static int window_filter_passes(struct plan_exec_ctx *ctx, struct window_state *st,
@@ -6230,9 +6109,16 @@ static int window_filter_passes(struct plan_exec_ctx *ctx, struct window_state *
     if (!pn->window.win_has_filter[w]) return 1;
     uint32_t filt_expr = pn->window.win_filter_expr[w];
     if (filt_expr == IDX_NONE) return 1;
-    window_reconstruct_row(st, flat_ri, &ctx->arena->scratch);
-    struct cell cv = eval_expr(filt_expr, ctx->arena, pn->window.table,
-                               &st->tmp_row, NULL, &ctx->arena->scratch);
+    struct flat_row_ref fref = {
+        .col_data    = st->flat_data,
+        .col_nulls   = st->flat_nulls,
+        .col_types   = st->flat_types,
+        .col_vec_dims = NULL,
+        .ncols       = st->input_ncols,
+        .ri          = flat_ri,
+    };
+    struct cell cv = eval_expr_flat(filt_expr, ctx->arena, pn->window.table,
+                                    &fref, NULL, &ctx->arena->scratch);
     if (cv.is_null) return 0;
     switch (cv.type) {
     case COLUMN_TYPE_BOOLEAN:
