@@ -2120,14 +2120,14 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
     plan_exec_init(&ctx, &inner_qp->arena, db, current);
 
     uint16_t ncols = plan_node_ncols(&inner_qp->arena, current);
-    if (ncols == 0) { cte_cache_invalidate(); return -1; }
+    if (ncols == 0) { plan_exec_cleanup(&ctx); cte_cache_invalidate(); return -1; }
 
     struct row_block block;
     row_block_alloc(&block, ncols, &inner_qp->arena.scratch);
 
     int rc = plan_next_block(&ctx, current, &block);
     if (rc != 0) {
-        if (inner_qp->arena.errmsg[0]) { cte_cache_invalidate(); return -1; }
+        if (inner_qp->arena.errmsg[0]) { plan_exec_cleanup(&ctx); cte_cache_invalidate(); return -1; }
         /* No rows — send empty RowDescription */
         enum column_type types[64];
         for (uint16_t i = 0; i < ncols && i < 64; i++)
@@ -2136,8 +2136,9 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
         struct msgbuf rd_buf;
         msgbuf_init(&rd_buf);
         build_row_desc_for_plan(&rd_buf, inner_qp, src, NULL, 0, ncols, types);
-        if (msg_send(fd, 'T', &rd_buf) != 0) { msgbuf_free(&rd_buf); return -1; }
+        if (msg_send(fd, 'T', &rd_buf) != 0) { msgbuf_free(&rd_buf); plan_exec_cleanup(&ctx); return -1; }
         msgbuf_free(&rd_buf);
+        plan_exec_cleanup(&ctx);
         return 0;
     }
 
@@ -2153,6 +2154,7 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
 
     if (msg_send(fd, 'T', &rd_buf) != 0) {
         msgbuf_free(&rd_buf);
+        plan_exec_cleanup(&ctx);
         return -1;
     }
 
@@ -2213,6 +2215,7 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
         if (wire.len >= 262144) {
             if (send_all(fd, wire.data, wire.len) != 0) {
                 msgbuf_free(&wire); msgbuf_free(&cache_buf);
+                plan_exec_cleanup(&ctx);
                 return -1;
             }
             wire.len = 0;
@@ -2222,6 +2225,7 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
         if (plan_next_block(&ctx, current, &block) != 0) {
             if (inner_qp->arena.errmsg[0]) {
                 msgbuf_free(&wire); msgbuf_free(&cache_buf);
+                plan_exec_cleanup(&ctx);
                 cte_cache_invalidate();
                 return -1;
             }
@@ -2232,6 +2236,7 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
     if (wire.len > 0) {
         if (send_all(fd, wire.data, wire.len) != 0) {
             msgbuf_free(&wire); msgbuf_free(&cache_buf);
+            plan_exec_cleanup(&ctx);
             return -1;
         }
     }
@@ -2239,6 +2244,7 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
 
     rcache_store_plan_result(rce, rc_hash, rc_gen, (int)total_rows, &cache_buf);
     msgbuf_free(&cache_buf);
+    plan_exec_cleanup(&ctx);
     return (int)total_rows;
 }
 
@@ -2607,14 +2613,14 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
     plan_exec_init(&ctx, qa, db, current);
 
     uint16_t ncols = plan_node_ncols(qa, current);
-    if (ncols == 0) { remove_temp_table(db, agg_temp); return -1; }
+    if (ncols == 0) { plan_exec_cleanup(&ctx); remove_temp_table(db, agg_temp); return -1; }
 
     struct row_block block;
     row_block_alloc(&block, ncols, &qa->scratch);
 
     int rc = plan_next_block(&ctx, current, &block);
     if (rc != 0) {
-        if (qa->errmsg[0]) { remove_temp_table(db, agg_temp); return -1; }
+        if (qa->errmsg[0]) { plan_exec_cleanup(&ctx); remove_temp_table(db, agg_temp); return -1; }
         /* No rows — send empty result */
         enum column_type types[64];
         for (uint16_t i = 0; i < ncols && i < 64; i++)
@@ -2635,6 +2641,7 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
             }
         }
         send_row_desc_plan(fd, outer_t, NULL, 0, q, ncols, types);
+        plan_exec_cleanup(&ctx);
         remove_temp_table(db, agg_temp);
         return 0;
     }
@@ -2651,6 +2658,7 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
 
     if (msg_send(fd, 'T', &rd_buf) != 0) {
         msgbuf_free(&rd_buf);
+        plan_exec_cleanup(&ctx);
         remove_temp_table(db, agg_temp);
         return -1;
     }
@@ -2712,6 +2720,7 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
         if (wire.len >= 262144) {
             if (send_all(fd, wire.data, wire.len) != 0) {
                 msgbuf_free(&wire); msgbuf_free(&cache_buf);
+                plan_exec_cleanup(&ctx);
                 remove_temp_table(db, agg_temp);
                 return -1;
             }
@@ -2722,6 +2731,7 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
         if (plan_next_block(&ctx, current, &block) != 0) {
             if (qa->errmsg[0]) {
                 msgbuf_free(&wire); msgbuf_free(&cache_buf);
+                plan_exec_cleanup(&ctx);
                 remove_temp_table(db, agg_temp);
                 return -1;
             }
@@ -2732,6 +2742,7 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
     if (wire.len > 0) {
         if (send_all(fd, wire.data, wire.len) != 0) {
             msgbuf_free(&wire); msgbuf_free(&cache_buf);
+            plan_exec_cleanup(&ctx);
             remove_temp_table(db, agg_temp);
             return -1;
         }
@@ -2740,6 +2751,7 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
 
     rcache_store_plan_result(rce, rc_hash, rc_gen, (int)total_rows, &cache_buf);
     msgbuf_free(&cache_buf);
+    plan_exec_cleanup(&ctx);
     remove_temp_table(db, agg_temp);
     return (int)total_rows;
 }
@@ -2784,6 +2796,8 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     struct table *from_sub_temp = NULL;
     uint32_t saved_from_sub_sql = s->from_subquery_sql;
     sv saved_table = s->table;
+    struct plan_exec_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
 
     uint32_t saved_ctes_count = s->ctes_count;
     uint32_t saved_ctes_start = s->ctes_start;
@@ -2817,6 +2831,7 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     if (0) {
     cte_bail:;
     cte_restore_bail:
+        plan_exec_cleanup(&ctx);
         s->ctes_count = saved_ctes_count;
         s->ctes_start = saved_ctes_start;
         s->cte_name = saved_cte_name;
@@ -2871,7 +2886,6 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     if (pr.status != PLAN_OK)
         goto cte_restore_bail;
 
-    struct plan_exec_ctx ctx;
     plan_exec_init(&ctx, &q->arena, db, pr.node);
 
     uint16_t ncols = plan_node_ncols(&q->arena, pr.node);
@@ -2994,18 +3008,21 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
     rcache_store_plan_result(rce, rc_hash, rc_gen, (int)total_rows, &cache_buf);
     msgbuf_free(&cache_buf);
 
+    plan_exec_cleanup(&ctx);
     if (from_sub_temp) remove_temp_table(db, from_sub_temp);
     for (size_t ci = n_cte_temps; ci > 0; ci--)
         remove_temp_table(db, cte_temps[ci - 1]);
     return (int)total_rows;
 
 cte_cleanup_ok:
+    plan_exec_cleanup(&ctx);
     if (from_sub_temp) remove_temp_table(db, from_sub_temp);
     for (size_t ci = n_cte_temps; ci > 0; ci--)
         remove_temp_table(db, cte_temps[ci - 1]);
     return 0;
 
 cte_cleanup:
+    plan_exec_cleanup(&ctx);
     if (from_sub_temp) remove_temp_table(db, from_sub_temp);
     for (size_t ci = n_cte_temps; ci > 0; ci--)
         remove_temp_table(db, cte_temps[ci - 1]);
@@ -4452,13 +4469,20 @@ int pgwire_run(struct pgwire_server *srv)
         fds[0].revents = 0;
         fds[1].revents = 0;
 
-        int nready = poll(fds, (nfds_t)(2 + nclients), -1 /* block until event */);
+        /* Use a short poll timeout when disk tables need compaction;
+         * otherwise block indefinitely until a client event arrives. */
+        int poll_timeout = db_needs_compaction(srv->db) ? 50 : -1;
+        int nready = poll(fds, (nfds_t)(2 + nclients), poll_timeout);
         if (nready < 0) {
             if (errno == EINTR) continue;
             perror("poll");
             break;
         }
-        if (nready == 0) continue; /* timeout, check g_running */
+        if (nready == 0) {
+            /* Idle timeout — run one compaction step */
+            db_compact_step(srv->db);
+            continue;
+        }
 
         /* drain wakeup pipe if signalled */
         if (fds[0].revents & POLLIN) {

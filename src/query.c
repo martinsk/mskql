@@ -7089,7 +7089,7 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                 passes = !cell_is_null(&hv) && hv.value.as_bool;
                 cell_release_rb(&hv, rb);
             } else {
-                passes = eval_condition(s->having_cond, arena, &dst, &having_t, NULL);
+                passes = eval_condition(s->having_cond, arena, &dst, &having_t, db);
             }
             if (!passes) {
                 if (rb) da_free(&dst.cells);
@@ -7236,6 +7236,9 @@ static int query_select_exec(struct table *t, struct query_select *s, struct que
             plan_exec_init(&ctx, arena, db, pr.node);
             return plan_exec_to_rows(&ctx, pr.node, result, rb);
         }
+        if (s->has_group_by && s->aggregates_count > 0)
+            fprintf(stderr, "DEBUG: plan_build_select NOTIMPL for GROUP BY+AGG (grp=%u agg=%u parsed=%u having=%d)\n",
+                    s->group_by_count, s->aggregates_count, s->parsed_columns_count, s->has_having);
     }
 
     /* dispatch to GROUP BY path */
@@ -7896,6 +7899,10 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct que
                 t->rows.items[j] = t->rows.items[j + 1];
             t->rows.count--;
             table_flat_delete_row(t, i);
+            if (t->kind == TABLE_DISK) {
+                int wb = (int)disk_wal_append_delete(t->disk.dir_path, (uint64_t)i);
+                if (wb > 0) { t->disk.wal_bytes += (uint64_t)wb; t->disk.wal_dirty = 1; }
+            }
             deleted++;
             t->generation++;
             db->total_generation++;
@@ -8136,6 +8143,9 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                 table_flat_update_row(t, ri, &t->rows.items[ri]);
             }
         }
+        /* Mark disk table dirty so compaction rewrites the base file */
+        if (t->kind == TABLE_DISK)
+            t->disk.wal_dirty = 1;
     }
 
     if (!has_ret && result) {
@@ -8778,6 +8788,17 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
     size_t rows_added = t->rows.count - rows_before;
     if (rows_added > 0) {
         table_flat_append_rows_bulk(t, &t->rows.items[rows_before], rows_added);
+        /* For disk tables, also write to WAL */
+        if (t->kind == TABLE_DISK) {
+            int wb = disk_wal_append_insert(t->disk.dir_path,
+                                            &t->rows.items[rows_before],
+                                            rows_added, t->columns.items,
+                                            (uint16_t)t->columns.count);
+            if (wb > 0) {
+                t->disk.wal_bytes += (uint64_t)wb;
+                t->disk.wal_dirty = 1;
+            }
+        }
         t->generation++;
         db->total_generation++;
     }

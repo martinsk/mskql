@@ -141,6 +141,13 @@ void table_deep_copy(struct table *dst, const struct table *src)
         dst->parquet.path = src->parquet.path ? strdup(src->parquet.path) : NULL;
         memset(&dst->parquet.pq_cache, 0, sizeof(dst->parquet.pq_cache));
         break;
+    case TABLE_DISK:
+        dst->disk.dir_path = src->disk.dir_path ? strdup(src->disk.dir_path) : NULL;
+        memset(&dst->disk.meta, 0, sizeof(dst->disk.meta));
+        dst->disk.cache_valid = 0;
+        dst->disk.wal_bytes = src->disk.wal_bytes;
+        dst->disk.wal_dirty = src->disk.wal_dirty;
+        break;
     }
 }
 
@@ -566,6 +573,11 @@ void table_free(struct table *t)
             free(t->parquet.pq_cache.col_types);
             free(t->parquet.pq_cache.col_str_lens);
         }
+        break;
+    case TABLE_DISK:
+        free(t->disk.dir_path);
+        disk_meta_free(&t->disk.meta);
+        /* flat_table cache is freed above (shared flat field) */
         break;
     }
 }

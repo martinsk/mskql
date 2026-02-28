@@ -95,6 +95,57 @@ pq.write_table(pa.table({
     "tax_rate": pa.array([10, 8, 12, 9], type=pa.int32()),
 }), os.path.join(OUT, "ref_regions.parquet"))
 
+# ── Large-scale stress test fixtures ──────────────────────────────────────────
+
+L = 5_000_000   # 5M row fact table
+
+CATS_20 = [
+    "groceries", "dining", "travel", "fuel", "utilities",
+    "entertainment", "healthcare", "insurance", "clothing", "electronics",
+    "education", "subscriptions", "home", "auto", "gifts",
+    "charity", "sports", "pets", "beauty", "office",
+]
+REGIONS_8 = ["us_east", "us_west", "us_central", "eu_west",
+             "eu_east", "apac", "latam", "africa"]
+TIERS_4 = ["free", "basic", "premium", "enterprise"]
+
+# 9. large_transactions.parquet — 5M rows
+#    id INT, account_id INT (100K), merchant_id INT (20K), amount INT,
+#    fee INT, ts_day INT (0..729 ≈ 2 years), category TEXT (20 categories)
+print("Generating large_transactions.parquet (5M rows)...")
+pq.write_table(pa.table({
+    "id":          pa.array(list(range(L)), type=pa.int32()),
+    "account_id":  pa.array([i % 100_000 for i in range(L)], type=pa.int32()),
+    "merchant_id": pa.array([i % 20_000 for i in range(L)], type=pa.int32()),
+    "amount":      pa.array([1 + (i * 13) % 9999 for i in range(L)], type=pa.int32()),
+    "fee":         pa.array([(i * 7) % 50 for i in range(L)], type=pa.int32()),
+    "ts_day":      pa.array([i % 730 for i in range(L)], type=pa.int32()),
+    "category":    pa.array([CATS_20[i % 20] for i in range(L)], type=pa.string()),
+}), os.path.join(OUT, "large_transactions.parquet"))
+
+# 10. large_accounts.parquet — 100K rows
+#     id INT, name TEXT, region TEXT (8), tier TEXT (4), balance INT, created_day INT
+print("Generating large_accounts.parquet (100K rows)...")
+pq.write_table(pa.table({
+    "id":          pa.array(list(range(100_000)), type=pa.int32()),
+    "name":        pa.array([f"acct_{i}" for i in range(100_000)], type=pa.string()),
+    "region":      pa.array([REGIONS_8[i % 8] for i in range(100_000)], type=pa.string()),
+    "tier":        pa.array([TIERS_4[i % 4] for i in range(100_000)], type=pa.string()),
+    "balance":     pa.array([100 + (i * 31) % 99_900 for i in range(100_000)], type=pa.int32()),
+    "created_day": pa.array([i % 730 for i in range(100_000)], type=pa.int32()),
+}), os.path.join(OUT, "large_accounts.parquet"))
+
+# 11. large_merchants.parquet — 20K rows
+#     id INT, name TEXT, category TEXT (20), city TEXT (200), rating INT
+print("Generating large_merchants.parquet (20K rows)...")
+pq.write_table(pa.table({
+    "id":       pa.array(list(range(20_000)), type=pa.int32()),
+    "name":     pa.array([f"merch_{i}" for i in range(20_000)], type=pa.string()),
+    "category": pa.array([CATS_20[i % 20] for i in range(20_000)], type=pa.string()),
+    "city":     pa.array([f"city_{i % 200}" for i in range(20_000)], type=pa.string()),
+    "rating":   pa.array([1 + (i * 17) % 5 for i in range(20_000)], type=pa.int32()),
+}), os.path.join(OUT, "large_merchants.parquet"))
+
 print(f"Generated benchmark fixtures in {OUT}/")
 for f in sorted(os.listdir(OUT)):
     sz = os.path.getsize(os.path.join(OUT, f))

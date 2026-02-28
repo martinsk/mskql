@@ -5,3 +5,4 @@ tests/fixtures/
 bench/parquet_fixtures/
 .DS_Store
 bench/__pycache__
+mskql_data/

@@ -773,6 +773,9 @@ struct query_create_table {
     /* table-level UNIQUE (col1, col2, ...) */
     uint32_t unique_columns_start; /* index into arena.svs */
     uint32_t unique_columns_count;
+    /* disk-backed table */
+    int is_disk;            /* 1 = CREATE DISK TABLE */
+    sv dir_path;            /* DIRECTORY 'path' clause */
 };
 
 struct query_drop_table {

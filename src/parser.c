@@ -116,7 +116,7 @@ static int is_keyword(sv word)
         "SHOW", "RESET", "DISCARD", "DEALLOCATE",
         "OPERATOR", "COLLATE",
         "NULLS", "FIRST", "LAST", "FILTER",
-        "FOREIGN", "OPTIONS", "FILENAME",
+        "FOREIGN", "OPTIONS", "FILENAME", "DISK", "DIRECTORY",
         "SIMILAR", "ESCAPE",
         "WINDOW",
         "BOOL_AND", "BOOL_OR", "STDDEV", "VARIANCE",
@@ -6747,7 +6747,12 @@ static int parse_create(struct lexer *l, struct query *out)
         return 0;
     }
 
-    /* CREATE TABLE ... */
+    /* CREATE DISK TABLE ... or CREATE TABLE ... */
+    int is_disk = 0;
+    if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "DISK")) {
+        is_disk = 1;
+        tok = lexer_next(l); /* consume DISK, expect TABLE next */
+    }
     if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "TABLE")) {
         arena_set_error(&out->arena, "42601", "expected TABLE, INDEX, or UNIQUE INDEX after CREATE");
         return -1;
@@ -6779,7 +6784,29 @@ static int parse_create(struct lexer *l, struct query *out)
     }
 
     int rc = parse_create_table(l, out);
-    if (rc == 0) out->create_table.if_not_exists = if_not_exists;
+    if (rc == 0) {
+        out->create_table.if_not_exists = if_not_exists;
+        out->create_table.is_disk = is_disk;
+    }
+
+    /* For disk tables, parse trailing DIRECTORY 'path' clause */
+    if (rc == 0 && is_disk) {
+        struct token dir_tok = lexer_peek(l);
+        if ((dir_tok.type == TOK_KEYWORD || dir_tok.type == TOK_IDENTIFIER) &&
+            sv_eq_ignorecase_cstr(dir_tok.value, "DIRECTORY")) {
+            lexer_next(l); /* consume DIRECTORY */
+            struct token path_tok = lexer_next(l);
+            if (path_tok.type != TOK_STRING) {
+                arena_set_error(&out->arena, "42601", "expected quoted path after DIRECTORY");
+                return -1;
+            }
+            out->create_table.dir_path = path_tok.value;
+        } else {
+            arena_set_error(&out->arena, "42601", "CREATE DISK TABLE requires DIRECTORY 'path' clause");
+            return -1;
+        }
+    }
+
     return rc;
 }
 

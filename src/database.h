@@ -47,6 +47,7 @@ struct database {
      * Safe because the server is single-threaded. */
     struct txn_state *active_txn;
     uint64_t total_generation; /* sum of all table generations — bumped alongside t->generation++ */
+    char *catalog_path; /* path to disk table catalog file, or NULL if none */
 };
 
 void db_init(struct database *db, const char *name);
@@ -77,5 +78,10 @@ void snapshot_free(struct db_snapshot *snap);
 /* COW trigger: call before mutating a table inside a transaction.
  * Saves a deep-copy of the table if not already saved. */
 void snapshot_cow_table(struct db_snapshot *snap, struct database *db, const char *table_name);
+
+/* Disk table compaction: returns 1 if any table needs compaction, 0 otherwise.
+ * db_compact_step compacts at most one dirty disk table per call (incremental). */
+int db_needs_compaction(struct database *db);
+int db_compact_step(struct database *db);
 
 #endif

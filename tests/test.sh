@@ -145,7 +145,9 @@ start_server() {
     local lsan_opts="suppressions=$LSAN_SUPP"
     ASAN_OPTIONS="detect_leaks=1:exitcode=0" \
         LSAN_OPTIONS="$lsan_opts" \
-        MSKQL_PORT="$port" "$PROJECT_DIR/build/mskql_debug" >/dev/null 2>"$worker_dir/asan.log" &
+        MSKQL_PORT="$port" \
+        MSKQL_DATA_DIR="$worker_dir/mskql_data" \
+        "$PROJECT_DIR/build/mskql_debug" >/dev/null 2>"$worker_dir/asan.log" &
     local srv_pid=$!
     echo "$srv_pid" > "$pidfile"
     # wait until the server is accepting connections

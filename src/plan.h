@@ -386,8 +386,8 @@ struct hash_agg_state {
     uint32_t *str_ord_cap;   /* bump: [agg_count * group_cap] */
     /* STDDEV accumulator */
     double  *sumsq;        /* bump: [agg_count * group_cap] sum of squares */
-    /* group key values stored in col_blocks */
-    struct col_block *group_keys;
+    /* group key values stored in a growable flat_table */
+    struct flat_table gk;         /* ncols = ngroup_cols, heap-allocated */
     uint32_t  ngroups;
     uint32_t  group_cap;
     int       input_done;
@@ -517,6 +517,9 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
  * This is the main entry point for the plan executor. */
 int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
                       struct rows *result, struct bump_alloc *rb);
+
+/* Free heap-allocated state (e.g. flat_table group keys) after plan execution. */
+void plan_exec_cleanup(struct plan_exec_ctx *ctx);
 
 /* Get output column count for a plan node. */
 uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx);

@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 void db_init(struct database *db, const char *name)
 {
@@ -20,6 +22,7 @@ void db_init(struct database *db, const char *name)
     da_init(&db->sequences);
     db->active_txn = NULL;
     db->total_generation = 0;
+    db->catalog_path = NULL;
 }
 
 struct enum_type *db_find_type(struct database *db, const char *name)
@@ -3152,18 +3155,65 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                 uq_idx.is_unique = 1;
                 da_push(&t.indexes, uq_idx);
             }
+            /* If this is a disk-backed table, set up the disk storage */
+            if (crt->is_disk) {
+                char *dir = sv_to_cstr(crt->dir_path);
+                mkdir(dir, 0755);
+                t.kind = TABLE_DISK;
+                t.disk.dir_path = dir;
+                memset(&t.disk.meta, 0, sizeof(t.disk.meta));
+                t.disk.cache_valid = 0;
+                t.disk.wal_bytes = 0;
+                t.disk.wal_dirty = 0;
+                /* Write initial .mskd file with schema only */
+                char mskd_path[1024];
+                disk_path_base(dir, mskd_path, sizeof(mskd_path));
+                /* Need flat_table initialized so disk_write_table can read schema */
+                if (t.columns.count > 0)
+                    table_flat_init_schema(&t);
+                if (disk_write_table(mskd_path, &t) != 0) {
+                    arena_set_error(&q->arena, "58000", "failed to write disk table file");
+                    table_free(&t);
+                    return -1;
+                }
+                /* Read back the schema into disk.meta */
+                if (disk_read_schema(mskd_path, &t.disk.meta) != 0) {
+                    arena_set_error(&q->arena, "58000", "failed to read disk table schema");
+                    table_free(&t);
+                    return -1;
+                }
+                t.disk.cache_valid = 1; /* flat is current (empty but valid) */
+            }
+
             da_push(&db->tables, t);
             db->total_generation++;
+            /* Persist disk catalog after adding a disk table */
+            if (crt->is_disk && db->catalog_path)
+                disk_catalog_save(db->catalog_path, db);
             return 0;
         }
         case QUERY_TYPE_DROP: {
             sv drop_tbl = q->drop_table.table;
             int found = 0;
+            int was_disk = 0;
             for (size_t i = 0; i < db->tables.count; i++) {
                 if (sv_eq_cstr(drop_tbl, db->tables.items[i].name)) {
                     /* COW trigger for DROP TABLE */
                     if (txn && txn->in_transaction && txn->snapshot)
                         snapshot_cow_table(txn->snapshot, db, db->tables.items[i].name);
+                    was_disk = (db->tables.items[i].kind == TABLE_DISK);
+                    /* Remove disk files for TABLE_DISK */
+                    if (was_disk && db->tables.items[i].disk.dir_path) {
+                        char path_buf[1024];
+                        disk_path_base(db->tables.items[i].disk.dir_path, path_buf, sizeof(path_buf));
+                        remove(path_buf);
+                        disk_path_wal(db->tables.items[i].disk.dir_path, path_buf, sizeof(path_buf));
+                        remove(path_buf);
+                        snprintf(path_buf, sizeof(path_buf), "%s/data.mskd.tmp",
+                                 db->tables.items[i].disk.dir_path);
+                        remove(path_buf);
+                        rmdir(db->tables.items[i].disk.dir_path);
+                    }
                     table_free(&db->tables.items[i]);
                     for (size_t j = i; j + 1 < db->tables.count; j++)
                         db->tables.items[j] = db->tables.items[j + 1];
@@ -3196,6 +3246,9 @@ int db_exec(struct database *db, struct query *q, struct rows *result, struct bu
                     }
                 }
             }
+            /* Persist disk catalog after dropping a disk table */
+            if (was_disk && db->catalog_path)
+                disk_catalog_save(db->catalog_path, db);
             return 0;
         }
         case QUERY_TYPE_CREATE_TYPE: {
@@ -4141,6 +4194,7 @@ void db_free(struct database *db)
 {
     catalog_cleanup(db);
     free(db->name);
+    free(db->catalog_path);
     for (size_t i = 0; i < db->tables.count; i++) {
         table_free(&db->tables.items[i]);
     }
@@ -4158,9 +4212,25 @@ void db_free(struct database *db)
 void db_reset(struct database *db)
 {
     char *name = db->name;
+    char *cat_path = db->catalog_path;
     db->name = NULL;
-    for (size_t i = 0; i < db->tables.count; i++)
+    db->catalog_path = NULL;
+    for (size_t i = 0; i < db->tables.count; i++) {
+        /* Clean up disk files for TABLE_DISK before freeing */
+        if (db->tables.items[i].kind == TABLE_DISK &&
+            db->tables.items[i].disk.dir_path) {
+            char path_buf[1024];
+            disk_path_base(db->tables.items[i].disk.dir_path, path_buf, sizeof(path_buf));
+            remove(path_buf);
+            disk_path_wal(db->tables.items[i].disk.dir_path, path_buf, sizeof(path_buf));
+            remove(path_buf);
+            snprintf(path_buf, sizeof(path_buf), "%s/data.mskd.tmp",
+                     db->tables.items[i].disk.dir_path);
+            remove(path_buf);
+            rmdir(db->tables.items[i].disk.dir_path);
+        }
         table_free(&db->tables.items[i]);
+    }
     da_free(&db->tables);
     for (size_t i = 0; i < db->types.count; i++)
         enum_type_free(&db->types.items[i]);
@@ -4170,4 +4240,44 @@ void db_reset(struct database *db)
     da_free(&db->sequences);
     db_init(db, name);
     free(name);
+    db->catalog_path = cat_path;
+    /* Save empty catalog after reset */
+    if (db->catalog_path)
+        disk_catalog_save(db->catalog_path, db);
+}
+
+int db_needs_compaction(struct database *db)
+{
+    for (size_t i = 0; i < db->tables.count; i++) {
+        if (db->tables.items[i].kind == TABLE_DISK &&
+            db->tables.items[i].disk.wal_dirty)
+            return 1;
+    }
+    return 0;
+}
+
+int db_compact_step(struct database *db)
+{
+    for (size_t i = 0; i < db->tables.count; i++) {
+        struct table *t = &db->tables.items[i];
+        if (t->kind != TABLE_DISK || !t->disk.wal_dirty) continue;
+
+        /* Ensure cache is loaded before compacting */
+        if (!t->disk.cache_valid) {
+            char mskd_path[1024];
+            disk_path_base(t->disk.dir_path, mskd_path, sizeof(mskd_path));
+            flat_table_free(&t->flat);
+            memset(&t->flat, 0, sizeof(t->flat));
+            if (disk_load_cache(mskd_path, &t->disk.meta, &t->flat) == 0)
+                disk_wal_replay(t->disk.dir_path, &t->flat, &t->disk.meta);
+            t->disk.cache_valid = 1;
+        }
+
+        if (disk_compact(t->disk.dir_path, &t->flat, &t->disk.meta) == 0) {
+            t->disk.wal_dirty = 0;
+            t->disk.wal_bytes = 0;
+        }
+        return 1; /* compacted one table — return to event loop */
+    }
+    return 0;
 }

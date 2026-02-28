@@ -309,14 +309,6 @@ static inline void cb_copy_value(struct col_block *dst, uint32_t dst_i,
            cb_elem_size(src));
 }
 
-/* Helper: bulk copy count values from src col_block to dst col_block. */
-static inline void cb_bulk_copy(struct col_block *dst,
-                                const struct col_block *src, uint32_t count)
-{
-    memcpy(dst->nulls, src->nulls, count);
-    memcpy(cb_data_ptr(dst, 0), cb_data_ptr(src, 0), count * cb_elem_size(src));
-}
-
 /* Helper: get output column count for a plan node. */
 uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
 {
@@ -481,8 +473,19 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     row_block_reset(out);
 
     /* Read directly from table->flat — always up-to-date (maintained on every
-     * INSERT/UPDATE/DELETE via table_flat_append_row/update_row/delete_row). */
+     * INSERT/UPDATE/DELETE via table_flat_append_row/update_row/delete_row).
+     * For TABLE_DISK: lazy-load from .mskd file on first access. */
     struct table *t = pn->seq_scan.table;
+    if (t->kind == TABLE_DISK && !t->disk.cache_valid) {
+        char mskd_path[1024];
+        disk_path_base(t->disk.dir_path, mskd_path, sizeof(mskd_path));
+        flat_table_free(&t->flat);
+        memset(&t->flat, 0, sizeof(t->flat));
+        if (disk_load_cache(mskd_path, &t->disk.meta, &t->flat) == 0) {
+            disk_wal_replay(t->disk.dir_path, &t->flat, &t->disk.meta);
+            t->disk.cache_valid = 1;
+        }
+    }
     if (!t->flat.col_data || t->flat.nrows == 0) return -1;
 
     uint16_t n = flat_table_read(&t->flat, &st->cursor, out,
@@ -1533,10 +1536,48 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             }
             case COLUMN_TYPE_INT:
             case COLUMN_TYPE_BOOLEAN: {
-                sel_count = vec_filter_i32(cb->data.i32, cb->nulls, pn->filter.cmp_val.value.as_int, op, cand, cand_count, sel);
+                if (pn->filter.cmp_val.type == COLUMN_TYPE_FLOAT ||
+                    pn->filter.cmp_val.type == COLUMN_TYPE_NUMERIC) {
+                    /* Promote INT column to double for correct cross-type comparison */
+                    double cv = pn->filter.cmp_val.value.as_float;
+                    const int32_t *vals = cb->data.i32;
+                    const uint8_t *nulls = cb->nulls;
+                    switch (op) {
+                        case CMP_EQ: FILTER_LOOP(!nulls[r] && (double)vals[r] == cv); break;
+                        case CMP_NE: FILTER_LOOP(!nulls[r] && (double)vals[r] != cv); break;
+                        case CMP_LT: FILTER_LOOP(!nulls[r] && (double)vals[r] <  cv); break;
+                        case CMP_GT: FILTER_LOOP(!nulls[r] && (double)vals[r] >  cv); break;
+                        case CMP_LE: FILTER_LOOP(!nulls[r] && (double)vals[r] <= cv); break;
+                        case CMP_GE: FILTER_LOOP(!nulls[r] && (double)vals[r] >= cv); break;
+                        default: break;
+                    }
+                    goto done;
+                }
+                int32_t cv = (pn->filter.cmp_val.type == COLUMN_TYPE_BIGINT)
+                    ? (int32_t)pn->filter.cmp_val.value.as_bigint
+                    : (pn->filter.cmp_val.type == COLUMN_TYPE_SMALLINT)
+                    ? (int32_t)pn->filter.cmp_val.value.as_smallint
+                    : pn->filter.cmp_val.value.as_int;
+                sel_count = vec_filter_i32(cb->data.i32, cb->nulls, cv, op, cand, cand_count, sel);
                 goto done;
             }
             case COLUMN_TYPE_BIGINT: {
+                if (pn->filter.cmp_val.type == COLUMN_TYPE_FLOAT ||
+                    pn->filter.cmp_val.type == COLUMN_TYPE_NUMERIC) {
+                    double cv = pn->filter.cmp_val.value.as_float;
+                    const int64_t *vals = cb->data.i64;
+                    const uint8_t *nulls = cb->nulls;
+                    switch (op) {
+                        case CMP_EQ: FILTER_LOOP(!nulls[r] && (double)vals[r] == cv); break;
+                        case CMP_NE: FILTER_LOOP(!nulls[r] && (double)vals[r] != cv); break;
+                        case CMP_LT: FILTER_LOOP(!nulls[r] && (double)vals[r] <  cv); break;
+                        case CMP_GT: FILTER_LOOP(!nulls[r] && (double)vals[r] >  cv); break;
+                        case CMP_LE: FILTER_LOOP(!nulls[r] && (double)vals[r] <= cv); break;
+                        case CMP_GE: FILTER_LOOP(!nulls[r] && (double)vals[r] >= cv); break;
+                        default: break;
+                    }
+                    goto done;
+                }
                 int64_t cv = (pn->filter.cmp_val.type == COLUMN_TYPE_INT ||
                                    pn->filter.cmp_val.type == COLUMN_TYPE_BOOLEAN)
                     ? (int64_t)pn->filter.cmp_val.value.as_int
@@ -3223,6 +3264,105 @@ static inline void agg_emit_minmax(struct col_block *dst, uint16_t out_idx,
 
 /* ---- Hash aggregation ---- */
 
+/* Helper: copy a value from col_block src[src_i] into flat_table ft column c at row dst_i.
+ * For TEXT columns, the string pointer is stored directly — caller must ensure
+ * the source string outlives the flat_table (true for table scans and parquet scans
+ * whose strings live in table flat_table or arena lifetime). */
+static inline void gk_store(struct flat_table *ft, uint16_t c, size_t dst_i,
+                             const struct col_block *src, uint16_t src_i)
+{
+    ft->col_nulls[c][dst_i] = src->nulls[src_i];
+    if (src->nulls[src_i]) return;
+    switch (column_type_storage(ft->col_types[c])) {
+    case STORE_I16: ((int16_t *)ft->col_data[c])[dst_i] = src->data.i16[src_i]; break;
+    case STORE_I32: ((int32_t *)ft->col_data[c])[dst_i] = src->data.i32[src_i]; break;
+    case STORE_I64: ((int64_t *)ft->col_data[c])[dst_i] = src->data.i64[src_i]; break;
+    case STORE_F64: ((double *)ft->col_data[c])[dst_i] = src->data.f64[src_i]; break;
+    case STORE_STR: {
+        /* Store pointer directly — source strings live in table storage or arena */
+        ((char **)ft->col_data[c])[dst_i] = src->data.str[src_i];
+        if (ft->col_str_lens && ft->col_str_lens[c] && src->data.str[src_i])
+            ft->col_str_lens[c][dst_i] = src->str_lens
+                ? src->str_lens[src_i]
+                : (uint32_t)strlen(src->data.str[src_i]);
+        break;
+    }
+    case STORE_IV:   ((struct interval *)ft->col_data[c])[dst_i] = src->data.iv[src_i]; break;
+    case STORE_UUID: ((struct uuid_val *)ft->col_data[c])[dst_i] = src->data.uuid[src_i]; break;
+    case STORE_VEC: {
+        uint16_t dim = ft->col_vec_dims[c];
+        memcpy(&((float *)ft->col_data[c])[dst_i * dim],
+               &src->data.vec[src_i * src->vec_dim], dim * sizeof(float));
+        break;
+    }
+    }
+}
+
+/* Helper: check equality between col_block src[src_i] and flat_table ft column c at row ft_i. */
+static inline int gk_eq(const struct flat_table *ft, uint16_t c, size_t ft_i,
+                         const struct col_block *src, uint16_t src_i)
+{
+    int a_null = src->nulls[src_i];
+    int b_null = ft->col_nulls[c][ft_i];
+    if (a_null && b_null) return 1; /* NULL == NULL for grouping */
+    if (a_null || b_null) return 0;
+    switch (column_type_storage(ft->col_types[c])) {
+    case STORE_I16: return src->data.i16[src_i] == ((int16_t *)ft->col_data[c])[ft_i];
+    case STORE_I32: return src->data.i32[src_i] == ((int32_t *)ft->col_data[c])[ft_i];
+    case STORE_I64: return src->data.i64[src_i] == ((int64_t *)ft->col_data[c])[ft_i];
+    case STORE_F64: return src->data.f64[src_i] == ((double *)ft->col_data[c])[ft_i];
+    case STORE_STR: {
+        const char *a = src->data.str[src_i];
+        const char *b = ((const char **)ft->col_data[c])[ft_i];
+        if (!a || !b) return a == b;
+        if (src->str_lens && ft->col_str_lens && ft->col_str_lens[c]) {
+            uint32_t al = src->str_lens[src_i];
+            uint32_t bl = ft->col_str_lens[c][ft_i];
+            if (al != bl) return 0;
+            return memcmp(a, b, al) == 0;
+        }
+        return strcmp(a, b) == 0;
+    }
+    case STORE_IV:
+        return memcmp(&src->data.iv[src_i],
+                      &((struct interval *)ft->col_data[c])[ft_i],
+                      sizeof(struct interval)) == 0;
+    case STORE_UUID:
+        return uuid_equal(src->data.uuid[src_i],
+                          ((struct uuid_val *)ft->col_data[c])[ft_i]);
+    case STORE_VEC: {
+        uint16_t dim = ft->col_vec_dims[c];
+        return memcmp(&src->data.vec[src_i * src->vec_dim],
+                      &((float *)ft->col_data[c])[ft_i * dim],
+                      dim * sizeof(float)) == 0;
+    }
+    }
+    return 0;
+}
+
+/* Helper: copy value from flat_table ft column c at row ft_i into col_block dst[dst_i]. */
+static inline void gk_emit(struct col_block *dst, uint16_t dst_i,
+                            const struct flat_table *ft, uint16_t c, size_t ft_i)
+{
+    dst->nulls[dst_i] = ft->col_nulls[c][ft_i];
+    if (ft->col_nulls[c][ft_i]) return;
+    switch (column_type_storage(ft->col_types[c])) {
+    case STORE_I16: dst->data.i16[dst_i] = ((int16_t *)ft->col_data[c])[ft_i]; break;
+    case STORE_I32: dst->data.i32[dst_i] = ((int32_t *)ft->col_data[c])[ft_i]; break;
+    case STORE_I64: dst->data.i64[dst_i] = ((int64_t *)ft->col_data[c])[ft_i]; break;
+    case STORE_F64: dst->data.f64[dst_i] = ((double *)ft->col_data[c])[ft_i]; break;
+    case STORE_STR: dst->data.str[dst_i] = ((char **)ft->col_data[c])[ft_i]; break;
+    case STORE_IV:  dst->data.iv[dst_i] = ((struct interval *)ft->col_data[c])[ft_i]; break;
+    case STORE_UUID: dst->data.uuid[dst_i] = ((struct uuid_val *)ft->col_data[c])[ft_i]; break;
+    case STORE_VEC: {
+        uint16_t dim = ft->col_vec_dims[c];
+        memcpy(&dst->data.vec[dst_i * dim],
+               &((float *)ft->col_data[c])[ft_i * dim], dim * sizeof(float));
+        break;
+    }
+    }
+}
+
 /* Specialized INT consume: all group keys are STORE_I32/I64/I16,
  * all aggregate sources are STORE_I32/I64/I16 or COUNT(*).
  * Type resolution hoisted out of the per-row loop. */
@@ -3325,25 +3465,25 @@ static void hash_agg_int_consume(struct hash_agg_state *st,
                 int eq = 1;
                 if (single_i32_key) {
                     int a_null = grp_cb[0]->nulls[ri];
-                    int b_null = st->group_keys[0].nulls[(uint16_t)entry];
+                    int b_null = st->gk.col_nulls[0][entry];
                     if (a_null && b_null) { /* eq stays 1 */ }
                     else if (a_null || b_null) eq = 0;
-                    else eq = (grp_cb[0]->data.i32[ri] == st->group_keys[0].data.i32[(uint16_t)entry]);
+                    else eq = (grp_cb[0]->data.i32[ri] == ((int32_t *)st->gk.col_data[0])[entry]);
                 } else {
                     for (uint16_t g = 0; g < ngrp && eq; g++) {
                         int a_null = grp_cb[g]->nulls[ri];
-                        int b_null = st->group_keys[g].nulls[(uint16_t)entry];
+                        int b_null = st->gk.col_nulls[g][entry];
                         if (a_null && b_null) continue;
                         if (a_null || b_null) { eq = 0; break; }
                         switch (grp_sc[g]) {
                         case STORE_I32:
-                            eq = (grp_cb[g]->data.i32[ri] == st->group_keys[g].data.i32[(uint16_t)entry]);
+                            eq = (grp_cb[g]->data.i32[ri] == ((int32_t *)st->gk.col_data[g])[entry]);
                             break;
                         case STORE_I64:
-                            eq = (grp_cb[g]->data.i64[ri] == st->group_keys[g].data.i64[(uint16_t)entry]);
+                            eq = (grp_cb[g]->data.i64[ri] == ((int64_t *)st->gk.col_data[g])[entry]);
                             break;
                         case STORE_I16:
-                            eq = (grp_cb[g]->data.i16[ri] == st->group_keys[g].data.i16[(uint16_t)entry]);
+                            eq = (grp_cb[g]->data.i16[ri] == ((int16_t *)st->gk.col_data[g])[entry]);
                             break;
                         case STORE_F64: case STORE_STR: case STORE_IV:
                         case STORE_UUID: case STORE_VEC: eq = 0; break;
@@ -3382,15 +3522,7 @@ static void hash_agg_int_consume(struct hash_agg_state *st,
                 size_t *new_counts = (size_t *)bump_calloc(scratch, new_cap, sizeof(size_t));
                 memcpy(new_counts, st->grp_counts, old_cap * sizeof(size_t));
                 st->grp_counts = new_counts;
-                struct col_block *new_keys = (struct col_block *)bump_calloc(
-                    scratch, ngrp, sizeof(struct col_block));
-                for (uint16_t g = 0; g < ngrp; g++) {
-                    new_keys[g].type = st->group_keys[g].type;
-                    uint16_t copy_cnt = (uint16_t)(old_cap < BLOCK_CAPACITY ? old_cap : BLOCK_CAPACITY);
-                    new_keys[g].count = copy_cnt;
-                    cb_bulk_copy(&new_keys[g], &st->group_keys[g], copy_cnt);
-                }
-                st->group_keys = new_keys;
+                flat_table_grow(&st->gk, new_cap);
                 block_ht_init(&st->ht, new_cap, scratch);
                 for (uint32_t gi = 0; gi < st->ngroups; gi++) {
                     st->ht.hashes[gi] = saved_hashes[gi];
@@ -3405,11 +3537,14 @@ static void hash_agg_int_consume(struct hash_agg_state *st,
             }
 
             group_idx = st->ngroups++;
-            for (uint16_t g = 0; g < ngrp; g++) {
-                struct col_block *dst = &st->group_keys[g];
-                if (group_idx == 0) dst->type = grp_cb[g]->type;
-                cb_copy_value(dst, group_idx, grp_cb[g], ri);
+            if (group_idx == 0) {
+                for (uint16_t g = 0; g < ngrp; g++)
+                    st->gk.col_types[g] = grp_cb[g]->type;
+                flat_table_alloc_cols(&st->gk);
             }
+            for (uint16_t g = 0; g < ngrp; g++)
+                gk_store(&st->gk, g, group_idx, grp_cb[g], ri);
+            st->gk.nrows = st->ngroups;
             st->ht.hashes[group_idx] = h;
             st->ht.nexts[group_idx] = st->ht.buckets[bucket];
             st->ht.buckets[bucket] = group_idx;
@@ -3477,14 +3612,9 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         st->emit_cursor = 0;
 
         uint16_t ngrp = pn->hash_agg.ngroup_cols;
-        st->group_keys = (struct col_block *)bump_calloc(&ctx->arena->scratch,
-                                                         ngrp, sizeof(struct col_block));
-        /* Pre-allocate str_lens for TEXT group key columns */
-        for (uint16_t g = 0; g < ngrp; g++) {
-            int gc = pn->hash_agg.group_cols[g];
-            /* We don't know the type yet (no input seen), so defer to first row */
-            (void)gc;
-        }
+        /* flat_table for group keys — types set on first row, cols allocated then */
+        flat_table_init(&st->gk, ngrp, st->group_cap);
+        st->gk.nrows = 0;
 
         uint32_t agg_n = pn->hash_agg.agg_count;
         uint32_t max_groups = st->group_cap;
@@ -3579,12 +3709,7 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         int eq = 1;
                         for (uint16_t g = 0; g < ngrp; g++) {
                             int gc = pn->hash_agg.group_cols[g];
-                            int a_null = input.cols[gc].nulls[ri];
-                            int b_null = st->group_keys[g].nulls[(uint16_t)entry];
-                            if (a_null && b_null) continue; /* NULL == NULL for grouping */
-                            if (a_null || b_null) { eq = 0; break; }
-                            if (!block_cell_eq(&input.cols[gc], ri,
-                                               &st->group_keys[g], (uint16_t)entry)) {
+                            if (!gk_eq(&st->gk, g, entry, &input.cols[gc], ri)) {
                                 eq = 0;
                                 break;
                             }
@@ -3628,31 +3753,13 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         memcpy(new_counts, st->grp_counts, old_cap * sizeof(size_t));
                         st->grp_counts = new_counts;
 
-                        /* Grow group key col_blocks — allocate fresh and bulk copy */
-                        struct col_block *new_keys = (struct col_block *)bump_calloc(
-                            &ctx->arena->scratch, ngrp, sizeof(struct col_block));
-                        for (uint16_t g = 0; g < ngrp; g++) {
-                            new_keys[g].type = st->group_keys[g].type;
-                            uint16_t copy_cnt = (uint16_t)(old_cap < BLOCK_CAPACITY ? old_cap : BLOCK_CAPACITY);
-                            new_keys[g].count = copy_cnt;
-                            cb_bulk_copy(&new_keys[g], &st->group_keys[g], copy_cnt);
-                            if (st->group_keys[g].str_lens) {
-                                new_keys[g].str_lens = (uint32_t *)bump_calloc(
-                                    &ctx->arena->scratch, new_cap, sizeof(uint32_t));
-                                memcpy(new_keys[g].str_lens, st->group_keys[g].str_lens,
-                                       old_cap * sizeof(uint32_t));
-                            }
-                        }
-                        st->group_keys = new_keys;
+                        /* Grow group key flat_table */
+                        flat_table_grow(&st->gk, new_cap);
 
                         /* Rebuild hash table with new capacity */
                         block_ht_init(&st->ht, new_cap, &ctx->arena->scratch);
                         for (uint32_t gi = 0; gi < st->ngroups; gi++) {
-                            uint32_t gh = 2166136261u;
-                            for (uint16_t g = 0; g < ngrp; g++) {
-                                gh ^= block_hash_cell(&st->group_keys[g], (uint16_t)gi);
-                                gh *= 16777619u;
-                            }
+                            uint32_t gh = flat_table_hash_row(&st->gk, gi, ngrp);
                             st->ht.hashes[gi] = gh;
                             uint32_t gb = gh & (st->ht.nbuckets - 1);
                             st->ht.nexts[gi] = st->ht.buckets[gb];
@@ -3668,23 +3775,25 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     /* New group */
                     group_idx = st->ngroups++;
                     /* Store group key values */
+                    if (group_idx == 0) {
+                        for (uint16_t g = 0; g < ngrp; g++) {
+                            int gc = pn->hash_agg.group_cols[g];
+                            st->gk.col_types[g] = input.cols[gc].type;
+                            if (input.cols[gc].type == COLUMN_TYPE_VECTOR)
+                                st->gk.col_vec_dims[g] = input.cols[gc].vec_dim;
+                        }
+                        flat_table_alloc_cols(&st->gk);
+                        /* Allocate str_lens for TEXT columns */
+                        for (uint16_t g = 0; g < ngrp; g++) {
+                            if (column_type_is_text(st->gk.col_types[g]))
+                                st->gk.col_str_lens[g] = (uint32_t *)calloc(st->gk.cap, sizeof(uint32_t));
+                        }
+                    }
                     for (uint16_t g = 0; g < ngrp; g++) {
                         int gc = pn->hash_agg.group_cols[g];
-                        struct col_block *src = &input.cols[gc];
-                        struct col_block *dst = &st->group_keys[g];
-                        if (group_idx == 0) {
-                            dst->type = src->type;
-                            if (column_type_is_text(src->type))
-                                dst->str_lens = (uint32_t *)bump_calloc(
-                                    &ctx->arena->scratch, st->group_cap, sizeof(uint32_t));
-                        }
-                        cb_ensure_vec(dst, src, &ctx->arena->scratch);
-                        cb_copy_value(dst, group_idx, src, ri);
-                        if (dst->str_lens && !src->nulls[ri] && src->data.str[ri])
-                            dst->str_lens[group_idx] = src->str_lens
-                                ? src->str_lens[ri]
-                                : (uint32_t)strlen(src->data.str[ri]);
+                        gk_store(&st->gk, g, group_idx, &input.cols[gc], ri);
                     }
+                    st->gk.nrows = st->ngroups;
                     /* Insert into hash table */
                     st->ht.hashes[group_idx] = h;
                     st->ht.nexts[group_idx] = st->ht.buckets[bucket];
@@ -3960,9 +4069,14 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         if (!pn->hash_agg.agg_before_cols) {
             /* Group key columns first */
             for (uint16_t k = 0; k < ngrp; k++) {
-                out->cols[k].type = st->group_keys[k].type;
-                cb_ensure_vec(&out->cols[k], &st->group_keys[k], &ctx->arena->scratch);
-                cb_copy_value(&out->cols[k], out_count, &st->group_keys[k], (uint16_t)g);
+                out->cols[k].type = st->gk.col_types[k];
+                if (st->gk.col_types[k] == COLUMN_TYPE_VECTOR) {
+                    uint16_t dim = st->gk.col_vec_dims[k];
+                    if (!out->cols[k].data.vec)
+                        out->cols[k].data.vec = (float *)bump_alloc(&ctx->arena->scratch, BLOCK_CAPACITY * dim * sizeof(float));
+                    out->cols[k].vec_dim = dim;
+                }
+                gk_emit(&out->cols[k], out_count, &st->gk, k, g);
             }
         }
 
@@ -4167,10 +4281,14 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         if (pn->hash_agg.agg_before_cols) {
             uint16_t grp_offset = (uint16_t)agg_n;
             for (uint16_t k = 0; k < ngrp; k++) {
-                out->cols[grp_offset + k].type = st->group_keys[k].type;
-                cb_ensure_vec(&out->cols[grp_offset + k], &st->group_keys[k], &ctx->arena->scratch);
-                cb_copy_value(&out->cols[grp_offset + k], out_count,
-                              &st->group_keys[k], (uint16_t)g);
+                out->cols[grp_offset + k].type = st->gk.col_types[k];
+                if (st->gk.col_types[k] == COLUMN_TYPE_VECTOR) {
+                    uint16_t dim = st->gk.col_vec_dims[k];
+                    if (!out->cols[grp_offset + k].data.vec)
+                        out->cols[grp_offset + k].data.vec = (float *)bump_alloc(&ctx->arena->scratch, BLOCK_CAPACITY * dim * sizeof(float));
+                    out->cols[grp_offset + k].vec_dim = dim;
+                }
+                gk_emit(&out->cols[grp_offset + k], out_count, &st->gk, k, g);
             }
         }
 
@@ -8403,7 +8521,23 @@ int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
         row_block_reset(&block);
     }
 
+    /* Free heap-allocated state (flat_table group keys in hash_agg nodes) */
+    plan_exec_cleanup(ctx);
+
     return 0;
+}
+
+void plan_exec_cleanup(struct plan_exec_ctx *ctx)
+{
+    if (!ctx->node_states || ctx->nnodes == 0) return;
+    for (uint32_t i = 0; i < ctx->nnodes; i++) {
+        if (!ctx->node_states[i]) continue;
+        struct plan_node *pn = &PLAN_NODE(ctx->arena, i);
+        if (pn->op == PLAN_HASH_AGG) {
+            struct hash_agg_state *st = (struct hash_agg_state *)ctx->node_states[i];
+            flat_table_free(&st->gk);
+        }
+    }
 }
 
 /* ---- EXPLAIN ---- */
@@ -9960,7 +10094,17 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
 
         /* Append HAVING filter if present */
         if (s->has_having && s->having_cond != IDX_NONE) {
+            struct condition *hcond = &COND(arena, s->having_cond);
+            uint32_t saved_lhs = hcond->lhs_expr;
+            if (saved_lhs != IDX_NONE) {
+                struct expr *he = &EXPR(arena, saved_lhs);
+                if (he->type == EXPR_FUNC_CALL &&
+                    he->func_call.func >= FUNC_AGG_SUM &&
+                    he->func_call.func <= FUNC_AGG_VARIANCE)
+                    hcond->lhs_expr = IDX_NONE;
+            }
             current = try_append_having_filter(current, s, arena);
+            hcond->lhs_expr = saved_lhs;
             if (current == IDX_NONE) return PLAN_RES_NOTIMPL;
         }
 
@@ -11774,7 +11918,23 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
 
     /* Add HAVING filter if present */
     if (s->has_having && s->having_cond != IDX_NONE) {
+        /* When HAVING uses an aggregate call (e.g. HAVING SUM(amount) > 50000),
+         * the parser sets lhs_expr to the FUNC_AGG_* expression and column to
+         * the virtual name ("sum", "count", etc.).  try_append_having_filter
+         * bails on lhs_expr != IDX_NONE to protect other call sites, but here
+         * the column name is sufficient for matching.  Temporarily clear
+         * lhs_expr so the existing name-matching logic works, then restore. */
+        struct condition *hcond = &COND(arena, s->having_cond);
+        uint32_t saved_lhs = hcond->lhs_expr;
+        if (saved_lhs != IDX_NONE) {
+            struct expr *he = &EXPR(arena, saved_lhs);
+            if (he->type == EXPR_FUNC_CALL &&
+                he->func_call.func >= FUNC_AGG_SUM &&
+                he->func_call.func <= FUNC_AGG_VARIANCE)
+                hcond->lhs_expr = IDX_NONE;
+        }
         current = try_append_having_filter(current, s, arena);
+        hcond->lhs_expr = saved_lhs;
         if (current == IDX_NONE) return PLAN_RES_NOTIMPL;
     }
 

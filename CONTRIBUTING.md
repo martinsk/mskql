@@ -14,6 +14,8 @@ make clean; CC=/opt/homebrew/opt/llvm/bin/clang make
 
 The test runner (`tests/test.sh`) auto-detects Homebrew Clang and sets `CC` if available.
 
+Do not run `pkill -f mskql` will kill the development environment due to naming colisions.
+
 ## Code layout
 
 All source lives in `src/`, one `.c`/`.h` pair per module:

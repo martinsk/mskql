@@ -487,4 +487,15 @@ static inline int flat_table_eq_cell(const struct flat_table *ft, uint16_t c,
     __builtin_unreachable();
 }
 
+/* Hash the first ncols columns of flat_table row r (FNV-1a). */
+static inline uint32_t flat_table_hash_row(const struct flat_table *ft, size_t r, uint16_t ncols)
+{
+    uint32_t h = FNV_OFFSET;
+    for (uint16_t c = 0; c < ncols; c++) {
+        h ^= flat_table_hash_cell(ft, c, r);
+        h *= FNV_PRIME;
+    }
+    return h;
+}
+
 #endif

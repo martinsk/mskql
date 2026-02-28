@@ -7,6 +7,7 @@
 #include "row.h"
 #include "index.h"
 #include "block.h"
+#include "diskio.h"
 
 /* Cached hash join build result for a specific join key column.
  * Invalidated when table->generation changes.
@@ -38,6 +39,7 @@ enum table_kind {
     TABLE_MEMORY,   /* in-memory row-store + columnar flat storage */
     TABLE_VIEW,     /* virtual — stores SELECT SQL, no data */
     TABLE_PARQUET,  /* read-only Parquet foreign table */
+    TABLE_DISK,     /* disk-backed columnar table (.mskd + WAL) */
 };
 
 static inline int table_is_writable(enum table_kind kind)
@@ -46,6 +48,7 @@ static inline int table_is_writable(enum table_kind kind)
     case TABLE_MEMORY:  return 1;
     case TABLE_VIEW:    return 0;
     case TABLE_PARQUET: return 0;
+    case TABLE_DISK:    return 1;
     }
     __builtin_unreachable();
 }
@@ -73,6 +76,13 @@ struct table {
             char *path;
             struct parquet_cache pq_cache;
         } parquet;
+        struct {
+            char *dir_path;       /* directory containing data.mskd + data.mskd.wal */
+            struct disk_meta meta; /* parsed file header + column descriptors */
+            int cache_valid;      /* 1 if flat_table is populated from disk */
+            uint64_t wal_bytes;   /* bytes written to WAL since last compact */
+            int wal_dirty;        /* 1 if WAL has uncompacted entries */
+        } disk;
     };
 };
 

@@ -102,7 +102,38 @@ def duckdb_fixup(lines):
 
 # ── no-cache variant helper ──────────────────────────────────────────────────
 # Benchmarks that are inherently write-heavy or already vary parameters per query.
-CACHE_RESISTANT = {"insert_bulk", "update", "delete", "transaction", "index_lookup", "composite_index_lookup", "vector_insert"}
+CACHE_RESISTANT = {
+    "insert_bulk", "update", "delete", "transaction", "index_lookup",
+    "composite_index_lookup", "vector_insert",
+    "stress_full_agg", "stress_high_card_gb", "stress_large_sort",
+    "stress_join_2way", "stress_join_3way", "stress_filtered_expr",
+    "stress_window", "stress_nested_cte",
+}
+
+# ── disk-backed table variant helper ─────────────────────────────────────────
+# Benchmarks whose setup SQL contains CREATE TABLE and can be auto-converted
+# to CREATE DISK TABLE for the "disk" column.  Benchmarks that create tables
+# inside the *bench* loop, use indexes, or have no tables are excluded.
+DISK_ELIGIBLE = {
+    "select_full_scan", "select_where", "aggregate", "order_by", "join",
+    "update", "window_functions", "distinct", "subquery", "cte",
+    "scalar_functions", "expression_agg", "multi_sort", "set_ops",
+}
+
+
+def _diskify_lines(lines, name_suffix):
+    """Convert CREATE TABLE statements to CREATE DISK TABLE ... DIRECTORY for mskql."""
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        m = re.match(r"(CREATE\s+TABLE\s+)(\w+)(\s*\(.*)", stripped, re.IGNORECASE)
+        if m:
+            tname = m.group(2)
+            dir_path = f"/tmp/mskql_bench_disk_{tname}_{name_suffix}"
+            out.append(f"CREATE DISK TABLE {tname}{m.group(3).rstrip(';')} DIRECTORY '{dir_path}';")
+            continue
+        out.append(line)
+    return out
 
 
 def nocache_lines(bench_lines):
@@ -1107,6 +1138,209 @@ def bench_vector_filter():
     return {"mskql": (setup, bench), "duck": None, "pg": (pg_setup, bench)}
 
 
+# ── Large-scale stress benchmarks (5M rows, all engines) ─────────────────────
+# These run against parquet (mskql + DuckDB) and PostgreSQL (bulk-loaded tables).
+# The "disk" column is auto-populated for PG-style benchmarks via DISK_ELIGIBLE,
+# but these use dict-style returns so we handle disk setup explicitly.
+
+_STRESS_CATS_20 = [
+    "groceries", "dining", "travel", "fuel", "utilities",
+    "entertainment", "healthcare", "insurance", "clothing", "electronics",
+    "education", "subscriptions", "home", "auto", "gifts",
+    "charity", "sports", "pets", "beauty", "office",
+]
+_STRESS_REGIONS_8 = ["us_east", "us_west", "us_central", "eu_west",
+                     "eu_east", "apac", "latam", "africa"]
+_STRESS_TIERS_4 = ["free", "basic", "premium", "enterprise"]
+
+
+def _pg_stress_setup():
+    """PostgreSQL setup: CREATE + bulk INSERT via generate_series for 5M transactions,
+    100K accounts, 20K merchants."""
+    cats = _STRESS_CATS_20
+    cat_case = " ".join(
+        f"WHEN n % 20 = {i} THEN '{c}'" for i, c in enumerate(cats)
+    )
+    regions = _STRESS_REGIONS_8
+    reg_case = " ".join(
+        f"WHEN n % 8 = {i} THEN '{r}'" for i, r in enumerate(regions)
+    )
+    tiers = _STRESS_TIERS_4
+    tier_case = " ".join(
+        f"WHEN n % 4 = {i} THEN '{t}'" for i, t in enumerate(tiers)
+    )
+    return [
+        # transactions — 5M rows
+        "DROP TABLE IF EXISTS st_txn;",
+        "CREATE TABLE st_txn (id INT, account_id INT, merchant_id INT, "
+        "amount INT, fee INT, ts_day INT, category TEXT);",
+        "INSERT INTO st_txn SELECT n, n % 100000, n % 20000, "
+        "1 + (n * 13) % 9999, (n * 7) % 50, n % 730, "
+        f"CASE {cat_case} END "
+        "FROM generate_series(0, 4999999) AS g(n);",
+        # accounts — 100K rows
+        "DROP TABLE IF EXISTS st_acct;",
+        "CREATE TABLE st_acct (id INT, name TEXT, region TEXT, tier TEXT, "
+        "balance INT, created_day INT);",
+        "INSERT INTO st_acct SELECT n, 'acct_' || n, "
+        f"CASE {reg_case} END, "
+        f"CASE {tier_case} END, "
+        "100 + (n * 31) % 99900, n % 730 "
+        "FROM generate_series(0, 99999) AS g(n);",
+        # merchants — 20K rows
+        "DROP TABLE IF EXISTS st_merch;",
+        "CREATE TABLE st_merch (id INT, name TEXT, category TEXT, "
+        "city TEXT, rating INT);",
+        "INSERT INTO st_merch SELECT n, 'merch_' || n, "
+        f"CASE {cat_case} END, "
+        "'city_' || (n % 200), 1 + (n * 17) % 5 "
+        "FROM generate_series(0, 19999) AS g(n);",
+    ]
+
+
+def _mskql_stress_setup():
+    """mskql setup: parquet foreign tables for the 3 large fixtures."""
+    return [
+        _mskql_foreign("st_txn", "large_transactions.parquet"),
+        _mskql_foreign("st_acct", "large_accounts.parquet"),
+        _mskql_foreign("st_merch", "large_merchants.parquet"),
+    ]
+
+
+def _duck_stress_setup():
+    """DuckDB setup: read_parquet views for the 3 large fixtures."""
+    return [
+        _duck_from_pq("st_txn", "large_transactions.parquet"),
+        _duck_from_pq("st_acct", "large_accounts.parquet"),
+        _duck_from_pq("st_merch", "large_merchants.parquet"),
+    ]
+
+
+def bench_stress_full_agg():
+    """5M rows: GROUP BY 20 categories with SUM/AVG/COUNT."""
+    bench = [
+        "SELECT category, COUNT(*), SUM(amount), AVG(fee) "
+        "FROM st_txn GROUP BY category ORDER BY category;"
+    ] * 3
+    return {
+        "mskql": (_mskql_stress_setup(), bench),
+        "duck":  (_duck_stress_setup(), bench),
+        "pg":    (_pg_stress_setup(), bench),
+    }
+
+
+def bench_stress_high_card_gb():
+    """5M rows: GROUP BY account_id (100K groups) with HAVING."""
+    bench = [
+        "SELECT account_id, SUM(amount) AS total, COUNT(*) "
+        "FROM st_txn GROUP BY account_id "
+        "HAVING SUM(amount) > 50000 "
+        "ORDER BY total DESC LIMIT 100;"
+    ] * 3
+    return {
+        "mskql": (_mskql_stress_setup(), bench),
+        "duck":  (_duck_stress_setup(), bench),
+        "pg":    (_pg_stress_setup(), bench),
+    }
+
+
+def bench_stress_large_sort():
+    """5M rows: ORDER BY amount DESC LIMIT 1000 — top-N sort."""
+    bench = [
+        "SELECT id, account_id, amount, fee "
+        "FROM st_txn ORDER BY amount DESC LIMIT 1000;"
+    ] * 3
+    return {
+        "mskql": (_mskql_stress_setup(), bench),
+        "duck":  (_duck_stress_setup(), bench),
+        "pg":    (_pg_stress_setup(), bench),
+    }
+
+
+def bench_stress_join_2way():
+    """5M transactions × 100K accounts: GROUP BY region."""
+    bench = [
+        "SELECT a.region, COUNT(*), SUM(t.amount) "
+        "FROM st_txn t "
+        "JOIN st_acct a ON t.account_id = a.id "
+        "GROUP BY a.region ORDER BY a.region;"
+    ] * 3
+    return {
+        "mskql": (_mskql_stress_setup(), bench),
+        "duck":  (_duck_stress_setup(), bench),
+        "pg":    (_pg_stress_setup(), bench),
+    }
+
+
+def bench_stress_join_3way():
+    """5M × 100K × 20K: 3-way join, GROUP BY region + merchant category."""
+    bench = [
+        "SELECT a.region, m.category, COUNT(*), SUM(t.amount) "
+        "FROM st_txn t "
+        "JOIN st_acct a ON t.account_id = a.id "
+        "JOIN st_merch m ON t.merchant_id = m.id "
+        "GROUP BY a.region, m.category "
+        "ORDER BY a.region, m.category;"
+    ] * 2
+    return {
+        "mskql": (_mskql_stress_setup(), bench),
+        "duck":  (_duck_stress_setup(), bench),
+        "pg":    (_pg_stress_setup(), bench),
+    }
+
+
+def bench_stress_filtered_expr():
+    """5M rows: WHERE filter + computed expression column."""
+    bench = [
+        "SELECT id, account_id, amount - fee AS net, category "
+        "FROM st_txn "
+        "WHERE category = 'dining' AND amount > 5000 "
+        "ORDER BY net DESC LIMIT 500;"
+    ] * 5
+    return {
+        "mskql": (_mskql_stress_setup(), bench),
+        "duck":  (_duck_stress_setup(), bench),
+        "pg":    (_pg_stress_setup(), bench),
+    }
+
+
+def bench_stress_window():
+    """Window function: RANK() partitioned by category over filtered 5M rows."""
+    bench = [
+        "SELECT category, account_id, amount, "
+        "RANK() OVER (PARTITION BY category ORDER BY amount DESC) "
+        "FROM st_txn WHERE ts_day < 30 "
+        "ORDER BY category, amount DESC "
+        "LIMIT 200;"
+    ] * 3
+    return {
+        "mskql": (_mskql_stress_setup(), bench),
+        "duck":  (_duck_stress_setup(), bench),
+        "pg":    (_pg_stress_setup(), bench),
+    }
+
+
+def bench_stress_nested_cte():
+    """Nested CTE: per-account totals → per-region ranking on 5M rows."""
+    bench = [
+        "WITH acct_totals AS ("
+        "SELECT account_id, SUM(amount) AS total, COUNT(*) AS cnt "
+        "FROM st_txn GROUP BY account_id"
+        "), ranked AS ("
+        "SELECT a.region, at.total, at.cnt "
+        "FROM acct_totals at "
+        "JOIN st_acct a ON at.account_id = a.id "
+        "WHERE at.total > 10000"
+        ") SELECT region, COUNT(*) AS num_accounts, SUM(total) AS revenue "
+        "FROM ranked GROUP BY region ORDER BY revenue DESC;"
+    ] * 3
+    return {
+        "mskql": (_mskql_stress_setup(), bench),
+        "duck":  (_duck_stress_setup(), bench),
+        "pg":    (_pg_stress_setup(), bench),
+    }
+
+
 _BASE_BENCHMARKS = [
     ("insert_bulk",        bench_insert_bulk),
     ("select_full_scan",   bench_select_full_scan),
@@ -1161,6 +1395,15 @@ _BASE_BENCHMARKS = [
     ("vector_scan",        bench_vector_scan),
     ("vector_wide",        bench_vector_wide),
     ("vector_filter",      bench_vector_filter),
+    # ── Large-scale stress benchmarks (5M rows, all engines) ──
+    ("stress_full_agg",      bench_stress_full_agg),
+    ("stress_high_card_gb",  bench_stress_high_card_gb),
+    ("stress_large_sort",    bench_stress_large_sort),
+    ("stress_join_2way",     bench_stress_join_2way),
+    ("stress_join_3way",     bench_stress_join_3way),
+    ("stress_filtered_expr", bench_stress_filtered_expr),
+    ("stress_window",        bench_stress_window),
+    ("stress_nested_cte",    bench_stress_nested_cte),
 ]
 
 
@@ -1341,13 +1584,46 @@ def main():
         else:
             duck_ms = -2.0  # sentinel: not applicable
 
-        results.append((name, mskql_ms, pg_ms, duck_ms))
+        # ── disk-backed mskql (4th column, eligible benchmarks only) ──
+        # Strip the _nc suffix to check eligibility of the base benchmark name.
+        base_name = name[:-3] if name.endswith("_nc") else name
+        # For non-parquet benchmarks: diskify the mskql setup directly.
+        # For dict-style benchmarks with a pg spec (e.g. stress_*): diskify
+        # the PG setup SQL (which uses CREATE TABLE + generate_series).
+        disk_source = None
+        if base_name in DISK_ELIGIBLE and not is_parquet:
+            disk_source = mskql_spec[0]
+        elif is_parquet and pg_spec is not None and base_name.startswith("stress_"):
+            disk_source = pg_spec[0]
+
+        if disk_source is not None:
+            disk_setup_lines = _diskify_lines(disk_source, base_name)
+            dk_setup_f = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".sql", prefix=f"bench_setup_{name}_dk_", delete=False
+            )
+            dk_bench_f = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".sql", prefix=f"bench_run_{name}_dk_", delete=False
+            )
+            dk_setup_f.write("\n".join(disk_setup_lines) + "\n")
+            dk_setup_f.close()
+            dk_bench_f.write("\n".join(mskql_spec[1]) + "\n")
+            dk_bench_f.close()
+            run_cli(host, args.mskql_port, args.pg_user, "mskql", dk_setup_f.name)
+            disk_ms = time_cli(host, args.mskql_port, args.pg_user, "mskql", dk_bench_f.name)
+            os.unlink(dk_setup_f.name)
+            os.unlink(dk_bench_f.name)
+        else:
+            disk_ms = -2.0  # not applicable
+
+        results.append((name, mskql_ms, pg_ms, duck_ms, disk_ms))
         tag = f" mskql={mskql_ms:.0f}ms" if mskql_ms >= 0 else " ERROR"
+        if disk_ms >= 0:
+            tag += f" disk={disk_ms:.0f}ms"
         print(tag, flush=True)
 
     # ── sort: mskql wins (fastest) first, losses last ──
     def sort_key(r):
-        _name, m, p, d = r
+        _name, m, p, d, _dk = r
         best = min(t for t in (m, p, d) if t >= 0) if any(t >= 0 for t in (m, p, d)) else 0
         if m >= 0 and m <= best:
             return (0, m / max(best, 0.001))
@@ -1359,23 +1635,28 @@ def main():
     GREEN = "\033[32m"
     RED = "\033[31m"
     YELLOW = "\033[33m"
+    CYAN = "\033[36m"
     RESET = "\033[0m"
 
     # ── print sorted results ──
     print()
-    print(f"  {'BENCHMARK':<25s} {'mskql (ms)':>12s} {'pg (ms)':>12s} {'duck (ms)':>12s} {'ms/pg':>8s} {'ms/duck':>8s}  fastest")
-    print(f"  {'-' * 90}")
+    print(f"  {'BENCHMARK':<25s} {'mskql (ms)':>12s} {'disk (ms)':>12s} {'pg (ms)':>12s} {'duck (ms)':>12s} {'ms/pg':>8s} {'ms/duck':>8s} {'dk/mem':>8s}  fastest")
+    print(f"  {'-' * 116}")
 
-    for name, mskql_ms, pg_ms, duck_ms in results:
+    for name, mskql_ms, pg_ms, duck_ms, disk_ms in results:
         mskql_str = f"{mskql_ms:.1f}" if mskql_ms >= 0 else "ERROR"
+        disk_str = "-" if disk_ms == -2.0 else (f"{disk_ms:.1f}" if disk_ms >= 0 else "ERROR")
         pg_str = "-" if pg_ms == -2.0 else (f"{pg_ms:.1f}" if pg_ms >= 0 else "ERROR")
         duck_str = "-" if duck_ms == -2.0 else (f"{duck_ms:.1f}" if duck_ms >= 0 else "ERROR")
         ms_pg_str = f"{mskql_ms / pg_ms:.2f}x" if pg_ms > 0 and mskql_ms >= 0 else "-"
         ms_duck_str = f"{mskql_ms / duck_ms:.2f}x" if duck_ms > 0 and mskql_ms >= 0 else "n/a"
+        dk_mem_str = f"{disk_ms / mskql_ms:.2f}x" if disk_ms > 0 and mskql_ms > 0 else "-"
 
         times = {"mskql": mskql_ms, "duck": duck_ms}
         if pg_ms >= 0:
             times["pg"] = pg_ms
+        if disk_ms >= 0:
+            times["disk"] = disk_ms
         valid = {k: v for k, v in times.items() if v >= 0}
         if valid:
             winner = min(valid, key=valid.get)
@@ -1384,6 +1665,8 @@ def main():
 
         if winner == "mskql":
             tag = f"{GREEN}mskql{RESET}"
+        elif winner == "disk":
+            tag = f"{CYAN}disk{RESET}"
         elif winner == "pg":
             tag = f"{RED}pg{RESET}"
         elif winner == "duck":
@@ -1391,32 +1674,36 @@ def main():
         else:
             tag = "?"
 
-        print(f"  {name:<25s} {mskql_str:>12s} {pg_str:>12s} {duck_str:>12s} {ms_pg_str:>8s} {ms_duck_str:>8s}  {tag}")
+        print(f"  {name:<25s} {mskql_str:>12s} {disk_str:>12s} {pg_str:>12s} {duck_str:>12s} {ms_pg_str:>8s} {ms_duck_str:>8s} {dk_mem_str:>8s}  {tag}")
 
-    print(f"  {'-' * 90}")
+    print(f"  {'-' * 116}")
     print()
-    print("  ratio = mskql / X  (< 1.0 means mskql is faster)")
+    print("  ratio = mskql / X  (< 1.0 means mskql is faster)    dk/mem = disk / mskql  (overhead of disk-backed tables)")
     print()
-    mskql_wins = sum(1 for _, m, p, d in results
+    mskql_wins = sum(1 for _, m, p, d, _dk in results
                      if m >= 0 and all(m <= t for t in (p, d) if t >= 0))
     print(f"done. ({len(results)} benchmarks, mskql fastest in {mskql_wins})")
 
     if args.markdown and results:
         print()
-        print("| Benchmark | mskql (ms) | pg (ms) | duck (ms) | ms/pg | ms/duck | fastest |")
-        print("|-----------|-----------|---------|-----------|-------|---------|---------|")
-        for name, m_ms, p_ms, d_ms in results:
+        print("| Benchmark | mskql (ms) | disk (ms) | pg (ms) | duck (ms) | ms/pg | ms/duck | dk/mem | fastest |")
+        print("|-----------|-----------|-----------|---------|-----------|-------|---------|--------|---------|")
+        for name, m_ms, p_ms, d_ms, dk_ms in results:
             m_str = f"{m_ms:.1f}" if m_ms >= 0 else "ERROR"
+            dk_str = "-" if dk_ms == -2.0 else (f"{dk_ms:.1f}" if dk_ms >= 0 else "ERROR")
             p_str = "-" if p_ms == -2.0 else (f"{p_ms:.1f}" if p_ms >= 0 else "ERROR")
             d_str = "-" if d_ms == -2.0 else (f"{d_ms:.1f}" if d_ms >= 0 else "ERROR")
             mp = f"{m_ms / p_ms:.2f}x" if p_ms > 0 and m_ms >= 0 else "-"
             md = f"{m_ms / d_ms:.2f}x" if d_ms > 0 and m_ms >= 0 else "n/a"
+            dkm = f"{dk_ms / m_ms:.2f}x" if dk_ms > 0 and m_ms > 0 else "-"
             times = {"mskql": m_ms, "duck": d_ms}
             if p_ms >= 0:
                 times["pg"] = p_ms
+            if dk_ms >= 0:
+                times["disk"] = dk_ms
             valid = {k: v for k, v in times.items() if v >= 0}
             winner = min(valid, key=valid.get) if valid else "?"
-            print(f"| {name} | {m_str} | {p_str} | {d_str} | {mp} | {md} | {winner} |")
+            print(f"| {name} | {m_str} | {dk_str} | {p_str} | {d_str} | {mp} | {md} | {dkm} | {winner} |")
 
 
 if __name__ == "__main__":
