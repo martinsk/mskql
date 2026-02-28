@@ -155,6 +155,7 @@ static inline void query_arena_reset(struct query_arena *a)
     da_reset(&a->columns);
     da_reset(&a->arg_indices);
     da_reset(&a->plan_nodes);
+    da_reset(&a->logical_nodes);
     bump_reset(&a->bump);
     bump_reset(&a->result_text);
     bump_reset(&a->scratch);
@@ -188,6 +189,7 @@ static inline void query_arena_destroy(struct query_arena *a)
     da_free(&a->svs);
     da_free(&a->arg_indices);
     da_free(&a->plan_nodes);
+    da_free(&a->logical_nodes);
     bump_destroy(&a->bump);
     bump_destroy(&a->result_text);
     bump_destroy(&a->scratch);

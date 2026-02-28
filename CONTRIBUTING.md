@@ -25,6 +25,7 @@ All source lives in `src/`, one `.c`/`.h` pair per module:
 | `parser.c` | Lexer + recursive-descent SQL parser |
 | `query.c` | Row-at-a-time expression evaluator, aggregates, window functions |
 | `plan.c` | Block-oriented columnar executor (scan, filter, join, sort, …) |
+| `logical.c` / `logical.h` | Logical IR: `logical_build`, `logical_normalize`, `logical_to_physical` |
 | `pgwire.c` | PostgreSQL wire protocol server + direct columnar→wire send |
 | `database.c` | DDL execution, query dispatch, transactions |
 | `table.c` / `row.c` / `column.c` / `index.c` | Storage primitives |
@@ -74,9 +75,17 @@ Tagged unions exist so the compiler can enforce exhaustive handling via `-Wswitc
 
 ## Architecture patterns
 
-**Two execution paths**: The legacy row-at-a-time evaluator (`query.c`) and the block-oriented columnar executor (`plan.c`). `plan_build_select` tries to build a columnar plan; if it returns `IDX_NONE`, the query falls back to the legacy path. Both paths must produce identical results.
+**Two execution paths**: The legacy row-at-a-time evaluator (`query.c`) and the block-oriented columnar executor (`plan.c`). The columnar path is a three-stage pipeline:
 
-**Plan nodes**: Arena-allocated, children referenced by `uint32_t` index. Each node type has a `_next()` function that pulls blocks from its children (volcano / pull model).
+1. **`logical_build`** (`logical.c`) desugars the parser's `query_select` AST (~40 flags) into a minimal 7-node logical IR tree (`L_SCAN`, `L_FILTER`, `L_PROJECT`, `L_JOIN`, `L_AGGREGATE`, `L_SORT`, `L_LIMIT`).
+2. **`logical_normalize`** applies semantics-preserving tree rewrites (filter merge, predicate pushdown, dead project elimination).
+3. **`logical_to_physical`** (in `plan.c`) pattern-matches the tree shape to a physical builder (`build_join`, `build_aggregate`, `build_single_table`, …) which emits arena-allocated `plan_node` trees.
+
+On `PLAN_RES_NOTIMPL` from any builder, the query falls back to the legacy path. Both paths must produce identical results.
+
+**Logical nodes** (`logical.h`): Arena-allocated in `arena->logical_nodes`. Built once per query by `logical_build`, with the DA reset before each call. Children referenced by `uint32_t` index into the same array. Nodes are never individually freed — the backing buffer is reused across queries and freed with the arena.
+
+**Plan nodes** (physical): Arena-allocated in `arena->plan_nodes`, children referenced by `uint32_t` index. Each node type has a `_next()` function that pulls blocks from its children (volcano / pull model).
 
 **Wire protocol**: `try_plan_send` in `pgwire.c` serializes directly from `col_block` arrays into pgwire DataRow messages — bypasses the row-store entirely. Writes are batched into a 64 KB buffer.
 
@@ -105,7 +114,9 @@ This applies across both execution paths:
 
 **New SQL syntax**: Add token(s) to the lexer → parse function in `parser.c` → AST fields in `query.h` → evaluation in `query.c` or `database.c`.
 
-**New plan node**: Add `PLAN_*` to `enum plan_op` → node fields in `plan_node` union → state struct → `_next()` executor → wire into `plan_next_block` dispatcher + `plan_node_ncols` → build logic in `plan_build_select`.
+**New plan node** (physical): Add `PLAN_*` to `enum plan_op` → node fields in `plan_node` union → state struct → `_next()` executor → wire into `plan_next_block` dispatcher + `plan_node_ncols` → build logic in `plan_build_select`.
+
+**New logical op**: Add `L_*` to `enum logical_op` in `logical.h` → add payload struct → add union member in `struct logical_node` → emit in `logical_build` (desugar from `query_select`) → handle in `normalize_node` if needed → add dispatch case in `logical_to_physical` in `plan.c`.
 
 **New scalar function**: Add `FUNC_*` enum → keyword registration in `parser.c` → evaluation case in `eval_expr()`.
 
@@ -122,6 +133,8 @@ Reject unsupported or invalid inputs at the top of a function with early returns
 ### Validation-then-build
 
 Plan builders validate all inputs (columns exist, types match, features supported) before allocating any plan nodes. This prevents orphaned arena allocations on error paths.
+
+The logical IR layer (`logical_build`) always succeeds — it only desugars, never validates. Validation and bail-outs happen in `logical_to_physical` and the physical builders, after the tree is fully built.
 
 ## Testing
 

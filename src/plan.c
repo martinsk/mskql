@@ -2,6 +2,7 @@
 #include "query.h"
 #include "parser.h"
 #include "arena_helpers.h"
+#include "logical.h"
 #include "vector.h"
 #ifndef MSKQL_WASM
 #include "parquet.h"
@@ -13078,6 +13079,103 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
     return PLAN_RES_OK(current);
 }
 
+/* ---- Logical → Physical pattern matcher ----
+ *
+ * Walks a logical IR tree produced by logical_build() + logical_normalize()
+ * and routes to the appropriate physical plan builder.
+ *
+ * The logical tree shape is the authoritative dispatch signal.  Physical
+ * builders (build_join, build_aggregate, build_single_table) still read
+ * the original query_select fields — the tree op just determines which
+ * builder is called, removing the ad-hoc flag cascade that was here before.
+ *
+ * Returns PLAN_RES_NOTIMPL for query shapes not yet handled (falls back to
+ * the legacy row-at-a-time executor via the caller).
+ */
+static struct plan_result logical_to_physical(struct table *t,
+                                              struct query_select *s,
+                                              struct query_arena *arena,
+                                              struct database *db,
+                                              uint32_t root)
+{
+    if (root == IDX_NONE) return PLAN_RES_NOTIMPL;
+
+    struct logical_node *rn = logical_node_get(arena, root);
+    if (!rn) return PLAN_RES_NOTIMPL;
+
+    /* ---- Route by dominant logical operator ----
+     * Walk down through wrapper nodes (LIMIT, SORT, PROJECT, FILTER,
+     * AGGREGATE) to find the dominant structural node that determines
+     * which physical builder to call.  Priority: L_JOIN > L_AGGREGATE > L_SCAN.
+     * We track the highest-priority structural node seen while descending. */
+    enum logical_op dominant = rn->op;
+    uint32_t cur = root;
+    struct logical_node *cn = rn;
+    while (cn) {
+        if (cn->op == L_JOIN) {
+            dominant = L_JOIN;
+            break; /* L_JOIN is highest priority — stop immediately */
+        }
+        if (cn->op == L_AGGREGATE && dominant != L_JOIN) {
+            dominant = L_AGGREGATE;
+        }
+        cur = cn->child;
+        cn = logical_node_get(arena, cur);
+    }
+
+    switch (dominant) {
+        case L_JOIN:
+            /* The L_JOIN node is present — route to build_join which handles
+             * both plain joins and join + GROUP BY + HAVING queries. */
+            if (db) return build_join(t, s, arena, db);
+            return PLAN_RES_NOTIMPL;
+
+        case L_AGGREGATE:
+            /* L_AGGREGATE without a join: GROUP BY, bare aggregates, DISTINCT.
+             * CTE / subquery / recursive queries: fall back to legacy. */
+            if (s->has_set_op ||
+                s->ctes_count > 0 || s->cte_sql != IDX_NONE ||
+                s->from_subquery_sql != IDX_NONE || s->has_recursive_cte)
+                return PLAN_RES_NOTIMPL;
+
+            /* DISTINCT-only (group_by_count==0, agg_count==0) */
+            if (s->has_distinct && !s->has_group_by && s->aggregates_count == 0)
+                return build_single_table(t, s, arena, db);
+
+            /* Simple aggregate: no GROUP BY, single-table */
+            if (!s->has_group_by && s->aggregates_count > 0 && t &&
+                s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
+                !s->has_distinct && !s->has_distinct_on &&
+                (s->parsed_columns_count == 0 ||
+                 s->parsed_columns_count == s->aggregates_count)) {
+                struct plan_result sa_pr = build_simple_agg(t, s, arena);
+                if (sa_pr.status == PLAN_OK) return sa_pr;
+            }
+
+            /* GROUP BY + aggregates, single-table */
+            if (s->has_group_by && s->aggregates_count > 0 && t &&
+                s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
+                !s->has_distinct && !s->has_distinct_on &&
+                !s->group_by_rollup && !s->group_by_cube) {
+                struct plan_result agg_pr = build_aggregate(t, s, arena);
+                if (agg_pr.status == PLAN_OK) return agg_pr;
+            }
+
+            return PLAN_RES_NOTIMPL;
+
+        case L_SCAN:
+        case L_FILTER:
+        case L_SORT:
+        case L_LIMIT:
+        case L_PROJECT:
+            /* Single-table path: scan ± filter ± project ± sort ± limit */
+            return build_single_table(t, s, arena, db);
+    }
+
+    /* Exhaustive switch above covers all enum values — unreachable */
+    __builtin_unreachable();
+}
+
 /* ---- Plan builder ---- */
 
 /* Try to build a block-oriented plan for a SELECT query.
@@ -13143,11 +13241,6 @@ struct plan_result plan_build_select(struct table *t, struct query_select *s,
         return PLAN_RES_OK(current);
     }
 
-    /* ---- Join fast path (single or multi-table) ---- */
-    if (s->has_join && s->joins_count >= 1 && db) {
-        return build_join(t, s, arena, db);
-    }
-
     /* ---- Window function fast path ---- */
     if (s->select_exprs_count > 0 && !s->has_join && !s->has_group_by &&
         s->aggregates_count == 0 && !s->has_set_op && s->ctes_count == 0 &&
@@ -13167,28 +13260,6 @@ struct plan_result plan_build_select(struct table *t, struct query_select *s,
         return build_set_op(t, s, arena, db);
     }
 
-    /* ---- Simple aggregate (no GROUP BY) fast path ---- */
-    if (!s->has_group_by && s->aggregates_count > 0 && t && !s->has_join &&
-        !s->has_set_op && s->ctes_count == 0 && s->cte_sql == IDX_NONE &&
-        s->from_subquery_sql == IDX_NONE && !s->has_recursive_cte &&
-        s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
-        !s->has_distinct && !s->has_distinct_on &&
-        (s->parsed_columns_count == 0 || s->parsed_columns_count == s->aggregates_count)) {
-        struct plan_result sa_pr = build_simple_agg(t, s, arena);
-        if (sa_pr.status == PLAN_OK) return sa_pr;
-    }
-
-    /* ---- Single-table GROUP BY + aggregates fast path ---- */
-    if (s->has_group_by && s->aggregates_count > 0 && t && !s->has_join &&
-        !s->has_set_op && s->ctes_count == 0 && s->cte_sql == IDX_NONE &&
-        s->from_subquery_sql == IDX_NONE && !s->has_recursive_cte &&
-        s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
-        !s->has_distinct && !s->has_distinct_on &&
-        !s->group_by_rollup && !s->group_by_cube) {
-        struct plan_result agg_pr = build_aggregate(t, s, arena);
-        if (agg_pr.status == PLAN_OK) return agg_pr;
-    }
-
     /* ---- Inline aggregate expressions (e.g. SUM(val) + 1, COALESCE(SUM(x), 0)) ---- */
     if (s->has_expr_aggs && t) {
         struct plan_result ea_pr = build_expr_agg(t, s, arena);
@@ -13197,6 +13268,25 @@ struct plan_result plan_build_select(struct table *t, struct query_select *s,
         if (ea_pr.status == PLAN_ERROR) return ea_pr;
     }
 
-    /* ---- Single-table path ---- */
+    /* ---- Logical IR path ----
+     * Build the canonical logical tree, apply normalization rewrites,
+     * then pattern-match to physical plan nodes.
+     * Falls back to build_single_table on NOTIMPL.
+     * Reset logical_nodes count first so that a previous failed attempt
+     * (e.g. from try_plan_send → NOTIMPL → legacy retry) doesn't leave
+     * stale nodes in the DA, and so the backing buffer is reused. */
+    da_reset(&arena->logical_nodes);
+    {
+        uint32_t lroot = logical_build(s, arena, db);
+        if (lroot != IDX_NONE) {
+            lroot = logical_normalize(lroot, arena, db);
+            struct plan_result lpr = logical_to_physical(t, s, arena, db, lroot);
+            if (lpr.status == PLAN_OK || lpr.status == PLAN_ERROR)
+                return lpr;
+            /* PLAN_NOTIMPL: fall through to build_single_table */
+        }
+    }
+
+    /* ---- Single-table path (final fallback) ---- */
     return build_single_table(t, s, arena, db);
 }

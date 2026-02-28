@@ -11,9 +11,9 @@ ifeq ($(origin CC),default)
 endif
 CFLAGS  ?= -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O1 -g -fsanitize=address -fno-omit-frame-pointer -MMD -MP
 BUILDDIR = ../build
-SRCS     = main.c database.c table.c query.c row.c parser.c pgwire.c index.c column.c plan.c catalog.c datetime.c parquet.c hnsw.c diskio.c
+SRCS     = main.c database.c table.c query.c row.c parser.c pgwire.c index.c column.c plan.c catalog.c datetime.c parquet.c hnsw.c diskio.c logical.c
 OBJS     = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
-LIB_SRCS = database.c table.c query.c row.c parser.c index.c column.c plan.c catalog.c datetime.c parquet.c hnsw.c diskio.c
+LIB_SRCS = database.c table.c query.c row.c parser.c index.c column.c plan.c catalog.c datetime.c parquet.c hnsw.c diskio.c logical.c
 LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/%.o,$(LIB_SRCS))
 
 # ── Carquet (auto-cloned Parquet library) ─────────────────────────

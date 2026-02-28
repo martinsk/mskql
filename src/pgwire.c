@@ -3500,6 +3500,7 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
     conn_arena->scratch = q.arena.scratch;
     conn_arena->bump = q.arena.bump;
     conn_arena->plan_nodes = q.arena.plan_nodes;
+    conn_arena->logical_nodes = q.arena.logical_nodes;
     conn_arena->cells = q.arena.cells;
     conn_arena->svs = q.arena.svs;
     conn_arena->conditions = q.arena.conditions;

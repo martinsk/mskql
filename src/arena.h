@@ -172,6 +172,7 @@ struct order_by_item;
 struct join_info;
 struct cte_def;
 struct plan_node;
+struct logical_node;
 
 /* Pool-based arena: each parsed type gets its own flat dynamic array.
  * Structures reference items by uint32_t index instead of pointers.
@@ -196,6 +197,7 @@ struct query_arena {
     DYNAMIC_ARRAY(struct column)           columns;     /* CREATE TABLE columns */
     DYNAMIC_ARRAY(uint32_t)                arg_indices; /* func call arg expr indices */
     DYNAMIC_ARRAY(struct plan_node)         plan_nodes;  /* query plan tree nodes */
+    DYNAMIC_ARRAY(struct logical_node)      logical_nodes; /* logical IR tree nodes */
     /* bump slab for strings, scratch buffers, result row cells */
     struct bump_alloc bump;
     /* result rows: bump-allocated cells, reset with arena */
@@ -245,6 +247,7 @@ static inline void query_arena_init(struct query_arena *a)
     da_init(&a->columns);
     da_init(&a->arg_indices);
     da_init(&a->plan_nodes);
+    da_init(&a->logical_nodes);
     bump_init(&a->bump);
     a->result.data = NULL;
     a->result.count = 0;
