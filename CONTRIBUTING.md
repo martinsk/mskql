@@ -51,6 +51,19 @@ Tagged unions exist so the compiler can enforce exhaustive handling via `-Wswitc
 - **No `default:` on finite enums** — list every variant explicitly, even if the body is just `break`. A `default:` silences the compiler warning and hides missing cases.
 - **No fallback return after an exhaustive switch** — a trailing `return -1` after a switch that already covers every variant defeats the compiler warning. Use `__builtin_unreachable()` if the compiler insists on a return.
 - **Short cases**: if a case body exceeds ~3 lines, extract it into a named `static` function. The switch should read like a dispatch table: `case PLAN_X: return handle_x(pn->x);` — the switch "picks" the relevant part of the union and sends only that to the handler, like SML pattern matching.
+- **Dispatch on union members**: pass *only* the relevant variant to the handler — not the whole union. The switch reduces the union to one concrete type; the handler knows nothing of the others:
+
+  ```c
+  static int area_circle(struct shape_CIRCLE *c) { return 3.14 * c->r * c->r; }
+  static int area_square(struct shape_SQUARE *s) { return s->a * s->b; }
+
+  int area(struct shape *s) {
+      switch (s->of) {
+          case CIRCLE: return area_circle(&s->data.CIRCLE);
+          case SQUARE: return area_square(&s->data.SQUARE);
+      }
+  }
+  ```
 - **Exception**: grouping types that share identical handling (e.g. all text-like `column_type` variants) is fine — list them all explicitly as fall-through cases, just don't add `default:`.
 
 **Strings**: `sv` (string view) for non-owning references; `char *` (strdup'd) for owned strings. Use `SV_FMT` / `SV_ARG()` for printf formatting.

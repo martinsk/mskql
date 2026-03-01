@@ -8896,6 +8896,14 @@ static int explain_binary(struct query_arena *arena, struct plan_node *pn,
     return written;
 }
 
+static int explain_top_n(struct query_arena *arena, struct plan_node *pn,
+                          char *buf, int buflen, int depth)
+{
+    char label[64];
+    snprintf(label, sizeof(label), "Top-N Sort (limit=%zu)", pn->top_n.limit);
+    return explain_unary(arena, pn, label, buf, buflen, depth);
+}
+
 static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
                               char *buf, int buflen, int depth)
 {
@@ -8938,13 +8946,10 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
         n = explain_sort(arena, pn, buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
-    case PLAN_TOP_N: {
-        char label[64];
-        snprintf(label, sizeof(label), "Top-N Sort (limit=%zu)", pn->top_n.limit);
-        n = explain_unary(arena, pn, label, buf + written, buflen - written, depth);
+    case PLAN_TOP_N:
+        n = explain_top_n(arena, pn, buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
-    }
     case PLAN_HASH_JOIN:
         n = explain_binary(arena, pn, "Hash Join", buf + written, buflen - written, depth);
         if (n > 0) written += n;

@@ -2949,1222 +2949,1271 @@ static int db_exec_select(struct database *db, struct query *q, struct rows *res
     return sel_rc;
 }
 
+static int db_exec_create(struct database *db, struct query_create_table *crt,
+                          struct query_arena *arena, struct rows *result)
+{
+    if (crt->if_not_exists && db_find_table_sv(db, crt->table))
+        return 0;
+    /* CREATE TABLE name LIKE source_table */
+    if (crt->like_table.len > 0) {
+        struct table *src = db_find_table_sv(db, crt->like_table);
+        if (!src) {
+            arena_set_error(arena, "42P01", "table '%.*s' not found",
+                            (int)crt->like_table.len, crt->like_table.data);
+            return -1;
+        }
+        struct table t;
+        table_init_own(&t, sv_to_cstr(crt->table));
+        for (size_t c = 0; c < src->columns.count; c++) {
+            struct column col = {0};
+            col.name = strdup(src->columns.items[c].name);
+            col.type = src->columns.items[c].type;
+            da_push(&t.columns, col);
+        }
+        da_push(&db->tables, t);
+        db->total_generation++;
+        return 0;
+    }
+    /* CREATE TABLE ... AS SELECT */
+    if (crt->as_select_sql != IDX_NONE) {
+        const char *sel_sql = ASTRING(arena, crt->as_select_sql);
+        struct query sel_q;
+        if (query_parse(sel_sql, &sel_q) != 0) {
+            arena_set_error(arena, "42601", "CREATE TABLE AS: invalid SELECT");
+            return -1;
+        }
+        struct rows sel_rows = {0};
+        if (db_exec(db, &sel_q, &sel_rows, NULL) != 0) {
+            query_free(&sel_q);
+            arena_set_error(arena, "42601", "CREATE TABLE AS: SELECT failed");
+            return -1;
+        }
+        struct table t;
+        table_init_own(&t, sv_to_cstr(crt->table));
+        /* infer columns from SELECT result */
+        if (sel_rows.count > 0 && sel_rows.data[0].cells.count > 0) {
+            /* try to get column names from the select query */
+            sv cols = sel_q.select.columns;
+            size_t ncols = sel_rows.data[0].cells.count;
+            for (size_t ci = 0; ci < ncols; ci++) {
+                struct column col = {0};
+                col.type = sel_rows.data[0].cells.items[ci].type;
+                /* extract column name from raw columns text */
+                char colname[128];
+                int got_name = 0;
+                if (cols.len > 0 && ci == 0) {
+                    /* parse comma-separated column names */
+                    sv remaining = cols;
+                    for (size_t k = 0; k <= ci && remaining.len > 0; k++) {
+                        while (remaining.len > 0 && remaining.data[0] == ' ')
+                            { remaining.data++; remaining.len--; }
+                        size_t end = 0;
+                        int depth = 0;
+                        while (end < remaining.len) {
+                            if (remaining.data[end] == '(') depth++;
+                            else if (remaining.data[end] == ')') depth--;
+                            else if (remaining.data[end] == ',' && depth == 0) break;
+                            end++;
+                        }
+                        if (k == ci) {
+                            sv cn = sv_from(remaining.data, end);
+                            while (cn.len > 0 && cn.data[cn.len-1] == ' ') cn.len--;
+                            /* check for AS alias */
+                            for (size_t p = 0; p + 2 < cn.len; p++) {
+                                if ((cn.data[p] == ' ') &&
+                                    (cn.data[p+1] == 'A' || cn.data[p+1] == 'a') &&
+                                    (cn.data[p+2] == 'S' || cn.data[p+2] == 's') &&
+                                    (p+3 >= cn.len || cn.data[p+3] == ' ')) {
+                                    cn = sv_from(cn.data + p + 3, cn.len - p - 3);
+                                    while (cn.len > 0 && cn.data[0] == ' ')
+                                        { cn.data++; cn.len--; }
+                                    break;
+                                }
+                            }
+                            snprintf(colname, sizeof(colname), "%.*s", (int)cn.len, cn.data);
+                            got_name = 1;
+                        }
+                        if (end < remaining.len) { remaining.data += end + 1; remaining.len -= end + 1; }
+                        else break;
+                    }
+                }
+                if (!got_name || ci > 0) {
+                    /* for subsequent columns, re-parse from cols */
+                    sv remaining = cols;
+                    size_t col_idx = 0;
+                    while (remaining.len > 0 && col_idx <= ci) {
+                        while (remaining.len > 0 && remaining.data[0] == ' ')
+                            { remaining.data++; remaining.len--; }
+                        size_t end = 0;
+                        int depth = 0;
+                        while (end < remaining.len) {
+                            if (remaining.data[end] == '(') depth++;
+                            else if (remaining.data[end] == ')') depth--;
+                            else if (remaining.data[end] == ',' && depth == 0) break;
+                            end++;
+                        }
+                        if (col_idx == ci) {
+                            sv cn = sv_from(remaining.data, end);
+                            while (cn.len > 0 && cn.data[cn.len-1] == ' ') cn.len--;
+                            snprintf(colname, sizeof(colname), "%.*s", (int)cn.len, cn.data);
+                            got_name = 1;
+                        }
+                        col_idx++;
+                        if (end < remaining.len) { remaining.data += end + 1; remaining.len -= end + 1; }
+                        else break;
+                    }
+                }
+                if (!got_name)
+                    snprintf(colname, sizeof(colname), "col%zu", ci + 1);
+                col.name = strdup(colname);
+                table_add_column(&t, &col);
+                free(col.name);
+            }
+        }
+        /* copy rows */
+        for (size_t ri = 0; ri < sel_rows.count; ri++) {
+            struct row nr = {0};
+            da_init(&nr.cells);
+            for (size_t ci = 0; ci < sel_rows.data[ri].cells.count; ci++) {
+                struct cell cp;
+                cell_copy(&cp, &sel_rows.data[ri].cells.items[ci]);
+                da_push(&nr.cells, cp);
+            }
+            da_push(&t.rows, nr);
+            table_flat_append_row(&t, &t.rows.items[t.rows.count - 1]);
+        }
+        da_push(&db->tables, t);
+        db->total_generation++;
+        /* store row count in result for command tag */
+        if (result) {
+            struct row r = {0};
+            da_init(&r.cells);
+            struct cell c = { .type = COLUMN_TYPE_INT };
+            c.value.as_int = (int)sel_rows.count;
+            da_push(&r.cells, c);
+            rows_push(result, r);
+        }
+        /* free select results */
+        for (size_t ri = 0; ri < sel_rows.count; ri++)
+            row_free(&sel_rows.data[ri]);
+        free(sel_rows.data);
+        query_free(&sel_q);
+        return 0;
+    }
+    struct table t;
+    table_init_own(&t, sv_to_cstr(crt->table));
+    for (uint32_t i = 0; i < crt->columns_count; i++) {
+        table_add_column(&t, &arena->columns.items[crt->columns_start + i]);
+    }
+    /* table-level PRIMARY KEY (col1, col2, ...) */
+    if (crt->pk_columns_count > 0) {
+        sv pk_col_names[MAX_INDEX_COLS];
+        int pk_col_indices[MAX_INDEX_COLS];
+        int pk_n = (int)crt->pk_columns_count;
+        if (pk_n > MAX_INDEX_COLS) pk_n = MAX_INDEX_COLS;
+        for (int c = 0; c < pk_n; c++) {
+            pk_col_names[c] = arena->svs.items[crt->pk_columns_start + c];
+            pk_col_indices[c] = table_find_column_sv(&t, pk_col_names[c]);
+            if (pk_col_indices[c] >= 0) {
+                t.columns.items[pk_col_indices[c]].is_primary_key = 1;
+                t.columns.items[pk_col_indices[c]].not_null = 1;
+                if (pk_n == 1)
+                    t.columns.items[pk_col_indices[c]].is_unique = 1;
+            }
+        }
+        char idx_name[256];
+        snprintf(idx_name, sizeof(idx_name), "%.*s_pkey", (int)crt->table.len, crt->table.data);
+        struct index pk_idx;
+        index_init_sv(&pk_idx, (sv){idx_name, strlen(idx_name)}, pk_col_names, pk_col_indices, pk_n);
+        pk_idx.is_unique = 1;
+        da_push(&t.indexes, pk_idx);
+    }
+    /* table-level UNIQUE (col1, col2, ...) */
+    if (crt->unique_columns_count > 0) {
+        sv uq_col_names[MAX_INDEX_COLS];
+        int uq_col_indices[MAX_INDEX_COLS];
+        int uq_n = (int)crt->unique_columns_count;
+        if (uq_n > MAX_INDEX_COLS) uq_n = MAX_INDEX_COLS;
+        for (int c = 0; c < uq_n; c++) {
+            uq_col_names[c] = arena->svs.items[crt->unique_columns_start + c];
+            uq_col_indices[c] = table_find_column_sv(&t, uq_col_names[c]);
+            if (uq_col_indices[c] >= 0 && uq_n == 1)
+                t.columns.items[uq_col_indices[c]].is_unique = 1;
+        }
+        char idx_name[256];
+        snprintf(idx_name, sizeof(idx_name), "%.*s_unique", (int)crt->table.len, crt->table.data);
+        struct index uq_idx;
+        index_init_sv(&uq_idx, (sv){idx_name, strlen(idx_name)}, uq_col_names, uq_col_indices, uq_n);
+        uq_idx.is_unique = 1;
+        da_push(&t.indexes, uq_idx);
+    }
+    /* If this is a disk-backed table, set up the disk storage */
+    if (crt->is_disk) {
+        char *dir = sv_to_cstr(crt->dir_path);
+        mkdir(dir, 0755);
+        t.kind = TABLE_DISK;
+        t.disk.dir_path = dir;
+        memset(&t.disk.meta, 0, sizeof(t.disk.meta));
+        t.disk.cache_valid = 0;
+        t.disk.wal_bytes = 0;
+        t.disk.wal_dirty = 0;
+        /* Write initial .mskd file with schema only */
+        char mskd_path[1024];
+        disk_path_base(dir, mskd_path, sizeof(mskd_path));
+        /* Need flat_table initialized so disk_write_table can read schema */
+        if (t.columns.count > 0)
+            table_flat_init_schema(&t);
+        if (disk_write_table(mskd_path, &t) != 0) {
+            arena_set_error(arena, "58000", "failed to write disk table file");
+            table_free(&t);
+            return -1;
+        }
+        /* Read back the schema into disk.meta */
+        if (disk_read_schema(mskd_path, &t.disk.meta) != 0) {
+            arena_set_error(arena, "58000", "failed to read disk table schema");
+            table_free(&t);
+            return -1;
+        }
+        t.disk.cache_valid = 1; /* flat is current (empty but valid) */
+    }
+    da_push(&db->tables, t);
+    db->total_generation++;
+    /* Persist disk catalog after adding a disk table */
+    if (crt->is_disk && db->catalog_path)
+        disk_catalog_save(db->catalog_path, db);
+    return 0;
+}
+
+static int db_exec_drop(struct database *db, struct query_drop_table *dt,
+                        struct query_arena *arena, struct txn_state *txn)
+{
+    sv drop_tbl = dt->table;
+    int found = 0;
+    int was_disk = 0;
+    for (size_t i = 0; i < db->tables.count; i++) {
+        if (sv_eq_cstr(drop_tbl, db->tables.items[i].name)) {
+            /* COW trigger for DROP TABLE */
+            if (txn && txn->in_transaction && txn->snapshot)
+                snapshot_cow_table(txn->snapshot, db, db->tables.items[i].name);
+            was_disk = (db->tables.items[i].kind == TABLE_DISK);
+            /* Remove disk files for TABLE_DISK */
+            if (was_disk && db->tables.items[i].disk.dir_path) {
+                char path_buf[1024];
+                disk_path_base(db->tables.items[i].disk.dir_path, path_buf, sizeof(path_buf));
+                remove(path_buf);
+                disk_path_wal(db->tables.items[i].disk.dir_path, path_buf, sizeof(path_buf));
+                remove(path_buf);
+                snprintf(path_buf, sizeof(path_buf), "%s/data.mskd.tmp",
+                         db->tables.items[i].disk.dir_path);
+                remove(path_buf);
+                rmdir(db->tables.items[i].disk.dir_path);
+            }
+            table_free(&db->tables.items[i]);
+            for (size_t j = i; j + 1 < db->tables.count; j++)
+                db->tables.items[j] = db->tables.items[j + 1];
+            db->tables.count--;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        if (dt->if_exists) return 0;
+        arena_set_error(arena, "42P01", "table '%.*s' does not exist", (int)drop_tbl.len, drop_tbl.data);
+        return -1;
+    }
+    /* CASCADE: drop all tables that have a foreign key referencing the dropped table */
+    if (dt->cascade) {
+        char drop_name[256];
+        snprintf(drop_name, sizeof(drop_name), "%.*s", (int)drop_tbl.len, drop_tbl.data);
+        restart_cascade:
+        for (size_t i = 0; i < db->tables.count; i++) {
+            struct table *dep = &db->tables.items[i];
+            for (size_t c = 0; c < dep->columns.count; c++) {
+                if (dep->columns.items[c].fk_table &&
+                    strcasecmp(dep->columns.items[c].fk_table, drop_name) == 0) {
+                    table_free(dep);
+                    for (size_t j = i; j + 1 < db->tables.count; j++)
+                        db->tables.items[j] = db->tables.items[j + 1];
+                    db->tables.count--;
+                    goto restart_cascade;
+                }
+            }
+        }
+    }
+    /* Persist disk catalog after dropping a disk table */
+    if (was_disk && db->catalog_path)
+        disk_catalog_save(db->catalog_path, db);
+    return 0;
+}
+
+static int db_exec_create_type(struct database *db, struct query_create_type *ct,
+                               struct query_arena *arena)
+{
+    if (db_find_type_sv(db, ct->type_name)) {
+        arena_set_error(arena, "42710", "type '%.*s' already exists", (int)ct->type_name.len, ct->type_name.data);
+        return -1;
+    }
+    struct enum_type et;
+    et.name = sv_to_cstr(ct->type_name);
+    da_init(&et.values);
+    for (uint32_t i = 0; i < ct->enum_values_count; i++) {
+        /* copy the string (arena owns the original) */
+        da_push(&et.values, strdup(arena->strings.items[ct->enum_values_start + i]));
+    }
+    da_push(&db->types, et);
+    return 0;
+}
+
+static int db_exec_drop_type(struct database *db, struct query_drop_type *dt,
+                             struct query_arena *arena)
+{
+    sv dtn = dt->type_name;
+    for (size_t i = 0; i < db->types.count; i++) {
+        if (sv_eq_cstr(dtn, db->types.items[i].name)) {
+            enum_type_free(&db->types.items[i]);
+            for (size_t j = i; j + 1 < db->types.count; j++)
+                db->types.items[j] = db->types.items[j + 1];
+            db->types.count--;
+            return 0;
+        }
+    }
+    arena_set_error(arena, "42704", "type '%.*s' does not exist", (int)dtn.len, dtn.data);
+    return -1;
+}
+
+static int db_exec_create_sequence(struct database *db, struct query_create_sequence *cs,
+                                   struct query_arena *arena)
+{
+    for (size_t i = 0; i < db->sequences.count; i++) {
+        if (sv_eq_cstr(cs->name, db->sequences.items[i].name)) {
+            arena_set_error(arena, "42P07", "sequence '%.*s' already exists", (int)cs->name.len, cs->name.data);
+            return -1;
+        }
+    }
+    struct sequence seq;
+    seq.name = sv_to_cstr(cs->name);
+    seq.current_value = cs->start_value;
+    seq.increment = cs->increment;
+    seq.min_value = cs->min_value;
+    seq.max_value = cs->max_value;
+    seq.has_been_called = 0;
+    da_push(&db->sequences, seq);
+    return 0;
+}
+
+static int db_exec_drop_sequence(struct database *db, struct query_drop_sequence *ds,
+                                 struct query_arena *arena)
+{
+    sv sn = ds->name;
+    for (size_t i = 0; i < db->sequences.count; i++) {
+        if (sv_eq_cstr(sn, db->sequences.items[i].name)) {
+            free(db->sequences.items[i].name);
+            for (size_t j = i; j + 1 < db->sequences.count; j++)
+                db->sequences.items[j] = db->sequences.items[j + 1];
+            db->sequences.count--;
+            return 0;
+        }
+    }
+    arena_set_error(arena, "42P01", "sequence '%.*s' does not exist", (int)sn.len, sn.data);
+    return -1;
+}
+
+static int db_exec_create_view(struct database *db, struct query_create_view *cv,
+                               struct query_arena *arena)
+{
+    if (cv->sql_idx == IDX_NONE) {
+        arena_set_error(arena, "42601", "CREATE VIEW: missing SELECT body");
+        return -1;
+    }
+    const char *sql = ASTRING(arena, cv->sql_idx);
+    struct table *existing = db_find_table_sv(db, cv->name);
+    if (existing) {
+        if (cv->or_replace && existing->kind == TABLE_VIEW) {
+            for (size_t i = 0; i < db->tables.count; i++) {
+                if (db->tables.items[i].kind == TABLE_VIEW &&
+                    sv_eq_cstr(cv->name, db->tables.items[i].name)) {
+                    table_free(&db->tables.items[i]);
+                    for (size_t j = i; j + 1 < db->tables.count; j++)
+                        db->tables.items[j] = db->tables.items[j + 1];
+                    db->tables.count--;
+                    break;
+                }
+            }
+        } else {
+            arena_set_error(arena, "42P07", "relation '%.*s' already exists", (int)cv->name.len, cv->name.data);
+            return -1;
+        }
+    }
+    struct table vt;
+    char vname[512];
+    snprintf(vname, sizeof(vname), "%.*s", (int)cv->name.len, cv->name.data);
+    table_init(&vt, vname);
+    vt.kind = TABLE_VIEW;
+    vt.view.sql = strdup(sql);
+    da_push(&db->tables, vt);
+    db->total_generation++;
+    return 0;
+}
+
+static int db_exec_drop_view(struct database *db, struct query_drop_view *dv,
+                             struct query_arena *arena)
+{
+    sv vn = dv->name;
+    for (size_t i = 0; i < db->tables.count; i++) {
+        if (sv_eq_cstr(vn, db->tables.items[i].name) && db->tables.items[i].kind == TABLE_VIEW) {
+            table_free(&db->tables.items[i]);
+            for (size_t j = i; j + 1 < db->tables.count; j++)
+                db->tables.items[j] = db->tables.items[j + 1];
+            db->tables.count--;
+            return 0;
+        }
+    }
+    arena_set_error(arena, "42P01", "view '%.*s' does not exist", (int)vn.len, vn.data);
+    return -1;
+}
+
+static int db_exec_explain(struct database *db, struct query_explain *ex,
+                           struct query_arena *arena, struct rows *result,
+                           struct bump_alloc *rb)
+{
+    size_t sql_len = ex->inner_sql.len;
+    char inner_sql[sql_len + 1];
+    memcpy(inner_sql, ex->inner_sql.data, sql_len);
+    inner_sql[sql_len] = '\0';
+
+    struct query inner_q;
+    memset(&inner_q, 0, sizeof(inner_q));
+    query_arena_init(&inner_q.arena);
+    int prc = query_parse_into(inner_sql, &inner_q, &inner_q.arena);
+    if (prc != 0) {
+        if (inner_q.arena.errmsg[0])
+            arena_set_error(arena, inner_q.arena.sqlstate, "%s", inner_q.arena.errmsg);
+        query_arena_destroy(&inner_q.arena);
+        return -1;
+    }
+
+    char explain_buf[4096];
+    int explain_len = 0;
+
+    if (inner_q.query_type == QUERY_TYPE_SELECT) {
+        struct table *t = db_find_table_sv(db, inner_q.select.table);
+        struct plan_result epr = { .node = IDX_NONE, .status = PLAN_NOTIMPL };
+        if (t)
+            epr = plan_build_select(t, &inner_q.select, &inner_q.arena, db);
+        if (epr.status == PLAN_OK) {
+            explain_len = plan_explain(&inner_q.arena, epr.node, explain_buf, sizeof(explain_buf));
+        } else {
+            explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
+        }
+    } else {
+        explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
+    }
+
+    /* Build result rows — one row per line */
+    char *line = explain_buf;
+    for (int i = 0; i <= explain_len; i++) {
+        if (i == explain_len || explain_buf[i] == '\n') {
+            explain_buf[i] = '\0';
+            struct row r = {0};
+            da_init(&r.cells);
+            struct cell c = {0};
+            c.type = COLUMN_TYPE_TEXT;
+            c.value.as_text = rb ? bump_strdup(rb, line) : strdup(line);
+            da_push(&r.cells, c);
+            rows_push(result, r);
+            line = explain_buf + i + 1;
+        }
+    }
+
+    query_arena_destroy(&inner_q.arena);
+    return 0;
+}
+
+static int db_exec_truncate(struct database *db, struct query_delete *del,
+                            struct query_arena *arena, struct txn_state *txn)
+{
+    uint32_t tt_count = del->truncate_tables_count;
+    uint32_t tt_start = del->truncate_tables_start;
+    if (tt_count == 0) {
+        tt_count = 1;
+        tt_start = 0; /* unused — use del->table directly */
+    }
+    for (uint32_t ti = 0; ti < tt_count; ti++) {
+        sv tname = (del->truncate_tables_count > 0)
+            ? arena->svs.items[tt_start + ti]
+            : del->table;
+        struct table *t = db_find_table_sv(db, tname);
+        if (!t) {
+            arena_set_error(arena, "42P01", "table '%.*s' does not exist",
+                            (int)tname.len, tname.data);
+            return -1;
+        }
+        /* COW trigger for TRUNCATE */
+        if (txn && txn->in_transaction && txn->snapshot)
+            snapshot_cow_table(txn->snapshot, db, t->name);
+        /* free all rows */
+        for (size_t i = 0; i < t->rows.count; i++)
+            row_free(&t->rows.items[i]);
+        t->rows.count = 0;
+        flat_table_free(&t->flat);
+        t->generation++;
+        db->total_generation++;
+        /* reset SERIAL counters */
+        for (size_t i = 0; i < t->columns.count; i++) {
+            if (t->columns.items[i].is_serial)
+                t->columns.items[i].serial_next = 1;
+        }
+        /* clear indexes */
+        for (size_t i = 0; i < t->indexes.count; i++)
+            index_reset(&t->indexes.items[i]);
+        /* CASCADE: truncate tables that have FK columns referencing this table */
+        if (del->truncate_cascade) {
+            for (size_t ti2 = 0; ti2 < db->tables.count; ti2++) {
+                struct table *ref = &db->tables.items[ti2];
+                if (ref == t) continue;
+                int has_fk = 0;
+                for (size_t ci = 0; ci < ref->columns.count; ci++) {
+                    if (ref->columns.items[ci].fk_table &&
+                        strcmp(ref->columns.items[ci].fk_table, t->name) == 0) {
+                        has_fk = 1; break;
+                    }
+                }
+                if (!has_fk) continue;
+                if (txn && txn->in_transaction && txn->snapshot)
+                    snapshot_cow_table(txn->snapshot, db, ref->name);
+                for (size_t ri = 0; ri < ref->rows.count; ri++)
+                    row_free(&ref->rows.items[ri]);
+                ref->rows.count = 0;
+                flat_table_free(&ref->flat);
+                ref->generation++;
+                db->total_generation++;
+                for (size_t ii = 0; ii < ref->indexes.count; ii++)
+                    index_reset(&ref->indexes.items[ii]);
+            }
+        }
+    }
+    return 0;
+}
+
+static int db_exec_create_index(struct database *db, struct query_create_index *ci,
+                                struct query_arena *arena)
+{
+    struct table *t = db_find_table_sv(db, ci->table);
+    if (!t) {
+        arena_set_error(arena, "42P01", "table '%.*s' does not exist", (int)ci->table.len, ci->table.data);
+        return -1;
+    }
+    /* IF NOT EXISTS: check if index already exists */
+    if (ci->if_not_exists) {
+        for (size_t ii = 0; ii < t->indexes.count; ii++) {
+            if (sv_eq_cstr(ci->index_name, t->indexes.items[ii].name))
+                return 0;
+        }
+    }
+    int ncols = (int)ci->index_columns_count;
+    if (ncols < 1 || ncols > MAX_INDEX_COLS) {
+        arena_set_error(arena, "42601", "index must have 1-%d columns", MAX_INDEX_COLS);
+        return -1;
+    }
+    sv col_names[MAX_INDEX_COLS];
+    int col_indices[MAX_INDEX_COLS];
+    for (int c = 0; c < ncols; c++) {
+        col_names[c] = arena->svs.items[ci->index_columns_start + c];
+        col_indices[c] = table_find_column_sv(t, col_names[c]);
+        if (col_indices[c] < 0) {
+            arena_set_error(arena, "42703", "column '%.*s' not found in table '%.*s'",
+                            (int)col_names[c].len, col_names[c].data,
+                            (int)ci->table.len, ci->table.data);
+            return -1;
+        }
+    }
+    struct index idx;
+    index_init_sv(&idx, ci->index_name, col_names, col_indices, ncols);
+
+    /* ---- HNSW index path ---- */
+    if (ci->using_method.len > 0 && sv_eq_ignorecase_cstr(ci->using_method, "hnsw")) {
+        if (ncols != 1) {
+            arena_set_error(arena, "42601", "HNSW index must have exactly one column");
+            index_free(&idx);
+            return -1;
+        }
+        int ci0 = col_indices[0];
+        if (t->columns.items[ci0].type != COLUMN_TYPE_VECTOR) {
+            arena_set_error(arena, "42601", "HNSW index column must be of type VECTOR");
+            index_free(&idx);
+            return -1;
+        }
+        enum hnsw_dist_type dist = HNSW_L2;
+        if (ci->ops_class.len > 0) {
+            if (sv_eq_ignorecase_cstr(ci->ops_class, "vector_l2_ops"))
+                dist = HNSW_L2;
+            else if (sv_eq_ignorecase_cstr(ci->ops_class, "vector_cosine_ops"))
+                dist = HNSW_COSINE;
+            else if (sv_eq_ignorecase_cstr(ci->ops_class, "vector_ip_ops"))
+                dist = HNSW_IP;
+            else {
+                arena_set_error(arena, "42601", "unknown operator class '%.*s'",
+                                (int)ci->ops_class.len, ci->ops_class.data);
+                index_free(&idx);
+                return -1;
+            }
+        }
+        uint16_t dim = t->columns.items[ci0].vector_dim;
+        struct hnsw_index *hnsw = (struct hnsw_index *)malloc(sizeof(struct hnsw_index));
+        hnsw_init(hnsw, dim, 16, 200, dist);
+        hnsw->col_idx = ci0;
+        idx.type = INDEX_HNSW;
+        free(idx.root);
+        idx.root = NULL;
+        idx.hnsw = hnsw;
+        /* backfill existing rows */
+        for (size_t i = 0; i < t->rows.count; i++) {
+            if ((size_t)ci0 < t->rows.items[i].cells.count &&
+                !t->rows.items[i].cells.items[ci0].is_null &&
+                t->rows.items[i].cells.items[ci0].value.as_vector) {
+                hnsw_insert(hnsw, t->rows.items[i].cells.items[ci0].value.as_vector, i);
+            }
+        }
+        da_push(&t->indexes, idx);
+        return 0;
+    }
+
+    /* ---- B-tree index path (default) ---- */
+    /* backfill existing rows */
+    for (size_t i = 0; i < t->rows.count; i++) {
+        struct cell composite[MAX_INDEX_COLS];
+        int ok = 1;
+        for (int c = 0; c < ncols; c++) {
+            if ((size_t)col_indices[c] < t->rows.items[i].cells.count)
+                composite[c] = t->rows.items[i].cells.items[col_indices[c]];
+            else
+                ok = 0;
+        }
+        if (ok) index_insert(&idx, composite, i);
+    }
+    da_push(&t->indexes, idx);
+    return 0;
+}
+
+static int db_exec_drop_index(struct database *db, struct query_drop_index *di,
+                              struct query_arena *arena)
+{
+    for (size_t ti = 0; ti < db->tables.count; ti++) {
+        struct table *t = &db->tables.items[ti];
+        for (size_t ii = 0; ii < t->indexes.count; ii++) {
+            if (sv_eq_cstr(di->index_name, t->indexes.items[ii].name)) {
+                index_free(&t->indexes.items[ii]);
+                for (size_t j = ii; j + 1 < t->indexes.count; j++)
+                    t->indexes.items[j] = t->indexes.items[j + 1];
+                t->indexes.count--;
+                return 0;
+            }
+        }
+    }
+    arena_set_error(arena, "42704", "index '%.*s' does not exist", (int)di->index_name.len, di->index_name.data);
+    return -1;
+}
+
+static int db_exec_values(struct database *db, struct query_insert *ins,
+                          struct query_arena *arena, struct rows *result,
+                          struct bump_alloc *rb)
+{
+    result->data = NULL; result->count = 0; result->capacity = 0;
+    struct row *ir_data = &arena->rows.items[ins->insert_rows_start];
+    uint32_t ir_count = ins->insert_rows_count;
+    for (uint32_t ri = 0; ri < ir_count; ri++) {
+        struct row *src = &ir_data[ri];
+        struct row dst;
+        da_init(&dst.cells);
+        for (size_t ci = 0; ci < src->cells.count; ci++) {
+            struct cell c = src->cells.items[ci];
+            if (c.is_null == 2) {
+                c = eval_expr((uint32_t)c.value.as_int, arena, NULL, NULL, db, NULL);
+            } else if (column_type_is_text(c.type) && c.value.as_text) {
+                c.value.as_text = rb ? bump_strdup(rb, c.value.as_text) : strdup(c.value.as_text);
+            }
+            da_push(&dst.cells, c);
+        }
+        rows_push(result, dst);
+    }
+    return 0;
+}
+
+static int db_exec_delete(struct database *db, struct query *q,
+                          struct rows *result, struct bump_alloc *rb)
+{
+    struct query_delete *del = &q->del;
+    struct query_arena *arena = &q->arena;
+    /* resolve subqueries in WHERE */
+    if (del->where.has_where && del->where.where_cond != IDX_NONE)
+        resolve_subqueries(db, arena, del->where.where_cond, NULL);
+    /* DELETE ... USING: build merged table to evaluate cross-table WHERE */
+    if (del->using_table.len > 0 && del->where.has_where && del->where.where_cond != IDX_NONE) {
+        struct table *dt = db_find_table_sv(db, del->table);
+        struct table *ut = db_find_table_sv(db, del->using_table);
+        if (!dt || !ut) {
+            arena_set_error(arena, "42P01", "DELETE USING: table not found");
+            return -1;
+        }
+        /* COW trigger */
+        if (db->active_txn && db->active_txn->in_transaction && db->active_txn->snapshot)
+            snapshot_cow_table(db->active_txn->snapshot, db, dt->name);
+        /* build merged column metadata: t1 cols (qualified) + t2 cols (qualified) */
+        struct table merged = {0};
+        da_init(&merged.columns);
+        da_init(&merged.rows);
+        da_init(&merged.indexes);
+        char t1name[128], t2name[128];
+        snprintf(t1name, sizeof(t1name), "%.*s", (int)del->table.len, del->table.data);
+        snprintf(t2name, sizeof(t2name), "%.*s", (int)del->using_table.len, del->using_table.data);
+        for (size_t c = 0; c < dt->columns.count; c++) {
+            struct column col = {0};
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s.%s", t1name, dt->columns.items[c].name);
+            col.name = strdup(buf);
+            col.type = dt->columns.items[c].type;
+            da_push(&merged.columns, col);
+        }
+        for (size_t c = 0; c < ut->columns.count; c++) {
+            struct column col = {0};
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s.%s", t2name, ut->columns.items[c].name);
+            col.name = strdup(buf);
+            col.type = ut->columns.items[c].type;
+            da_push(&merged.columns, col);
+        }
+        /* find which target rows match any USING row */
+        size_t dt_ncols = dt->columns.count;
+        size_t ut_ncols = ut->columns.count;
+        int *to_delete = calloc(dt->rows.count, sizeof(int));
+        for (size_t i = 0; i < dt->rows.count; i++) {
+            for (size_t j = 0; j < ut->rows.count; j++) {
+                /* build merged row */
+                struct row mr = {0};
+                da_init(&mr.cells);
+                for (size_t c = 0; c < dt_ncols; c++)
+                    da_push(&mr.cells, dt->rows.items[i].cells.items[c]);
+                for (size_t c = 0; c < ut_ncols; c++)
+                    da_push(&mr.cells, ut->rows.items[j].cells.items[c]);
+                int match = eval_condition(del->where.where_cond, arena, &mr, &merged, NULL);
+                da_free(&mr.cells);
+                if (match) { to_delete[i] = 1; break; }
+            }
+        }
+        /* delete matched rows (iterate backwards to avoid index shifting issues) */
+        size_t deleted = 0;
+        for (size_t i = dt->rows.count; i > 0; i--) {
+            size_t idx = i - 1;
+            if (to_delete[idx]) {
+                row_free(&dt->rows.items[idx]);
+                for (size_t k = idx; k + 1 < dt->rows.count; k++)
+                    dt->rows.items[k] = dt->rows.items[k + 1];
+                dt->rows.count--;
+                table_flat_delete_row(dt, idx);
+                deleted++;
+                dt->generation++;
+                db->total_generation++;
+            }
+        }
+        free(to_delete);
+        for (size_t c = 0; c < merged.columns.count; c++) free(merged.columns.items[c].name);
+        da_free(&merged.columns);
+        /* indexes are rebuilt via generation change */
+        /* store deleted count */
+        if (result) {
+            struct row r = {0};
+            da_init(&r.cells);
+            struct cell c = { .type = COLUMN_TYPE_INT };
+            c.value.as_int = (int)deleted;
+            da_push(&r.cells, c);
+            rows_push(result, r);
+        }
+        return 0;
+    }
+    return db_table_exec_query(db, del->table, q, result, rb);
+}
+
+static int db_exec_update(struct database *db, struct query *q,
+                          struct rows *result, struct bump_alloc *rb)
+{
+    struct query_update *u = &q->update;
+    struct query_arena *arena = &q->arena;
+    /* resolve subqueries in WHERE */
+    if (u->where.has_where && u->where.where_cond != IDX_NONE)
+        resolve_subqueries(db, arena, u->where.where_cond, NULL);
+    /* UPDATE ... FROM — use parsed join columns */
+    if (u->has_update_from) {
+        struct table *t = db_find_table_sv(db, u->table);
+        struct table *ft = db_find_table_sv(db, u->update_from_table);
+        if (!t || !ft) {
+            arena_set_error(arena, "42P01", "UPDATE FROM: table not found");
+            return -1;
+        }
+        /* resolve join columns from the parsed WHERE t1.col = t2.col */
+        int t_join_col = -1, ft_join_col = -1;
+        if (u->update_from_join_left.len > 0 && u->update_from_join_right.len > 0) {
+            char lbuf[256], rbuf[256];
+            const char *lcol = extract_col_name(u->update_from_join_left, lbuf, sizeof(lbuf));
+            const char *rcol = extract_col_name(u->update_from_join_right, rbuf, sizeof(rbuf));
+            int l_in_t = table_find_column(t, lcol);
+            int l_in_ft = table_find_column(ft, lcol);
+            int r_in_t = table_find_column(t, rcol);
+            int r_in_ft = table_find_column(ft, rcol);
+            if (l_in_t >= 0 && r_in_ft >= 0) {
+                t_join_col = l_in_t; ft_join_col = r_in_ft;
+            } else if (l_in_ft >= 0 && r_in_t >= 0) {
+                t_join_col = r_in_t; ft_join_col = l_in_ft;
+            }
+        }
+        /* build merged table descriptor: target columns + FROM columns */
+        struct table merged_meta = {0};
+        da_init(&merged_meta.columns);
+        da_init(&merged_meta.rows);
+        da_init(&merged_meta.indexes);
+        for (size_t c = 0; c < t->columns.count; c++) {
+            struct column col = {0};
+            col.name = strdup(t->columns.items[c].name);
+            col.type = t->columns.items[c].type;
+            da_push(&merged_meta.columns, col);
+        }
+        char ft_name_buf[256];
+        snprintf(ft_name_buf, sizeof(ft_name_buf), "%.*s",
+                 (int)u->update_from_table.len, u->update_from_table.data);
+        for (size_t c = 0; c < ft->columns.count; c++) {
+            struct column col = {0};
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s.%s", ft_name_buf, ft->columns.items[c].name);
+            col.name = strdup(buf);
+            col.type = ft->columns.items[c].type;
+            da_push(&merged_meta.columns, col);
+        }
+
+        size_t updated = 0;
+        for (size_t i = 0; i < t->rows.count; i++) {
+            int matched = 0;
+            size_t matched_j = 0;
+            for (size_t j = 0; j < ft->rows.count; j++) {
+                if (t_join_col >= 0 && ft_join_col >= 0) {
+                    if (cell_equal(&t->rows.items[i].cells.items[t_join_col],
+                                    &ft->rows.items[j].cells.items[ft_join_col])) {
+                        matched = 1;
+                        matched_j = j;
+                        break;
+                    }
+                }
+            }
+            if (!matched) continue;
+            updated++;
+
+            /* build merged row: target row cells + FROM row cells */
+            struct row merged_row = {0};
+            da_init(&merged_row.cells);
+            for (size_t c = 0; c < t->rows.items[i].cells.count; c++)
+                da_push(&merged_row.cells, t->rows.items[i].cells.items[c]);
+            for (size_t c = 0; c < ft->rows.items[matched_j].cells.count; c++)
+                da_push(&merged_row.cells, ft->rows.items[matched_j].cells.items[c]);
+
+            /* evaluate all SET expressions against merged row */
+            uint32_t nsc = u->set_clauses_count;
+            struct cell *new_vals = bump_calloc(&arena->scratch, nsc, sizeof(struct cell));
+            int *col_idxs = bump_calloc(&arena->scratch, nsc, sizeof(int));
+            for (uint32_t sc = 0; sc < nsc; sc++) {
+                struct set_clause *scp = &arena->set_clauses.items[u->set_clauses_start + sc];
+                col_idxs[sc] = table_find_column_sv(t, scp->column);
+                if (col_idxs[sc] < 0) {
+                    arena_set_error(arena, "42703",
+                        "column \"%.*s\" of relation \"%s\" does not exist",
+                        (int)scp->column.len, scp->column.data, t->name);
+                    return -1;
+                }
+                if (scp->expr_idx != IDX_NONE) {
+                    new_vals[sc] = eval_expr(scp->expr_idx, arena, &merged_meta, &merged_row, db, NULL);
+                } else {
+                    cell_copy(&new_vals[sc], &scp->value);
+                }
+            }
+            for (size_t sc = 0; sc < nsc; sc++) {
+                if (col_idxs[sc] < 0) continue;
+                struct cell *dst = &t->rows.items[i].cells.items[col_idxs[sc]];
+                if (column_type_is_text(dst->type) && dst->value.as_text)
+                    free(dst->value.as_text);
+                *dst = new_vals[sc];
+            }
+            table_flat_update_row(t, i, &t->rows.items[i]);
+            da_free(&merged_row.cells);
+        }
+        if (updated > 0) {
+            t->generation++;
+            db->total_generation++;
+        }
+        /* free merged table descriptor */
+        for (size_t c = 0; c < merged_meta.columns.count; c++)
+            free(merged_meta.columns.items[c].name);
+        da_free(&merged_meta.columns);
+        da_free(&merged_meta.rows);
+        da_free(&merged_meta.indexes);
+        if (result) {
+            struct row r = {0};
+            da_init(&r.cells);
+            struct cell c = { .type = COLUMN_TYPE_INT };
+            c.value.as_int = (int)updated;
+            da_push(&r.cells, c);
+            rows_push(result, r);
+        }
+        return 0;
+    }
+    return db_table_exec_query(db, u->table, q, result, rb);
+}
+
+static int db_exec_alter(struct database *db, struct query_alter *a,
+                         struct query_arena *arena, struct txn_state *txn)
+{
+    struct table *t = db_find_table_sv(db, a->table);
+    if (!t) {
+        arena_set_error(arena, "42P01", "table '%.*s' does not exist", (int)a->table.len, a->table.data);
+        return -1;
+    }
+    /* COW trigger for ALTER TABLE */
+    if (txn && txn->in_transaction && txn->snapshot)
+        snapshot_cow_table(txn->snapshot, db, t->name);
+    switch (a->alter_action) {
+        case ALTER_ADD_COLUMN: {
+            /* check for duplicate column name */
+            if (table_find_column(t, a->alter_new_col.name) >= 0) {
+                arena_set_error(arena, "42701",
+                    "column \"%s\" of relation \"%s\" already exists",
+                    a->alter_new_col.name, t->name);
+                return -1;
+            }
+            table_add_column(t, &a->alter_new_col);
+            /* table_add_column deep-copies default_value — free the parser's copy */
+            if (a->alter_new_col.default_value) {
+                free(a->alter_new_col.default_value);
+                a->alter_new_col.default_value = NULL;
+            }
+            /* pad existing rows with default value (or NULL) for the new column */
+            size_t new_idx = t->columns.count - 1;
+            struct column *new_col = &t->columns.items[new_idx];
+            for (size_t i = 0; i < t->rows.count; i++) {
+                struct cell pad_cell = {0};
+                if (new_col->has_default && new_col->default_value) {
+                    cell_copy(&pad_cell, new_col->default_value);
+                } else {
+                    pad_cell.type = new_col->type;
+                    pad_cell.is_null = 1;
+                }
+                da_push(&t->rows.items[i].cells, pad_cell);
+            }
+            /* schema changed — rebuild flat storage from updated row-store */
+            table_flat_rebuild_from_rows(t);
+            t->generation++;
+            db->total_generation++;
+            return 0;
+        }
+        case ALTER_DROP_COLUMN: {
+            int col_idx = table_find_column_sv(t, a->alter_column);
+            if (col_idx < 0) {
+                arena_set_error(arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                return -1;
+            }
+            /* remove column from schema */
+            free(t->columns.items[col_idx].name);
+            free(t->columns.items[col_idx].enum_type_name);
+            if (t->columns.items[col_idx].default_value) {
+                if (column_type_is_text(t->columns.items[col_idx].default_value->type)
+                    && t->columns.items[col_idx].default_value->value.as_text)
+                    free(t->columns.items[col_idx].default_value->value.as_text);
+                free(t->columns.items[col_idx].default_value);
+            }
+            for (size_t j = (size_t)col_idx; j + 1 < t->columns.count; j++)
+                t->columns.items[j] = t->columns.items[j + 1];
+            t->columns.count--;
+            /* remove cell from each row */
+            for (size_t i = 0; i < t->rows.count; i++) {
+                struct row *r = &t->rows.items[i];
+                if ((size_t)col_idx < r->cells.count) {
+                    cell_free_text(&r->cells.items[col_idx]);
+                    for (size_t j = (size_t)col_idx; j + 1 < r->cells.count; j++)
+                        r->cells.items[j] = r->cells.items[j + 1];
+                    r->cells.count--;
+                }
+            }
+            /* schema changed — rebuild flat storage from updated row-store */
+            table_flat_rebuild_from_rows(t);
+            t->generation++;
+            db->total_generation++;
+            return 0;
+        }
+        case ALTER_RENAME_TABLE: {
+            free(t->name);
+            t->name = sv_to_cstr(a->alter_new_name);
+            /* invalidate scan cache since table identity changed */
+            t->generation++;
+            db->total_generation++;
+            return 0;
+        }
+        case ALTER_RENAME_COLUMN: {
+            int col_idx = table_find_column_sv(t, a->alter_column);
+            if (col_idx < 0) {
+                arena_set_error(arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                return -1;
+            }
+            free(t->columns.items[col_idx].name);
+            t->columns.items[col_idx].name = sv_to_cstr(a->alter_new_name);
+            return 0;
+        }
+        case ALTER_COLUMN_TYPE: {
+            int col_idx = table_find_column_sv(t, a->alter_column);
+            if (col_idx < 0) {
+                arena_set_error(arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                return -1;
+            }
+            enum column_type old_type = t->columns.items[col_idx].type;
+            enum column_type new_type = a->alter_new_col.type;
+            t->columns.items[col_idx].type = new_type;
+            /* convert existing cell values to the new type */
+            if (old_type != new_type) {
+                for (size_t ri = 0; ri < t->rows.count; ri++) {
+                    struct cell *c = &t->rows.items[ri].cells.items[col_idx];
+                    if (c->is_null) { c->type = new_type; continue; }
+                    if (new_type == COLUMN_TYPE_BOOLEAN) {
+                        int bval = 0;
+                        if (old_type == COLUMN_TYPE_INT) bval = (c->value.as_int != 0);
+                        else if (old_type == COLUMN_TYPE_SMALLINT) bval = (c->value.as_smallint != 0);
+                        else if (old_type == COLUMN_TYPE_BIGINT) bval = (c->value.as_bigint != 0);
+                        else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) bval = (c->value.as_float != 0.0);
+                        else if (column_type_is_text(old_type) && c->value.as_text) bval = (c->value.as_text[0] == 't' || c->value.as_text[0] == 'T' || c->value.as_text[0] == '1');
+                        c->type = COLUMN_TYPE_BOOLEAN;
+                        c->value.as_bool = bval;
+                    } else if (new_type == COLUMN_TYPE_INT) {
+                        int ival = 0;
+                        if (old_type == COLUMN_TYPE_BOOLEAN) ival = c->value.as_bool;
+                        else if (old_type == COLUMN_TYPE_SMALLINT) ival = c->value.as_smallint;
+                        else if (old_type == COLUMN_TYPE_BIGINT) ival = (int)c->value.as_bigint;
+                        else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) ival = (int)c->value.as_float;
+                        else if (column_type_is_text(old_type) && c->value.as_text) ival = atoi(c->value.as_text);
+                        c->type = COLUMN_TYPE_INT;
+                        c->value.as_int = ival;
+                    } else if (new_type == COLUMN_TYPE_BIGINT) {
+                        long long bval = 0;
+                        if (old_type == COLUMN_TYPE_INT) bval = c->value.as_int;
+                        else if (old_type == COLUMN_TYPE_BOOLEAN) bval = c->value.as_bool;
+                        else if (old_type == COLUMN_TYPE_SMALLINT) bval = c->value.as_smallint;
+                        else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) bval = (long long)c->value.as_float;
+                        else if (column_type_is_text(old_type) && c->value.as_text) bval = atoll(c->value.as_text);
+                        c->type = COLUMN_TYPE_BIGINT;
+                        c->value.as_bigint = bval;
+                    } else if (new_type == COLUMN_TYPE_FLOAT || new_type == COLUMN_TYPE_NUMERIC) {
+                        double dval = 0.0;
+                        if (old_type == COLUMN_TYPE_INT) dval = c->value.as_int;
+                        else if (old_type == COLUMN_TYPE_BOOLEAN) dval = c->value.as_bool;
+                        else if (old_type == COLUMN_TYPE_SMALLINT) dval = c->value.as_smallint;
+                        else if (old_type == COLUMN_TYPE_BIGINT) dval = (double)c->value.as_bigint;
+                        else if (column_type_is_text(old_type) && c->value.as_text) dval = atof(c->value.as_text);
+                        c->type = new_type;
+                        c->value.as_float = dval;
+                    } else if (column_type_is_text(new_type)) {
+                        char buf[64];
+                        if (old_type == COLUMN_TYPE_INT) snprintf(buf, sizeof(buf), "%d", c->value.as_int);
+                        else if (old_type == COLUMN_TYPE_BOOLEAN) snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "true" : "false");
+                        else if (old_type == COLUMN_TYPE_SMALLINT) snprintf(buf, sizeof(buf), "%d", c->value.as_smallint);
+                        else if (old_type == COLUMN_TYPE_BIGINT) snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint);
+                        else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) snprintf(buf, sizeof(buf), "%g", c->value.as_float);
+                        else buf[0] = '\0';
+                        c->type = new_type;
+                        c->value.as_text = strdup(buf);
+                    } else {
+                        c->type = new_type;
+                    }
+                }
+                /* rebuild flat storage with new types/values */
+                table_flat_rebuild_from_rows(t);
+                t->generation++;
+                db->total_generation++;
+            }
+            return 0;
+        }
+        case ALTER_SET_DEFAULT: {
+            int col_idx = table_find_column_sv(t, a->alter_column);
+            if (col_idx < 0) {
+                arena_set_error(arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                return -1;
+            }
+            struct column *col = &t->columns.items[col_idx];
+            /* free old default if any */
+            if (col->default_value) {
+                if (column_type_is_text(col->default_value->type) && col->default_value->value.as_text)
+                    free(col->default_value->value.as_text);
+                free(col->default_value);
+            }
+            col->has_default = 1;
+            col->default_value = calloc(1, sizeof(struct cell));
+            col->default_value->type = a->alter_new_col.default_value->type;
+            col->default_value->is_null = a->alter_new_col.default_value->is_null;
+            if (column_type_is_text(a->alter_new_col.default_value->type) && a->alter_new_col.default_value->value.as_text)
+                col->default_value->value.as_text = strdup(a->alter_new_col.default_value->value.as_text);
+            else
+                col->default_value->value = a->alter_new_col.default_value->value;
+            /* free parser's copy */
+            free(a->alter_new_col.default_value);
+            a->alter_new_col.default_value = NULL;
+            return 0;
+        }
+        case ALTER_SET_NOT_NULL: {
+            int col_idx = table_find_column_sv(t, a->alter_column);
+            if (col_idx < 0) {
+                arena_set_error(arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                return -1;
+            }
+            t->columns.items[col_idx].not_null = 1;
+            return 0;
+        }
+        case ALTER_DROP_DEFAULT: {
+            int col_idx = table_find_column_sv(t, a->alter_column);
+            if (col_idx < 0) {
+                arena_set_error(arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                return -1;
+            }
+            struct column *col = &t->columns.items[col_idx];
+            if (col->default_value) {
+                if (column_type_is_text(col->default_value->type) && col->default_value->value.as_text)
+                    free(col->default_value->value.as_text);
+                free(col->default_value);
+                col->default_value = NULL;
+            }
+            col->has_default = 0;
+            return 0;
+        }
+        case ALTER_DROP_NOT_NULL: {
+            int col_idx = table_find_column_sv(t, a->alter_column);
+            if (col_idx < 0) {
+                arena_set_error(arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
+                return -1;
+            }
+            t->columns.items[col_idx].not_null = 0;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int db_exec_show(struct database *db, struct query_show *sh,
+                        struct query_arena *arena, struct rows *result,
+                        struct bump_alloc *rb)
+{
+    (void)db;
+    sv param = sh->parameter;
+    const char *val = "";
+    if (sv_eq_ignorecase_cstr(param, "search_path"))
+        val = "\"$user\", public";
+    else if (sv_eq_ignorecase_cstr(param, "server_version"))
+        val = "15.0";
+    else if (sv_eq_ignorecase_cstr(param, "server_encoding"))
+        val = "UTF8";
+    else if (sv_eq_ignorecase_cstr(param, "client_encoding"))
+        val = "UTF8";
+    else if (sv_eq_ignorecase_cstr(param, "standard_conforming_strings"))
+        val = "on";
+    else if (sv_eq_ignorecase_cstr(param, "is_superuser"))
+        val = "on";
+    else if (sv_eq_ignorecase_cstr(param, "TimeZone") ||
+             sv_eq_ignorecase_cstr(param, "timezone"))
+        val = "UTC";
+    else if (sv_eq_ignorecase_cstr(param, "integer_datetimes"))
+        val = "on";
+    else if (sv_eq_ignorecase_cstr(param, "DateStyle"))
+        val = "ISO, MDY";
+    else {
+        arena_set_error(arena, "42704",
+            "unrecognized configuration parameter \"%.*s\"",
+            (int)param.len, param.data);
+        return -1;
+    }
+    struct row r = {0};
+    da_init(&r.cells);
+    struct cell c = {0};
+    c.type = COLUMN_TYPE_TEXT;
+    c.value.as_text = rb ? bump_strdup(rb, val) : strdup(val);
+    da_push(&r.cells, c);
+    rows_push(result, r);
+    return 0;
+}
+
+#ifndef MSKQL_WASM
+static int db_exec_create_foreign_table(struct database *db,
+                                        struct query_create_foreign_table *ft,
+                                        struct query_arena *arena)
+{
+    char *path = sv_to_cstr(ft->filename);
+
+    struct parquet_table_info info;
+    if (parquet_open_metadata(path, &info) != 0) {
+        arena_set_error(arena, "58030",
+            "could not open Parquet file: %.*s",
+            (int)ft->filename.len, ft->filename.data);
+        free(path);
+        return -1;
+    }
+
+    struct table t;
+    table_init_own(&t, sv_to_cstr(ft->table_name));
+    t.kind = TABLE_PARQUET;
+    t.parquet.path = path;
+
+    for (uint16_t i = 0; i < info.ncols; i++) {
+        struct column col = {0};
+        col.name = strdup(info.col_names[i]);
+        col.type = info.col_types[i];
+        da_push(&t.columns, col);
+    }
+    parquet_info_free(&info);
+
+    da_push(&db->tables, t);
+    db->total_generation++;
+    return 0;
+}
+#endif
+
 int db_exec(struct database *db, struct query *q, struct rows *result, struct bump_alloc *rb)
 {
     struct txn_state *txn = db->active_txn; /* may be NULL (wasm / internal) */
 
     switch (q->query_type) {
-        case QUERY_TYPE_CREATE: {
-            struct query_create_table *crt = &q->create_table;
-            if (crt->if_not_exists && db_find_table_sv(db, crt->table))
-                return 0;
-            /* CREATE TABLE name LIKE source_table */
-            if (crt->like_table.len > 0) {
-                struct table *src = db_find_table_sv(db, crt->like_table);
-                if (!src) {
-                    arena_set_error(&q->arena, "42P01", "table '%.*s' not found",
-                                    (int)crt->like_table.len, crt->like_table.data);
-                    return -1;
-                }
-                struct table t;
-                table_init_own(&t, sv_to_cstr(crt->table));
-                for (size_t c = 0; c < src->columns.count; c++) {
-                    struct column col = {0};
-                    col.name = strdup(src->columns.items[c].name);
-                    col.type = src->columns.items[c].type;
-                    da_push(&t.columns, col);
-                }
-                da_push(&db->tables, t);
-                db->total_generation++;
-                return 0;
-            }
-            /* CREATE TABLE ... AS SELECT */
-            if (crt->as_select_sql != IDX_NONE) {
-                const char *sel_sql = ASTRING(&q->arena, crt->as_select_sql);
-                struct query sel_q;
-                if (query_parse(sel_sql, &sel_q) != 0) {
-                    arena_set_error(&q->arena, "42601", "CREATE TABLE AS: invalid SELECT");
-                    return -1;
-                }
-                struct rows sel_rows = {0};
-                if (db_exec(db, &sel_q, &sel_rows, NULL) != 0) {
-                    query_free(&sel_q);
-                    arena_set_error(&q->arena, "42601", "CREATE TABLE AS: SELECT failed");
-                    return -1;
-                }
-                struct table t;
-                table_init_own(&t, sv_to_cstr(crt->table));
-                /* infer columns from SELECT result */
-                if (sel_rows.count > 0 && sel_rows.data[0].cells.count > 0) {
-                    /* try to get column names from the select query */
-                    sv cols = sel_q.select.columns;
-                    size_t ncols = sel_rows.data[0].cells.count;
-                    for (size_t ci = 0; ci < ncols; ci++) {
-                        struct column col = {0};
-                        col.type = sel_rows.data[0].cells.items[ci].type;
-                        /* extract column name from raw columns text */
-                        char colname[128];
-                        int got_name = 0;
-                        if (cols.len > 0 && ci == 0) {
-                            /* parse comma-separated column names */
-                            sv remaining = cols;
-                            for (size_t k = 0; k <= ci && remaining.len > 0; k++) {
-                                while (remaining.len > 0 && remaining.data[0] == ' ')
-                                    { remaining.data++; remaining.len--; }
-                                size_t end = 0;
-                                int depth = 0;
-                                while (end < remaining.len) {
-                                    if (remaining.data[end] == '(') depth++;
-                                    else if (remaining.data[end] == ')') depth--;
-                                    else if (remaining.data[end] == ',' && depth == 0) break;
-                                    end++;
-                                }
-                                if (k == ci) {
-                                    sv cn = sv_from(remaining.data, end);
-                                    while (cn.len > 0 && cn.data[cn.len-1] == ' ') cn.len--;
-                                    /* check for AS alias */
-                                    for (size_t p = 0; p + 2 < cn.len; p++) {
-                                        if ((cn.data[p] == ' ') &&
-                                            (cn.data[p+1] == 'A' || cn.data[p+1] == 'a') &&
-                                            (cn.data[p+2] == 'S' || cn.data[p+2] == 's') &&
-                                            (p+3 >= cn.len || cn.data[p+3] == ' ')) {
-                                            cn = sv_from(cn.data + p + 3, cn.len - p - 3);
-                                            while (cn.len > 0 && cn.data[0] == ' ')
-                                                { cn.data++; cn.len--; }
-                                            break;
-                                        }
-                                    }
-                                    snprintf(colname, sizeof(colname), "%.*s", (int)cn.len, cn.data);
-                                    got_name = 1;
-                                }
-                                if (end < remaining.len) { remaining.data += end + 1; remaining.len -= end + 1; }
-                                else break;
-                            }
-                        }
-                        if (!got_name || ci > 0) {
-                            /* for subsequent columns, re-parse from cols */
-                            sv remaining = cols;
-                            size_t col_idx = 0;
-                            while (remaining.len > 0 && col_idx <= ci) {
-                                while (remaining.len > 0 && remaining.data[0] == ' ')
-                                    { remaining.data++; remaining.len--; }
-                                size_t end = 0;
-                                int depth = 0;
-                                while (end < remaining.len) {
-                                    if (remaining.data[end] == '(') depth++;
-                                    else if (remaining.data[end] == ')') depth--;
-                                    else if (remaining.data[end] == ',' && depth == 0) break;
-                                    end++;
-                                }
-                                if (col_idx == ci) {
-                                    sv cn = sv_from(remaining.data, end);
-                                    while (cn.len > 0 && cn.data[cn.len-1] == ' ') cn.len--;
-                                    snprintf(colname, sizeof(colname), "%.*s", (int)cn.len, cn.data);
-                                    got_name = 1;
-                                }
-                                col_idx++;
-                                if (end < remaining.len) { remaining.data += end + 1; remaining.len -= end + 1; }
-                                else break;
-                            }
-                        }
-                        if (!got_name)
-                            snprintf(colname, sizeof(colname), "col%zu", ci + 1);
-                        col.name = strdup(colname);
-                        table_add_column(&t, &col);
-                        free(col.name);
-                    }
-                }
-                /* copy rows */
-                for (size_t ri = 0; ri < sel_rows.count; ri++) {
-                    struct row nr = {0};
-                    da_init(&nr.cells);
-                    for (size_t ci = 0; ci < sel_rows.data[ri].cells.count; ci++) {
-                        struct cell cp;
-                        cell_copy(&cp, &sel_rows.data[ri].cells.items[ci]);
-                        da_push(&nr.cells, cp);
-                    }
-                    da_push(&t.rows, nr);
-                    table_flat_append_row(&t, &t.rows.items[t.rows.count - 1]);
-                }
-                da_push(&db->tables, t);
-                db->total_generation++;
-                /* store row count in result for command tag */
-                if (result) {
-                    struct row r = {0};
-                    da_init(&r.cells);
-                    struct cell c = { .type = COLUMN_TYPE_INT };
-                    c.value.as_int = (int)sel_rows.count;
-                    da_push(&r.cells, c);
-                    rows_push(result, r);
-                }
-                /* free select results */
-                for (size_t ri = 0; ri < sel_rows.count; ri++)
-                    row_free(&sel_rows.data[ri]);
-                free(sel_rows.data);
-                query_free(&sel_q);
-                return 0;
-            }
-            struct table t;
-            table_init_own(&t, sv_to_cstr(crt->table));
-            for (uint32_t i = 0; i < crt->columns_count; i++) {
-                table_add_column(&t, &q->arena.columns.items[crt->columns_start + i]);
-            }
-            /* table-level PRIMARY KEY (col1, col2, ...) */
-            if (crt->pk_columns_count > 0) {
-                sv pk_col_names[MAX_INDEX_COLS];
-                int pk_col_indices[MAX_INDEX_COLS];
-                int pk_n = (int)crt->pk_columns_count;
-                if (pk_n > MAX_INDEX_COLS) pk_n = MAX_INDEX_COLS;
-                for (int c = 0; c < pk_n; c++) {
-                    pk_col_names[c] = q->arena.svs.items[crt->pk_columns_start + c];
-                    pk_col_indices[c] = table_find_column_sv(&t, pk_col_names[c]);
-                    if (pk_col_indices[c] >= 0) {
-                        t.columns.items[pk_col_indices[c]].is_primary_key = 1;
-                        t.columns.items[pk_col_indices[c]].not_null = 1;
-                        /* Only mark is_unique for single-column PK; composite PK
-                         * enforces uniqueness on the combination via the index */
-                        if (pk_n == 1)
-                            t.columns.items[pk_col_indices[c]].is_unique = 1;
-                    }
-                }
-                char idx_name[256];
-                snprintf(idx_name, sizeof(idx_name), "%.*s_pkey", (int)crt->table.len, crt->table.data);
-                struct index pk_idx;
-                index_init_sv(&pk_idx, (sv){idx_name, strlen(idx_name)}, pk_col_names, pk_col_indices, pk_n);
-                pk_idx.is_unique = 1;
-                da_push(&t.indexes, pk_idx);
-            }
-            /* table-level UNIQUE (col1, col2, ...) */
-            if (crt->unique_columns_count > 0) {
-                sv uq_col_names[MAX_INDEX_COLS];
-                int uq_col_indices[MAX_INDEX_COLS];
-                int uq_n = (int)crt->unique_columns_count;
-                if (uq_n > MAX_INDEX_COLS) uq_n = MAX_INDEX_COLS;
-                for (int c = 0; c < uq_n; c++) {
-                    uq_col_names[c] = q->arena.svs.items[crt->unique_columns_start + c];
-                    uq_col_indices[c] = table_find_column_sv(&t, uq_col_names[c]);
-                    /* Only mark is_unique for single-column UNIQUE; composite UNIQUE
-                     * enforces uniqueness on the combination via the index */
-                    if (uq_col_indices[c] >= 0 && uq_n == 1)
-                        t.columns.items[uq_col_indices[c]].is_unique = 1;
-                }
-                char idx_name[256];
-                snprintf(idx_name, sizeof(idx_name), "%.*s_unique", (int)crt->table.len, crt->table.data);
-                struct index uq_idx;
-                index_init_sv(&uq_idx, (sv){idx_name, strlen(idx_name)}, uq_col_names, uq_col_indices, uq_n);
-                uq_idx.is_unique = 1;
-                da_push(&t.indexes, uq_idx);
-            }
-            /* If this is a disk-backed table, set up the disk storage */
-            if (crt->is_disk) {
-                char *dir = sv_to_cstr(crt->dir_path);
-                mkdir(dir, 0755);
-                t.kind = TABLE_DISK;
-                t.disk.dir_path = dir;
-                memset(&t.disk.meta, 0, sizeof(t.disk.meta));
-                t.disk.cache_valid = 0;
-                t.disk.wal_bytes = 0;
-                t.disk.wal_dirty = 0;
-                /* Write initial .mskd file with schema only */
-                char mskd_path[1024];
-                disk_path_base(dir, mskd_path, sizeof(mskd_path));
-                /* Need flat_table initialized so disk_write_table can read schema */
-                if (t.columns.count > 0)
-                    table_flat_init_schema(&t);
-                if (disk_write_table(mskd_path, &t) != 0) {
-                    arena_set_error(&q->arena, "58000", "failed to write disk table file");
-                    table_free(&t);
-                    return -1;
-                }
-                /* Read back the schema into disk.meta */
-                if (disk_read_schema(mskd_path, &t.disk.meta) != 0) {
-                    arena_set_error(&q->arena, "58000", "failed to read disk table schema");
-                    table_free(&t);
-                    return -1;
-                }
-                t.disk.cache_valid = 1; /* flat is current (empty but valid) */
-            }
-
-            da_push(&db->tables, t);
-            db->total_generation++;
-            /* Persist disk catalog after adding a disk table */
-            if (crt->is_disk && db->catalog_path)
-                disk_catalog_save(db->catalog_path, db);
-            return 0;
-        }
-        case QUERY_TYPE_DROP: {
-            sv drop_tbl = q->drop_table.table;
-            int found = 0;
-            int was_disk = 0;
-            for (size_t i = 0; i < db->tables.count; i++) {
-                if (sv_eq_cstr(drop_tbl, db->tables.items[i].name)) {
-                    /* COW trigger for DROP TABLE */
-                    if (txn && txn->in_transaction && txn->snapshot)
-                        snapshot_cow_table(txn->snapshot, db, db->tables.items[i].name);
-                    was_disk = (db->tables.items[i].kind == TABLE_DISK);
-                    /* Remove disk files for TABLE_DISK */
-                    if (was_disk && db->tables.items[i].disk.dir_path) {
-                        char path_buf[1024];
-                        disk_path_base(db->tables.items[i].disk.dir_path, path_buf, sizeof(path_buf));
-                        remove(path_buf);
-                        disk_path_wal(db->tables.items[i].disk.dir_path, path_buf, sizeof(path_buf));
-                        remove(path_buf);
-                        snprintf(path_buf, sizeof(path_buf), "%s/data.mskd.tmp",
-                                 db->tables.items[i].disk.dir_path);
-                        remove(path_buf);
-                        rmdir(db->tables.items[i].disk.dir_path);
-                    }
-                    table_free(&db->tables.items[i]);
-                    for (size_t j = i; j + 1 < db->tables.count; j++)
-                        db->tables.items[j] = db->tables.items[j + 1];
-                    db->tables.count--;
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found) {
-                if (q->drop_table.if_exists) return 0;
-                arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)drop_tbl.len, drop_tbl.data);
-                return -1;
-            }
-            /* CASCADE: drop all tables that have a foreign key referencing the dropped table */
-            if (q->drop_table.cascade) {
-                char drop_name[256];
-                snprintf(drop_name, sizeof(drop_name), "%.*s", (int)drop_tbl.len, drop_tbl.data);
-                restart_cascade:
-                for (size_t i = 0; i < db->tables.count; i++) {
-                    struct table *dep = &db->tables.items[i];
-                    for (size_t c = 0; c < dep->columns.count; c++) {
-                        if (dep->columns.items[c].fk_table &&
-                            strcasecmp(dep->columns.items[c].fk_table, drop_name) == 0) {
-                            table_free(dep);
-                            for (size_t j = i; j + 1 < db->tables.count; j++)
-                                db->tables.items[j] = db->tables.items[j + 1];
-                            db->tables.count--;
-                            goto restart_cascade;
-                        }
-                    }
-                }
-            }
-            /* Persist disk catalog after dropping a disk table */
-            if (was_disk && db->catalog_path)
-                disk_catalog_save(db->catalog_path, db);
-            return 0;
-        }
-        case QUERY_TYPE_CREATE_TYPE: {
-            /* Ownership transfer: enum_values strings were allocated by parser.c
-             * and are moved into the database's enum_type via NULL-swap below.
-             * After transfer, query_create_type_free (parser.c) skips the
-             * NULLed slots, and enum_type_free (table.c) frees the strings
-             * when the type is dropped. */
-            struct query_create_type *ct = &q->create_type;
-            if (db_find_type_sv(db, ct->type_name)) {
-                arena_set_error(&q->arena, "42710", "type '%.*s' already exists", (int)ct->type_name.len, ct->type_name.data);
-                return -1;
-            }
-            struct enum_type et;
-            et.name = sv_to_cstr(ct->type_name);
-            da_init(&et.values);
-            for (uint32_t i = 0; i < ct->enum_values_count; i++) {
-                /* copy the string (arena owns the original) */
-                da_push(&et.values, strdup(q->arena.strings.items[ct->enum_values_start + i]));
-            }
-            da_push(&db->types, et);
-            return 0;
-        }
-        case QUERY_TYPE_DROP_TYPE: {
-            sv dtn = q->drop_type.type_name;
-            for (size_t i = 0; i < db->types.count; i++) {
-                if (sv_eq_cstr(dtn, db->types.items[i].name)) {
-                    enum_type_free(&db->types.items[i]);
-                    for (size_t j = i; j + 1 < db->types.count; j++)
-                        db->types.items[j] = db->types.items[j + 1];
-                    db->types.count--;
-                    return 0;
-                }
-            }
-            arena_set_error(&q->arena, "42704", "type '%.*s' does not exist", (int)dtn.len, dtn.data);
-            return -1;
-        }
-        case QUERY_TYPE_CREATE_SEQUENCE: {
-            struct query_create_sequence *cs = &q->create_seq;
-            /* check for duplicate */
-            for (size_t i = 0; i < db->sequences.count; i++) {
-                if (sv_eq_cstr(cs->name, db->sequences.items[i].name)) {
-                    arena_set_error(&q->arena, "42P07", "sequence '%.*s' already exists", (int)cs->name.len, cs->name.data);
-                    return -1;
-                }
-            }
-            struct sequence seq;
-            seq.name = sv_to_cstr(cs->name);
-            seq.current_value = cs->start_value;
-            seq.increment = cs->increment;
-            seq.min_value = cs->min_value;
-            seq.max_value = cs->max_value;
-            seq.has_been_called = 0;
-            da_push(&db->sequences, seq);
-            return 0;
-        }
-        case QUERY_TYPE_DROP_SEQUENCE: {
-            sv sn = q->drop_seq.name;
-            for (size_t i = 0; i < db->sequences.count; i++) {
-                if (sv_eq_cstr(sn, db->sequences.items[i].name)) {
-                    free(db->sequences.items[i].name);
-                    for (size_t j = i; j + 1 < db->sequences.count; j++)
-                        db->sequences.items[j] = db->sequences.items[j + 1];
-                    db->sequences.count--;
-                    return 0;
-                }
-            }
-            arena_set_error(&q->arena, "42P01", "sequence '%.*s' does not exist", (int)sn.len, sn.data);
-            return -1;
-        }
-        case QUERY_TYPE_CREATE_VIEW: {
-            struct query_create_view *cv = &q->create_view;
-            if (cv->sql_idx == IDX_NONE) {
-                arena_set_error(&q->arena, "42601", "CREATE VIEW: missing SELECT body");
-                return -1;
-            }
-            /* store view as a table with zero columns and the SQL in the name
-             * prefixed with "VIEW:" so we can detect it later */
-            const char *sql = ASTRING(&q->arena, cv->sql_idx);
-            /* check for existing view/table */
-            struct table *existing = db_find_table_sv(db, cv->name);
-            if (existing) {
-                if (cv->or_replace && existing->kind == TABLE_VIEW) {
-                    /* DROP the existing view so we can recreate it */
-                    for (size_t i = 0; i < db->tables.count; i++) {
-                        if (db->tables.items[i].kind == TABLE_VIEW &&
-                            sv_eq_cstr(cv->name, db->tables.items[i].name)) {
-                            table_free(&db->tables.items[i]);
-                            for (size_t j = i; j + 1 < db->tables.count; j++)
-                                db->tables.items[j] = db->tables.items[j + 1];
-                            db->tables.count--;
-                            break;
-                        }
-                    }
-                } else {
-                    arena_set_error(&q->arena, "42P07", "relation '%.*s' already exists", (int)cv->name.len, cv->name.data);
-                    return -1;
-                }
-            }
-            struct table vt;
-            char vname[512];
-            snprintf(vname, sizeof(vname), "%.*s", (int)cv->name.len, cv->name.data);
-            table_init(&vt, vname);
-            vt.kind = TABLE_VIEW;
-            vt.view.sql = strdup(sql);
-            da_push(&db->tables, vt);
-            db->total_generation++;
-            return 0;
-        }
-        case QUERY_TYPE_DROP_VIEW: {
-            sv vn = q->drop_view.name;
-            for (size_t i = 0; i < db->tables.count; i++) {
-                if (sv_eq_cstr(vn, db->tables.items[i].name) && db->tables.items[i].kind == TABLE_VIEW) {
-                    table_free(&db->tables.items[i]);
-                    for (size_t j = i; j + 1 < db->tables.count; j++)
-                        db->tables.items[j] = db->tables.items[j + 1];
-                    db->tables.count--;
-                    return 0;
-                }
-            }
-            arena_set_error(&q->arena, "42P01", "view '%.*s' does not exist", (int)vn.len, vn.data);
-            return -1;
-        }
-        case QUERY_TYPE_EXPLAIN: {
-            struct query_explain *ex = &q->explain;
-            /* Copy inner SQL to a stack buffer so stringviews remain valid */
-            size_t sql_len = ex->inner_sql.len;
-            char inner_sql[sql_len + 1];
-            memcpy(inner_sql, ex->inner_sql.data, sql_len);
-            inner_sql[sql_len] = '\0';
-
-            struct query inner_q;
-            memset(&inner_q, 0, sizeof(inner_q));
-            query_arena_init(&inner_q.arena);
-            int prc = query_parse_into(inner_sql, &inner_q, &inner_q.arena);
-            if (prc != 0) {
-                if (inner_q.arena.errmsg[0])
-                    arena_set_error(&q->arena, inner_q.arena.sqlstate, "%s", inner_q.arena.errmsg);
-                query_arena_destroy(&inner_q.arena);
-                return -1;
-            }
-
-            char explain_buf[4096];
-            int explain_len = 0;
-
-            if (inner_q.query_type == QUERY_TYPE_SELECT) {
-                struct table *t = db_find_table_sv(db, inner_q.select.table);
-                struct plan_result epr = { .node = IDX_NONE, .status = PLAN_NOTIMPL };
-                if (t)
-                    epr = plan_build_select(t, &inner_q.select, &inner_q.arena, db);
-                if (epr.status == PLAN_OK) {
-                    explain_len = plan_explain(&inner_q.arena, epr.node, explain_buf, sizeof(explain_buf));
-                } else {
-                    explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
-                }
-            } else {
-                explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
-            }
-
-            /* Build result rows — one row per line */
-            char *line = explain_buf;
-            for (int i = 0; i <= explain_len; i++) {
-                if (i == explain_len || explain_buf[i] == '\n') {
-                    explain_buf[i] = '\0';
-                    struct row r = {0};
-                    da_init(&r.cells);
-                    struct cell c = {0};
-                    c.type = COLUMN_TYPE_TEXT;
-                    c.value.as_text = rb ? bump_strdup(rb, line) : strdup(line);
-                    da_push(&r.cells, c);
-                    rows_push(result, r);
-                    line = explain_buf + i + 1;
-                }
-            }
-
-            query_arena_destroy(&inner_q.arena);
-            return 0;
-        }
-        case QUERY_TYPE_TRUNCATE: {
-            /* collect table names: use truncate_tables_start/count if set, else del.table */
-            uint32_t tt_count = q->del.truncate_tables_count;
-            uint32_t tt_start = q->del.truncate_tables_start;
-            if (tt_count == 0) {
-                /* legacy single-table path */
-                tt_count = 1;
-                tt_start = 0; /* unused — use del.table directly */
-            }
-            for (uint32_t ti = 0; ti < tt_count; ti++) {
-                sv tname = (q->del.truncate_tables_count > 0)
-                    ? q->arena.svs.items[tt_start + ti]
-                    : q->del.table;
-                struct table *t = db_find_table_sv(db, tname);
-                if (!t) {
-                    arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist",
-                                    (int)tname.len, tname.data);
-                    return -1;
-                }
-                /* COW trigger for TRUNCATE */
-                if (txn && txn->in_transaction && txn->snapshot)
-                    snapshot_cow_table(txn->snapshot, db, t->name);
-                /* free all rows */
-                for (size_t i = 0; i < t->rows.count; i++)
-                    row_free(&t->rows.items[i]);
-                t->rows.count = 0;
-                flat_table_free(&t->flat);
-                t->generation++;
-                db->total_generation++;
-                /* reset SERIAL counters */
-                for (size_t i = 0; i < t->columns.count; i++) {
-                    if (t->columns.items[i].is_serial)
-                        t->columns.items[i].serial_next = 1;
-                }
-                /* clear indexes */
-                for (size_t i = 0; i < t->indexes.count; i++)
-                    index_reset(&t->indexes.items[i]);
-                /* CASCADE: truncate tables that have FK columns referencing this table */
-                if (q->del.truncate_cascade) {
-                    for (size_t ti2 = 0; ti2 < db->tables.count; ti2++) {
-                        struct table *ref = &db->tables.items[ti2];
-                        if (ref == t) continue;
-                        int has_fk = 0;
-                        for (size_t ci = 0; ci < ref->columns.count; ci++) {
-                            if (ref->columns.items[ci].fk_table &&
-                                strcmp(ref->columns.items[ci].fk_table, t->name) == 0) {
-                                has_fk = 1; break;
-                            }
-                        }
-                        if (!has_fk) continue;
-                        if (txn && txn->in_transaction && txn->snapshot)
-                            snapshot_cow_table(txn->snapshot, db, ref->name);
-                        for (size_t ri = 0; ri < ref->rows.count; ri++)
-                            row_free(&ref->rows.items[ri]);
-                        ref->rows.count = 0;
-                        flat_table_free(&ref->flat);
-                        ref->generation++;
-                        db->total_generation++;
-                        for (size_t ii = 0; ii < ref->indexes.count; ii++)
-                            index_reset(&ref->indexes.items[ii]);
-                    }
-                }
-            }
-            return 0;
-        }
-        case QUERY_TYPE_CREATE_INDEX: {
-            struct query_create_index *ci = &q->create_index;
-            struct table *t = db_find_table_sv(db, ci->table);
-            if (!t) {
-                arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)ci->table.len, ci->table.data);
-                return -1;
-            }
-            /* IF NOT EXISTS: check if index already exists */
-            if (ci->if_not_exists) {
-                for (size_t ii = 0; ii < t->indexes.count; ii++) {
-                    if (sv_eq_cstr(ci->index_name, t->indexes.items[ii].name))
-                        return 0;
-                }
-            }
-            int ncols = (int)ci->index_columns_count;
-            if (ncols < 1 || ncols > MAX_INDEX_COLS) {
-                arena_set_error(&q->arena, "42601", "index must have 1-%d columns", MAX_INDEX_COLS);
-                return -1;
-            }
-            sv col_names[MAX_INDEX_COLS];
-            int col_indices[MAX_INDEX_COLS];
-            for (int c = 0; c < ncols; c++) {
-                col_names[c] = q->arena.svs.items[ci->index_columns_start + c];
-                col_indices[c] = table_find_column_sv(t, col_names[c]);
-                if (col_indices[c] < 0) {
-                    arena_set_error(&q->arena, "42703", "column '%.*s' not found in table '%.*s'",
-                                    (int)col_names[c].len, col_names[c].data,
-                                    (int)ci->table.len, ci->table.data);
-                    return -1;
-                }
-            }
-            struct index idx;
-            index_init_sv(&idx, ci->index_name, col_names, col_indices, ncols);
-
-            /* ---- HNSW index path ---- */
-            if (ci->using_method.len > 0 && sv_eq_ignorecase_cstr(ci->using_method, "hnsw")) {
-                if (ncols != 1) {
-                    arena_set_error(&q->arena, "42601", "HNSW index must have exactly one column");
-                    index_free(&idx);
-                    return -1;
-                }
-                int ci0 = col_indices[0];
-                if (t->columns.items[ci0].type != COLUMN_TYPE_VECTOR) {
-                    arena_set_error(&q->arena, "42601", "HNSW index column must be of type VECTOR");
-                    index_free(&idx);
-                    return -1;
-                }
-                enum hnsw_dist_type dist = HNSW_L2;
-                if (ci->ops_class.len > 0) {
-                    if (sv_eq_ignorecase_cstr(ci->ops_class, "vector_l2_ops"))
-                        dist = HNSW_L2;
-                    else if (sv_eq_ignorecase_cstr(ci->ops_class, "vector_cosine_ops"))
-                        dist = HNSW_COSINE;
-                    else if (sv_eq_ignorecase_cstr(ci->ops_class, "vector_ip_ops"))
-                        dist = HNSW_IP;
-                    else {
-                        arena_set_error(&q->arena, "42601", "unknown operator class '%.*s'",
-                                        (int)ci->ops_class.len, ci->ops_class.data);
-                        index_free(&idx);
-                        return -1;
-                    }
-                }
-                uint16_t dim = t->columns.items[ci0].vector_dim;
-                struct hnsw_index *hnsw = (struct hnsw_index *)malloc(sizeof(struct hnsw_index));
-                hnsw_init(hnsw, dim, 16, 200, dist);
-                hnsw->col_idx = ci0;
-                idx.type = INDEX_HNSW;
-                free(idx.root);
-                idx.root = NULL;
-                idx.hnsw = hnsw;
-                /* backfill existing rows */
-                for (size_t i = 0; i < t->rows.count; i++) {
-                    if ((size_t)ci0 < t->rows.items[i].cells.count &&
-                        !t->rows.items[i].cells.items[ci0].is_null &&
-                        t->rows.items[i].cells.items[ci0].value.as_vector) {
-                        hnsw_insert(hnsw, t->rows.items[i].cells.items[ci0].value.as_vector, i);
-                    }
-                }
-                da_push(&t->indexes, idx);
-                return 0;
-            }
-
-            /* ---- B-tree index path (default) ---- */
-            /* backfill existing rows */
-            for (size_t i = 0; i < t->rows.count; i++) {
-                struct cell composite[MAX_INDEX_COLS];
-                int ok = 1;
-                for (int c = 0; c < ncols; c++) {
-                    if ((size_t)col_indices[c] < t->rows.items[i].cells.count)
-                        composite[c] = t->rows.items[i].cells.items[col_indices[c]];
-                    else
-                        ok = 0;
-                }
-                if (ok) index_insert(&idx, composite, i);
-            }
-            da_push(&t->indexes, idx);
-            return 0;
-        }
-        case QUERY_TYPE_DROP_INDEX: {
-            /* search all tables for the named index */
-            for (size_t ti = 0; ti < db->tables.count; ti++) {
-                struct table *t = &db->tables.items[ti];
-                for (size_t ii = 0; ii < t->indexes.count; ii++) {
-                    if (sv_eq_cstr(q->drop_index.index_name, t->indexes.items[ii].name)) {
-                        index_free(&t->indexes.items[ii]);
-                        for (size_t j = ii; j + 1 < t->indexes.count; j++)
-                            t->indexes.items[j] = t->indexes.items[j + 1];
-                        t->indexes.count--;
-                        return 0;
-                    }
-                }
-            }
-            arena_set_error(&q->arena, "42704", "index '%.*s' does not exist", (int)q->drop_index.index_name.len, q->drop_index.index_name.data);
-            return -1;
-        }
-        case QUERY_TYPE_SELECT:
-            return db_exec_select(db, q, result, rb);
-        case QUERY_TYPE_VALUES: {
-            struct query_insert *ins = &q->insert;
-            result->data = NULL; result->count = 0; result->capacity = 0;
-            struct row *ir_data = &q->arena.rows.items[ins->insert_rows_start];
-            uint32_t ir_count = ins->insert_rows_count;
-            for (uint32_t ri = 0; ri < ir_count; ri++) {
-                struct row *src = &ir_data[ri];
-                struct row dst;
-                da_init(&dst.cells);
-                for (size_t ci = 0; ci < src->cells.count; ci++) {
-                    struct cell c = src->cells.items[ci];
-                    if (c.is_null == 2) {
-                        c = eval_expr((uint32_t)c.value.as_int, &q->arena, NULL, NULL, db, NULL);
-                    } else if (column_type_is_text(c.type) && c.value.as_text) {
-                        c.value.as_text = rb ? bump_strdup(rb, c.value.as_text) : strdup(c.value.as_text);
-                    }
-                    da_push(&dst.cells, c);
-                }
-                rows_push(result, dst);
-            }
-            return 0;
-        }
-        case QUERY_TYPE_INSERT:
-            return db_exec_insert(db, q, result, rb);
-        case QUERY_TYPE_DELETE:
-            /* resolve subqueries in WHERE */
-            if (q->del.where.has_where && q->del.where.where_cond != IDX_NONE)
-                resolve_subqueries(db, &q->arena, q->del.where.where_cond, NULL);
-            /* DELETE ... USING: build merged table to evaluate cross-table WHERE */
-            if (q->del.using_table.len > 0 && q->del.where.has_where && q->del.where.where_cond != IDX_NONE) {
-                struct table *dt = db_find_table_sv(db, q->del.table);
-                struct table *ut = db_find_table_sv(db, q->del.using_table);
-                if (!dt || !ut) {
-                    arena_set_error(&q->arena, "42P01", "DELETE USING: table not found");
-                    return -1;
-                }
-                /* COW trigger */
-                if (db->active_txn && db->active_txn->in_transaction && db->active_txn->snapshot)
-                    snapshot_cow_table(db->active_txn->snapshot, db, dt->name);
-                /* build merged column metadata: t1 cols (qualified) + t2 cols (qualified) */
-                struct table merged = {0};
-                da_init(&merged.columns);
-                da_init(&merged.rows);
-                da_init(&merged.indexes);
-                char t1name[128], t2name[128];
-                snprintf(t1name, sizeof(t1name), "%.*s", (int)q->del.table.len, q->del.table.data);
-                snprintf(t2name, sizeof(t2name), "%.*s", (int)q->del.using_table.len, q->del.using_table.data);
-                for (size_t c = 0; c < dt->columns.count; c++) {
-                    struct column col = {0};
-                    char buf[256];
-                    snprintf(buf, sizeof(buf), "%s.%s", t1name, dt->columns.items[c].name);
-                    col.name = strdup(buf);
-                    col.type = dt->columns.items[c].type;
-                    da_push(&merged.columns, col);
-                }
-                for (size_t c = 0; c < ut->columns.count; c++) {
-                    struct column col = {0};
-                    char buf[256];
-                    snprintf(buf, sizeof(buf), "%s.%s", t2name, ut->columns.items[c].name);
-                    col.name = strdup(buf);
-                    col.type = ut->columns.items[c].type;
-                    da_push(&merged.columns, col);
-                }
-                /* find which target rows match any USING row */
-                size_t dt_ncols = dt->columns.count;
-                size_t ut_ncols = ut->columns.count;
-                int *to_delete = calloc(dt->rows.count, sizeof(int));
-                for (size_t i = 0; i < dt->rows.count; i++) {
-                    for (size_t j = 0; j < ut->rows.count; j++) {
-                        /* build merged row */
-                        struct row mr = {0};
-                        da_init(&mr.cells);
-                        for (size_t c = 0; c < dt_ncols; c++)
-                            da_push(&mr.cells, dt->rows.items[i].cells.items[c]);
-                        for (size_t c = 0; c < ut_ncols; c++)
-                            da_push(&mr.cells, ut->rows.items[j].cells.items[c]);
-                        int match = eval_condition(q->del.where.where_cond, &q->arena, &mr, &merged, NULL);
-                        da_free(&mr.cells);
-                        if (match) { to_delete[i] = 1; break; }
-                    }
-                }
-                /* delete matched rows (iterate backwards to avoid index shifting issues) */
-                size_t deleted = 0;
-                for (size_t i = dt->rows.count; i > 0; i--) {
-                    size_t idx = i - 1;
-                    if (to_delete[idx]) {
-                        row_free(&dt->rows.items[idx]);
-                        for (size_t k = idx; k + 1 < dt->rows.count; k++)
-                            dt->rows.items[k] = dt->rows.items[k + 1];
-                        dt->rows.count--;
-                        table_flat_delete_row(dt, idx);
-                        deleted++;
-                        dt->generation++;
-                        db->total_generation++;
-                    }
-                }
-                free(to_delete);
-                for (size_t c = 0; c < merged.columns.count; c++) free(merged.columns.items[c].name);
-                da_free(&merged.columns);
-                /* indexes are rebuilt via generation change */
-                /* store deleted count */
-                if (result) {
-                    struct row r = {0};
-                    da_init(&r.cells);
-                    struct cell c = { .type = COLUMN_TYPE_INT };
-                    c.value.as_int = (int)deleted;
-                    da_push(&r.cells, c);
-                    rows_push(result, r);
-                }
-                return 0;
-            }
-            return db_table_exec_query(db, q->del.table, q, result, rb);
-        case QUERY_TYPE_UPDATE: {
-            struct query_update *u = &q->update;
-            /* resolve subqueries in WHERE */
-            if (u->where.has_where && u->where.where_cond != IDX_NONE)
-                resolve_subqueries(db, &q->arena, u->where.where_cond, NULL);
-            /* UPDATE ... FROM — use parsed join columns */
-            if (u->has_update_from) {
-                struct table *t = db_find_table_sv(db, u->table);
-                struct table *ft = db_find_table_sv(db, u->update_from_table);
-                if (!t || !ft) {
-                    arena_set_error(&q->arena, "42P01", "UPDATE FROM: table not found");
-                    return -1;
-                }
-                /* resolve join columns from the parsed WHERE t1.col = t2.col */
-                int t_join_col = -1, ft_join_col = -1;
-                if (u->update_from_join_left.len > 0 && u->update_from_join_right.len > 0) {
-                    char lbuf[256], rbuf[256];
-                    const char *lcol = extract_col_name(u->update_from_join_left, lbuf, sizeof(lbuf));
-                    const char *rcol = extract_col_name(u->update_from_join_right, rbuf, sizeof(rbuf));
-                    int l_in_t = table_find_column(t, lcol);
-                    int l_in_ft = table_find_column(ft, lcol);
-                    int r_in_t = table_find_column(t, rcol);
-                    int r_in_ft = table_find_column(ft, rcol);
-                    if (l_in_t >= 0 && r_in_ft >= 0) {
-                        t_join_col = l_in_t; ft_join_col = r_in_ft;
-                    } else if (l_in_ft >= 0 && r_in_t >= 0) {
-                        t_join_col = r_in_t; ft_join_col = l_in_ft;
-                    }
-                }
-                /* build merged table descriptor: target columns + FROM columns
-                 * (prefixed with FROM table name for qualified refs) */
-                struct table merged_meta = {0};
-                da_init(&merged_meta.columns);
-                da_init(&merged_meta.rows);
-                da_init(&merged_meta.indexes);
-                for (size_t c = 0; c < t->columns.count; c++) {
-                    struct column col = {0};
-                    col.name = strdup(t->columns.items[c].name);
-                    col.type = t->columns.items[c].type;
-                    da_push(&merged_meta.columns, col);
-                }
-                char ft_name_buf[256];
-                snprintf(ft_name_buf, sizeof(ft_name_buf), "%.*s",
-                         (int)u->update_from_table.len, u->update_from_table.data);
-                for (size_t c = 0; c < ft->columns.count; c++) {
-                    struct column col = {0};
-                    char buf[512];
-                    snprintf(buf, sizeof(buf), "%s.%s", ft_name_buf, ft->columns.items[c].name);
-                    col.name = strdup(buf);
-                    col.type = ft->columns.items[c].type;
-                    da_push(&merged_meta.columns, col);
-                }
-
-                size_t updated = 0;
-                for (size_t i = 0; i < t->rows.count; i++) {
-                    int matched = 0;
-                    size_t matched_j = 0;
-                    for (size_t j = 0; j < ft->rows.count; j++) {
-                        if (t_join_col >= 0 && ft_join_col >= 0) {
-                            if (cell_equal(&t->rows.items[i].cells.items[t_join_col],
-                                            &ft->rows.items[j].cells.items[ft_join_col])) {
-                                matched = 1;
-                                matched_j = j;
-                                break;
-                            }
-                        }
-                    }
-                    if (!matched) continue;
-                    updated++;
-
-                    /* build merged row: target row cells + FROM row cells */
-                    struct row merged_row = {0};
-                    da_init(&merged_row.cells);
-                    for (size_t c = 0; c < t->rows.items[i].cells.count; c++)
-                        da_push(&merged_row.cells, t->rows.items[i].cells.items[c]);
-                    for (size_t c = 0; c < ft->rows.items[matched_j].cells.count; c++)
-                        da_push(&merged_row.cells, ft->rows.items[matched_j].cells.items[c]);
-
-                    /* evaluate all SET expressions against merged row */
-                    uint32_t nsc = u->set_clauses_count;
-                    struct cell *new_vals = bump_calloc(&q->arena.scratch, nsc, sizeof(struct cell));
-                    int *col_idxs = bump_calloc(&q->arena.scratch, nsc, sizeof(int));
-                    for (uint32_t sc = 0; sc < nsc; sc++) {
-                        struct set_clause *scp = &q->arena.set_clauses.items[u->set_clauses_start + sc];
-                        col_idxs[sc] = table_find_column_sv(t, scp->column);
-                        if (col_idxs[sc] < 0) {
-                            arena_set_error(&q->arena, "42703",
-                                "column \"%.*s\" of relation \"%s\" does not exist",
-                                (int)scp->column.len, scp->column.data, t->name);
-                            return -1;
-                        }
-                        if (scp->expr_idx != IDX_NONE) {
-                            new_vals[sc] = eval_expr(scp->expr_idx, &q->arena, &merged_meta, &merged_row, db, NULL);
-                        } else {
-                            cell_copy(&new_vals[sc], &scp->value);
-                        }
-                    }
-                    for (size_t sc = 0; sc < nsc; sc++) {
-                        if (col_idxs[sc] < 0) continue;
-                        struct cell *dst = &t->rows.items[i].cells.items[col_idxs[sc]];
-                        if (column_type_is_text(dst->type) && dst->value.as_text)
-                            free(dst->value.as_text);
-                        *dst = new_vals[sc];
-                    }
-                    table_flat_update_row(t, i, &t->rows.items[i]);
-                    da_free(&merged_row.cells);
-                }
-                if (updated > 0) {
-                    t->generation++;
-                    db->total_generation++;
-                }
-                /* free merged table descriptor */
-                for (size_t c = 0; c < merged_meta.columns.count; c++)
-                    free(merged_meta.columns.items[c].name);
-                da_free(&merged_meta.columns);
-                da_free(&merged_meta.rows);
-                da_free(&merged_meta.indexes);
-                if (result) {
-                    struct row r = {0};
-                    da_init(&r.cells);
-                    struct cell c = { .type = COLUMN_TYPE_INT };
-                    c.value.as_int = (int)updated;
-                    da_push(&r.cells, c);
-                    rows_push(result, r);
-                }
-                return 0;
-            }
-            return db_table_exec_query(db, u->table, q, result, rb);
-        }
-        case QUERY_TYPE_ALTER: {
-            struct query_alter *a = &q->alter;
-            struct table *t = db_find_table_sv(db, a->table);
-            if (!t) {
-                arena_set_error(&q->arena, "42P01", "table '%.*s' does not exist", (int)a->table.len, a->table.data);
-                return -1;
-            }
-            /* COW trigger for ALTER TABLE */
-            if (txn && txn->in_transaction && txn->snapshot)
-                snapshot_cow_table(txn->snapshot, db, t->name);
-            switch (a->alter_action) {
-                case ALTER_ADD_COLUMN: {
-                    /* check for duplicate column name */
-                    if (table_find_column(t, a->alter_new_col.name) >= 0) {
-                        arena_set_error(&q->arena, "42701",
-                            "column \"%s\" of relation \"%s\" already exists",
-                            a->alter_new_col.name, t->name);
-                        return -1;
-                    }
-                    table_add_column(t, &a->alter_new_col);
-                    /* table_add_column deep-copies default_value — free the parser's copy */
-                    if (a->alter_new_col.default_value) {
-                        free(a->alter_new_col.default_value);
-                        a->alter_new_col.default_value = NULL;
-                    }
-                    /* pad existing rows with default value (or NULL) for the new column */
-                    size_t new_idx = t->columns.count - 1;
-                    struct column *new_col = &t->columns.items[new_idx];
-                    for (size_t i = 0; i < t->rows.count; i++) {
-                        struct cell pad_cell = {0};
-                        if (new_col->has_default && new_col->default_value) {
-                            cell_copy(&pad_cell, new_col->default_value);
-                        } else {
-                            pad_cell.type = new_col->type;
-                            pad_cell.is_null = 1;
-                        }
-                        da_push(&t->rows.items[i].cells, pad_cell);
-                    }
-                    /* schema changed — rebuild flat storage from updated row-store */
-                    table_flat_rebuild_from_rows(t);
-                    t->generation++;
-                    db->total_generation++;
-                    return 0;
-                }
-                case ALTER_DROP_COLUMN: {
-                    int col_idx = table_find_column_sv(t, a->alter_column);
-                    if (col_idx < 0) {
-                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
-                        return -1;
-                    }
-                    /* remove column from schema */
-                    free(t->columns.items[col_idx].name);
-                    free(t->columns.items[col_idx].enum_type_name);
-                    if (t->columns.items[col_idx].default_value) {
-                        if (column_type_is_text(t->columns.items[col_idx].default_value->type)
-                            && t->columns.items[col_idx].default_value->value.as_text)
-                            free(t->columns.items[col_idx].default_value->value.as_text);
-                        free(t->columns.items[col_idx].default_value);
-                    }
-                    for (size_t j = (size_t)col_idx; j + 1 < t->columns.count; j++)
-                        t->columns.items[j] = t->columns.items[j + 1];
-                    t->columns.count--;
-                    /* remove cell from each row */
-                    for (size_t i = 0; i < t->rows.count; i++) {
-                        struct row *r = &t->rows.items[i];
-                        if ((size_t)col_idx < r->cells.count) {
-                            cell_free_text(&r->cells.items[col_idx]);
-                            for (size_t j = (size_t)col_idx; j + 1 < r->cells.count; j++)
-                                r->cells.items[j] = r->cells.items[j + 1];
-                            r->cells.count--;
-                        }
-                    }
-                    /* schema changed — rebuild flat storage from updated row-store */
-                    table_flat_rebuild_from_rows(t);
-                    t->generation++;
-                    db->total_generation++;
-                    return 0;
-                }
-                case ALTER_RENAME_TABLE: {
-                    free(t->name);
-                    t->name = sv_to_cstr(a->alter_new_name);
-                    /* invalidate scan cache since table identity changed */
-                    t->generation++;
-                    db->total_generation++;
-                    return 0;
-                }
-                case ALTER_RENAME_COLUMN: {
-                    int col_idx = table_find_column_sv(t, a->alter_column);
-                    if (col_idx < 0) {
-                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
-                        return -1;
-                    }
-                    free(t->columns.items[col_idx].name);
-                    t->columns.items[col_idx].name = sv_to_cstr(a->alter_new_name);
-                    return 0;
-                }
-                case ALTER_COLUMN_TYPE: {
-                    int col_idx = table_find_column_sv(t, a->alter_column);
-                    if (col_idx < 0) {
-                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
-                        return -1;
-                    }
-                    enum column_type old_type = t->columns.items[col_idx].type;
-                    enum column_type new_type = a->alter_new_col.type;
-                    t->columns.items[col_idx].type = new_type;
-                    /* convert existing cell values to the new type */
-                    if (old_type != new_type) {
-                        for (size_t ri = 0; ri < t->rows.count; ri++) {
-                            struct cell *c = &t->rows.items[ri].cells.items[col_idx];
-                            if (c->is_null) { c->type = new_type; continue; }
-                            if (new_type == COLUMN_TYPE_BOOLEAN) {
-                                int bval = 0;
-                                if (old_type == COLUMN_TYPE_INT) bval = (c->value.as_int != 0);
-                                else if (old_type == COLUMN_TYPE_SMALLINT) bval = (c->value.as_smallint != 0);
-                                else if (old_type == COLUMN_TYPE_BIGINT) bval = (c->value.as_bigint != 0);
-                                else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) bval = (c->value.as_float != 0.0);
-                                else if (column_type_is_text(old_type) && c->value.as_text) bval = (c->value.as_text[0] == 't' || c->value.as_text[0] == 'T' || c->value.as_text[0] == '1');
-                                c->type = COLUMN_TYPE_BOOLEAN;
-                                c->value.as_bool = bval;
-                            } else if (new_type == COLUMN_TYPE_INT) {
-                                int ival = 0;
-                                if (old_type == COLUMN_TYPE_BOOLEAN) ival = c->value.as_bool;
-                                else if (old_type == COLUMN_TYPE_SMALLINT) ival = c->value.as_smallint;
-                                else if (old_type == COLUMN_TYPE_BIGINT) ival = (int)c->value.as_bigint;
-                                else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) ival = (int)c->value.as_float;
-                                else if (column_type_is_text(old_type) && c->value.as_text) ival = atoi(c->value.as_text);
-                                c->type = COLUMN_TYPE_INT;
-                                c->value.as_int = ival;
-                            } else if (new_type == COLUMN_TYPE_BIGINT) {
-                                long long bval = 0;
-                                if (old_type == COLUMN_TYPE_INT) bval = c->value.as_int;
-                                else if (old_type == COLUMN_TYPE_BOOLEAN) bval = c->value.as_bool;
-                                else if (old_type == COLUMN_TYPE_SMALLINT) bval = c->value.as_smallint;
-                                else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) bval = (long long)c->value.as_float;
-                                else if (column_type_is_text(old_type) && c->value.as_text) bval = atoll(c->value.as_text);
-                                c->type = COLUMN_TYPE_BIGINT;
-                                c->value.as_bigint = bval;
-                            } else if (new_type == COLUMN_TYPE_FLOAT || new_type == COLUMN_TYPE_NUMERIC) {
-                                double dval = 0.0;
-                                if (old_type == COLUMN_TYPE_INT) dval = c->value.as_int;
-                                else if (old_type == COLUMN_TYPE_BOOLEAN) dval = c->value.as_bool;
-                                else if (old_type == COLUMN_TYPE_SMALLINT) dval = c->value.as_smallint;
-                                else if (old_type == COLUMN_TYPE_BIGINT) dval = (double)c->value.as_bigint;
-                                else if (column_type_is_text(old_type) && c->value.as_text) dval = atof(c->value.as_text);
-                                c->type = new_type;
-                                c->value.as_float = dval;
-                            } else if (column_type_is_text(new_type)) {
-                                char buf[64];
-                                if (old_type == COLUMN_TYPE_INT) snprintf(buf, sizeof(buf), "%d", c->value.as_int);
-                                else if (old_type == COLUMN_TYPE_BOOLEAN) snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "true" : "false");
-                                else if (old_type == COLUMN_TYPE_SMALLINT) snprintf(buf, sizeof(buf), "%d", c->value.as_smallint);
-                                else if (old_type == COLUMN_TYPE_BIGINT) snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint);
-                                else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) snprintf(buf, sizeof(buf), "%g", c->value.as_float);
-                                else buf[0] = '\0';
-                                c->type = new_type;
-                                c->value.as_text = strdup(buf);
-                            } else {
-                                c->type = new_type;
-                            }
-                        }
-                        /* rebuild flat storage with new types/values */
-                        table_flat_rebuild_from_rows(t);
-                        t->generation++;
-                        db->total_generation++;
-                    }
-                    return 0;
-                }
-                case ALTER_SET_DEFAULT: {
-                    int col_idx = table_find_column_sv(t, a->alter_column);
-                    if (col_idx < 0) {
-                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
-                        return -1;
-                    }
-                    struct column *col = &t->columns.items[col_idx];
-                    /* free old default if any */
-                    if (col->default_value) {
-                        if (column_type_is_text(col->default_value->type) && col->default_value->value.as_text)
-                            free(col->default_value->value.as_text);
-                        free(col->default_value);
-                    }
-                    col->has_default = 1;
-                    col->default_value = calloc(1, sizeof(struct cell));
-                    col->default_value->type = a->alter_new_col.default_value->type;
-                    col->default_value->is_null = a->alter_new_col.default_value->is_null;
-                    if (column_type_is_text(a->alter_new_col.default_value->type) && a->alter_new_col.default_value->value.as_text)
-                        col->default_value->value.as_text = strdup(a->alter_new_col.default_value->value.as_text);
-                    else
-                        col->default_value->value = a->alter_new_col.default_value->value;
-                    /* free parser's copy */
-                    free(a->alter_new_col.default_value);
-                    a->alter_new_col.default_value = NULL;
-                    return 0;
-                }
-                case ALTER_SET_NOT_NULL: {
-                    int col_idx = table_find_column_sv(t, a->alter_column);
-                    if (col_idx < 0) {
-                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
-                        return -1;
-                    }
-                    t->columns.items[col_idx].not_null = 1;
-                    return 0;
-                }
-                case ALTER_DROP_DEFAULT: {
-                    int col_idx = table_find_column_sv(t, a->alter_column);
-                    if (col_idx < 0) {
-                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
-                        return -1;
-                    }
-                    struct column *col = &t->columns.items[col_idx];
-                    if (col->default_value) {
-                        if (column_type_is_text(col->default_value->type) && col->default_value->value.as_text)
-                            free(col->default_value->value.as_text);
-                        free(col->default_value);
-                        col->default_value = NULL;
-                    }
-                    col->has_default = 0;
-                    return 0;
-                }
-                case ALTER_DROP_NOT_NULL: {
-                    int col_idx = table_find_column_sv(t, a->alter_column);
-                    if (col_idx < 0) {
-                        arena_set_error(&q->arena, "42703", "column '%.*s' does not exist", (int)a->alter_column.len, a->alter_column.data);
-                        return -1;
-                    }
-                    t->columns.items[col_idx].not_null = 0;
-                    return 0;
-                }
-            }
-            return -1;
-        }
-        case QUERY_TYPE_BEGIN:    return db_exec_begin(db, q);
-        case QUERY_TYPE_COMMIT:   return db_exec_commit(db, q);
-        case QUERY_TYPE_ROLLBACK: return db_exec_rollback(db, q);
-        case QUERY_TYPE_COPY:
-            return 0; /* handled in pgwire */
+        case QUERY_TYPE_CREATE:           return db_exec_create(db, &q->create_table, &q->arena, result);
+        case QUERY_TYPE_DROP:             return db_exec_drop(db, &q->drop_table, &q->arena, txn);
+        case QUERY_TYPE_CREATE_TYPE:      return db_exec_create_type(db, &q->create_type, &q->arena);
+        case QUERY_TYPE_DROP_TYPE:        return db_exec_drop_type(db, &q->drop_type, &q->arena);
+        case QUERY_TYPE_CREATE_SEQUENCE:  return db_exec_create_sequence(db, &q->create_seq, &q->arena);
+        case QUERY_TYPE_DROP_SEQUENCE:    return db_exec_drop_sequence(db, &q->drop_seq, &q->arena);
+        case QUERY_TYPE_CREATE_VIEW:      return db_exec_create_view(db, &q->create_view, &q->arena);
+        case QUERY_TYPE_DROP_VIEW:        return db_exec_drop_view(db, &q->drop_view, &q->arena);
+        case QUERY_TYPE_EXPLAIN:          return db_exec_explain(db, &q->explain, &q->arena, result, rb);
+        case QUERY_TYPE_TRUNCATE:         return db_exec_truncate(db, &q->del, &q->arena, txn);
+        case QUERY_TYPE_CREATE_INDEX:     return db_exec_create_index(db, &q->create_index, &q->arena);
+        case QUERY_TYPE_DROP_INDEX:       return db_exec_drop_index(db, &q->drop_index, &q->arena);
+        case QUERY_TYPE_SELECT:           return db_exec_select(db, q, result, rb);
+        case QUERY_TYPE_VALUES:           return db_exec_values(db, &q->insert, &q->arena, result, rb);
+        case QUERY_TYPE_INSERT:           return db_exec_insert(db, q, result, rb);
+        case QUERY_TYPE_DELETE:           return db_exec_delete(db, q, result, rb);
+        case QUERY_TYPE_UPDATE:           return db_exec_update(db, q, result, rb);
+        case QUERY_TYPE_ALTER:            return db_exec_alter(db, &q->alter, &q->arena, txn);
+        case QUERY_TYPE_BEGIN:            return db_exec_begin(db, q);
+        case QUERY_TYPE_COMMIT:           return db_exec_commit(db, q);
+        case QUERY_TYPE_ROLLBACK:         return db_exec_rollback(db, q);
+        case QUERY_TYPE_SHOW:             return db_exec_show(db, &q->show, &q->arena, result, rb);
+        case QUERY_TYPE_COPY:             return 0; /* handled in pgwire */
         case QUERY_TYPE_SET:
         case QUERY_TYPE_ALTER_SEQUENCE:
-        case QUERY_TYPE_SAVEPOINT:
-            return 0; /* no-op */
-        case QUERY_TYPE_SHOW: {
-            /* return a single-row, single-column result */
-            sv param = q->show.parameter;
-            const char *val = "";
-            if (sv_eq_ignorecase_cstr(param, "search_path"))
-                val = "\"$user\", public";
-            else if (sv_eq_ignorecase_cstr(param, "server_version"))
-                val = "15.0";
-            else if (sv_eq_ignorecase_cstr(param, "server_encoding"))
-                val = "UTF8";
-            else if (sv_eq_ignorecase_cstr(param, "client_encoding"))
-                val = "UTF8";
-            else if (sv_eq_ignorecase_cstr(param, "standard_conforming_strings"))
-                val = "on";
-            else if (sv_eq_ignorecase_cstr(param, "is_superuser"))
-                val = "on";
-            else if (sv_eq_ignorecase_cstr(param, "TimeZone") ||
-                     sv_eq_ignorecase_cstr(param, "timezone"))
-                val = "UTC";
-            else if (sv_eq_ignorecase_cstr(param, "integer_datetimes"))
-                val = "on";
-            else if (sv_eq_ignorecase_cstr(param, "DateStyle"))
-                val = "ISO, MDY";
-            else {
-                arena_set_error(&q->arena, "42704",
-                    "unrecognized configuration parameter \"%.*s\"",
-                    (int)param.len, param.data);
-                return -1;
-            }
-            struct row r = {0};
-            da_init(&r.cells);
-            struct cell c = {0};
-            c.type = COLUMN_TYPE_TEXT;
-            c.value.as_text = rb ? bump_strdup(rb, val) : strdup(val);
-            da_push(&r.cells, c);
-            rows_push(result, r);
-            return 0;
-        }
+        case QUERY_TYPE_SAVEPOINT:        return 0; /* no-op */
 #ifndef MSKQL_WASM
-        case QUERY_TYPE_CREATE_FOREIGN_TABLE: {
-            struct query_create_foreign_table *ft = &q->create_foreign_table;
-            char *path = sv_to_cstr(ft->filename);
-
-            struct parquet_table_info info;
-            if (parquet_open_metadata(path, &info) != 0) {
-                arena_set_error(&q->arena, "58030",
-                    "could not open Parquet file: %.*s",
-                    (int)ft->filename.len, ft->filename.data);
-                free(path);
-                return -1;
-            }
-
-            struct table t;
-            table_init_own(&t, sv_to_cstr(ft->table_name));
-            t.kind = TABLE_PARQUET;
-            t.parquet.path = path;
-
-            for (uint16_t i = 0; i < info.ncols; i++) {
-                struct column col = {0};
-                col.name = strdup(info.col_names[i]);
-                col.type = info.col_types[i];
-                da_push(&t.columns, col);
-            }
-            parquet_info_free(&info);
-
-            da_push(&db->tables, t);
-            db->total_generation++;
-            return 0;
-        }
+        case QUERY_TYPE_CREATE_FOREIGN_TABLE: return db_exec_create_foreign_table(db, &q->create_foreign_table, &q->arena);
 #else
-        case QUERY_TYPE_CREATE_FOREIGN_TABLE:
-            return -1;
+        case QUERY_TYPE_CREATE_FOREIGN_TABLE: return -1;
 #endif
     }
     return -1;
 }
+
 
 int db_exec_sql(struct database *db, const char *sql, struct rows *result)
 {

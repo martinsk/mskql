@@ -44,7 +44,10 @@ CLI_DBG  = $(BUILDDIR)/mskqlcli_debug
 CLI_REL  = $(BUILDDIR)/mskqlcli
 
 # ── Release flags (for benchmarks / production) ──────────────────
-RELEASE_CFLAGS = -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O3 -flto -DNDEBUG -g -MMD -MP -I$(CARQUET_INC)
+RELEASE_CFLAGS = -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 \
+  -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+  -O3 -flto -DNDEBUG -g -MMD -MP -I$(CARQUET_INC) \
+  -march=native -ffast-math -funroll-loops
 RELEASE_OBJS     = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(SRCS))
 RELEASE_LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(LIB_SRCS))
 

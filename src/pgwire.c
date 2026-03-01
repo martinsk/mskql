@@ -3160,6 +3160,79 @@ static int handle_copy_to_stdout(int fd, struct database *db, struct query *q,
     return 0;
 }
 
+static void bct_insert(int fd, struct database *db, struct query *q,
+                       struct rows *result, int skip_row_desc, int rc,
+                       char *tag_buf, size_t tag_sz, struct table *t)
+{
+    if (result->count > 0) {
+        if (!skip_row_desc)
+            send_row_description(fd, db, q, result);
+        send_data_rows(fd, result, db, t);
+    }
+    size_t ins_count = q->insert.insert_rows_count;
+    if (rc > 0) ins_count = (size_t)rc; /* INSERT...SELECT */
+    snprintf(tag_buf, tag_sz, "INSERT 0 %zu", ins_count);
+}
+
+static void bct_delete(int fd, struct database *db, struct query *q,
+                       struct rows *result, int skip_row_desc,
+                       char *tag_buf, size_t tag_sz, struct table *t)
+{
+    if (q->del.has_returning && result->count > 0) {
+        if (!skip_row_desc)
+            send_row_description(fd, db, q, result);
+        send_data_rows(fd, result, db, t);
+        snprintf(tag_buf, tag_sz, "DELETE %zu", result->count);
+    } else {
+        size_t del_count = 0;
+        if (result->count > 0 && result->data[0].cells.count > 0)
+            del_count = (size_t)result->data[0].cells.items[0].value.as_int;
+        snprintf(tag_buf, tag_sz, "DELETE %zu", del_count);
+    }
+}
+
+static void bct_update(int fd, struct database *db, struct query *q,
+                       struct rows *result, int skip_row_desc,
+                       char *tag_buf, size_t tag_sz, struct table *t)
+{
+    if (q->update.has_returning && result->count > 0) {
+        if (!skip_row_desc)
+            send_row_description(fd, db, q, result);
+        send_data_rows(fd, result, db, t);
+        snprintf(tag_buf, tag_sz, "UPDATE %zu", result->count);
+    } else {
+        size_t upd_count = 0;
+        if (result->count > 0 && result->data[0].cells.count > 0)
+            upd_count = (size_t)result->data[0].cells.items[0].value.as_int;
+        snprintf(tag_buf, tag_sz, "UPDATE %zu", upd_count);
+    }
+}
+
+static void bct_show(int fd, struct database *db, struct query *q,
+                     struct rows *result, struct msgbuf *m,
+                     int skip_row_desc, char *tag_buf, size_t tag_sz)
+{
+    if (!skip_row_desc) {
+        /* send a single-column RowDescription with the parameter name */
+        char col_name[128];
+        snprintf(col_name, sizeof(col_name), "%.*s",
+                 (int)q->show.parameter.len, q->show.parameter.data);
+        m->len = 0;
+        msgbuf_push_u16(m, 1); /* 1 column */
+        msgbuf_push(m, (const uint8_t *)col_name, strlen(col_name));
+        msgbuf_push_byte(m, 0); /* null terminator */
+        msgbuf_push_u32(m, 0);  /* table OID */
+        msgbuf_push_u16(m, 0);  /* column attr number */
+        msgbuf_push_u32(m, 25); /* type OID: text */
+        msgbuf_push_u16(m, (uint16_t)-1); /* type size */
+        msgbuf_push_u32(m, 0);  /* type modifier */
+        msgbuf_push_u16(m, 0);  /* format: text */
+        msg_send(fd, 'T', m);
+    }
+    send_data_rows(fd, result, db, NULL);
+    snprintf(tag_buf, tag_sz, "SHOW");
+}
+
 /* Build command tag and send result data for the given query type.
  * Writes the tag into tag_buf (must be >= 128 bytes). */
 static void build_command_tag(int fd, struct database *db, struct query *q,
@@ -3170,148 +3243,48 @@ static void build_command_tag(int fd, struct database *db, struct query *q,
 {
     switch (q->query_type) {
         case QUERY_TYPE_CREATE:
-            if (q->create_table.as_select_sql != IDX_NONE && result->count > 0) {
-                size_t sel_count = (size_t)result->data[0].cells.items[0].value.as_int;
-                snprintf(tag_buf, tag_sz, "SELECT %zu", sel_count);
-            } else {
+            if (q->create_table.as_select_sql != IDX_NONE && result->count > 0)
+                snprintf(tag_buf, tag_sz, "SELECT %zu", (size_t)result->data[0].cells.items[0].value.as_int);
+            else
                 snprintf(tag_buf, tag_sz, "CREATE TABLE");
-            }
             break;
-        case QUERY_TYPE_DROP:
-            snprintf(tag_buf, tag_sz, "DROP TABLE");
-            break;
+        case QUERY_TYPE_DROP:             snprintf(tag_buf, tag_sz, "DROP TABLE"); break;
         case QUERY_TYPE_SELECT:
-            if (!skip_row_desc)
-                send_row_description(fd, db, q, result);
+            if (!skip_row_desc) send_row_description(fd, db, q, result);
             send_data_rows(fd, result, db, t);
             snprintf(tag_buf, tag_sz, "SELECT %zu", result->count);
             break;
-        case QUERY_TYPE_INSERT:
-            if (result->count > 0) {
-                if (!skip_row_desc)
-                    send_row_description(fd, db, q, result);
-                send_data_rows(fd, result, db, t);
-            }
-            {
-                size_t ins_count = q->insert.insert_rows_count;
-                if (rc > 0) ins_count = (size_t)rc; /* INSERT...SELECT */
-                snprintf(tag_buf, tag_sz, "INSERT 0 %zu", ins_count);
-            }
-            break;
-        case QUERY_TYPE_DELETE: {
-            if (q->del.has_returning && result->count > 0) {
-                if (!skip_row_desc)
-                    send_row_description(fd, db, q, result);
-                send_data_rows(fd, result, db, t);
-                snprintf(tag_buf, tag_sz, "DELETE %zu", result->count);
-            } else {
-                size_t del_count = 0;
-                if (result->count > 0 && result->data[0].cells.count > 0)
-                    del_count = (size_t)result->data[0].cells.items[0].value.as_int;
-                snprintf(tag_buf, tag_sz, "DELETE %zu", del_count);
-            }
-            break;
-        }
-        case QUERY_TYPE_UPDATE: {
-            if (q->update.has_returning && result->count > 0) {
-                if (!skip_row_desc)
-                    send_row_description(fd, db, q, result);
-                send_data_rows(fd, result, db, t);
-                snprintf(tag_buf, tag_sz, "UPDATE %zu", result->count);
-            } else {
-                size_t upd_count = 0;
-                if (result->count > 0 && result->data[0].cells.count > 0)
-                    upd_count = (size_t)result->data[0].cells.items[0].value.as_int;
-                snprintf(tag_buf, tag_sz, "UPDATE %zu", upd_count);
-            }
-            break;
-        }
-        case QUERY_TYPE_CREATE_INDEX:
-            snprintf(tag_buf, tag_sz, "CREATE INDEX");
-            break;
-        case QUERY_TYPE_DROP_INDEX:
-            snprintf(tag_buf, tag_sz, "DROP INDEX");
-            break;
-        case QUERY_TYPE_CREATE_TYPE:
-            snprintf(tag_buf, tag_sz, "CREATE TYPE");
-            break;
-        case QUERY_TYPE_DROP_TYPE:
-            snprintf(tag_buf, tag_sz, "DROP TYPE");
-            break;
-        case QUERY_TYPE_ALTER:
-            snprintf(tag_buf, tag_sz, "ALTER TABLE");
-            break;
-        case QUERY_TYPE_CREATE_SEQUENCE:
-            snprintf(tag_buf, tag_sz, "CREATE SEQUENCE");
-            break;
-        case QUERY_TYPE_DROP_SEQUENCE:
-            snprintf(tag_buf, tag_sz, "DROP SEQUENCE");
-            break;
-        case QUERY_TYPE_CREATE_VIEW:
-            snprintf(tag_buf, tag_sz, "CREATE VIEW");
-            break;
-        case QUERY_TYPE_DROP_VIEW:
-            snprintf(tag_buf, tag_sz, "DROP VIEW");
-            break;
-        case QUERY_TYPE_TRUNCATE:
-            snprintf(tag_buf, tag_sz, "TRUNCATE TABLE");
-            break;
+        case QUERY_TYPE_INSERT:           bct_insert(fd, db, q, result, skip_row_desc, rc, tag_buf, tag_sz, t); break;
+        case QUERY_TYPE_DELETE:           bct_delete(fd, db, q, result, skip_row_desc, tag_buf, tag_sz, t); break;
+        case QUERY_TYPE_UPDATE:           bct_update(fd, db, q, result, skip_row_desc, tag_buf, tag_sz, t); break;
+        case QUERY_TYPE_CREATE_INDEX:     snprintf(tag_buf, tag_sz, "CREATE INDEX"); break;
+        case QUERY_TYPE_DROP_INDEX:       snprintf(tag_buf, tag_sz, "DROP INDEX"); break;
+        case QUERY_TYPE_CREATE_TYPE:      snprintf(tag_buf, tag_sz, "CREATE TYPE"); break;
+        case QUERY_TYPE_DROP_TYPE:        snprintf(tag_buf, tag_sz, "DROP TYPE"); break;
+        case QUERY_TYPE_ALTER:            snprintf(tag_buf, tag_sz, "ALTER TABLE"); break;
+        case QUERY_TYPE_CREATE_SEQUENCE:  snprintf(tag_buf, tag_sz, "CREATE SEQUENCE"); break;
+        case QUERY_TYPE_DROP_SEQUENCE:    snprintf(tag_buf, tag_sz, "DROP SEQUENCE"); break;
+        case QUERY_TYPE_CREATE_VIEW:      snprintf(tag_buf, tag_sz, "CREATE VIEW"); break;
+        case QUERY_TYPE_DROP_VIEW:        snprintf(tag_buf, tag_sz, "DROP VIEW"); break;
+        case QUERY_TYPE_TRUNCATE:         snprintf(tag_buf, tag_sz, "TRUNCATE TABLE"); break;
         case QUERY_TYPE_EXPLAIN:
             if (result->count > 0) {
-                if (!skip_row_desc)
-                    send_row_description(fd, db, q, result);
+                if (!skip_row_desc) send_row_description(fd, db, q, result);
                 send_data_rows(fd, result, db, NULL);
             }
             snprintf(tag_buf, tag_sz, "EXPLAIN");
             break;
-        case QUERY_TYPE_BEGIN:
-            snprintf(tag_buf, tag_sz, "BEGIN");
-            break;
-        case QUERY_TYPE_COMMIT:
-            snprintf(tag_buf, tag_sz, "COMMIT");
-            break;
-        case QUERY_TYPE_ROLLBACK:
-            snprintf(tag_buf, tag_sz, "ROLLBACK");
-            break;
-        case QUERY_TYPE_COPY:
-            snprintf(tag_buf, tag_sz, "COPY");
-            break;
-        case QUERY_TYPE_SET:
-            snprintf(tag_buf, tag_sz, "SET");
-            break;
-        case QUERY_TYPE_SHOW:
-            if (!skip_row_desc) {
-                /* send a single-column RowDescription with the parameter name */
-                char col_name[128];
-                snprintf(col_name, sizeof(col_name), "%.*s",
-                         (int)q->show.parameter.len, q->show.parameter.data);
-                m->len = 0;
-                msgbuf_push_u16(m, 1); /* 1 column */
-                msgbuf_push(m, (const uint8_t *)col_name, strlen(col_name));
-                msgbuf_push_byte(m, 0); /* null terminator */
-                msgbuf_push_u32(m, 0);  /* table OID */
-                msgbuf_push_u16(m, 0);  /* column attr number */
-                msgbuf_push_u32(m, 25); /* type OID: text */
-                msgbuf_push_u16(m, (uint16_t)-1); /* type size */
-                msgbuf_push_u32(m, 0);  /* type modifier */
-                msgbuf_push_u16(m, 0);  /* format: text */
-                msg_send(fd, 'T', m);
-            }
-            send_data_rows(fd, result, db, NULL);
-            snprintf(tag_buf, tag_sz, "SHOW");
-            break;
-        case QUERY_TYPE_CREATE_FOREIGN_TABLE:
-            snprintf(tag_buf, tag_sz, "CREATE FOREIGN TABLE");
-            break;
-        case QUERY_TYPE_ALTER_SEQUENCE:
-            snprintf(tag_buf, tag_sz, "ALTER SEQUENCE");
-            break;
-        case QUERY_TYPE_SAVEPOINT:
-            snprintf(tag_buf, tag_sz, "SAVEPOINT");
-            break;
+        case QUERY_TYPE_BEGIN:            snprintf(tag_buf, tag_sz, "BEGIN"); break;
+        case QUERY_TYPE_COMMIT:           snprintf(tag_buf, tag_sz, "COMMIT"); break;
+        case QUERY_TYPE_ROLLBACK:         snprintf(tag_buf, tag_sz, "ROLLBACK"); break;
+        case QUERY_TYPE_COPY:             snprintf(tag_buf, tag_sz, "COPY"); break;
+        case QUERY_TYPE_SET:              snprintf(tag_buf, tag_sz, "SET"); break;
+        case QUERY_TYPE_SHOW:             bct_show(fd, db, q, result, m, skip_row_desc, tag_buf, tag_sz); break;
+        case QUERY_TYPE_CREATE_FOREIGN_TABLE: snprintf(tag_buf, tag_sz, "CREATE FOREIGN TABLE"); break;
+        case QUERY_TYPE_ALTER_SEQUENCE:   snprintf(tag_buf, tag_sz, "ALTER SEQUENCE"); break;
+        case QUERY_TYPE_SAVEPOINT:        snprintf(tag_buf, tag_sz, "SAVEPOINT"); break;
         case QUERY_TYPE_VALUES:
-            if (!skip_row_desc)
-                send_row_description(fd, db, q, result);
+            if (!skip_row_desc) send_row_description(fd, db, q, result);
             send_data_rows(fd, result, db, t);
             snprintf(tag_buf, tag_sz, "SELECT %zu", result->count);
             break;
