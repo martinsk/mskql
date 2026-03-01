@@ -345,6 +345,10 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
         return pn->hnsw_scan.ncols;
     case PLAN_NESTED_LOOP:
         return pn->nested_loop.left_ncols + pn->nested_loop.right_ncols;
+    case PLAN_SUBQUERY:
+        return pn->subquery.ncols;
+    case PLAN_DISTINCT_ON:
+        return plan_node_ncols(arena, pn->left);
     }
     __builtin_unreachable();
 }
@@ -1178,6 +1182,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case PLAN_HASH_SEMI_JOIN:
             case PLAN_GENERATE_SERIES:
             case PLAN_PARQUET_SCAN:
+            case PLAN_SUBQUERY:
+            case PLAN_DISTINCT_ON:
                 goto walk_done;
             }
         }
@@ -8458,6 +8464,137 @@ static int nested_loop_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* ---- PLAN_SUBQUERY executor ----
+ * Streams rows from an inline sub-plan.  The inner plan was built into
+ * iq->arena by build_subquery.  On first call we initialise a sub-ctx
+ * using iq->arena; subsequent calls pull the next block from it. */
+static int subquery_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                         struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct subquery_state *st = (struct subquery_state *)ctx->node_states[node_idx];
+
+    if (!st) {
+        st = (struct subquery_state *)bump_alloc(&ctx->arena->scratch,
+                                                 sizeof(struct subquery_state));
+        memset(st, 0, sizeof(*st));
+        ctx->node_states[node_idx] = st;
+
+        struct query *iq = pn->subquery.inner_q;
+        if (!iq) { st->done = 1; return -1; }
+
+        st->sub_root = pn->left; /* root index is in iq->arena->plan_nodes */
+
+        /* Allocate a sub execution context that owns iq->arena */
+        st->sub_ctx = (struct plan_exec_ctx *)bump_alloc(&ctx->arena->scratch,
+                                                          sizeof(struct plan_exec_ctx));
+        plan_exec_init(st->sub_ctx, &iq->arena, ctx->db, st->sub_root);
+        st->done = 0;
+    }
+
+    if (st->done) return -1;
+
+    int rc = plan_next_block(st->sub_ctx, st->sub_root, out);
+    if (rc != 0) { st->done = 1; return -1; }
+    return 0;
+}
+
+/* ---- PLAN_DISTINCT_ON executor ----
+ * Keeps only the first row per key group.  Input must already be sorted by
+ * the key columns (guaranteed by the L_DISTINCT_ON desugaring which emits
+ * L_SORT before L_DISTINCT_ON). */
+static int distinct_on_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                             struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct distinct_on_state *st = (struct distinct_on_state *)ctx->node_states[node_idx];
+
+    if (!st) {
+        st = (struct distinct_on_state *)bump_alloc(&ctx->arena->scratch,
+                                                     sizeof(struct distinct_on_state));
+        memset(st, 0, sizeof(*st));
+        /* Allocate space for last key values */
+        int nk = pn->distinct_on.nkey_cols;
+        st->last_key = (struct cell *)bump_alloc(&ctx->arena->scratch,
+                                                  (size_t)nk * sizeof(struct cell));
+        memset(st->last_key, 0, (size_t)nk * sizeof(struct cell));
+        st->has_last = 0;
+        ctx->node_states[node_idx] = st;
+    }
+
+    uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
+    if (child_ncols == 0) return -1;
+
+    struct row_block input;
+    row_block_alloc(&input, child_ncols, &ctx->arena->scratch);
+
+    int nk = pn->distinct_on.nkey_cols;
+    int *key_cols = pn->distinct_on.key_cols;
+
+    /* Collect output rows — pull blocks from child until we have at least one
+     * output row or child is exhausted. */
+    uint16_t out_count = 0;
+    /* Copy structure from input to output */
+    for (uint16_t c = 0; c < child_ncols && c < out->ncols; c++)
+        out->cols[c].type = COLUMN_TYPE_INT; /* will be overwritten below */
+
+    for (;;) {
+        int rc = plan_next_block(ctx, pn->left, &input);
+        if (rc != 0) break;
+
+        uint16_t active = row_block_active_count(&input);
+        for (uint16_t ri = 0; ri < active; ri++) {
+            /* Copy row from input block into a temporary cell array */
+            struct cell *row_cells = (struct cell *)bump_alloc(
+                &ctx->arena->scratch, child_ncols * sizeof(struct cell));
+            for (uint16_t c = 0; c < child_ncols; c++)
+                cb_to_cell_at(&input.cols[c], ri, &row_cells[c]);
+
+            /* Check if key changed */
+            int key_changed = !st->has_last;
+            if (!key_changed) {
+                for (int k = 0; k < nk; k++) {
+                    int ci = key_cols[k];
+                    if (ci < 0 || ci >= child_ncols) { key_changed = 1; break; }
+                    if (!cell_equal(&row_cells[ci], &st->last_key[k])) {
+                        key_changed = 1;
+                        break;
+                    }
+                }
+            }
+
+            if (key_changed) {
+                /* Emit this row */
+                if (out_count >= BLOCK_CAPACITY) goto flush;
+
+                for (uint16_t c = 0; c < child_ncols && c < out->ncols; c++) {
+                    out->cols[c].type = input.cols[c].type;
+                    cell_to_cb_at(&out->cols[c], out_count, &row_cells[c]);
+                }
+                out_count++;
+
+                /* Update last key */
+                for (int k = 0; k < nk; k++) {
+                    int ci = key_cols[k];
+                    if (ci >= 0 && ci < child_ncols)
+                        st->last_key[k] = row_cells[ci];
+                }
+                st->has_last = 1;
+            }
+        }
+        row_block_reset(&input);
+
+        if (out_count > 0) break; /* return what we have */
+    }
+
+flush:
+    if (out_count == 0) return -1;
+    out->count = out_count;
+    for (uint16_t c = 0; c < out->ncols; c++)
+        out->cols[c].count = out_count;
+    return 0;
+}
+
 /* ---- Dispatcher ---- */
 
 int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -8491,6 +8628,8 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     case PLAN_SIMPLE_AGG:       return simple_agg_next(ctx, node_idx, out);
     case PLAN_HNSW_SCAN:        return hnsw_scan_next(ctx, node_idx, out);
     case PLAN_NESTED_LOOP:      return nested_loop_next(ctx, node_idx, out);
+    case PLAN_SUBQUERY:         return subquery_next(ctx, node_idx, out);
+    case PLAN_DISTINCT_ON:      return distinct_on_next(ctx, node_idx, out);
     }
     __builtin_unreachable();
 }
@@ -8537,6 +8676,10 @@ void plan_exec_cleanup(struct plan_exec_ctx *ctx)
         if (pn->op == PLAN_HASH_AGG) {
             struct hash_agg_state *st = (struct hash_agg_state *)ctx->node_states[i];
             flat_table_free(&st->gk);
+        }
+        if (pn->op == PLAN_SUBQUERY && pn->subquery.inner_q) {
+            query_free(pn->subquery.inner_q);
+            pn->subquery.inner_q = NULL;
         }
     }
 }
@@ -8860,6 +9003,15 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
         n = explain_binary(arena, pn, "Nested Loop", buf + written, buflen - written, depth);
         if (n > 0) written += n;
         break;
+    case PLAN_SUBQUERY:
+        n = snprintf(buf + written, buflen - written, "Subquery Scan on %.*s\n",
+                     (int)pn->subquery.alias.len, pn->subquery.alias.data);
+        if (n > 0) written += n;
+        break;
+    case PLAN_DISTINCT_ON:
+        n = explain_unary(arena, pn, "Unique (DISTINCT ON)", buf + written, buflen - written, depth);
+        if (n > 0) written += n;
+        break;
     }
     return written;
 }
@@ -9014,6 +9166,58 @@ static int single_table_resolve(sv col, void *ctx) {
 }
 static enum column_type single_table_col_type(int col_idx, void *ctx) {
     return ((struct single_table_ctx *)ctx)->tbl->columns.items[col_idx].type;
+}
+
+/* Narrowed-table resolver: maps column names → narrowed column positions.
+ * Used for pushed-down filters after projection pushdown in build_join. */
+struct narrowed_table_ctx {
+    struct table *tbl;
+    int *remap;    /* remap[original_idx] = narrowed_idx (-1 if dropped) */
+    int *inv_remap; /* inv_remap[narrowed_idx] = original_idx */
+    uint16_t narrowed_count;
+};
+static int narrowed_table_resolve(sv col, void *ctx) {
+    struct narrowed_table_ctx *n = (struct narrowed_table_ctx *)ctx;
+    int orig = table_find_column_sv(n->tbl, col);
+    if (orig < 0) return -1;
+    return n->remap[orig];
+}
+static enum column_type narrowed_table_col_type(int col_idx, void *ctx) {
+    struct narrowed_table_ctx *n = (struct narrowed_table_ctx *)ctx;
+    if (col_idx >= 0 && col_idx < (int)n->narrowed_count)
+        return n->tbl->columns.items[n->inv_remap[col_idx]].type;
+    return COLUMN_TYPE_INT; /* fallback */
+}
+
+/* Narrowed multi-table resolver context:
+ * resolves column names and types in the narrowed cumulative column space.
+ * new_offsets[ti] is the cumulative offset of table ti after narrowing.
+ * inv_remap[ti][narrowed_local] = original_local (for correct type lookup). */
+struct narrowed_multi_ctx {
+    struct table    **tables;
+    uint16_t        *new_offsets; /* narrowed cumulative offsets */
+    uint16_t        *new_ncols;   /* narrowed column count per table */
+    int            **inv_remap;   /* inv_remap[ti][narrowed_local] = original_local */
+    sv              *aliases;
+    int              ntables;
+};
+static int narrowed_multi_resolve(sv col, void *ctx) {
+    struct narrowed_multi_ctx *m = (struct narrowed_multi_ctx *)ctx;
+    return find_col_in_tables_a(col, m->tables, m->new_offsets, m->aliases, m->ntables);
+}
+static enum column_type narrowed_multi_col_type(int col_idx, void *ctx) {
+    struct narrowed_multi_ctx *m = (struct narrowed_multi_ctx *)ctx;
+    for (int ti = m->ntables - 1; ti >= 0; ti--) {
+        if (col_idx >= m->new_offsets[ti]) {
+            int narrowed_local = col_idx - m->new_offsets[ti];
+            if (narrowed_local < (int)m->new_ncols[ti]) {
+                int orig_local = m->inv_remap[ti][narrowed_local];
+                return m->tables[ti]->columns.items[orig_local].type;
+            }
+            break;
+        }
+    }
+    return COLUMN_TYPE_INT;
 }
 
 /* Multi-table (join) resolver context */
@@ -9514,6 +9718,45 @@ static struct table *build_merged_table_desc(struct table **tables, int ntables,
     return mt;
 }
 
+/* Build a merged table descriptor using only the narrowed columns.
+ * inv_remap[ti][narrowed_local] = original_local for name/type lookup. */
+static struct table *build_narrowed_merged_table_desc(
+        struct table **tables, int ntables, sv *aliases,
+        uint16_t *new_ncols, int **inv_remap,
+        uint16_t new_cum_cols, struct query_arena *arena)
+{
+    struct table *mt = (struct table *)bump_calloc(&arena->scratch, 1, sizeof(struct table));
+    mt->columns.items = (struct column *)bump_calloc(&arena->scratch, new_cum_cols, sizeof(struct column));
+    mt->columns.count = new_cum_cols;
+    mt->columns.capacity = new_cum_cols;
+
+    size_t ci = 0;
+    for (int ti = 0; ti < ntables; ti++) {
+        sv alias = aliases[ti];
+        for (uint16_t nl = 0; nl < new_ncols[ti]; nl++) {
+            int orig = inv_remap[ti][nl];
+            const char *base = tables[ti]->columns.items[orig].name;
+            size_t base_len = strlen(base);
+            if (alias.len > 0) {
+                size_t qlen = alias.len + 1 + base_len + 1;
+                char *qname = (char *)bump_alloc(&arena->scratch, qlen);
+                memcpy(qname, alias.data, alias.len);
+                qname[alias.len] = '.';
+                memcpy(qname + alias.len + 1, base, base_len);
+                qname[qlen - 1] = '\0';
+                mt->columns.items[ci].name = qname;
+            } else {
+                char *name = (char *)bump_alloc(&arena->scratch, base_len + 1);
+                memcpy(name, base, base_len + 1);
+                mt->columns.items[ci].name = name;
+            }
+            mt->columns.items[ci].type = tables[ti]->columns.items[orig].type;
+            ci++;
+        }
+    }
+    return mt;
+}
+
 /* Find a column in the merged column space.
  * table_prefix: optional table alias/name qualifier (empty sv = unqualified).
  * col: the bare column name.
@@ -9998,15 +10241,222 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
 
     /* --- All validation passed, build plan nodes --- */
 
+    /* ---- Projection pushdown: narrow each scan to only needed columns ----
+     * For each table, mark which original columns are required:
+     *   - join key columns (outer_keys / inner_keys)
+     *   - GROUP BY source columns
+     *   - aggregate source columns
+     *   - pushed-down WHERE filter columns (single-column predicates)
+     * Then build a narrowed scan and a global_remap[] that translates
+     * cumulative column indices to their new positions after narrowing. */
+
+    /* needed[ti][local_col] = 1 if table ti needs original column local_col */
+    uint8_t **needed = (uint8_t **)bump_calloc(&arena->scratch, ntables, sizeof(uint8_t *));
+    for (int ti = 0; ti < ntables; ti++) {
+        needed[ti] = (uint8_t *)bump_calloc(&arena->scratch,
+                                             tables[ti]->columns.count, sizeof(uint8_t));
+    }
+
+    /* Helper: mark a cumulative column index as needed */
+    #define MARK_NEEDED(cum_col) do { \
+        int _c = (int)(cum_col); \
+        for (int _ti = ntables - 1; _ti >= 0; _ti--) { \
+            if (_c >= offsets[_ti]) { \
+                int _local = _c - offsets[_ti]; \
+                needed[_ti][_local] = 1; \
+                break; \
+            } \
+        } \
+    } while(0)
+
+    /* Mark join key columns */
+    for (uint32_t j = 0; j < s->joins_count; j++) {
+        struct join_info *ji2 = &arena->joins.items[s->joins_start + j];
+        if (ji2->join_type == 4) continue; /* CROSS JOIN — no key */
+        if (outer_keys[j] >= 0) MARK_NEEDED(outer_keys[j]);
+        if (inner_keys[j] >= 0)
+            needed[j + 1][inner_keys[j]] = 1; /* inner_key is local to table j+1 */
+    }
+
+    /* Mark GROUP BY / aggregate source columns.
+     * Only apply projection pushdown when has_agg is true.
+     * For non-agg queries, mark all columns to disable narrowing — there are
+     * too many edge cases (WHERE filter cols, expression projections, ORDER BY,
+     * CROSS JOIN, LEFT JOIN) to handle safely without regressions. */
+    if (has_agg) {
+        int has_expr_agg = 0; /* any agg_col_idxs[a] == -2 (expression-based) */
+        for (uint32_t g = 0; g < s->group_by_count; g++)
+            if (grp_col_idxs[g] >= 0) MARK_NEEDED(grp_col_idxs[g]);
+        for (uint32_t a = 0; a < s->aggregates_count; a++) {
+            int ac = agg_col_idxs[a];
+            if (ac >= 0) MARK_NEEDED(ac);
+            if (ac == -2) has_expr_agg = 1;
+        }
+        /* For expression-based aggregates (agg_col_idxs[a]==-2), we cannot
+         * easily determine which columns are needed without re-parsing the
+         * expression.  Calling try_vectorize_agg_exprs here would mutate
+         * agg_col_idxs and break the build-time vectorization.  Instead,
+         * mark all columns of all tables as needed, disabling narrowing
+         * for those tables. */
+        if (has_expr_agg) {
+            for (int ti = 0; ti < ntables; ti++)
+                for (size_t c = 0; c < tables[ti]->columns.count; c++)
+                    needed[ti][c] = 1;
+        }
+    } else {
+        /* Non-agg: mark all columns needed (no pushdown for non-agg joins) */
+        for (int ti = 0; ti < ntables; ti++)
+            for (size_t c = 0; c < tables[ti]->columns.count; c++)
+                needed[ti][c] = 1;
+    }
+
+    /* Mark single-table pushed-down filter columns */
+    for (int i = 0; i < nleaves; i++) {
+        int ti = leaf_tables[i];
+        if (ti >= 0) {
+            struct condition *lc = &COND(arena, all_leaves[i]);
+            if (lc->type == COND_COMPARE) {
+                int lc_col = table_find_column_sv(tables[ti], lc->column);
+                if (lc_col >= 0) needed[ti][lc_col] = 1;
+            } else {
+                /* Complex pushed predicate — mark all columns to be safe */
+                for (size_t c = 0; c < tables[ti]->columns.count; c++)
+                    needed[ti][c] = 1;
+            }
+        }
+    }
+
+    /* Build per-table remap arrays and new cumulative offsets.
+     * tab_remap[ti][local_col] = new local position (-1 if dropped).
+     * inv_remap[ti][new_local] = original local position.
+     * new_offsets[ti] = new cumulative offset after narrowing. */
+    int **tab_remap = (int **)bump_alloc(&arena->scratch, ntables * sizeof(int *));
+    int **inv_remap = (int **)bump_alloc(&arena->scratch, ntables * sizeof(int *));
+    uint16_t *new_offsets = (uint16_t *)bump_alloc(&arena->scratch, ntables * sizeof(uint16_t));
+    uint16_t *new_ncols   = (uint16_t *)bump_alloc(&arena->scratch, ntables * sizeof(uint16_t));
+    uint16_t new_cum = 0;
+    for (int ti = 0; ti < ntables; ti++) {
+        uint16_t tc = (uint16_t)tables[ti]->columns.count;
+        tab_remap[ti] = (int *)bump_alloc(&arena->scratch, tc * sizeof(int));
+        /* Allocate inv_remap to worst case (tc entries) */
+        inv_remap[ti] = (int *)bump_alloc(&arena->scratch, tc * sizeof(int));
+        new_offsets[ti] = new_cum;
+        uint16_t pos = 0;
+        for (uint16_t c = 0; c < tc; c++) {
+            if (needed[ti][c]) {
+                inv_remap[ti][pos] = (int)c;
+                tab_remap[ti][c] = (int)pos++;
+            } else {
+                tab_remap[ti][c] = -1;
+            }
+        }
+        new_ncols[ti] = pos;
+        new_cum += pos;
+    }
+    uint16_t new_cum_cols = new_cum;
+
+    /* Global remap: old cumulative col → new cumulative col */
+    int *global_remap = (int *)bump_alloc(&arena->scratch, cum_cols * sizeof(int));
+    for (uint16_t oc = 0; oc < cum_cols; oc++) {
+        global_remap[oc] = -1;
+        for (int ti = ntables - 1; ti >= 0; ti--) {
+            if ((int)oc >= offsets[ti]) {
+                int local = (int)oc - offsets[ti];
+                if (local < (int)tables[ti]->columns.count && tab_remap[ti][local] >= 0)
+                    global_remap[oc] = new_offsets[ti] + tab_remap[ti][local];
+                break;
+            }
+        }
+    }
+
+    /* Determine whether any table was actually narrowed */
+    int any_narrowed = 0;
+    for (int ti = 0; ti < ntables; ti++)
+        if (new_ncols[ti] < (uint16_t)tables[ti]->columns.count) { any_narrowed = 1; break; }
+
+    /* If narrowing is beneficial, rewrite all downstream column indices */
+    if (any_narrowed) {
+        /* Remap join key columns */
+        for (uint32_t j = 0; j < s->joins_count; j++) {
+            if (outer_keys[j] >= 0) outer_keys[j] = global_remap[outer_keys[j]];
+            /* inner_key is local to table j+1; remap via tab_remap */
+            if (inner_keys[j] >= 0)
+                inner_keys[j] = tab_remap[j + 1][inner_keys[j]];
+        }
+        /* Remap GROUP BY columns */
+        if (has_agg) {
+            for (uint32_t g = 0; g < s->group_by_count; g++)
+                if (grp_col_idxs[g] >= 0) grp_col_idxs[g] = global_remap[grp_col_idxs[g]];
+            for (uint32_t a = 0; a < s->aggregates_count; a++) {
+                int ac = agg_col_idxs[a];
+                if (ac >= 0) agg_col_idxs[a] = global_remap[ac];
+            }
+        }
+        /* Remap non-agg projection map */
+        if (!has_agg && need_project_join && proj_map_join) {
+            for (uint16_t p = 0; p < proj_ncols_join; p++)
+                if (proj_map_join[p] >= 0) proj_map_join[p] = global_remap[proj_map_join[p]];
+        }
+        /* Remap ORDER BY sort columns (non-agg path) */
+        if (!has_agg) {
+            for (uint16_t k = 0; k < join_sort_nord; k++)
+                if (join_sort_cols[k] >= 0) join_sort_cols[k] = global_remap[join_sort_cols[k]];
+        }
+        /* Update cum_cols to new value for downstream plan nodes */
+        cum_cols = new_cum_cols;
+    }
+    #undef MARK_NEEDED
+
     /* Build per-table scan nodes with pushed-down filters */
     uint32_t *scan_nodes = (uint32_t *)bump_alloc(&arena->scratch, ntables * sizeof(uint32_t));
     for (int ti = 0; ti < ntables; ti++) {
-        scan_nodes[ti] = build_seq_scan(tables[ti], arena);
-        /* Append pushed-down filters for this table */
+        if (any_narrowed && new_ncols[ti] < (uint16_t)tables[ti]->columns.count
+            && new_ncols[ti] > 0) {
+            /* Build narrowed scan */
+            int *col_map = (int *)bump_alloc(&arena->scratch, new_ncols[ti] * sizeof(int));
+            uint16_t pos = 0;
+            for (uint16_t c = 0; c < (uint16_t)tables[ti]->columns.count; c++)
+                if (needed[ti][c]) col_map[pos++] = (int)c;
+#ifndef MSKQL_WASM
+            if (tables[ti]->kind == TABLE_PARQUET) {
+                scan_nodes[ti] = plan_alloc_node(arena, PLAN_PARQUET_SCAN);
+                PLAN_NODE(arena, scan_nodes[ti]).parquet_scan.table = tables[ti];
+                PLAN_NODE(arena, scan_nodes[ti]).parquet_scan.ncols = new_ncols[ti];
+                PLAN_NODE(arena, scan_nodes[ti]).parquet_scan.col_map = col_map;
+                PLAN_NODE(arena, scan_nodes[ti]).est_rows = 0;
+            } else
+#endif
+            {
+                scan_nodes[ti] = plan_alloc_node(arena, PLAN_SEQ_SCAN);
+                PLAN_NODE(arena, scan_nodes[ti]).seq_scan.table = tables[ti];
+                PLAN_NODE(arena, scan_nodes[ti]).seq_scan.ncols = new_ncols[ti];
+                PLAN_NODE(arena, scan_nodes[ti]).seq_scan.col_map = col_map;
+                PLAN_NODE(arena, scan_nodes[ti]).est_rows = (double)tables[ti]->rows.count;
+            }
+        } else {
+            scan_nodes[ti] = build_seq_scan(tables[ti], arena);
+        }
+        /* Append pushed-down filters for this table.
+         * When the scan is narrowed, we must use a resolver that returns
+         * narrowed column indices (not original ones), so filter_next sees
+         * the correct col_idx for the narrowed block layout. */
         for (int i = 0; i < nleaves; i++) {
-            if (leaf_tables[i] == ti)
-                scan_nodes[ti] = append_compound_filter_r(scan_nodes[ti],
-                    &per_table_cr[ti], arena, arena, all_leaves[i]);
+            if (leaf_tables[i] == ti) {
+                if (any_narrowed && new_ncols[ti] < (uint16_t)tables[ti]->columns.count) {
+                    struct narrowed_table_ctx ntc;
+                    ntc.tbl = tables[ti];
+                    ntc.remap = tab_remap[ti];
+                    ntc.inv_remap = inv_remap[ti];
+                    ntc.narrowed_count = new_ncols[ti];
+                    struct col_resolver ncr = { narrowed_table_resolve,
+                                                narrowed_table_col_type, &ntc };
+                    scan_nodes[ti] = append_compound_filter_r(scan_nodes[ti],
+                        &ncr, arena, arena, all_leaves[i]);
+                } else {
+                    scan_nodes[ti] = append_compound_filter_r(scan_nodes[ti],
+                        &per_table_cr[ti], arena, arena, all_leaves[i]);
+                }
+            }
         }
     }
 
@@ -10041,14 +10491,31 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
 
     /* Append residual (cross-table) post-join WHERE filter(s) */
     if (join_filter_ok) {
+        struct col_resolver post_join_cr;
+        struct multi_table_ctx post_mtc;
+        struct narrowed_multi_ctx post_nmtc;
+        if (any_narrowed) {
+            post_nmtc.tables = tables;
+            post_nmtc.new_offsets = new_offsets;
+            post_nmtc.new_ncols = new_ncols;
+            post_nmtc.inv_remap = inv_remap;
+            post_nmtc.aliases = aliases;
+            post_nmtc.ntables = ntables;
+            post_join_cr = (struct col_resolver){ narrowed_multi_resolve,
+                                                  narrowed_multi_col_type, &post_nmtc };
+        } else {
+            post_mtc = (struct multi_table_ctx){ tables, offsets, aliases, ntables };
+            post_join_cr = (struct col_resolver){ multi_table_resolve,
+                                                  multi_table_col_type, &post_mtc };
+        }
         for (int i = 0; i < nleaves; i++) {
             if (leaf_tables[i] == -1)
-                current = append_compound_filter_r(current, &join_cr, arena, arena, all_leaves[i]);
+                current = append_compound_filter_r(current, &post_join_cr, arena, arena, all_leaves[i]);
         }
         /* If no leaves were decomposed (e.g. single OR spanning tables),
          * fall back to applying the whole WHERE as post-join filter */
         if (nleaves == 0)
-            current = append_compound_filter_r(current, &join_cr, arena, arena, s->where.where_cond);
+            current = append_compound_filter_r(current, &post_join_cr, arena, arena, s->where.where_cond);
     }
     #undef MAX_PUSH_PREDS
 
@@ -10062,9 +10529,14 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
         PLAN_NODE(arena, agg_idx).hash_agg.agg_count = s->aggregates_count;
         PLAN_NODE(arena, agg_idx).hash_agg.agg_before_cols = s->agg_before_cols;
         PLAN_NODE(arena, agg_idx).hash_agg.agg_col_indices = agg_col_idxs;
-        /* Try to vectorize expression aggregates (col OP col / col OP lit) */
+        /* Try to vectorize expression aggregates (col OP col / col OP lit).
+         * Use narrowed offsets if projection was applied. */
         {
-            struct agg_resolve_multi_ctx mc = { tables, offsets, aliases, ntables };
+            struct agg_resolve_multi_ctx mc = {
+                tables,
+                any_narrowed ? new_offsets : offsets,
+                aliases, ntables
+            };
             int *va, *vb, *vo; double *vl;
             try_vectorize_agg_exprs(s, arena, agg_col_idxs, &va, &vb, &vo, &vl,
                                      agg_resolve_multi_table, &mc);
@@ -10074,8 +10546,11 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
             PLAN_NODE(arena, agg_idx).hash_agg.agg_vec_lit = vl;
         }
         /* Build merged table descriptor for eval_expr column resolution */
-        PLAN_NODE(arena, agg_idx).hash_agg.table =
-            build_merged_table_desc(tables, ntables, aliases, cum_cols, arena);
+        PLAN_NODE(arena, agg_idx).hash_agg.table = any_narrowed
+            ? build_narrowed_merged_table_desc(tables, ntables, aliases,
+                                               new_ncols, inv_remap,
+                                               new_cum_cols, arena)
+            : build_merged_table_desc(tables, ntables, aliases, cum_cols, arena);
         /* Resolve STRING_AGG ORDER BY columns */
         {
             int *aoc = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
@@ -12289,15 +12764,15 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
         return PLAN_RES_NOTIMPL;
     }
 
-    /* ORDER BY + expr_project: sort on raw columns before expression eval.
-     * DISTINCT + expr_project: EXPR_PROJECT runs before DISTINCT.
-     * Both are handled by the existing node construction order. */
-
     /* Pre-validate ORDER BY columns BEFORE allocating plan nodes */
     int  sort_cols_buf[MAX_SORT_KEYS];
     int  sort_descs_buf[MAX_SORT_KEYS];
     int  sort_nf_buf[MAX_SORT_KEYS];
     uint16_t sort_nord = 0;
+    /* When ORDER BY references an expression-projection alias (e.g. ORDER BY net
+     * where net = amount - fee AS net), the sort must happen AFTER the expression
+     * projection node using the output column index, not the raw table column index. */
+    int sort_after_expr_project = 0;
     if (s->has_order_by && s->order_by_count > 0) {
         sort_nord = s->order_by_count < MAX_SORT_KEYS ? (uint16_t)s->order_by_count : MAX_SORT_KEYS;
         for (uint16_t k = 0; k < sort_nord; k++) {
@@ -12305,12 +12780,22 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
             sort_descs_buf[k] = obi->desc;
             sort_nf_buf[k] = obi->nulls_first;
             sort_cols_buf[k] = table_find_column_sv(t, obi->column);
-            if (sort_cols_buf[k] < 0 && need_project) {
+            if (sort_cols_buf[k] < 0 && (need_project || need_expr_project)) {
                 for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
                     struct select_column *scp = &arena->select_cols.items[s->parsed_columns_start + pc];
                     if (scp->alias.len > 0 && sv_eq_ignorecase(obi->column, scp->alias)) {
-                        if (scp->expr_idx != IDX_NONE && EXPR(arena, scp->expr_idx).type == EXPR_COLUMN_REF)
-                            sort_cols_buf[k] = table_find_column_sv(t, EXPR(arena, scp->expr_idx).column_ref.column);
+                        if (scp->expr_idx != IDX_NONE) {
+                            struct expr *ae = &EXPR(arena, scp->expr_idx);
+                            if (ae->type == EXPR_COLUMN_REF) {
+                                /* Simple alias — resolve to pre-projection table column */
+                                sort_cols_buf[k] = table_find_column_sv(t, ae->column_ref.column);
+                            } else if (need_expr_project) {
+                                /* Expression alias (e.g. amount - fee AS net) — sort on the
+                                 * projected output column index after expression projection */
+                                sort_cols_buf[k] = (int)pc;
+                                sort_after_expr_project = 1;
+                            }
+                        }
                         break;
                     }
                 }
@@ -12629,8 +13114,11 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
             current = try_append_simple_filter(current, t, arena, arena, extra_filter_cond);
     }
 
-    /* Add SORT node if ORDER BY was validated */
-    if (sort_nord > 0)
+    /* Add SORT node if ORDER BY was validated AND sort does not reference
+     * expression-projection output columns (sort_after_expr_project == 0).
+     * When sort_after_expr_project is set, the sort is deferred until after
+     * the expression projection node below. */
+    if (sort_nord > 0 && !sort_after_expr_project)
         current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, sort_nf_buf, sort_nord);
 
     /* Add projection node if specific columns are selected */
@@ -13067,6 +13555,11 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
         }
     }
 
+    /* Deferred SORT: when sort keys reference expression-projection output columns,
+     * emit SORT after the VEC_PROJECT/EXPR_PROJECT node. */
+    if (sort_nord > 0 && sort_after_expr_project)
+        current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, sort_nf_buf, sort_nord);
+
     /* Add DISTINCT node if present (after sort+project, before limit) */
     if (s->has_distinct) {
         uint32_t dist_idx = plan_alloc_node(arena, PLAN_DISTINCT);
@@ -13077,6 +13570,134 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
     current = build_limit(current, s, arena);
 
     return PLAN_RES_OK(current);
+}
+
+/* ---- Plan builder: subquery / CTE inline path ----
+ *
+ * Builds a PLAN_SUBQUERY node that streams rows from a sub-plan.
+ * The inner SQL is parsed here (validate-then-build pattern), the parsed
+ * query is bump-allocated so it lives for the duration of the outer query,
+ * and the column count is resolved from the inner scan table's schema.
+ * On PLAN_NOTIMPL from the inner plan_build_select, falls back to NOTIMPL
+ * so the outer query can fall through to the legacy path. */
+static struct plan_result build_subquery(struct query_select *s,
+                                         struct query_arena *arena,
+                                         struct database *db,
+                                         uint32_t sql_idx,
+                                         sv alias)
+{
+    if (!db) return PLAN_RES_NOTIMPL;
+    if (sql_idx == IDX_NONE) return PLAN_RES_NOTIMPL;
+
+    const char *sql = ASTRING(arena, sql_idx);
+    if (!sql || !*sql) return PLAN_RES_NOTIMPL;
+
+    /* Parse the inner SQL with its own arena (query_parse_into resets the
+     * outer arena which would destroy all outer AST state).  The parsed
+     * query is used only to build the inner plan; it is freed after build. */
+    struct query *iq = (struct query *)bump_alloc(&arena->scratch, sizeof(struct query));
+    memset(iq, 0, sizeof(*iq));
+    if (query_parse(sql, iq) != 0)
+        return PLAN_RES_NOTIMPL;
+    if (iq->query_type != QUERY_TYPE_SELECT) {
+        query_free(iq);
+        return PLAN_RES_NOTIMPL;
+    }
+
+    /* Bail if the outer query has WHERE/ORDER BY/LIMIT/DISTINCT that reference
+     * subquery output columns — those need name resolution against the
+     * materialized subquery output, which only the legacy path handles. */
+    if (s->where.has_where || s->has_order_by || s->has_limit || s->has_offset ||
+        s->has_distinct || s->has_distinct_on || s->has_group_by ||
+        s->aggregates_count > 0 || s->has_having) {
+        query_free(iq);
+        return PLAN_RES_NOTIMPL;
+    }
+
+    /* Validate: only non-recursive inner queries for now */
+    struct query_select *iss = &iq->select;
+    if (iss->has_recursive_cte) {
+        query_free(iq);
+        return PLAN_RES_NOTIMPL;
+    }
+
+    /* Build the inner plan using iq's own arena so that all index fields
+     * in iss (where_cond, group_by_start, etc.) resolve correctly.  The
+     * inner plan nodes live in iq->arena and are executed via a sub-ctx
+     * in subquery_next. */
+    struct table *sub_t = NULL;
+    if (iss->table.len > 0)
+        sub_t = db_find_table_sv(db, iss->table);
+
+    struct plan_result inner_pr = plan_build_select(sub_t, iss, &iq->arena, db);
+    if (inner_pr.status != PLAN_OK) {
+        query_free(iq);
+        return PLAN_RES_NOTIMPL;
+    }
+
+    uint16_t ncols = plan_node_ncols(&iq->arena, inner_pr.node);
+    if (ncols == 0) {
+        query_free(iq);
+        return PLAN_RES_NOTIMPL;
+    }
+
+    /* Allocate the PLAN_SUBQUERY node in the outer arena */
+    uint32_t sq_idx = plan_alloc_node(arena, PLAN_SUBQUERY);
+    struct plan_node *sq = &PLAN_NODE(arena, sq_idx);
+    sq->left               = inner_pr.node; /* inner plan root (index into iq->arena) */
+    sq->subquery.inner_q   = iq;            /* owns iq; freed in plan_exec_cleanup */
+    sq->subquery.alias     = alias;
+    sq->subquery.ncols     = ncols;
+
+    return PLAN_RES_OK(sq_idx);
+}
+
+/* ---- Plan builder: DISTINCT ON path ----
+ *
+ * Builds a PLAN_SORT + PLAN_DISTINCT_ON node pair from DISTINCT ON key columns.
+ * The sort ensures rows with identical key are adjacent so distinct_on_next
+ * can skip duplicates in a single pass. */
+static struct plan_result build_distinct_on(struct table *t,
+                                             struct query_select *s,
+                                             struct query_arena *arena,
+                                             struct database *db)
+{
+    /* Delegate to build_single_table which handles the base scan + sort.
+     * Then wrap the result in PLAN_DISTINCT_ON. */
+    if (!t) return PLAN_RES_NOTIMPL;
+    if (s->distinct_on_count == 0) return PLAN_RES_NOTIMPL;
+
+    /* Resolve key column indices against the table schema */
+    int key_cols[32];
+    int nk = 0;
+    for (uint32_t i = 0; i < s->distinct_on_count && nk < 32; i++) {
+        sv col_name = arena->svs.items[s->distinct_on_start + i];
+        int found = -1;
+        for (size_t c = 0; c < t->columns.count; c++) {
+            if (sv_eq_cstr(col_name, t->columns.items[c].name)) {
+                found = (int)c;
+                break;
+            }
+        }
+        if (found < 0) return PLAN_RES_NOTIMPL; /* unknown column */
+        key_cols[nk++] = found;
+    }
+
+    /* Build the underlying plan (scan + optional filter + sort by key cols) */
+    struct plan_result base = build_single_table(t, s, arena, db);
+    if (base.status != PLAN_OK) return base;
+
+    /* Wrap with PLAN_DISTINCT_ON */
+    int *kc = (int *)bump_alloc(&arena->scratch, (size_t)nk * sizeof(int));
+    memcpy(kc, key_cols, (size_t)nk * sizeof(int));
+
+    uint32_t don_idx = plan_alloc_node(arena, PLAN_DISTINCT_ON);
+    struct plan_node *don = &PLAN_NODE(arena, don_idx);
+    don->left                  = base.node;
+    don->distinct_on.key_cols  = kc;
+    don->distinct_on.nkey_cols = (uint16_t)nk;
+
+    return PLAN_RES_OK(don_idx);
 }
 
 /* ---- Logical → Physical pattern matcher ----
@@ -13105,18 +13726,24 @@ static struct plan_result logical_to_physical(struct table *t,
 
     /* ---- Route by dominant logical operator ----
      * Walk down through wrapper nodes (LIMIT, SORT, PROJECT, FILTER,
-     * AGGREGATE) to find the dominant structural node that determines
-     * which physical builder to call.  Priority: L_JOIN > L_AGGREGATE > L_SCAN.
+     * AGGREGATE, DISTINCT_ON) to find the dominant structural node.
+     * Priority: L_JOIN > L_SUBQUERY > L_AGGREGATE > L_SCAN.
      * We track the highest-priority structural node seen while descending. */
     enum logical_op dominant = rn->op;
     uint32_t cur = root;
     struct logical_node *cn = rn;
+    uint32_t subquery_node_idx = IDX_NONE;
     while (cn) {
         if (cn->op == L_JOIN) {
             dominant = L_JOIN;
             break; /* L_JOIN is highest priority — stop immediately */
         }
-        if (cn->op == L_AGGREGATE && dominant != L_JOIN) {
+        if (cn->op == L_SUBQUERY) {
+            dominant = L_SUBQUERY;
+            subquery_node_idx = cur;
+            break; /* L_SUBQUERY is a leaf — stop */
+        }
+        if (cn->op == L_AGGREGATE && dominant != L_JOIN && dominant != L_SUBQUERY) {
             dominant = L_AGGREGATE;
         }
         cur = cn->child;
@@ -13130,12 +13757,17 @@ static struct plan_result logical_to_physical(struct table *t,
             if (db) return build_join(t, s, arena, db);
             return PLAN_RES_NOTIMPL;
 
+        case L_SUBQUERY: {
+            /* Non-recursive CTE or FROM subquery: build inline. */
+            struct logical_node *sqn = logical_node_get(arena, subquery_node_idx);
+            if (!sqn) return PLAN_RES_NOTIMPL;
+            return build_subquery(s, arena, db, sqn->subquery.sql_idx, sqn->subquery.alias);
+        }
+
         case L_AGGREGATE:
             /* L_AGGREGATE without a join: GROUP BY, bare aggregates, DISTINCT.
-             * CTE / subquery / recursive queries: fall back to legacy. */
-            if (s->has_set_op ||
-                s->ctes_count > 0 || s->cte_sql != IDX_NONE ||
-                s->from_subquery_sql != IDX_NONE || s->has_recursive_cte)
+             * Recursive CTE: fall back to legacy. */
+            if (s->has_set_op || s->has_recursive_cte)
                 return PLAN_RES_NOTIMPL;
 
             /* DISTINCT-only (group_by_count==0, agg_count==0) */
@@ -13162,6 +13794,10 @@ static struct plan_result logical_to_physical(struct table *t,
             }
 
             return PLAN_RES_NOTIMPL;
+
+        case L_DISTINCT_ON:
+            /* DISTINCT ON desugared: sort + keep first per key */
+            return build_distinct_on(t, s, arena, db);
 
         case L_SCAN:
         case L_FILTER:
@@ -13283,7 +13919,13 @@ struct plan_result plan_build_select(struct table *t, struct query_select *s,
             struct plan_result lpr = logical_to_physical(t, s, arena, db, lroot);
             if (lpr.status == PLAN_OK || lpr.status == PLAN_ERROR)
                 return lpr;
-            /* PLAN_NOTIMPL: fall through to build_single_table */
+            /* PLAN_NOTIMPL from a subquery/CTE dominant: propagate so the
+             * caller's legacy path can materialise the subquery/CTE. */
+            if (s->from_subquery_sql != IDX_NONE ||
+                s->ctes_count > 0 || s->cte_sql != IDX_NONE ||
+                s->has_recursive_cte)
+                return PLAN_RES_NOTIMPL;
+            /* Otherwise fall through to build_single_table */
         }
     }
 

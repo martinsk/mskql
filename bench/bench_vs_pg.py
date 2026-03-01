@@ -115,9 +115,17 @@ CACHE_RESISTANT = {
 # to CREATE DISK TABLE for the "disk" column.  Benchmarks that create tables
 # inside the *bench* loop, use indexes, or have no tables are excluded.
 DISK_ELIGIBLE = {
+    # original set
     "select_full_scan", "select_where", "aggregate", "order_by", "join",
     "update", "window_functions", "distinct", "subquery", "cte",
     "scalar_functions", "expression_agg", "multi_sort", "set_ops",
+    # bootstrap-schema benchmarks (customers/products/orders/events/metrics/sales)
+    "multi_join", "analytical_cte", "wide_agg", "large_sort",
+    "subquery_complex", "window_rank", "mixed_analytical",
+    "wc_join_reorder", "wc_nested_cte",
+    # custom-table benchmarks without indexes
+    "wc_large_dataset", "wc_string_heavy", "wc_wide_output",
+    "wc_correlated_subq",
 }
 
 
@@ -1476,6 +1484,22 @@ def main():
     print("=" * 90)
     print()
 
+    # ── check parquet fixtures ──
+    if os.path.isdir(PARQUET_DIR):
+        missing = [f for f in os.listdir(PARQUET_DIR) if f.endswith(".parquet.generating")]
+        all_pq = [f for f in os.listdir(PARQUET_DIR) if f.endswith(".parquet")]
+        if not all_pq:
+            print("  WARNING: no parquet fixtures found in bench/parquet_fixtures/")
+            print("           Run: python3 tests/gen_parquet_fixtures.py")
+            print()
+        elif missing:
+            print(f"  WARNING: {len(missing)} fixture(s) still generating: {missing}")
+            print()
+    else:
+        print("  WARNING: bench/parquet_fixtures/ directory not found")
+        print("           Run: python3 tests/gen_parquet_fixtures.py")
+        print()
+
     # ── verify connectivity ──
     rc, _ = run_cli_cmd(host, args.mskql_port, args.pg_user, "mskql", "SELECT 1")
     if rc != 0:
@@ -1507,7 +1531,8 @@ def main():
             continue
         bench_idx += 1
 
-        print(f"  [{bench_idx}/{bench_count}] {name:<25s} ...", end="", flush=True)
+        prefix = f"  [{bench_idx}/{bench_count}] {name:<25s}"
+        print(f"{prefix} ", end="", flush=True)
 
         # Generate SQL — benchmark functions return either:
         #   (setup_lines, bench_lines)  — shared SQL for all engines
@@ -1526,13 +1551,14 @@ def main():
             pg_spec = (setup_lines, bench_lines)
 
         # ── mskql ──
+        print("mskql..", end="", flush=True)
         m_setup_f = tempfile.NamedTemporaryFile(
             mode="w", suffix=".sql", prefix=f"bench_setup_{name}_m_", delete=False
         )
         m_bench_f = tempfile.NamedTemporaryFile(
             mode="w", suffix=".sql", prefix=f"bench_run_{name}_m_", delete=False
         )
-        m_setup_f.write("\n".join(mskql_spec[0]) + "\n")
+        m_setup_f.write("SELECT __invalidate_cache();\n" + "\n".join(mskql_spec[0]) + "\n")
         m_setup_f.close()
         m_bench_f.write("\n".join(mskql_spec[1]) + "\n")
         m_bench_f.close()
@@ -1543,6 +1569,7 @@ def main():
 
         # ── postgres ──
         if pg_spec is not None:
+            print(" pg..", end="", flush=True)
             p_setup_f = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".sql", prefix=f"bench_setup_{name}_p_", delete=False
             )
@@ -1562,6 +1589,7 @@ def main():
 
         # ── duckdb ──
         if duck_spec is not None:
+            print(" duck..", end="", flush=True)
             duck_db = tempfile.mktemp(suffix=".duckdb", prefix=f"bench_{name}_")
             d_setup_lines = duck_spec[0] if is_parquet else duckdb_fixup(duck_spec[0])
             d_bench_lines = duck_spec[1] if is_parquet else duckdb_fixup(duck_spec[1])
@@ -1593,10 +1621,11 @@ def main():
         disk_source = None
         if base_name in DISK_ELIGIBLE and not is_parquet:
             disk_source = mskql_spec[0]
-        elif is_parquet and pg_spec is not None and base_name.startswith("stress_"):
-            disk_source = pg_spec[0]
+        # stress_* parquet benchmarks skip disk variant — inserting 5M rows via
+        # generate_series into disk tables takes too long to be useful here.
 
         if disk_source is not None:
+            print(" disk..", end="", flush=True)
             disk_setup_lines = _diskify_lines(disk_source, base_name)
             dk_setup_f = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".sql", prefix=f"bench_setup_{name}_dk_", delete=False
@@ -1604,7 +1633,7 @@ def main():
             dk_bench_f = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".sql", prefix=f"bench_run_{name}_dk_", delete=False
             )
-            dk_setup_f.write("\n".join(disk_setup_lines) + "\n")
+            dk_setup_f.write("SELECT __invalidate_cache();\n" + "\n".join(disk_setup_lines) + "\n")
             dk_setup_f.close()
             dk_bench_f.write("\n".join(mskql_spec[1]) + "\n")
             dk_bench_f.close()
@@ -1619,7 +1648,7 @@ def main():
         tag = f" mskql={mskql_ms:.0f}ms" if mskql_ms >= 0 else " ERROR"
         if disk_ms >= 0:
             tag += f" disk={disk_ms:.0f}ms"
-        print(tag, flush=True)
+        print(f" {tag}", flush=True)
 
     # ── sort: mskql wins (fastest) first, losses last ──
     def sort_key(r):

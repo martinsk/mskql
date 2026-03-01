@@ -29,6 +29,8 @@ enum plan_op {
     PLAN_VEC_PROJECT,    /* vectorized columnar expression eval (no per-row overhead) */
     PLAN_TOP_N,          /* fused SORT + LIMIT: heap-based top-N selection */
     PLAN_HNSW_SCAN,      /* HNSW approximate nearest neighbor scan */
+    PLAN_SUBQUERY,       /* inline subquery / CTE — streams rows from a sub-plan */
+    PLAN_DISTINCT_ON,    /* keep first row per key group (DISTINCT ON desugaring) */
 };
 
 /* ---- Plan builder result ---- */
@@ -223,6 +225,15 @@ struct plan_node {
             size_t   limit;            /* N = number of rows to keep */
             size_t   offset;           /* skip first M rows from sorted result */
         } top_n;
+        struct {
+            struct query *inner_q; /* heap-allocated parsed inner query (owns its arena) */
+            sv            alias;   /* table alias (CTE name or FROM subquery alias) */
+            uint16_t      ncols;   /* output column count (set at build time) */
+        } subquery;
+        struct {
+            int     *key_cols;       /* bump-allocated: column indices for key */
+            uint16_t nkey_cols;
+        } distinct_on;
         struct {
             struct table *table;
             struct hnsw_index *hnsw;  /* pointer to the HNSW index */
@@ -483,6 +494,17 @@ struct top_n_state {
 struct gen_series_state {
     long long current;   /* next value to emit */
     int       done;      /* 1 = exhausted */
+};
+
+struct subquery_state {
+    struct plan_exec_ctx *sub_ctx;  /* bump-allocated sub-plan execution context */
+    uint32_t              sub_root; /* root node index within sub_ctx->arena */
+    int                   done;
+};
+
+struct distinct_on_state {
+    struct cell *last_key; /* bump-allocated: last emitted key values [nkey_cols] */
+    int          has_last; /* 1 after first row emitted */
 };
 
 /* Execution context: holds arena, database, and per-node state. */

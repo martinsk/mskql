@@ -3368,6 +3368,31 @@ static int handle_query_inner(int fd, struct database *db, const char *sql,
         return 0;
     }
 
+    /* Internal benchmark command: invalidate result cache only (no db reset) */
+    if (strncmp(sql, "SELECT __invalidate_cache()", sizeof("SELECT __invalidate_cache()") - 1) == 0) {
+        rcache_invalidate_all();
+        cte_cache_invalidate();
+        if (!skip_row_desc) {
+            m->len = 0;
+            msgbuf_push_u16(m, 1);
+            msgbuf_push_cstr(m, "__invalidate_cache");
+            msgbuf_push_u32(m, 0);
+            msgbuf_push_u16(m, 0);
+            msgbuf_push_u32(m, 25);
+            msgbuf_push_u16(m, (uint16_t)-1);
+            msgbuf_push_u32(m, (uint32_t)-1);
+            msgbuf_push_u16(m, 0);
+            msg_send(fd, 'T', m);
+        }
+        m->len = 0;
+        msgbuf_push_u16(m, 1);
+        msgbuf_push_u32(m, 2);
+        msgbuf_push(m, (const uint8_t *)"ok", 2);
+        msg_send(fd, 'D', m);
+        send_command_complete(fd, m, "SELECT 1");
+        return 0;
+    }
+
     /* Fast result cache check — skip parse entirely on cache hit */
     if (!skip_row_desc) {
         uint32_t rc_hash = rcache_hash_sql(sql, sql_len);

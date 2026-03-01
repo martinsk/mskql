@@ -44,13 +44,25 @@ uint32_t logical_build(struct query_select *s, struct query_arena *arena,
 {
     (void)db; /* reserved for future schema lookups */
 
-    /* ---- Base: L_SCAN ---- */
-    uint32_t scan_idx = logical_alloc_node(arena, L_SCAN);
-    struct logical_node *scan = logical_node_get(arena, scan_idx);
-    scan->scan.table = s->table;
-    scan->scan.alias = s->table_alias;
+    uint32_t current;
 
-    uint32_t current = scan_idx;
+    /* ---- Base: L_SUBQUERY (FROM subquery) or L_SCAN ---- */
+
+    if (s->from_subquery_sql != IDX_NONE) {
+        /* FROM (SELECT ...) AS alias: desugar to L_SUBQUERY */
+        uint32_t sq_idx = logical_alloc_node(arena, L_SUBQUERY);
+        struct logical_node *sq = logical_node_get(arena, sq_idx);
+        sq->subquery.sql_idx = s->from_subquery_sql;
+        sq->subquery.alias   = s->from_subquery_alias;
+        current = sq_idx;
+    } else {
+        /* Plain table scan (CTEs handled by legacy path via db_exec_select) */
+        uint32_t scan_idx = logical_alloc_node(arena, L_SCAN);
+        struct logical_node *scan = logical_node_get(arena, scan_idx);
+        scan->scan.table = s->table;
+        scan->scan.alias = s->table_alias;
+        current = scan_idx;
+    }
 
     /* ---- L_FILTER (WHERE) ---- */
     if (s->where.has_where && s->where.where_cond != IDX_NONE) {
@@ -125,6 +137,28 @@ uint32_t logical_build(struct query_select *s, struct query_arena *arena,
         pr->project.distinct_on_start     = s->distinct_on_start;
         pr->project.distinct_on_count     = s->distinct_on_count;
         current = proj_idx;
+    }
+
+    /* ---- L_DISTINCT_ON: desugar from DISTINCT ON (cols) ---- */
+    if (s->has_distinct_on && s->distinct_on_count > 0) {
+        /* First: sort by the DISTINCT ON key columns so duplicates are adjacent */
+        uint32_t sort_idx = logical_alloc_node(arena, L_SORT);
+        struct logical_node *so = logical_node_get(arena, sort_idx);
+        so->child               = current;
+        /* Re-use the distinct_on svs as the sort key (same columns).
+         * Store their sv start index in sort.order_by_start as a negative
+         * sentinel that the physical builder recognises as "sv-based sort". */
+        so->sort.order_by_start = s->distinct_on_start;
+        so->sort.order_by_count = s->distinct_on_count;
+        current = sort_idx;
+
+        /* Then: emit only the first row per key group */
+        uint32_t don_idx = logical_alloc_node(arena, L_DISTINCT_ON);
+        struct logical_node *don = logical_node_get(arena, don_idx);
+        don->child                   = current;
+        don->distinct_on.key_start   = s->distinct_on_start;
+        don->distinct_on.key_count   = s->distinct_on_count;
+        current = don_idx;
     }
 
     /* ---- L_SORT ---- */
@@ -243,6 +277,10 @@ static uint32_t normalize_node(uint32_t idx, struct query_arena *arena,
 
     struct logical_node *n = logical_node_get(arena, idx);
     if (!n) return idx;
+
+    /* L_SUBQUERY: inner tree is a separate logical plan built at physical
+     * build time; do not recurse into it from here. */
+    if (n->op == L_SUBQUERY) return idx;
 
     /* Recurse into children first (bottom-up) */
     uint32_t new_child = normalize_node(n->child, arena, db);

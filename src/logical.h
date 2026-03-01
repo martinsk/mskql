@@ -6,11 +6,11 @@
 
 /* ---- Logical IR node types ----
  *
- * A canonical 7-node intermediate representation sitting between the parser
+ * A canonical 9-node intermediate representation sitting between the parser
  * (query_select AST) and the physical plan builder (plan.c).
  *
  * The parser emits a rich query_select with ~40 flags.  logical_build()
- * desugars that into a minimal tree of logical_node using only these 7 ops.
+ * desugars that into a minimal tree of logical_node using only these ops.
  * logical_normalize() then applies semantics-preserving tree rewrites.
  * logical_to_physical() (in plan.c) pattern-matches the result to physical
  * plan_node types.
@@ -24,13 +24,15 @@
  */
 
 enum logical_op {
-    L_SCAN,       /* full table scan: table name + optional column list */
-    L_FILTER,     /* child + predicate (condition index in arena) */
-    L_PROJECT,    /* child + expression list (select columns) */
-    L_JOIN,       /* left + right children + explicit ON condition */
-    L_AGGREGATE,  /* child + group keys + agg exprs; HAVING becomes outer L_FILTER */
-    L_SORT,       /* child + sort keys */
-    L_LIMIT,      /* child + count + offset */
+    L_SCAN,        /* full table scan: table name + optional column list */
+    L_FILTER,      /* child + predicate (condition index in arena) */
+    L_PROJECT,     /* child + expression list (select columns) */
+    L_JOIN,        /* left + right children + explicit ON condition */
+    L_AGGREGATE,   /* child + group keys + agg exprs; HAVING becomes outer L_FILTER */
+    L_SORT,        /* child + sort keys */
+    L_LIMIT,       /* child + count + offset */
+    L_SUBQUERY,    /* inline subquery / CTE: child_root is root of inner logical tree */
+    L_DISTINCT_ON, /* keep first row per key after sort: desugared from DISTINCT ON */
 };
 
 /* L_SCAN payload */
@@ -91,6 +93,24 @@ struct logical_limit {
     int offset_count;
 };
 
+/* L_SUBQUERY payload — represents an inline subquery or non-recursive CTE.
+ * sql_idx is an index into arena->strings pointing to the inner SQL text.
+ * The physical builder (build_subquery in plan.c) calls query_parse on it
+ * and builds a sub-plan, just like build_set_op does for UNION/INTERSECT.
+ * The outer query treats the output of this node as if it were an L_SCAN. */
+struct logical_subquery {
+    uint32_t sql_idx;  /* index into arena->strings for inner SQL text */
+    sv       alias;    /* table alias (CTE name or FROM subquery alias) */
+};
+
+/* L_DISTINCT_ON payload — keep first row per (key_start..key_start+key_count).
+ * Desugared from DISTINCT ON (col1, col2): logical_build emits L_SORT on the
+ * DISTINCT ON keys first, then L_DISTINCT_ON to strip duplicates. */
+struct logical_distinct_on {
+    uint32_t key_start;  /* index into arena->svs */
+    uint32_t key_count;  /* number of key columns */
+};
+
 /* A logical plan node.  Arena-allocated in arena->bump.
  * Children referenced by index into the logical_nodes array (also bump). */
 struct logical_node {
@@ -98,13 +118,15 @@ struct logical_node {
     uint32_t        child;   /* primary child index, or IDX_NONE */
     uint32_t        right;   /* second child (L_JOIN only), or IDX_NONE */
     union {
-        struct logical_scan      scan;
-        struct logical_filter    filter;
-        struct logical_project   project;
-        struct logical_join      join;
-        struct logical_aggregate aggregate;
-        struct logical_sort      sort;
-        struct logical_limit     limit;
+        struct logical_scan        scan;
+        struct logical_filter      filter;
+        struct logical_project     project;
+        struct logical_join        join;
+        struct logical_aggregate   aggregate;
+        struct logical_sort        sort;
+        struct logical_limit       limit;
+        struct logical_subquery    subquery;
+        struct logical_distinct_on distinct_on;
     };
 };
 
@@ -120,6 +142,14 @@ struct logical_node {
  *   NATURAL JOIN       → L_JOIN with explicit ON condition (via join_info)
  *   JOIN ... USING(c)  → L_JOIN with explicit ON condition (via join_info)
  *   ORDER BY + LIMIT   → L_LIMIT wrapping L_SORT (TOP_N candidate for matcher)
+ *   Non-recursive CTE  → L_SUBQUERY (inline; no temp table materialization)
+ *   FROM subquery      → L_SUBQUERY (inline; no temp table materialization)
+ *   DISTINCT ON (cols) → L_SORT(cols) + L_DISTINCT_ON(cols)
+ *
+ * logical_build always succeeds (no validation) — inner parse errors for
+ * subquery SQL must be detected before calling logical_build.
+ *
+ * Returns IDX_NONE only if the arena is out of memory (fatal).
  */
 uint32_t logical_build(struct query_select *s, struct query_arena *arena,
                        struct database *db);
