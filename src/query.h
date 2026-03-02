@@ -257,7 +257,9 @@ enum expr_op {
     OP_BITAND,          /* & */
     OP_BITOR,           /* | */
     OP_LSHIFT,          /* << */
-    OP_RSHIFT           /* >> */
+    OP_RSHIFT,          /* >> */
+    OP_BITNOT,          /* ~ (unary) */
+    OP_BITXOR           /* # */
 };
 
 enum expr_func {
@@ -427,6 +429,7 @@ struct expr {
             enum column_type target;   /* target type */
             int scale;                 /* for NUMERIC(p,s): number of decimal places, -1 = unset */
             int precision;             /* for NUMERIC(p,s): total digits, 0 = unset */
+            uint32_t enum_type_name;   /* arena string index for ENUM type name, IDX_NONE if N/A */
         } cast;
 
         /* EXPR_EXISTS */
@@ -798,6 +801,7 @@ struct query_create_index {
     uint32_t index_columns_start; /* index into arena.svs (consecutive column names) */
     uint32_t index_columns_count;
     int if_not_exists;
+    int is_unique;    /* 1 if CREATE UNIQUE INDEX */
     sv using_method;  /* "hnsw", "btree", or empty (default btree) */
     sv ops_class;     /* "vector_l2_ops", "vector_cosine_ops", "vector_ip_ops", or empty */
 };

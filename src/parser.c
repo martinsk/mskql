@@ -38,6 +38,7 @@ enum token_type {
     TOK_PIPE,
     TOK_LSHIFT,
     TOK_RSHIFT,
+    TOK_HASH,
     TOK_EOF,
     TOK_UNKNOWN
 };
@@ -208,6 +209,12 @@ static struct token lexer_next(struct lexer *l)
     }
     if (c == '&') {
         tok.type = TOK_AMP;
+        tok.value = sv_from(&l->input[l->pos], 1);
+        l->pos++;
+        return tok;
+    }
+    if (c == '#') {
+        tok.type = TOK_HASH;
         tok.value = sv_from(&l->input[l->pos], 1);
         l->pos++;
         return tok;
@@ -849,6 +856,7 @@ static enum cmp_op cmp_from_token(enum token_type t)
         case TOK_PIPE:
         case TOK_LSHIFT:
         case TOK_RSHIFT:
+        case TOK_HASH:
         case TOK_EOF:
         case TOK_UNKNOWN:
             return CMP_EQ;
@@ -1132,11 +1140,13 @@ static int is_expr_terminator_keyword(sv name)
 static enum column_type parse_column_type(sv type_name);
 
 /* parse a SQL type name token and return the column_type */
-static enum column_type parse_cast_type_name_scale_prec(struct lexer *l, int *out_scale, int *out_prec)
+static enum column_type parse_cast_type_name_scale_prec(struct lexer *l, int *out_scale, int *out_prec, sv *out_raw_name)
 {
     if (out_scale) *out_scale = -1;
     if (out_prec) *out_prec = 0;
+    if (out_raw_name) out_raw_name->data = NULL, out_raw_name->len = 0;
     struct token tok = lexer_next(l);
+    if (out_raw_name) *out_raw_name = tok.value;
     /* Handle schema-qualified type: pg_catalog.regtype → skip schema */
     struct token dot_peek = lexer_peek(l);
     if (dot_peek.type == TOK_DOT) {
@@ -1219,7 +1229,8 @@ static uint32_t parse_cast_expr(struct lexer *l, struct query_arena *a)
         return IDX_NONE;
     }
     int scale = -1, prec = 0;
-    enum column_type target = parse_cast_type_name_scale_prec(l, &scale, &prec);
+    sv raw_name = {0};
+    enum column_type target = parse_cast_type_name_scale_prec(l, &scale, &prec, &raw_name);
     struct token rp = lexer_next(l); /* consume ) */
     if (rp.type != TOK_RPAREN) {
         arena_set_error(a, "42601", "expected ')' after CAST type");
@@ -1229,6 +1240,8 @@ static uint32_t parse_cast_expr(struct lexer *l, struct query_arena *a)
     EXPR(a, ei).cast.target = target;
     EXPR(a, ei).cast.scale = scale;
     EXPR(a, ei).cast.precision = prec;
+    EXPR(a, ei).cast.enum_type_name = (target == COLUMN_TYPE_ENUM && raw_name.data)
+        ? arena_store_string(a, raw_name.data, raw_name.len) : IDX_NONE;
     return ei;
 }
 
@@ -1661,7 +1674,8 @@ static uint32_t parse_expr_atom(struct lexer *l, struct query_arena *a)
         l->pos = saved;
     }
 
-    /* unary minus */
+    /* unary minus is now handled in parse_expr_unary (above mul level) */
+    /* keep this path only for atoms that appear inside parse_expr_exp context */
     if (tok.type == TOK_MINUS) {
         lexer_next(l);
         uint32_t operand = parse_expr_atom(l, a);
@@ -1830,36 +1844,82 @@ static uint32_t maybe_parse_postfix_cast(struct lexer *l, struct query_arena *a,
         if (peek.type != TOK_DOUBLE_COLON) break;
         lexer_next(l); /* consume :: */
         int scale = -1, prec = 0;
-        enum column_type target = parse_cast_type_name_scale_prec(l, &scale, &prec);
+        sv raw_name = {0};
+        enum column_type target = parse_cast_type_name_scale_prec(l, &scale, &prec, &raw_name);
         uint32_t ei = expr_alloc(a, EXPR_CAST);
         EXPR(a, ei).cast.operand = node;
         EXPR(a, ei).cast.target = target;
         EXPR(a, ei).cast.scale = scale;
         EXPR(a, ei).cast.precision = prec;
+        EXPR(a, ei).cast.enum_type_name = (target == COLUMN_TYPE_ENUM && raw_name.data)
+            ? arena_store_string(a, raw_name.data, raw_name.len) : IDX_NONE;
         node = ei;
     }
     return node;
 }
 
-/* multiplicative: atom (('^' | '*' | '/' | '%') atom)* */
-static uint32_t parse_expr_mul(struct lexer *l, struct query_arena *a)
+/* exponentiation (right-associative): atom ('^' atom)* */
+static uint32_t parse_expr_exp(struct lexer *l, struct query_arena *a)
 {
     uint32_t left = parse_expr_atom(l, a);
     left = maybe_parse_postfix_cast(l, a, left);
+    if (left == IDX_NONE) return IDX_NONE;
+    if (lexer_peek(l).type != TOK_CARET) return left;
+    lexer_next(l); /* consume ^ */
+    /* right-associative: recurse */
+    uint32_t right = parse_expr_exp(l, a);
+    right = maybe_parse_postfix_cast(l, a, right);
+    if (right == IDX_NONE) return left;
+    uint32_t bin = expr_alloc(a, EXPR_BINARY_OP);
+    EXPR(a, bin).binary.op = OP_EXP;
+    EXPR(a, bin).binary.left = left;
+    EXPR(a, bin).binary.right = right;
+    return bin;
+}
+
+/* unary: ['-' | '~'] exp */
+static uint32_t parse_expr_unary(struct lexer *l, struct query_arena *a)
+{
+    struct token tok = lexer_peek(l);
+    /* unary minus: lower precedence than ^, so -2^2 = -(2^2) */
+    if (tok.type == TOK_MINUS) {
+        lexer_next(l);
+        uint32_t operand = parse_expr_exp(l, a);
+        if (operand == IDX_NONE) return IDX_NONE;
+        uint32_t ei = expr_alloc(a, EXPR_UNARY_OP);
+        EXPR(a, ei).unary.op = OP_NEG;
+        EXPR(a, ei).unary.operand = operand;
+        return ei;
+    }
+    /* unary bitwise NOT ~ (at start of expression, ~ is bitwise NOT, not regex match) */
+    if (tok.type == TOK_TILDE) {
+        lexer_next(l); /* consume ~ */
+        uint32_t operand = parse_expr_exp(l, a);
+        if (operand == IDX_NONE) return IDX_NONE;
+        uint32_t ei = expr_alloc(a, EXPR_UNARY_OP);
+        EXPR(a, ei).unary.op = OP_BITNOT;
+        EXPR(a, ei).unary.operand = operand;
+        return ei;
+    }
+    return parse_expr_exp(l, a);
+}
+
+/* multiplicative: unary (('*' | '/' | '%') unary)* */
+static uint32_t parse_expr_mul(struct lexer *l, struct query_arena *a)
+{
+    uint32_t left = parse_expr_unary(l, a);
     if (left == IDX_NONE) return IDX_NONE;
 
     for (;;) {
         struct token tok = lexer_peek(l);
         enum expr_op op;
-        if (tok.type == TOK_CARET)       op = OP_EXP;
-        else if (tok.type == TOK_STAR)   op = OP_MUL;
+        if (tok.type == TOK_STAR)        op = OP_MUL;
         else if (tok.type == TOK_SLASH)  op = OP_DIV;
         else if (tok.type == TOK_PERCENT) op = OP_MOD;
         else break;
 
         lexer_next(l); /* consume operator */
-        uint32_t right = parse_expr_atom(l, a);
-        right = maybe_parse_postfix_cast(l, a, right);
+        uint32_t right = parse_expr_unary(l, a);
         if (right == IDX_NONE) return left;
 
         uint32_t bin = expr_alloc(a, EXPR_BINARY_OP);
@@ -1920,16 +1980,36 @@ static uint32_t parse_expr_shift(struct lexer *l, struct query_arena *a)
     return left;
 }
 
-/* bitwise AND: shift (('&') shift)* */
-static uint32_t parse_expr_bitand(struct lexer *l, struct query_arena *a)
+/* bitwise XOR: shift (('#') shift)* */
+static uint32_t parse_expr_bitxor(struct lexer *l, struct query_arena *a)
 {
     uint32_t left = parse_expr_shift(l, a);
     if (left == IDX_NONE) return IDX_NONE;
     for (;;) {
         struct token tok = lexer_peek(l);
-        if (tok.type != TOK_AMP) break;
+        if (tok.type != TOK_HASH) break;
         lexer_next(l);
         uint32_t right = parse_expr_shift(l, a);
+        if (right == IDX_NONE) return left;
+        uint32_t bin = expr_alloc(a, EXPR_BINARY_OP);
+        EXPR(a, bin).binary.op = OP_BITXOR;
+        EXPR(a, bin).binary.left = left;
+        EXPR(a, bin).binary.right = right;
+        left = bin;
+    }
+    return left;
+}
+
+/* bitwise AND: bitxor (('&') bitxor)* */
+static uint32_t parse_expr_bitand(struct lexer *l, struct query_arena *a)
+{
+    uint32_t left = parse_expr_bitxor(l, a);
+    if (left == IDX_NONE) return IDX_NONE;
+    for (;;) {
+        struct token tok = lexer_peek(l);
+        if (tok.type != TOK_AMP) break;
+        lexer_next(l);
+        uint32_t right = parse_expr_bitxor(l, a);
         if (right == IDX_NONE) return left;
         uint32_t bin = expr_alloc(a, EXPR_BINARY_OP);
         EXPR(a, bin).binary.op = OP_BITAND;
@@ -2114,6 +2194,10 @@ static uint32_t parse_expr_cmp(struct lexer *l, struct query_arena *a)
                 negate_prefix = 1;
                 tok = next;
                 /* fall through to LIKE handling */
+            } else if (next.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(next.value, "SIMILAR")) {
+                negate_prefix = 1;
+                tok = next;
+                /* fall through to SIMILAR TO handling */
             } else {
                 l->pos = saved; /* restore — NOT is not part of comparison */
                 break;
@@ -6239,14 +6323,36 @@ static int parse_create_table(struct lexer *l, struct query *out)
             (sv_eq_ignorecase_cstr(peek.value, "PRIMARY") ||
              sv_eq_ignorecase_cstr(peek.value, "UNIQUE") ||
              sv_eq_ignorecase_cstr(peek.value, "CONSTRAINT") ||
-             sv_eq_ignorecase_cstr(peek.value, "FOREIGN"))) {
+             sv_eq_ignorecase_cstr(peek.value, "FOREIGN") ||
+             sv_eq_ignorecase_cstr(peek.value, "CHECK"))) {
             /* table-level constraint */
             tok = lexer_next(l); /* consume keyword */
 
             /* CONSTRAINT name ... — consume the name, then re-read the constraint keyword */
             if (sv_eq_ignorecase_cstr(tok.value, "CONSTRAINT")) {
                 lexer_next(l); /* consume constraint name */
-                tok = lexer_next(l); /* PRIMARY / UNIQUE / FOREIGN */
+                tok = lexer_next(l); /* PRIMARY / UNIQUE / FOREIGN / CHECK */
+            }
+
+            /* table-level CHECK(expr) — skip expression (not enforced at parse time) */
+            if (sv_eq_ignorecase_cstr(tok.value, "CHECK")) {
+                struct token lp = lexer_next(l);
+                if (lp.type == TOK_LPAREN) {
+                    int depth = 1;
+                    while (depth > 0) {
+                        tok = lexer_next(l);
+                        if (tok.type == TOK_LPAREN) depth++;
+                        else if (tok.type == TOK_RPAREN) depth--;
+                        else if (tok.type == TOK_EOF) break;
+                    }
+                }
+                tok = lexer_next(l);
+                if (tok.type == TOK_RPAREN) break;
+                if (tok.type != TOK_COMMA) {
+                    arena_set_error(&out->arena, "42601", "expected ',' or ')' after table constraint");
+                    return -1;
+                }
+                continue;
             }
 
             if (sv_eq_ignorecase_cstr(tok.value, "PRIMARY")) {
@@ -6637,7 +6743,9 @@ static int parse_create(struct lexer *l, struct query *out)
     }
 
     /* CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column) */
+    int create_unique_idx = 0;
     if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "UNIQUE")) {
+        create_unique_idx = 1;
         /* consume UNIQUE, then expect INDEX */
         tok = lexer_next(l);
         if (tok.type != TOK_KEYWORD || !sv_eq_ignorecase_cstr(tok.value, "INDEX")) {
@@ -6649,6 +6757,7 @@ static int parse_create(struct lexer *l, struct query *out)
         out->query_type = QUERY_TYPE_CREATE_INDEX;
         struct query_create_index *ci = &out->create_index;
         ci->if_not_exists = 0;
+        ci->is_unique = create_unique_idx;
 
         /* optional IF NOT EXISTS */
         tok = lexer_peek(l);

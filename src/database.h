@@ -47,6 +47,7 @@ struct database {
      * Safe because the server is single-threaded. */
     struct txn_state *active_txn;
     uint64_t total_generation; /* sum of all table generations — bumped alongside t->generation++ */
+    uint64_t catalog_generation; /* value of total_generation when catalog was last refreshed */
     char *catalog_path; /* path to disk table catalog file, or NULL if none */
 };
 

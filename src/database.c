@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -3579,6 +3580,28 @@ static int db_exec_create_index(struct database *db, struct query_create_index *
     }
 
     /* ---- B-tree index path (default) ---- */
+    /* For UNIQUE INDEX: check existing data for duplicates before building */
+    if (ci->is_unique) {
+        char idx_name_buf[256];
+        snprintf(idx_name_buf, sizeof(idx_name_buf), "%.*s",
+                 (int)ci->index_name.len, ci->index_name.data);
+        for (size_t i = 0; i < t->rows.count; i++) {
+            if ((size_t)col_indices[0] >= t->rows.items[i].cells.count) continue;
+            struct cell *vi = &t->rows.items[i].cells.items[col_indices[0]];
+            if (vi->is_null || (column_type_is_text(vi->type) && !vi->value.as_text))
+                continue;
+            for (size_t j = i + 1; j < t->rows.count; j++) {
+                if ((size_t)col_indices[0] >= t->rows.items[j].cells.count) continue;
+                struct cell *vj = &t->rows.items[j].cells.items[col_indices[0]];
+                if (cell_compare(vi, vj) == 0) {
+                    index_free(&idx);
+                    arena_set_error(arena, "23505",
+                        "could not create unique index \"%s\"", idx_name_buf);
+                    return -1;
+                }
+            }
+        }
+    }
     /* backfill existing rows */
     for (size_t i = 0; i < t->rows.count; i++) {
         struct cell composite[MAX_INDEX_COLS];
@@ -3591,6 +3614,7 @@ static int db_exec_create_index(struct database *db, struct query_create_index *
         }
         if (ok) index_insert(&idx, composite, i);
     }
+    idx.is_unique = ci->is_unique;
     da_push(&t->indexes, idx);
     return 0;
 }
@@ -4223,10 +4247,14 @@ int db_exec_sql(struct database *db, const char *sql, struct rows *result)
         return -1;
     }
     /* Refresh catalog tables if the query references system schemas.
-     * Skip if we're already inside a subquery (catalog tables already populated). */
+     * Skip if we're already inside a subquery (catalog tables already populated).
+     * Also skip if the catalog is already up-to-date (generation unchanged since last build). */
     if (subquery_depth == 0 &&
-        (strstr(sql, "pg_") || strstr(sql, "information_schema")))
+        (strstr(sql, "pg_") || strstr(sql, "information_schema")) &&
+        db->catalog_generation != db->total_generation) {
         catalog_refresh(db);
+        db->catalog_generation = db->total_generation;
+    }
     struct query q = {0};
     if (query_parse(sql, &q) != 0) {
         query_free(&q);
@@ -4264,10 +4292,12 @@ void db_reset(struct database *db)
     char *cat_path = db->catalog_path;
     db->name = NULL;
     db->catalog_path = NULL;
+    int had_disk_tables = 0;
     for (size_t i = 0; i < db->tables.count; i++) {
         /* Clean up disk files for TABLE_DISK before freeing */
         if (db->tables.items[i].kind == TABLE_DISK &&
             db->tables.items[i].disk.dir_path) {
+            had_disk_tables = 1;
             char path_buf[1024];
             disk_path_base(db->tables.items[i].disk.dir_path, path_buf, sizeof(path_buf));
             remove(path_buf);
@@ -4290,8 +4320,10 @@ void db_reset(struct database *db)
     db_init(db, name);
     free(name);
     db->catalog_path = cat_path;
-    /* Save empty catalog after reset */
-    if (db->catalog_path)
+    /* Mark catalog stale so the next pg_ query triggers a rebuild */
+    db->catalog_generation = UINT64_MAX;
+    /* Only persist catalog if there were disk tables to save */
+    if (db->catalog_path && had_disk_tables)
         disk_catalog_save(db->catalog_path, db);
 }
 

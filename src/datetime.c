@@ -423,9 +423,14 @@ double date_extract(int32_t days, const char *field)
     if (strcasecmp(field, "epoch") == 0) return (double)days * 86400.0 + (double)PG_EPOCH_UNIX;
 
     if (strcasecmp(field, "dow") == 0) {
-        /* PG epoch 2000-01-01 is a Saturday (dow=6) */
+        /* PG epoch 2000-01-01 is a Saturday (dow=6 in Sun=0 scheme) */
         int dow = ((int)(days % 7) + 6) % 7;
         return (double)dow;
+    }
+    if (strcasecmp(field, "isodow") == 0) {
+        /* ISO 8601: Monday=1 .. Sunday=7 */
+        int dow = ((int)(days % 7) + 6) % 7; /* 0=Sun..6=Sat */
+        return (double)(dow == 0 ? 7 : dow);
     }
     if (strcasecmp(field, "doy") == 0) {
         int32_t jan1 = ymd_to_days(y, 1, 1);

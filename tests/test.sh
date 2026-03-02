@@ -193,53 +193,35 @@ check_asan_logs() {
 #   TC_NAME, TC_SETUP, TC_INPUT, TC_EXPECTED, TC_STATUS
 parse_testcase() {
     local file="$1"
-    TC_NAME=""
-    TC_SETUP=""
-    TC_INPUT=""
-    TC_EXPECTED=""
-    TC_STATUS="0"
-
-    local section=""
-    while IFS= read -r line; do
-        # first comment line is the test name
-        if [ -z "$TC_NAME" ] && [[ "$line" == --\ * ]]; then
-            TC_NAME="${line#-- }"
-            continue
-        fi
-
-        # section markers
-        case "$line" in
-            "-- setup:")     section="setup";    continue ;;
-            "-- input:")     section="input";    continue ;;
-            "-- expected output:") section="expected"; continue ;;
-            "-- expected status: "*)
-                TC_STATUS="${line#-- expected status: }"
-                # strip trailing period if present
-                TC_STATUS="${TC_STATUS%.}"
-                section=""
-                continue
-                ;;
-        esac
-
-        # skip bare comments not in a section
-        if [ -z "$section" ]; then continue; fi
-
-        case "$section" in
-            setup)
-                if [ -n "$TC_SETUP" ]; then TC_SETUP="$TC_SETUP"$'\n'"$line"
-                else TC_SETUP="$line"; fi
-                ;;
-            input)
-                if [ -n "$TC_INPUT" ]; then TC_INPUT="$TC_INPUT"$'\n'"$line"
-                else TC_INPUT="$line"; fi
-                ;;
-            expected)
-                if [ -n "$TC_EXPECTED" ]; then TC_EXPECTED="$TC_EXPECTED"$'\n'"$line"
-                else TC_EXPECTED="$line"; fi
-                ;;
-        esac
-    done < "$file"
-
+    # Single awk pass: emit fields separated by NUL bytes, read back with -d ''
+    # This replaces the bash while-read loop (much faster for 1400+ small files)
+    { IFS= read -r -d '' TC_NAME
+      IFS= read -r -d '' TC_SETUP
+      IFS= read -r -d '' TC_INPUT
+      IFS= read -r -d '' TC_EXPECTED
+      IFS= read -r -d '' TC_STATUS
+    } < <(awk '
+        BEGIN { name=""; setup=""; input=""; expected=""; status="0"; section="" }
+        /^-- setup:/            { section="setup";    next }
+        /^-- input:/            { section="input";    next }
+        /^-- expected output:/  { section="expected"; next }
+        /^-- expected status: / {
+            s = substr($0, length("-- expected status: ") + 1)
+            sub(/\.$/, "", s)
+            status = s; section=""; next
+        }
+        /^-- / {
+            if (name == "") { name = substr($0, 4) }
+            section = ""; next
+        }
+        section == "setup"    { setup    = (setup    == "") ? $0 : setup    "\n" $0; next }
+        section == "input"    { input    = (input    == "") ? $0 : input    "\n" $0; next }
+        section == "expected" { expected = (expected == "") ? $0 : expected "\n" $0; next }
+        END {
+            printf "%s\x00%s\x00%s\x00%s\x00%s\x00",
+                name, setup, input, expected, status
+        }
+    ' "$file")
     # default name to filename
     if [ -z "$TC_NAME" ]; then
         TC_NAME="$(basename "$file" .sql)"
@@ -297,8 +279,18 @@ run_worker_batch() {
 
         parse_testcase "$file"
 
-        # reset database to clean state (instead of restarting server)
-        if ! psql_cmd "$port" -c "SELECT __reset_db()" >/dev/null 2>&1; then
+        # Reset database and run setup in a single mskqlcli session.
+        # Prepending SELECT __reset_db() saves one full TCP round-trip per test.
+        local reset_ok=1
+        if [ -n "$TC_SETUP" ]; then
+            printf 'SELECT __reset_db();\n%s' "$TC_SETUP" \
+                | sed -e "s|@@FIXTURES@@|$FIXTURES_DIR|g" -e 's/;*$/;/' \
+                | psql_cmd "$port" >/dev/null 2>&1 || reset_ok=0
+        else
+            psql_cmd "$port" -c "SELECT __reset_db()" >/dev/null 2>&1 || reset_ok=0
+        fi
+
+        if [ "$reset_ok" -eq 0 ]; then
             # server may have crashed — try to restart
             stop_server "$pidfile"
             if ! start_server "$port" "$pidfile" "$worker_dir"; then
@@ -307,17 +299,10 @@ run_worker_batch() {
             fi
         fi
 
-        # run setup SQL in a single psql session
-        # (ensure each line ends with a semicolon so psql can parse them)
-        # Substitute @@FIXTURES@@ with absolute path to test fixtures directory
-        if [ -n "$TC_SETUP" ]; then
-            echo "$TC_SETUP" | sed "s|@@FIXTURES@@|$FIXTURES_DIR|g" | sed 's/;*$/;/' | psql_cmd "$port" >/dev/null 2>&1
-        fi
-
         # run input SQL in a single psql session
         local actual="" status=0
         if [ -n "$TC_INPUT" ]; then
-            actual=$(echo "$TC_INPUT" | sed "s|@@FIXTURES@@|$FIXTURES_DIR|g" | sed 's/;*$/;/' | psql_cmd "$port" 2>&1) || status=$?
+            actual=$(echo "$TC_INPUT" | sed -e "s|@@FIXTURES@@|$FIXTURES_DIR|g" -e 's/;*$/;/' | psql_cmd "$port" 2>&1) || status=$?
         fi
 
         # compare
@@ -439,14 +424,8 @@ while [ "$all_done" -eq 0 ]; do
         fi
     done
 
-    # count completed results
-    local_done=0
-    for f in "${testfiles[@]}"; do
-        rf="$TMPDIR_ROOT/result-$(basename "$f" .sql).txt"
-        if [ -f "$rf" ]; then
-            local_done=$((local_done + 1))
-        fi
-    done
+    # count completed results (single glob — avoids 1,411 individual stat calls)
+    local_done=$(ls "$TMPDIR_ROOT"/result-*.txt 2>/dev/null | wc -l | tr -d ' ')
     if [ "$local_done" -ne "$DONE" ]; then
         DONE=$local_done
         show_progress

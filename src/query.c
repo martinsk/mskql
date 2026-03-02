@@ -487,13 +487,20 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
                  * NULL NOT IN (...) → UNKNOWN */
                 if (lhs_is_null) { cond_result = -1; goto cond_cleanup; }
                 int found = 0;
+                int has_null = 0;
                 for (uint32_t i = 0; i < cond->in_values_count; i++) {
                     struct cell *iv = &ACELL(arena, cond->in_values_start + i);
-                    /* skip NULL values in the IN list */
-                    if (iv->is_null) continue;
+                    if (iv->is_null) { has_null = 1; continue; }
                     if (cell_compare(c, iv) == 0) { found = 1; break; }
                 }
-                cond_result = cond->op == CMP_IN ? found : !found;
+                if (cond->op == CMP_IN) {
+                    cond_result = found;
+                } else {
+                    /* NOT IN: if value found → false; if NULL in list and not found → UNKNOWN */
+                    if (found) { cond_result = 0; goto cond_cleanup; }
+                    if (has_null) { cond_result = -1; goto cond_cleanup; }
+                    cond_result = 1;
+                }
                 goto cond_cleanup;
             }
             /* BETWEEN */
@@ -1707,7 +1714,8 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
             case OP_NOT: case OP_LIKE:
             case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
             case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
-            case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT: break;
+            case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+            case OP_BITXOR: case OP_BITNOT: break;
             }
             return cell_make_bool(result);
         }
@@ -1746,6 +1754,16 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         return cell_make_bool(is_not ? !match : match);
     }
 
+    /* arithmetic: NULL propagation — must come before type checks so NULL+int = NULL not error */
+    if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
+        cell_release_rb(&lhs, rb);
+        cell_release_rb(&rhs, rb);
+        struct cell c = {0};
+        c.type = COLUMN_TYPE_INT;
+        c.is_null = 1;
+        return c;
+    }
+
     /* reject text operands in arithmetic — PostgreSQL: operator does not exist: text + integer */
     if ((e->binary.op == OP_ADD || e->binary.op == OP_SUB ||
          e->binary.op == OP_MUL || e->binary.op == OP_DIV || e->binary.op == OP_MOD) &&
@@ -1763,16 +1781,6 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
         arena_set_error(arena, "42883", "operator does not exist: %s %s %s", lname, opname, rname);
         return cell_make_null();
-    }
-
-    /* arithmetic: NULL propagation */
-    if (cell_is_null(&lhs) || cell_is_null(&rhs)) {
-        cell_release_rb(&lhs, rb);
-        cell_release_rb(&rhs, rb);
-        struct cell c = {0};
-        c.type = COLUMN_TYPE_INT;
-        c.is_null = 1;
-        return c;
     }
 
     /* date/time arithmetic: date/timestamp +/- interval, timestamp - timestamp */
@@ -1983,67 +1991,13 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         case OP_BITOR:   res = la | ra; break;
         case OP_LSHIFT:  res = la << ra; break;
         case OP_RSHIFT:  res = la >> ra; break;
+        case OP_BITXOR:  res = la ^ ra; break;
         case OP_CONCAT: case OP_NEG: case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE:
+        case OP_BITNOT:
         case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
         case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH: break;
         }
         cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
-        return cell_make_bigint(res);
-    }
-
-    /* INT/SMALLINT/BOOLEAN native arithmetic — no double conversion */
-    if (!use_float) {
-        long long la = (lhs.type == COLUMN_TYPE_INT) ? (long long)lhs.value.as_int
-                     : (lhs.type == COLUMN_TYPE_SMALLINT) ? (long long)lhs.value.as_smallint
-                     : (long long)lhs.value.as_bool;
-        long long ra = (rhs.type == COLUMN_TYPE_INT) ? (long long)rhs.value.as_int
-                     : (rhs.type == COLUMN_TYPE_SMALLINT) ? (long long)rhs.value.as_smallint
-                     : (long long)rhs.value.as_bool;
-        cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
-        long long res = 0;
-        switch (e->binary.op) {
-        case OP_ADD: res = la + ra; break;
-        case OP_SUB: res = la - ra; break;
-        case OP_MUL: res = la * ra; break;
-        case OP_DIV:
-            if (ra == 0) {
-                arena_set_error(arena, "22012", "division by zero");
-                return cell_make_null();
-            }
-            res = la / ra; break;
-        case OP_MOD:
-            if (ra == 0) {
-                arena_set_error(arena, "22012", "division by zero");
-                return cell_make_null();
-            }
-            res = la % ra; break;
-        case OP_EXP: return cell_make_float(pow((double)la, (double)ra));
-        case OP_EQ: return cell_make_bool(la == ra);
-        case OP_NE: return cell_make_bool(la != ra);
-        case OP_LT: return cell_make_bool(la < ra);
-        case OP_GT: return cell_make_bool(la > ra);
-        case OP_LE: return cell_make_bool(la <= ra);
-        case OP_GE: return cell_make_bool(la >= ra);
-        case OP_BITAND:  res = la & ra; break;
-        case OP_BITOR:   res = la | ra; break;
-        case OP_LSHIFT:  res = la << ra; break;
-        case OP_RSHIFT:  res = la >> ra; break;
-        case OP_CONCAT: case OP_NEG: case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE:
-        case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
-        case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH: break;
-        }
-        /* if both operands were SMALLINT, result must fit in SMALLINT */
-        int both_smallint = (lhs.type == COLUMN_TYPE_SMALLINT && rhs.type == COLUMN_TYPE_SMALLINT);
-        if (both_smallint) {
-            if (res < -32768 || res > 32767) {
-                arena_set_error(arena, "22003", "smallint out of range");
-                return cell_make_null();
-            }
-            struct cell r = {0};
-            r.type = COLUMN_TYPE_SMALLINT;
-            r.value.as_smallint = (int16_t)res;
-            return r;
-        }
         if (res >= INT32_MIN && res <= INT32_MAX)
             return cell_make_int((int)res);
         return cell_make_bigint(res);
@@ -2059,10 +2013,7 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         case OP_SUB: result_v = lv - rv; break;
         case OP_MUL: result_v = lv * rv; break;
         case OP_DIV:
-            if (rv == 0.0) {
-                arena_set_error(arena, "22012", "division by zero");
-                return cell_make_null();
-            }
+            /* IEEE 754: float/0.0 = ±Infinity, not an error for float types */
             result_v = lv / rv;
             break;
         case OP_MOD: result_v = fmod(lv, rv); break;
@@ -2077,11 +2028,13 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         case OP_GE: return cell_make_bool(lv >= rv);
         case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE:
         case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
-        case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH: break;
+        case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+        case OP_BITNOT: break;
         case OP_BITAND: result_v = (double)((long long)lv & (long long)rv); break;
         case OP_BITOR:  result_v = (double)((long long)lv | (long long)rv); break;
         case OP_LSHIFT: result_v = (double)((long long)lv << (int)rv); break;
         case OP_RSHIFT: result_v = (double)((long long)lv >> (int)rv); break;
+        case OP_BITXOR: result_v = (double)((long long)lv ^ (long long)rv); break;
     }
     return cell_make_float(result_v);
 }
@@ -2191,7 +2144,20 @@ static struct cell efc_nextval_currval(enum expr_func fn, EFC_ARGS) {
     cell_release_rb(&arg, rb);
     if (!seq) { arena_set_error(arena, "42P01", "sequence '%s' not found", seq_name); return cell_make_null(); }
     if (fn == FUNC_NEXTVAL) {
-        long long val = seq->has_been_called ? (seq->current_value += seq->increment) : (seq->has_been_called = 1, seq->current_value);
+        long long val;
+        if (!seq->has_been_called) {
+            seq->has_been_called = 1;
+            val = seq->current_value;
+        } else {
+            val = seq->current_value + seq->increment;
+        }
+        if (seq->max_value != 0 && val > seq->max_value) {
+            arena_set_error(arena, "2200H",
+                "nextval: reached maximum value of sequence \"%s\" (%lld)",
+                seq->name, seq->max_value);
+            return cell_make_null();
+        }
+        seq->current_value = val;
         struct cell r = {0}; r.type = COLUMN_TYPE_BIGINT; r.value.as_bigint = val; return r;
     } else {
         if (!seq->has_been_called) { arena_set_error(arena, "55000", "currval: sequence '%s' not yet called", seq_name); return cell_make_null(); }
@@ -2362,10 +2328,24 @@ static struct cell efc_to_char(EFC_ARGS) {
             hh = (int)(time_part / USEC_PER_HOUR); mi = (int)((time_part % USEC_PER_HOUR) / USEC_PER_MIN); ss = (int)((time_part % USEC_PER_MIN) / USEC_PER_SEC);
         }
         char *out = buf; const char *fp = fmt;
-        while (*fp && (size_t)(out - buf) < sizeof(buf) - 10) {
+        /* compute day-of-week for Day/Dy patterns */
+        static const char *day_names[]   = {"Sunday   ","Monday   ","Tuesday  ","Wednesday","Thursday ","Friday   ","Saturday "};
+        static const char *day_abbrevs[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+        static const char *month_names[] = {"","January  ","February ","March    ","April    ","May      ","June     ","July     ","August   ","September","October  ","November ","December "};
+        int32_t total_days = (src_c.type == COLUMN_TYPE_DATE) ? src_c.value.as_date :
+            (int32_t)((src_c.type == COLUMN_TYPE_TIMESTAMP || src_c.type == COLUMN_TYPE_TIMESTAMPTZ) ?
+                (src_c.value.as_timestamp >= 0 ? src_c.value.as_timestamp / USEC_PER_DAY :
+                 (src_c.value.as_timestamp - USEC_PER_DAY + 1) / USEC_PER_DAY) : 0);
+        /* PG epoch 2000-01-01 is Saturday = 6 */
+        int dow = ((int)(total_days % 7) + 7 + 6) % 7;
+        while (*fp && (size_t)(out - buf) < sizeof(buf) - 12) {
             if (strncasecmp(fp,"YYYY",4)==0){out+=sprintf(out,"%04d",y);fp+=4;}
+            else if(strncasecmp(fp,"Month",5)==0){out+=sprintf(out,"%s",month_names[mo > 0 && mo <= 12 ? mo : 0]);fp+=5;}
+            else if(strncasecmp(fp,"Mon",3)==0 && !(strncasecmp(fp,"Monday",6)==0)){out+=sprintf(out,"%s",day_abbrevs[dow]);fp+=3;}
             else if(strncasecmp(fp,"MM",2)==0){out+=sprintf(out,"%02d",mo);fp+=2;}
             else if(strncasecmp(fp,"DD",2)==0){out+=sprintf(out,"%02d",d);fp+=2;}
+            else if(strncasecmp(fp,"Day",3)==0){out+=sprintf(out,"%s",day_names[dow]);fp+=3;}
+            else if(strncasecmp(fp,"Dy",2)==0){out+=sprintf(out,"%s",day_abbrevs[dow]);fp+=2;}
             else if(strncasecmp(fp,"HH24",4)==0){out+=sprintf(out,"%02d",hh);fp+=4;}
             else if(strncasecmp(fp,"HH",2)==0){out+=sprintf(out,"%02d",hh);fp+=2;}
             else if(strncasecmp(fp,"MI",2)==0){out+=sprintf(out,"%02d",mi);fp+=2;}
@@ -2383,13 +2363,18 @@ static struct cell efc_substring(EFC_ARGS) {
     struct cell str    = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
     struct cell from_c = eval_expr(FUNC_ARG(arena, args_start, 1), arena, t, row, db, rb);
     if (cell_is_null(&str)) { cell_release_rb(&from_c, rb); return str; }
-    int from = (int)cell_to_double_val(&from_c);
-    if (from < 1) from = 1;
-    from--;
+    int from_raw = (int)cell_to_double_val(&from_c);
     cell_release_rb(&from_c, rb);
     if (column_type_is_text(str.type) && str.value.as_text) {
-        int slen = (int)strlen(str.value.as_text), len = slen - from;
+        int slen = (int)strlen(str.value.as_text), len = slen;
         if (nargs >= 3) { struct cell len_c = eval_expr(FUNC_ARG(arena, args_start, 2), arena, t, row, db, rb); len = (int)cell_to_double_val(&len_c); cell_release_rb(&len_c, rb); }
+        /* PostgreSQL: pos ≤ 0 means start at char 1, but consume (1-pos) from the length budget */
+        int from = from_raw;
+        if (from < 1) {
+            if (nargs >= 3) len = len + from - 1;
+            from = 1;
+        }
+        from--; /* convert 1-indexed position to 0-indexed offset */
         if (from >= slen || len <= 0) { if (!rb) free(str.value.as_text); str.value.as_text = rb ? bump_strdup(rb, "") : strdup(""); return str; }
         if (from + len > slen) len = slen - from;
         char *sub = rb ? (char *)bump_alloc(rb, (size_t)len + 1) : malloc((size_t)len + 1);
@@ -2449,7 +2434,13 @@ static struct cell efc_sqrt(EFC_ARGS) {
     if (nargs == 0) return cell_make_null();
     struct cell arg = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
     if (cell_is_null(&arg)) { arg.type = COLUMN_TYPE_FLOAT; return arg; }
-    return cell_make_float(sqrt(cell_to_double_val(&arg)));
+    double v = cell_to_double_val(&arg);
+    cell_release_rb(&arg, rb);
+    if (v < 0.0) {
+        arena_set_error(arena, "2201F", "cannot take square root of a negative number");
+        return cell_make_null();
+    }
+    return cell_make_float(sqrt(v));
 }
 
 static struct cell efc_mod(EFC_ARGS) {
@@ -2770,6 +2761,18 @@ static struct cell efc_make_date(EFC_ARGS) {
     if (cell_is_null(&y)||cell_is_null(&m)||cell_is_null(&d)) { cell_release_rb(&y,rb);cell_release_rb(&m,rb);cell_release_rb(&d,rb); return cell_make_null(); }
     int year=(int)cell_to_double_val(&y),month=(int)cell_to_double_val(&m),day=(int)cell_to_double_val(&d);
     cell_release_rb(&y,rb);cell_release_rb(&m,rb);cell_release_rb(&d,rb);
+    /* Validate month and day ranges */
+    if (month < 1 || month > 12) {
+        arena_set_error(arena, "22009", "date field value out of range: %d-%02d-%02d", year, month, day);
+        return cell_make_null();
+    }
+    static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    int is_leap = ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0);
+    int max_day = (month == 2 && is_leap) ? 29 : mdays[month];
+    if (day < 1 || day > max_day) {
+        arena_set_error(arena, "22009", "date field value out of range: %d-%02d-%02d", year, month, day);
+        return cell_make_null();
+    }
     int a=(14-month)/12,yr=year+4800-a,mo=month+12*a-3;
     int jdn=day+(153*mo+2)/5+365*yr+yr/4-yr/100+yr/400-32045;
     struct cell r={0}; r.type=COLUMN_TYPE_DATE; r.value.as_date=(int32_t)(jdn-2451545); return r;
@@ -3068,8 +3071,22 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
             }
             r.value.as_smallint = (int16_t)v;
             break;
-        case COLUMN_TYPE_INT:      r.value.as_int = (int)v; break;
-        case COLUMN_TYPE_BIGINT:   r.value.as_bigint = (long long)v; break;
+        case COLUMN_TYPE_INT: {
+            double rv2 = round(v);
+            if (rv2 < -2147483648.0 || rv2 > 2147483647.0) {
+                arena_set_error(arena, "22003", "integer out of range");
+                return cell_make_null();
+            }
+            r.value.as_int = (int)rv2; break;
+        }
+        case COLUMN_TYPE_BIGINT: {
+            double rv2 = round(v);
+            if (rv2 < -9223372036854775808.0 || rv2 > 9223372036854775807.0) {
+                arena_set_error(arena, "22003", "bigint out of range");
+                return cell_make_null();
+            }
+            r.value.as_bigint = (long long)rv2; break;
+        }
         case COLUMN_TYPE_FLOAT:    r.value.as_float = v; break;
         case COLUMN_TYPE_NUMERIC: {
             int prec = e->cast.precision;
@@ -3356,11 +3373,20 @@ static struct cell eval_cast(struct expr *e, struct query_arena *arena,
     case COLUMN_TYPE_TEXT:
         r.value.as_text = txt;
         break;
-    case COLUMN_TYPE_ENUM:
-        /* ENUM cells store ordinal; txt is discarded here — coercion happens at insert */
-        r.value.as_enum = 0;
+    case COLUMN_TYPE_ENUM: {
+        /* Look up ordinal from enum type name stored in the cast node */
+        int ord = -1;
+        if (txt && db && e->cast.enum_type_name != IDX_NONE) {
+            const char *type_name = ASTRING(arena, e->cast.enum_type_name);
+            if (type_name) {
+                struct enum_type *et = db_find_type(db, type_name);
+                if (et) ord = enum_ordinal(et, txt);
+            }
+        }
+        r.value.as_enum = (ord >= 0) ? ord : 0;
         if (!rb && txt) free(txt);
         break;
+    }
     case COLUMN_TYPE_UUID:
         if (txt) {
             uuid_parse(txt, &r.value.as_uuid);
@@ -3382,7 +3408,16 @@ static struct cell eval_unary_op(struct expr *e, struct query_arena *arena,
     struct cell operand = eval_expr(e->unary.operand, arena, t, row, db, rb);
     if (cell_is_null(&operand)) return operand;
     switch (e->unary.op) {
-    case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT: break;
+    case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT: case OP_BITXOR: break;
+    case OP_BITNOT: {
+        long long iv = 0;
+        if (operand.type == COLUMN_TYPE_INT)      iv = operand.value.as_int;
+        else if (operand.type == COLUMN_TYPE_BIGINT)  iv = operand.value.as_bigint;
+        else if (operand.type == COLUMN_TYPE_SMALLINT) iv = operand.value.as_smallint;
+        else { cell_release_rb(&operand, rb); return cell_make_null(); }
+        cell_release_rb(&operand, rb);
+        return cell_make_int((int)(~iv));
+    }
     case OP_NEG:
         switch (operand.type) {
         case COLUMN_TYPE_SMALLINT: operand.value.as_smallint = -operand.value.as_smallint; break;
@@ -7347,6 +7382,22 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                         new_vals[sc].type = COLUMN_TYPE_ENUM;
                         new_vals[sc].value.as_enum = ord;
                     }
+                }
+            }
+        }
+        /* enforce NOT NULL constraints on SET values */
+        for (uint32_t sc = 0; sc < nsc; sc++) {
+            if (col_idxs[sc] < 0) continue;
+            int ci = col_idxs[sc];
+            if (t->columns.items[ci].not_null) {
+                int is_null = new_vals[sc].is_null ||
+                    (column_type_is_text(new_vals[sc].type) && !new_vals[sc].value.as_text);
+                if (is_null) {
+                    arena_set_error(arena, "23502",
+                        "NOT NULL constraint violated for column '%s'",
+                        t->columns.items[ci].name);
+                    free(idx_row_ids);
+                    return -1;
                 }
             }
         }
