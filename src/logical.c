@@ -2,6 +2,7 @@
 #include "arena_helpers.h"
 #include "database.h"
 #include <string.h>
+#include <stdio.h>
 
 /* ---- Allocator ---- */
 
@@ -340,4 +341,323 @@ uint32_t logical_normalize(uint32_t root, struct query_arena *arena,
                            struct database *db)
 {
     return normalize_node(root, arena, db);
+}
+
+/* ---- logical_explain ---- */
+
+static const char *lcmp_op_str(enum cmp_op op)
+{
+    switch (op) {
+    case CMP_EQ:  return "=";  case CMP_NE: return "!=";
+    case CMP_LT:  return "<";  case CMP_GT: return ">";
+    case CMP_LE:  return "<="; case CMP_GE: return ">=";
+    case CMP_IS_NULL:     return "IS NULL";
+    case CMP_IS_NOT_NULL: return "IS NOT NULL";
+    case CMP_BETWEEN:     return "BETWEEN";
+    case CMP_LIKE:        return "LIKE";
+    case CMP_ILIKE:       return "ILIKE";
+    case CMP_IN:          return "IN";
+    case CMP_NOT_IN:      return "NOT IN";
+    case CMP_IS_DISTINCT: return "IS DISTINCT FROM";
+    case CMP_IS_NOT_DISTINCT: return "IS NOT DISTINCT FROM";
+    case CMP_EXISTS:      return "EXISTS";
+    case CMP_NOT_EXISTS:  return "NOT EXISTS";
+    case CMP_REGEX_MATCH: return "~";
+    case CMP_REGEX_NOT_MATCH: return "!~";
+    case CMP_REGEX_ICASE_MATCH: return "~*";
+    case CMP_REGEX_ICASE_NOT_MATCH: return "!~*";
+    case CMP_IS_NOT_TRUE:  return "IS NOT TRUE";
+    case CMP_IS_NOT_FALSE: return "IS NOT FALSE";
+    case CMP_SIMILAR_TO:   return "SIMILAR TO";
+    case CMP_NOT_SIMILAR_TO: return "NOT SIMILAR TO";
+    }
+    return "?";
+}
+
+/* Print a condition as a human-readable predicate into buf. Returns bytes written. */
+static int lcond_to_str(struct query_arena *arena, uint32_t cond_idx,
+                        char *buf, int buflen)
+{
+    if (cond_idx == IDX_NONE || cond_idx >= (uint32_t)arena->conditions.count)
+        return snprintf(buf, buflen, "(?)");
+    struct condition *c = &arena->conditions.items[cond_idx];
+    switch (c->type) {
+    case COND_AND: {
+        int w = lcond_to_str(arena, c->left, buf, buflen);
+        if (w < buflen - 5) w += snprintf(buf+w, buflen-w, " AND ");
+        w += lcond_to_str(arena, c->right, buf+w, buflen-w);
+        return w;
+    }
+    case COND_OR: {
+        int w = snprintf(buf, buflen, "(");
+        w += lcond_to_str(arena, c->left, buf+w, buflen-w);
+        if (w < buflen - 5) w += snprintf(buf+w, buflen-w, " OR ");
+        w += lcond_to_str(arena, c->right, buf+w, buflen-w);
+        if (w < buflen - 2) w += snprintf(buf+w, buflen-w, ")");
+        return w;
+    }
+    case COND_NOT: {
+        int w = snprintf(buf, buflen, "NOT ");
+        w += lcond_to_str(arena, c->left, buf+w, buflen-w);
+        return w;
+    }
+    case COND_COMPARE: {
+        const char *op = lcmp_op_str(c->op);
+        if (c->rhs_column.len > 0)
+            return snprintf(buf, buflen, SV_FMT " %s " SV_FMT,
+                            (int)c->column.len, c->column.data,
+                            op,
+                            (int)c->rhs_column.len, c->rhs_column.data);
+        if (c->op == CMP_IS_NULL || c->op == CMP_IS_NOT_NULL)
+            return snprintf(buf, buflen, SV_FMT " %s",
+                            (int)c->column.len, c->column.data, op);
+        /* simple literal comparison */
+        if (c->value.is_null)
+            return snprintf(buf, buflen, SV_FMT " %s NULL",
+                            (int)c->column.len, c->column.data, op);
+        switch (c->value.type) {
+        case COLUMN_TYPE_INT:
+            return snprintf(buf, buflen, SV_FMT " %s %d",
+                            (int)c->column.len, c->column.data, op, c->value.value.as_int);
+        case COLUMN_TYPE_BIGINT:
+            return snprintf(buf, buflen, SV_FMT " %s %lld",
+                            (int)c->column.len, c->column.data, op,
+                            (long long)c->value.value.as_bigint);
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:
+            return snprintf(buf, buflen, SV_FMT " %s %.15g",
+                            (int)c->column.len, c->column.data, op, c->value.value.as_float);
+        case COLUMN_TYPE_BOOLEAN:
+            return snprintf(buf, buflen, SV_FMT " %s %s",
+                            (int)c->column.len, c->column.data, op,
+                            c->value.value.as_bool ? "true" : "false");
+        case COLUMN_TYPE_TEXT:
+            return snprintf(buf, buflen, SV_FMT " %s '%s'",
+                            (int)c->column.len, c->column.data, op,
+                            c->value.value.as_text ? c->value.value.as_text : "");
+        case COLUMN_TYPE_SMALLINT:
+        case COLUMN_TYPE_ENUM:
+        case COLUMN_TYPE_DATE:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ:
+        case COLUMN_TYPE_INTERVAL:
+        case COLUMN_TYPE_UUID:
+        case COLUMN_TYPE_VECTOR:
+            return snprintf(buf, buflen, SV_FMT " %s ?",
+                            (int)c->column.len, c->column.data, op);
+        }
+        return snprintf(buf, buflen, SV_FMT " %s ?",
+                        (int)c->column.len, c->column.data, op);
+    }
+    case COND_MULTI_IN:
+        return snprintf(buf, buflen, "(multi-col) IN (...)");
+    }
+    return snprintf(buf, buflen, "(?)");
+}
+
+static const char *ljoin_type_str(int jt)
+{
+    switch (jt) {
+    case 0: return "INNER";
+    case 1: return "LEFT";
+    case 2: return "RIGHT";
+    case 3: return "FULL";
+    case 4: return "CROSS";
+    default: return "?";
+    }
+}
+
+static int logical_explain_node(struct query_arena *arena, uint32_t idx,
+                                 char *buf, int buflen, int depth);
+
+static int logical_explain_node(struct query_arena *arena, uint32_t idx,
+                                 char *buf, int buflen, int depth)
+{
+    if (idx == IDX_NONE || buflen <= 2) return 0;
+    struct logical_node *n = logical_node_get(arena, idx);
+    if (!n) return 0;
+
+    int written = 0, r;
+    /* indent */
+    for (int i = 0; i < depth * 2 && written < buflen - 1; i++)
+        buf[written++] = ' ';
+
+    switch (n->op) {
+    case L_SCAN:
+        if (n->scan.alias.len > 0)
+            r = snprintf(buf+written, buflen-written, "Scan on " SV_FMT " [alias: " SV_FMT "]\n",
+                         (int)n->scan.table.len, n->scan.table.data,
+                         (int)n->scan.alias.len, n->scan.alias.data);
+        else
+            r = snprintf(buf+written, buflen-written, "Scan on " SV_FMT "\n",
+                         (int)n->scan.table.len, n->scan.table.data);
+        if (r > 0) written += r;
+        break;
+
+    case L_FILTER: {
+        char pbuf[256] = "?";
+        lcond_to_str(arena, n->filter.cond_idx, pbuf, sizeof(pbuf));
+        r = snprintf(buf+written, buflen-written, "Filter: (%s)\n", pbuf);
+        if (r > 0) written += r;
+        r = logical_explain_node(arena, n->child, buf+written, buflen-written, depth+1);
+        if (r > 0) written += r;
+        break;
+    }
+
+    case L_PROJECT: {
+        if (n->project.columns.len > 0 &&
+            !(n->project.columns.len == 1 && n->project.columns.data[0] == '*'))
+            r = snprintf(buf+written, buflen-written, "Project [" SV_FMT "]\n",
+                         (int)n->project.columns.len, n->project.columns.data);
+        else if (n->project.parsed_columns_count > 0)
+            r = snprintf(buf+written, buflen-written, "Project [%u cols]\n",
+                         n->project.parsed_columns_count);
+        else if (n->project.aggregates_count > 0)
+            r = snprintf(buf+written, buflen-written, "Project [%u aggs]\n",
+                         n->project.aggregates_count);
+        else
+            r = snprintf(buf+written, buflen-written, "Project [*]\n");
+        if (r > 0) written += r;
+        r = logical_explain_node(arena, n->child, buf+written, buflen-written, depth+1);
+        if (r > 0) written += r;
+        break;
+    }
+
+    case L_JOIN: {
+        const char *jtype = ljoin_type_str(n->join.join_type);
+        /* Print each join_info entry */
+        for (uint32_t j = 0; j < n->join.joins_count && written < buflen - 4; j++) {
+            struct join_info *ji = &arena->joins.items[n->join.joins_start + j];
+            /* re-indent after first */
+            if (j > 0) {
+                for (int i = 0; i < depth * 2 && written < buflen - 1; i++)
+                    buf[written++] = ' ';
+            }
+            if (ji->join_left_col.len > 0 && ji->join_right_col.len > 0)
+                r = snprintf(buf+written, buflen-written,
+                             "Join %s on " SV_FMT " = " SV_FMT " [" SV_FMT "]\n",
+                             jtype,
+                             (int)ji->join_left_col.len, ji->join_left_col.data,
+                             (int)ji->join_right_col.len, ji->join_right_col.data,
+                             (int)ji->join_table.len, ji->join_table.data);
+            else
+                r = snprintf(buf+written, buflen-written, "Join %s [" SV_FMT "]\n",
+                             jtype,
+                             (int)ji->join_table.len, ji->join_table.data);
+            if (r > 0) written += r;
+        }
+        r = logical_explain_node(arena, n->child, buf+written, buflen-written, depth+1);
+        if (r > 0) written += r;
+        break;
+    }
+
+    case L_AGGREGATE: {
+        if (n->aggregate.group_by_count > 0) {
+            int w = snprintf(buf+written, buflen-written, "Aggregate GROUP BY [");
+            if (w > 0) written += w;
+            for (uint32_t k = 0; k < n->aggregate.group_by_count && written < buflen-4; k++) {
+                sv col = arena->svs.items[n->aggregate.group_by_start + k];
+                if (k > 0) { r = snprintf(buf+written, buflen-written, ", "); if (r>0) written+=r; }
+                r = snprintf(buf+written, buflen-written, SV_FMT, (int)col.len, col.data);
+                if (r > 0) written += r;
+            }
+            r = snprintf(buf+written, buflen-written, "]\n");
+            if (r > 0) written += r;
+        } else {
+            r = snprintf(buf+written, buflen-written, "Aggregate (DISTINCT)\n");
+            if (r > 0) written += r;
+        }
+        r = logical_explain_node(arena, n->child, buf+written, buflen-written, depth+1);
+        if (r > 0) written += r;
+        break;
+    }
+
+    case L_SORT: {
+        int w = snprintf(buf+written, buflen-written, "Sort [");
+        if (w > 0) written += w;
+        for (uint32_t k = 0; k < n->sort.order_by_count && written < buflen-4; k++) {
+            struct order_by_item *ob = &arena->order_items.items[n->sort.order_by_start + k];
+            if (k > 0) { r = snprintf(buf+written, buflen-written, ", "); if (r>0) written+=r; }
+            r = snprintf(buf+written, buflen-written, SV_FMT "%s",
+                         (int)ob->column.len, ob->column.data,
+                         ob->desc ? " DESC" : "");
+            if (r > 0) written += r;
+        }
+        r = snprintf(buf+written, buflen-written, "]\n");
+        if (r > 0) written += r;
+        r = logical_explain_node(arena, n->child, buf+written, buflen-written, depth+1);
+        if (r > 0) written += r;
+        break;
+    }
+
+    case L_LIMIT: {
+        if (n->limit.has_limit && n->limit.has_offset)
+            r = snprintf(buf+written, buflen-written, "Limit (%d offset %d)\n",
+                         n->limit.limit_count, n->limit.offset_count);
+        else if (n->limit.has_limit)
+            r = snprintf(buf+written, buflen-written, "Limit (%d)\n", n->limit.limit_count);
+        else
+            r = snprintf(buf+written, buflen-written, "Offset (%d)\n", n->limit.offset_count);
+        if (r > 0) written += r;
+        r = logical_explain_node(arena, n->child, buf+written, buflen-written, depth+1);
+        if (r > 0) written += r;
+        break;
+    }
+
+    case L_SUBQUERY:
+        r = snprintf(buf+written, buflen-written, "Subquery [alias: " SV_FMT "]\n",
+                     (int)n->subquery.alias.len, n->subquery.alias.data);
+        if (r > 0) written += r;
+        break;
+
+    case L_WINDOW:
+        r = snprintf(buf+written, buflen-written, "Window\n");
+        if (r > 0) written += r;
+        break;
+
+    case L_SET_OP: {
+        const char *opname = "Union";
+        if (n->set_op.set_op == 1) opname = "Intersect";
+        else if (n->set_op.set_op == 2) opname = "Except";
+        r = snprintf(buf+written, buflen-written, "SetOp %s%s\n",
+                     opname, n->set_op.set_all ? " ALL" : "");
+        if (r > 0) written += r;
+        break;
+    }
+
+    case L_GENERATE_SERIES:
+        r = snprintf(buf+written, buflen-written, "GenerateSeries\n");
+        if (r > 0) written += r;
+        break;
+
+    case L_DISTINCT_ON: {
+        int w = snprintf(buf+written, buflen-written, "DistinctOn [");
+        if (w > 0) written += w;
+        for (uint32_t k = 0; k < n->distinct_on.key_count && written < buflen-4; k++) {
+            sv col = arena->svs.items[n->distinct_on.key_start + k];
+            if (k > 0) { r = snprintf(buf+written, buflen-written, ", "); if (r>0) written+=r; }
+            r = snprintf(buf+written, buflen-written, SV_FMT, (int)col.len, col.data);
+            if (r > 0) written += r;
+        }
+        r = snprintf(buf+written, buflen-written, "]\n");
+        if (r > 0) written += r;
+        r = logical_explain_node(arena, n->child, buf+written, buflen-written, depth+1);
+        if (r > 0) written += r;
+        break;
+    }
+    }
+    return written;
+}
+
+int logical_explain(struct query_arena *arena, uint32_t root,
+                    char *buf, int buflen)
+{
+    int written = logical_explain_node(arena, root, buf, buflen, 0);
+    /* strip trailing newline */
+    if (written > 0 && buf[written - 1] == '\n')
+        buf[--written] = '\0';
+    else if (written < buflen)
+        buf[written] = '\0';
+    return written;
 }

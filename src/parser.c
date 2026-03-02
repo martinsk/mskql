@@ -7700,8 +7700,29 @@ static int query_parse_internal(const char *sql, struct query *out)
     if (sv_eq_ignorecase_cstr(tok.value, "EXPLAIN")) {
         out->query_type = QUERY_TYPE_EXPLAIN;
         out->explain.has_analyze = 0;
-        /* optional ANALYZE keyword */
+        out->explain.mode = EXPLAIN_PHYSICAL;
         tok = lexer_peek(&l);
+        /* optional (LOGICAL|PARSE|ALL) option in parentheses */
+        if (tok.type == TOK_LPAREN) {
+            lexer_next(&l); /* consume '(' */
+            tok = lexer_next(&l);
+            if (tok.type == TOK_KEYWORD || tok.type == TOK_IDENTIFIER) {
+                if (sv_eq_ignorecase_cstr(tok.value, "LOGICAL"))
+                    out->explain.mode = EXPLAIN_LOGICAL;
+                else if (sv_eq_ignorecase_cstr(tok.value, "PARSE"))
+                    out->explain.mode = EXPLAIN_PARSE;
+                else if (sv_eq_ignorecase_cstr(tok.value, "ALL"))
+                    out->explain.mode = EXPLAIN_ALL;
+                /* ANALYZE handled via has_analyze for compat */
+                else if (sv_eq_ignorecase_cstr(tok.value, "ANALYZE"))
+                    out->explain.has_analyze = 1;
+            }
+            /* consume closing ')' if present */
+            tok = lexer_peek(&l);
+            if (tok.type == TOK_RPAREN) lexer_next(&l);
+            tok = lexer_peek(&l);
+        }
+        /* optional bare ANALYZE keyword (legacy syntax) */
         if (tok.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(tok.value, "ANALYZE")) {
             lexer_next(&l);
             out->explain.has_analyze = 1;

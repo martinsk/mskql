@@ -12,7 +12,9 @@ INSERT INTO jga_customers VALUES (2, 'Bob');
 INSERT INTO jga_customers VALUES (3, 'Carol');
 -- input:
 SELECT c.name AS customer_name, SUM(o.amount) AS total FROM jga_orders o JOIN jga_customers c ON o.customer_id = c.id GROUP BY customer_name ORDER BY customer_name;
+EXPLAIN SELECT c.name AS customer_name, SUM(o.amount) AS total FROM jga_orders o JOIN jga_customers c ON o.customer_id = c.id GROUP BY customer_name ORDER BY customer_name
 -- expected output:
 Alice|300
 Bob|200
 Carol|300
+Legacy Row Executor

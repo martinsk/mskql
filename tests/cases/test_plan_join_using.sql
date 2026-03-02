@@ -6,6 +6,12 @@ CREATE TABLE t2 (id INT, score INT);
 INSERT INTO t2 (id, score) VALUES (1, 90), (2, 80);
 -- input:
 SELECT t1.name, t2.score FROM t1 JOIN t2 USING (id) ORDER BY t1.name;
+EXPLAIN SELECT t1.name, t2.score FROM t1 JOIN t2 USING (id) ORDER BY t1.name
 -- expected output:
 alice|90
 bob|80
+Project
+  Sort
+    Hash Join
+      Seq Scan on t1
+      Seq Scan on t2

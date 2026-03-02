@@ -21,6 +21,19 @@ WITH order_summary AS (
 SELECT c.region, COUNT(*) AS num_customers, SUM(os.total) AS revenue
 FROM order_summary os JOIN ma_customers c ON os.customer_id = c.id
 GROUP BY c.region ORDER BY revenue DESC;
+EXPLAIN WITH order_summary AS (
+  SELECT o.customer_id, SUM(o.quantity * p.price) AS total
+  FROM ma_orders o JOIN ma_products p ON o.product_id = p.id
+  GROUP BY o.customer_id
+)
+SELECT c.region, COUNT(*) AS num_customers, SUM(os.total) AS revenue
+FROM order_summary os JOIN ma_customers c ON os.customer_id = c.id
+GROUP BY c.region ORDER BY revenue DESC
 -- expected output:
 north|2|600
 south|1|300
+Sort
+  HashAggregate
+    Hash Join
+      Seq Scan on order_summary
+      Seq Scan on ma_customers

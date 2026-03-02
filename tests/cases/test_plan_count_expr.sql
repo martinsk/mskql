@@ -8,5 +8,8 @@ INSERT INTO t_ce VALUES (4, NULL, NULL);
 INSERT INTO t_ce VALUES (5, 50, 'e');
 -- input:
 SELECT COUNT(val) FROM t_ce;
+EXPLAIN SELECT COUNT(val) FROM t_ce
 -- expected output:
 3
+Aggregate
+  Seq Scan on t_ce

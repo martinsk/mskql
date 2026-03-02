@@ -6,6 +6,8 @@ INSERT INTO t_fs VALUES (2, 20);
 INSERT INTO t_fs VALUES (3, 30);
 -- input:
 SELECT * FROM (SELECT id, val FROM t_fs WHERE val > 10) AS sub ORDER BY id;
+EXPLAIN SELECT * FROM (SELECT id, val FROM t_fs WHERE val > 10) AS sub ORDER BY id
 -- expected output:
 2|20
 3|30
+Legacy Row Executor

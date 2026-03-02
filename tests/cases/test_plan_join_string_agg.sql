@@ -6,5 +6,7 @@ CREATE TABLE t2 (id INT, dept TEXT);
 INSERT INTO t2 (id, dept) VALUES (1, 'eng'), (2, 'sales');
 -- input:
 SELECT STRING_AGG(t1.name, ',') FROM t1 JOIN t2 ON t1.id = t2.id;
+EXPLAIN SELECT STRING_AGG(t1.name, ',') FROM t1 JOIN t2 ON t1.id = t2.id
 -- expected output:
 alice,bob
+Legacy Row Executor

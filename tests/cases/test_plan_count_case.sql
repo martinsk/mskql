@@ -8,5 +8,8 @@ INSERT INTO t_cc VALUES (4, 'refund', 50);
 INSERT INTO t_cc VALUES (5, 'paid', 300);
 -- input:
 SELECT COUNT(CASE WHEN status = 'paid' THEN 1 END) FROM t_cc;
+EXPLAIN SELECT COUNT(CASE WHEN status = 'paid' THEN 1 END) FROM t_cc
 -- expected output:
 3
+Aggregate
+  Seq Scan on t_cc

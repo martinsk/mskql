@@ -10,6 +10,10 @@ INSERT INTO t_cdg VALUES ('b', 30);
 INSERT INTO t_cdg VALUES ('b', 40);
 -- input:
 SELECT category, COUNT(DISTINCT val) FROM t_cdg GROUP BY category ORDER BY category;
+EXPLAIN SELECT category, COUNT(DISTINCT val) FROM t_cdg GROUP BY category ORDER BY category
 -- expected output:
 a|2
 b|2
+Sort
+  HashAggregate
+    Seq Scan on t_cdg

@@ -9,5 +9,8 @@ INSERT INTO t_cd VALUES (5, 20);
 INSERT INTO t_cd VALUES (6, 30);
 -- input:
 SELECT COUNT(DISTINCT val) FROM t_cd;
+EXPLAIN SELECT COUNT(DISTINCT val) FROM t_cd
 -- expected output:
 3
+Aggregate
+  Seq Scan on t_cd

@@ -6,7 +6,14 @@ INSERT INTO t1 VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');
 INSERT INTO t2 VALUES (1, 100), (1, 200), (2, 50), (2, 30), (3, 400);
 -- input:
 SELECT t1.name, COUNT(*) AS cnt FROM t1 JOIN t2 ON t1.id = t2.fk GROUP BY t1.name HAVING cnt >= 2 ORDER BY t1.name;
+EXPLAIN SELECT t1.name, COUNT(*) AS cnt FROM t1 JOIN t2 ON t1.id = t2.fk GROUP BY t1.name HAVING cnt >= 2 ORDER BY t1.name
 -- expected output:
 alice|2
 bob|2
+Sort
+  Filter: (cnt >= 2)
+    HashAggregate
+      Hash Join
+        Seq Scan on t1
+        Seq Scan on t2
 -- expected status: 0

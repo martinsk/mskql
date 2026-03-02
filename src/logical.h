@@ -201,4 +201,10 @@ struct logical_node *logical_node_get(struct query_arena *arena, uint32_t idx);
 /* Allocate a new logical_node in the arena, return its index. */
 uint32_t logical_alloc_node(struct query_arena *arena, enum logical_op op);
 
+/* Pretty-print the logical plan tree rooted at root into buf (buflen bytes).
+ * Returns the number of bytes written (excluding null terminator).
+ * Output uses 2-space indentation per depth level. */
+int logical_explain(struct query_arena *arena, uint32_t root,
+                    char *buf, int buflen);
+
 #endif

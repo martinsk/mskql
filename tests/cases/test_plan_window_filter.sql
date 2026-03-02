@@ -9,6 +9,7 @@ INSERT INTO wf_sales VALUES (5, 'B', -100);
 INSERT INTO wf_sales VALUES (6, 'B', 150);
 -- input:
 SELECT id, category, amount, SUM(amount) FILTER (WHERE amount > 0) OVER (PARTITION BY category) AS pos_sum FROM wf_sales ORDER BY id;
+EXPLAIN SELECT id, category, amount, SUM(amount) FILTER (WHERE amount > 0) OVER (PARTITION BY category) AS pos_sum FROM wf_sales ORDER BY id
 -- expected output:
 1|A|100|300
 2|A|200|300
@@ -16,3 +17,6 @@ SELECT id, category, amount, SUM(amount) FILTER (WHERE amount > 0) OVER (PARTITI
 4|B|300|450
 5|B|-100|450
 6|B|150|450
+Sort
+  WindowAgg
+    Seq Scan on wf_sales

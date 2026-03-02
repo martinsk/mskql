@@ -7,6 +7,8 @@ INSERT INTO t_fsw VALUES (3, 'charlie', 70);
 INSERT INTO t_fsw VALUES (4, 'dave', 95);
 -- input:
 SELECT name, score FROM (SELECT * FROM t_fsw WHERE score >= 80) AS sub WHERE score < 95 ORDER BY name;
+EXPLAIN SELECT name, score FROM (SELECT * FROM t_fsw WHERE score >= 80) AS sub WHERE score < 95 ORDER BY name
 -- expected output:
 alice|80
 bob|90
+Legacy Row Executor

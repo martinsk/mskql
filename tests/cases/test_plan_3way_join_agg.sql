@@ -12,6 +12,14 @@ INSERT INTO t3ja_orders VALUES (101, 2, 20, 1);
 INSERT INTO t3ja_orders VALUES (102, 1, 20, 2);
 -- input:
 SELECT c.name, SUM(o.qty) FROM t3ja_orders o JOIN t3ja_customers c ON o.customer_id = c.id JOIN t3ja_products p ON o.product_id = p.id GROUP BY c.name ORDER BY c.name;
+EXPLAIN SELECT c.name, SUM(o.qty) FROM t3ja_orders o JOIN t3ja_customers c ON o.customer_id = c.id JOIN t3ja_products p ON o.product_id = p.id GROUP BY c.name ORDER BY c.name
 -- expected output:
 alice|5
 bob|1
+Sort
+  HashAggregate
+    Hash Join
+      Hash Join
+        Seq Scan on t3ja_orders
+        Seq Scan on t3ja_customers
+      Seq Scan on t3ja_products

@@ -9,6 +9,10 @@ INSERT INTO t_ceg VALUES ('b', NULL);
 INSERT INTO t_ceg VALUES ('b', 60);
 -- input:
 SELECT category, COUNT(val) FROM t_ceg GROUP BY category ORDER BY category;
+EXPLAIN SELECT category, COUNT(val) FROM t_ceg GROUP BY category ORDER BY category
 -- expected output:
 a|2
 b|1
+Sort
+  HashAggregate
+    Seq Scan on t_ceg

@@ -12,6 +12,9 @@ INSERT INTO events_ic VALUES (8, 4, 0, 250, 25);
 INSERT INTO events_ic VALUES (9, 4, 0, 350, 35);
 -- input:
 WITH user_totals AS (SELECT user_id, SUM(amount) AS total FROM events_ic WHERE event_type = 0 GROUP BY user_id HAVING SUM(amount) > 500) SELECT * FROM user_totals ORDER BY total DESC LIMIT 100;
+EXPLAIN WITH user_totals AS (SELECT user_id, SUM(amount) AS total FROM events_ic WHERE event_type = 0 GROUP BY user_id HAVING SUM(amount) > 500) SELECT * FROM user_totals ORDER BY total DESC LIMIT 100
 -- expected output:
 2|700
 4|600
+Top-N Sort (limit=100)
+  Seq Scan on user_totals

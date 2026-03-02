@@ -4,6 +4,12 @@ CREATE TABLE t1 (id INT, val INT, active INT);
 INSERT INTO t1 VALUES (1, 5, 1), (2, 15, 1), (3, 25, 0), (4, 35, 1);
 -- input:
 SELECT id FROM t1 WHERE val BETWEEN 10 AND 30 AND active = 1 ORDER BY id;
+EXPLAIN SELECT id FROM t1 WHERE val BETWEEN 10 AND 30 AND active = 1 ORDER BY id
 -- expected output:
 2
+Project
+  Sort
+    Filter: (active = 1)
+      Filter: (val BETWEEN 10)
+        Seq Scan on t1
 -- expected status: 0

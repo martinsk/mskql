@@ -2,6 +2,8 @@
 #include "parser.h"
 #include "query.h"
 #include "plan.h"
+#include "logical.h"
+#include "explain_ast.h"
 #include "catalog.h"
 #include "parquet.h"
 #include "stringview.h"
@@ -3443,11 +3445,28 @@ static int db_exec_explain(struct database *db, struct query_explain *ex,
         return -1;
     }
 
-    char explain_buf[4096];
+    char explain_buf[16384];
     int explain_len = 0;
 
     if (inner_q.query_type == QUERY_TYPE_SELECT) {
         struct query_select *es = &inner_q.select;
+        enum explain_mode emode = ex->mode;
+
+        /* EXPLAIN (PARSE): dump parse AST only — no need to build a plan */
+        if (emode == EXPLAIN_PARSE) {
+            explain_len = query_select_print(es, &inner_q.arena,
+                                             explain_buf, sizeof(explain_buf));
+            goto explain_done;
+        }
+
+        /* EXPLAIN (LOGICAL): build logical IR and print it */
+        if (emode == EXPLAIN_LOGICAL) {
+            uint32_t lroot = logical_build(es, &inner_q.arena, db);
+            lroot = logical_normalize(lroot, &inner_q.arena, db);
+            explain_len = logical_explain(&inner_q.arena, lroot,
+                                          explain_buf, sizeof(explain_buf));
+            goto explain_done;
+        }
 
         /* Materialize CTEs so plan_build_select can find the temp tables */
         struct table *cte_temps[32] = {0};
@@ -3483,10 +3502,52 @@ static int db_exec_explain(struct database *db, struct query_explain *ex,
         struct plan_result epr = { .node = IDX_NONE, .status = PLAN_NOTIMPL };
         if (t)
             epr = plan_build_select(t, es, &inner_q.arena, db);
-        if (epr.status == PLAN_OK) {
-            explain_len = plan_explain(&inner_q.arena, epr.node, explain_buf, sizeof(explain_buf));
+
+        if (emode == EXPLAIN_ALL) {
+            /* EXPLAIN (ALL): parse section + --- + logical section + --- + physical section */
+            int pos = 0, r;
+
+            /* Parse section */
+            r = query_select_print(es, &inner_q.arena,
+                                   explain_buf + pos, (int)sizeof(explain_buf) - pos);
+            if (r > 0) pos += r;
+
+            /* Re-parse for logical (es may have been mutated by CTEs being cleared) */
+            /* Re-build logical from same arena — CTEs already cleared, scan table set */
+            r = snprintf(explain_buf + pos, sizeof(explain_buf) - pos, "---\n");
+            if (r > 0) pos += r;
+
+            uint32_t lroot2 = logical_build(es, &inner_q.arena, db);
+            lroot2 = logical_normalize(lroot2, &inner_q.arena, db);
+            r = logical_explain(&inner_q.arena, lroot2,
+                                 explain_buf + pos, (int)sizeof(explain_buf) - pos);
+            if (r > 0) pos += r;
+            /* ensure newline before separator */
+            if (pos > 0 && explain_buf[pos-1] != '\n' && pos < (int)sizeof(explain_buf)-1)
+                explain_buf[pos++] = '\n';
+
+            r = snprintf(explain_buf + pos, sizeof(explain_buf) - pos, "---\n");
+            if (r > 0) pos += r;
+
+            if (epr.status == PLAN_OK) {
+                r = plan_explain(&inner_q.arena, epr.node,
+                                 explain_buf + pos, (int)sizeof(explain_buf) - pos);
+                if (r > 0) pos += r;
+            } else {
+                r = snprintf(explain_buf + pos, sizeof(explain_buf) - pos,
+                             "Legacy Row Executor");
+                if (r > 0) pos += r;
+            }
+            explain_len = pos;
         } else {
-            explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
+            /* Default: EXPLAIN_PHYSICAL */
+            if (epr.status == PLAN_OK) {
+                explain_len = plan_explain(&inner_q.arena, epr.node,
+                                           explain_buf, sizeof(explain_buf));
+            } else {
+                explain_len = snprintf(explain_buf, sizeof(explain_buf),
+                                       "Legacy Row Executor");
+            }
         }
 
         /* Clean up CTE temp tables */
@@ -3495,6 +3556,8 @@ static int db_exec_explain(struct database *db, struct query_explain *ex,
     } else {
         explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
     }
+
+explain_done:;
 
     /* Build result rows — one row per line */
     char *line = explain_buf;

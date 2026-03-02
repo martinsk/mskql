@@ -842,9 +842,17 @@ struct query_drop_view {
     sv name;
 };
 
+enum explain_mode {
+    EXPLAIN_PHYSICAL = 0, /* default: physical plan tree */
+    EXPLAIN_LOGICAL,      /* EXPLAIN (LOGICAL): desugared logical IR */
+    EXPLAIN_PARSE,        /* EXPLAIN (PARSE): parsed query_select dump */
+    EXPLAIN_ALL,          /* EXPLAIN (ALL): parse + logical + physical */
+};
+
 struct query_explain {
-    sv inner_sql;        /* the SQL text after EXPLAIN [ANALYZE] */
-    int has_analyze;     /* 1 if EXPLAIN ANALYZE */
+    sv inner_sql;            /* the SQL text after EXPLAIN [...] */
+    int has_analyze;         /* 1 if EXPLAIN ANALYZE */
+    enum explain_mode mode;  /* which layers to show */
 };
 
 struct query_show {

@@ -6,6 +6,14 @@ INSERT INTO t1 VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');
 INSERT INTO t2 VALUES (1, 300, 1), (2, 100, 1), (3, 200, 0);
 -- input:
 SELECT t1.name, t2.amount FROM t1 JOIN t2 ON t1.id = t2.fk WHERE t2.amount > 150 AND t2.active = 1 ORDER BY t1.name;
+EXPLAIN SELECT t1.name, t2.amount FROM t1 JOIN t2 ON t1.id = t2.fk WHERE t2.amount > 150 AND t2.active = 1 ORDER BY t1.name
 -- expected output:
 alice|300
+Project
+  Sort
+    Hash Join
+      Seq Scan on t1
+      Filter: (t2.active = 1)
+        Filter: (t2.amount > 150)
+          Seq Scan on t2
 -- expected status: 0

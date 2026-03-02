@@ -8,6 +8,13 @@ INSERT INTO cjw_b VALUES (10, 'alpha');
 INSERT INTO cjw_b VALUES (20, 'beta');
 -- input:
 SELECT a.val, b.label FROM cjw_a a CROSS JOIN cjw_b b WHERE a.id = 1 ORDER BY b.label;
+EXPLAIN SELECT a.val, b.label FROM cjw_a a CROSS JOIN cjw_b b WHERE a.id = 1 ORDER BY b.label
 -- expected output:
 x|alpha
 x|beta
+Project
+  Sort
+    Filter: (a.id = 1)
+      Nested Loop
+        Seq Scan on cjw_a
+        Seq Scan on cjw_b

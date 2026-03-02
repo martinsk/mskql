@@ -9,6 +9,10 @@ INSERT INTO sa_test VALUES (5, 'B', 'elderberry');
 INSERT INTO sa_test VALUES (6, 'B', 'fig');
 -- input:
 SELECT grp, STRING_AGG(name, ', ' ORDER BY name) AS names FROM sa_test GROUP BY grp ORDER BY grp;
+EXPLAIN SELECT grp, STRING_AGG(name, ', ' ORDER BY name) AS names FROM sa_test GROUP BY grp ORDER BY grp
 -- expected output:
 A|apple, banana, cherry
 B|date, elderberry, fig
+Sort
+  HashAggregate
+    Seq Scan on sa_test

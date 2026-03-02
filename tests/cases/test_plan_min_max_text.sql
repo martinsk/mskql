@@ -8,5 +8,8 @@ INSERT INTO t_mmt VALUES (4, 'bob');
 INSERT INTO t_mmt VALUES (5, 'dave');
 -- input:
 SELECT MIN(name), MAX(name) FROM t_mmt;
+EXPLAIN SELECT MIN(name), MAX(name) FROM t_mmt
 -- expected output:
 alice|dave
+Aggregate
+  Seq Scan on t_mmt

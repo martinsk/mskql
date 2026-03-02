@@ -4,8 +4,13 @@ CREATE TABLE t1 (id INT, name TEXT, val INT);
 INSERT INTO t1 VALUES (1, 'alice', 10), (2, 'bob', NULL), (3, 'charlie', 30), (4, 'dave', NULL);
 -- input:
 SELECT name FROM t1 WHERE val IS NULL OR val > 20 ORDER BY name;
+EXPLAIN SELECT name FROM t1 WHERE val IS NULL OR val > 20 ORDER BY name
 -- expected output:
 bob
 charlie
 dave
+Project
+  Sort (name)
+    Filter: ( = 0)
+      Seq Scan on t1
 -- expected status: 0

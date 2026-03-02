@@ -9,6 +9,10 @@ INSERT INTO t_mmtg VALUES ('y', NULL);
 INSERT INTO t_mmtg VALUES ('y', 'eve');
 -- input:
 SELECT category, MIN(name), MAX(name) FROM t_mmtg GROUP BY category ORDER BY category;
+EXPLAIN SELECT category, MIN(name), MAX(name) FROM t_mmtg GROUP BY category ORDER BY category
 -- expected output:
 x|alice|charlie
 y|dave|eve
+Sort
+  HashAggregate
+    Seq Scan on t_mmtg

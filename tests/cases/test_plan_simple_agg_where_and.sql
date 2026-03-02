@@ -4,6 +4,11 @@ CREATE TABLE t1 (id INT, val INT, active INT);
 INSERT INTO t1 VALUES (1, 10, 1), (2, 20, 0), (3, 30, 1), (4, 40, 1), (5, 50, 0);
 -- input:
 SELECT SUM(val) FROM t1 WHERE val > 15 AND active = 1;
+EXPLAIN SELECT SUM(val) FROM t1 WHERE val > 15 AND active = 1
 -- expected output:
 70
+Aggregate
+  Filter: (active = 1)
+    Filter: (val > 15)
+      Seq Scan on t1
 -- expected status: 0
