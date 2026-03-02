@@ -46,6 +46,39 @@ uint32_t logical_build(struct query_select *s, struct query_arena *arena,
 
     uint32_t current;
 
+    /* ---- generate_series fast path: emit L_GENERATE_SERIES leaf ---- */
+    if (s->has_generate_series && s->gs_start_expr != IDX_NONE &&
+        s->gs_stop_expr != IDX_NONE) {
+        uint32_t gs_idx = logical_alloc_node(arena, L_GENERATE_SERIES);
+        struct logical_node *gs = logical_node_get(arena, gs_idx);
+        gs->gen_series.start_expr = s->gs_start_expr;
+        gs->gen_series.stop_expr  = s->gs_stop_expr;
+        gs->gen_series.step_expr  = s->gs_step_expr;
+        current = gs_idx;
+        /* generate_series does not support WHERE/JOIN/GROUP BY/etc in this path */
+        return current;
+    }
+
+    /* ---- Window function path: emit L_WINDOW leaf ---- */
+    if (s->select_exprs_count > 0) {
+        uint32_t win_idx = logical_alloc_node(arena, L_WINDOW);
+        /* no payload needed — build_window reads query_select directly */
+        (void)logical_node_get(arena, win_idx);
+        current = win_idx;
+        return current;
+    }
+
+    /* ---- Set operation path: emit L_SET_OP leaf ---- */
+    if (s->has_set_op && s->set_rhs_sql != IDX_NONE) {
+        uint32_t sop_idx = logical_alloc_node(arena, L_SET_OP);
+        struct logical_node *sop = logical_node_get(arena, sop_idx);
+        sop->set_op.set_op      = s->set_op;
+        sop->set_op.set_all     = s->set_all;
+        sop->set_op.rhs_sql_idx = s->set_rhs_sql;
+        current = sop_idx;
+        return current;
+    }
+
     /* ---- Base: L_SUBQUERY (FROM subquery) or L_SCAN ---- */
 
     if (s->from_subquery_sql != IDX_NONE) {
@@ -56,7 +89,11 @@ uint32_t logical_build(struct query_select *s, struct query_arena *arena,
         sq->subquery.alias   = s->from_subquery_alias;
         current = sq_idx;
     } else {
-        /* Plain table scan (CTEs handled by legacy path via db_exec_select) */
+        /* Plain table scan.
+         * NOTE: Non-recursive CTEs are pre-materialised by plan_build_select
+         * (and by try_plan_send in pgwire.c) into real temp tables before
+         * logical_build is called, so L_SCAN(cte_name) is correct here —
+         * the table already exists by the time the physical builder runs. */
         uint32_t scan_idx = logical_alloc_node(arena, L_SCAN);
         struct logical_node *scan = logical_node_get(arena, scan_idx);
         scan->scan.table = s->table;
@@ -278,9 +315,9 @@ static uint32_t normalize_node(uint32_t idx, struct query_arena *arena,
     struct logical_node *n = logical_node_get(arena, idx);
     if (!n) return idx;
 
-    /* L_SUBQUERY: inner tree is a separate logical plan built at physical
-     * build time; do not recurse into it from here. */
-    if (n->op == L_SUBQUERY) return idx;
+    /* Leaf-like nodes: no children to recurse into. */
+    if (n->op == L_SUBQUERY || n->op == L_WINDOW ||
+        n->op == L_SET_OP   || n->op == L_GENERATE_SERIES) return idx;
 
     /* Recurse into children first (bottom-up) */
     uint32_t new_child = normalize_node(n->child, arena, db);

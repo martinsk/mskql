@@ -349,6 +349,8 @@ uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
         return pn->subquery.ncols;
     case PLAN_DISTINCT_ON:
         return plan_node_ncols(arena, pn->left);
+    case PLAN_LEGACY_EXEC:
+        return pn->legacy_exec.ncols;
     }
     __builtin_unreachable();
 }
@@ -1184,6 +1186,7 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case PLAN_PARQUET_SCAN:
             case PLAN_SUBQUERY:
             case PLAN_DISTINCT_ON:
+            case PLAN_LEGACY_EXEC:
                 goto walk_done;
             }
         }
@@ -8499,6 +8502,144 @@ static int subquery_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     return 0;
 }
 
+/* ---- Rows → col_block conversion helper ----
+ * Copies a slice of struct rows [offset .. offset+n) into a row_block.
+ * Column types are inferred from the first non-null cell in each column;
+ * subsequent cells that differ are skipped as NULL.
+ * The output row_block must already have ncols col_blocks allocated
+ * (call row_block_alloc before this). */
+static void rows_slice_to_block(const struct rows *rows, size_t offset,
+                                uint16_t n, struct row_block *out)
+{
+    uint16_t ncols = out->ncols;
+    out->count = n;
+    for (uint16_t c = 0; c < ncols; c++) {
+        struct col_block *cb = &out->cols[c];
+        cb->count    = n;
+        cb->str_lens = NULL;
+        /* infer type from first non-null cell */
+        if (cb->type == 0) {
+            for (uint16_t r = 0; r < n; r++) {
+                size_t ri = offset + r;
+                if (ri >= rows->count) break;
+                struct row *row = &rows->data[ri];
+                if (c >= (uint16_t)row->cells.count) break;
+                struct cell *cell = &row->cells.items[c];
+                if (!cell->is_null) { cb->type = cell->type; break; }
+            }
+        }
+    }
+    for (uint16_t r = 0; r < n; r++) {
+        size_t ri = offset + r;
+        if (ri >= rows->count) {
+            for (uint16_t c = 0; c < ncols; c++)
+                out->cols[c].nulls[r] = 1;
+            continue;
+        }
+        struct row *row = &rows->data[ri];
+        for (uint16_t c = 0; c < ncols; c++) {
+            struct col_block *cb = &out->cols[c];
+            if (c >= (uint16_t)row->cells.count) { cb->nulls[r] = 1; continue; }
+            struct cell *cell = &row->cells.items[c];
+            if (cell->is_null) { cb->nulls[r] = 1; continue; }
+            cb->nulls[r] = 0;
+            switch (cb->type) {
+            case COLUMN_TYPE_SMALLINT:
+                cb->data.i16[r] = (int16_t)cell->value.as_smallint; break;
+            case COLUMN_TYPE_INT:
+            case COLUMN_TYPE_BOOLEAN:
+                cb->data.i32[r] = cell->value.as_int; break;
+            case COLUMN_TYPE_DATE:
+                cb->data.i32[r] = cell->value.as_date; break;
+            case COLUMN_TYPE_BIGINT:
+                cb->data.i64[r] = cell->value.as_bigint; break;
+            case COLUMN_TYPE_TIMESTAMP:
+            case COLUMN_TYPE_TIMESTAMPTZ:
+                cb->data.i64[r] = cell->value.as_timestamp; break;
+            case COLUMN_TYPE_TIME:
+                cb->data.i64[r] = cell->value.as_time; break;
+            case COLUMN_TYPE_FLOAT:
+                cb->data.f64[r] = cell->value.as_float; break;
+            case COLUMN_TYPE_NUMERIC:
+                cb->data.f64[r] = cell->value.as_numeric; break;
+            case COLUMN_TYPE_ENUM:
+                cb->data.i32[r] = cell->value.as_enum; break;
+            case COLUMN_TYPE_TEXT:
+                cb->data.str[r] = cell->value.as_text; break;
+            case COLUMN_TYPE_INTERVAL:
+                cb->data.iv[r] = cell->value.as_interval; break;
+            case COLUMN_TYPE_UUID:
+                cb->data.uuid[r] = cell->value.as_uuid; break;
+            case COLUMN_TYPE_VECTOR:
+                /* pointer passthrough — the float array is owned by the row */
+                if (r < BLOCK_CAPACITY)
+                    cb->data.str[r] = (char *)cell->value.as_vector;
+                break;
+            default:
+                cb->nulls[r] = 1; break;
+            }
+        }
+    }
+}
+
+/* ---- PLAN_LEGACY_EXEC executor ----
+ * On first call, runs query_select_exec to fully materialise the result into
+ * st->rows.  Subsequent calls slice the rows into BLOCK_CAPACITY-row col_blocks
+ * and return them to the outer pipeline. */
+static int legacy_exec_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
+                             struct row_block *out)
+{
+    struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
+    struct legacy_exec_state *st =
+        (struct legacy_exec_state *)ctx->node_states[node_idx];
+
+    if (!st) {
+        st = (struct legacy_exec_state *)bump_alloc(&ctx->arena->scratch,
+                                                     sizeof(struct legacy_exec_state));
+        memset(st, 0, sizeof(*st));
+        ctx->node_states[node_idx] = st;
+
+        struct query *q = pn->legacy_exec.q;
+        if (!q) { st->done = 1; return -1; }
+
+        /* Execute the inner query via the legacy row-at-a-time path.
+         * bump_alloc is NULL so text is heap-allocated in st->rows. */
+        if (query_select_exec(pn->legacy_exec.t, &q->select, &q->arena,
+                              &st->rows, ctx->db, NULL) != 0) {
+            st->done = 1;
+            return -1;
+        }
+        st->cursor = 0;
+        st->done   = (st->rows.count == 0);
+    }
+
+    if (st->done) return -1;
+
+    /* Determine output column count from first row if ncols was 0 */
+    uint16_t ncols = pn->legacy_exec.ncols;
+    if (ncols == 0 && st->rows.count > 0)
+        ncols = (uint16_t)st->rows.data[0].cells.count;
+    if (ncols == 0) { st->done = 1; return -1; }
+
+    /* Set output column types from first row if not yet initialised */
+    for (uint16_t c = 0; c < ncols && c < out->ncols; c++) {
+        if (out->cols[c].type == 0 && st->rows.count > 0 &&
+            c < (uint16_t)st->rows.data[0].cells.count) {
+            struct cell *cell = &st->rows.data[0].cells.items[c];
+            if (!cell->is_null) out->cols[c].type = cell->type;
+        }
+    }
+
+    size_t remaining = st->rows.count - st->cursor;
+    if (remaining == 0) { st->done = 1; return -1; }
+
+    uint16_t batch = (remaining > BLOCK_CAPACITY) ? BLOCK_CAPACITY : (uint16_t)remaining;
+    rows_slice_to_block(&st->rows, st->cursor, batch, out);
+    st->cursor += batch;
+    if (st->cursor >= st->rows.count) st->done = 1;
+    return 0;
+}
+
 /* ---- PLAN_DISTINCT_ON executor ----
  * Keeps only the first row per key group.  Input must already be sorted by
  * the key columns (guaranteed by the L_DISTINCT_ON desugaring which emits
@@ -8630,6 +8771,7 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
     case PLAN_NESTED_LOOP:      return nested_loop_next(ctx, node_idx, out);
     case PLAN_SUBQUERY:         return subquery_next(ctx, node_idx, out);
     case PLAN_DISTINCT_ON:      return distinct_on_next(ctx, node_idx, out);
+    case PLAN_LEGACY_EXEC:      return legacy_exec_next(ctx, node_idx, out);
     }
     __builtin_unreachable();
 }
@@ -8680,6 +8822,11 @@ void plan_exec_cleanup(struct plan_exec_ctx *ctx)
         if (pn->op == PLAN_SUBQUERY && pn->subquery.inner_q) {
             query_free(pn->subquery.inner_q);
             pn->subquery.inner_q = NULL;
+        }
+        if (pn->op == PLAN_LEGACY_EXEC && pn->legacy_exec.q) {
+            rows_free(&((struct legacy_exec_state *)ctx->node_states[i])->rows);
+            query_free(pn->legacy_exec.q);
+            pn->legacy_exec.q = NULL;
         }
     }
 }
@@ -9015,6 +9162,10 @@ static int plan_explain_node(struct query_arena *arena, uint32_t node_idx,
         break;
     case PLAN_DISTINCT_ON:
         n = explain_unary(arena, pn, "Unique (DISTINCT ON)", buf + written, buflen - written, depth);
+        if (n > 0) written += n;
+        break;
+    case PLAN_LEGACY_EXEC:
+        n = snprintf(buf + written, buflen - written, "Legacy Exec\n");
         if (n > 0) written += n;
         break;
     }
@@ -13591,6 +13742,7 @@ static struct plan_result build_subquery(struct query_select *s,
                                          uint32_t sql_idx,
                                          sv alias)
 {
+    (void)s; /* outer query clauses are applied by the caller, not here */
     if (!db) return PLAN_RES_NOTIMPL;
     if (sql_idx == IDX_NONE) return PLAN_RES_NOTIMPL;
 
@@ -13609,16 +13761,6 @@ static struct plan_result build_subquery(struct query_select *s,
         return PLAN_RES_NOTIMPL;
     }
 
-    /* Bail if the outer query has WHERE/ORDER BY/LIMIT/DISTINCT that reference
-     * subquery output columns — those need name resolution against the
-     * materialized subquery output, which only the legacy path handles. */
-    if (s->where.has_where || s->has_order_by || s->has_limit || s->has_offset ||
-        s->has_distinct || s->has_distinct_on || s->has_group_by ||
-        s->aggregates_count > 0 || s->has_having) {
-        query_free(iq);
-        return PLAN_RES_NOTIMPL;
-    }
-
     /* Validate: only non-recursive inner queries for now */
     struct query_select *iss = &iq->select;
     if (iss->has_recursive_cte) {
@@ -13629,32 +13771,56 @@ static struct plan_result build_subquery(struct query_select *s,
     /* Build the inner plan using iq's own arena so that all index fields
      * in iss (where_cond, group_by_start, etc.) resolve correctly.  The
      * inner plan nodes live in iq->arena and are executed via a sub-ctx
-     * in subquery_next. */
+     * in subquery_next.
+     *
+     * If plan_build_select returns NOTIMPL (inner query is unplannable by the
+     * columnar executor), fall back to PLAN_LEGACY_EXEC which materialises the
+     * inner result via the legacy row-at-a-time executor and streams it as
+     * BLOCK_CAPACITY-sized col_blocks. */
     struct table *sub_t = NULL;
     if (iss->table.len > 0)
         sub_t = db_find_table_sv(db, iss->table);
 
     struct plan_result inner_pr = plan_build_select(sub_t, iss, &iq->arena, db);
-    if (inner_pr.status != PLAN_OK) {
-        query_free(iq);
-        return PLAN_RES_NOTIMPL;
+
+    if (inner_pr.status == PLAN_OK) {
+        uint16_t ncols = plan_node_ncols(&iq->arena, inner_pr.node);
+        if (ncols == 0) {
+            query_free(iq);
+            return PLAN_RES_NOTIMPL;
+        }
+
+        /* Allocate the PLAN_SUBQUERY node in the outer arena */
+        uint32_t sq_idx = plan_alloc_node(arena, PLAN_SUBQUERY);
+        struct plan_node *sq = &PLAN_NODE(arena, sq_idx);
+        sq->left               = inner_pr.node; /* inner plan root (index into iq->arena) */
+        sq->subquery.inner_q   = iq;            /* owns iq; freed in plan_exec_cleanup */
+        sq->subquery.alias     = alias;
+        sq->subquery.ncols     = ncols;
+
+        return PLAN_RES_OK(sq_idx);
     }
 
-    uint16_t ncols = plan_node_ncols(&iq->arena, inner_pr.node);
-    if (ncols == 0) {
-        query_free(iq);
-        return PLAN_RES_NOTIMPL;
+    /* Inner plan is not handled by the columnar executor.
+     * Wrap in PLAN_LEGACY_EXEC: runs the full legacy query_select_exec at
+     * execution time and streams the result as blocks. */
+    if (inner_pr.status == PLAN_NOTIMPL) {
+        /* Determine output column count from schema; fall back to 0 (will be
+         * resolved at execution time from the first result row). */
+        uint16_t ncols = 0;
+        if (sub_t) ncols = (uint16_t)sub_t->columns.count;
+
+        uint32_t le_idx = plan_alloc_node(arena, PLAN_LEGACY_EXEC);
+        struct plan_node *le = &PLAN_NODE(arena, le_idx);
+        le->legacy_exec.q     = iq;    /* owns iq; freed in plan_exec_cleanup */
+        le->legacy_exec.t     = sub_t;
+        le->legacy_exec.ncols = ncols;
+
+        return PLAN_RES_OK(le_idx);
     }
 
-    /* Allocate the PLAN_SUBQUERY node in the outer arena */
-    uint32_t sq_idx = plan_alloc_node(arena, PLAN_SUBQUERY);
-    struct plan_node *sq = &PLAN_NODE(arena, sq_idx);
-    sq->left               = inner_pr.node; /* inner plan root (index into iq->arena) */
-    sq->subquery.inner_q   = iq;            /* owns iq; freed in plan_exec_cleanup */
-    sq->subquery.alias     = alias;
-    sq->subquery.ncols     = ncols;
-
-    return PLAN_RES_OK(sq_idx);
+    query_free(iq);
+    return PLAN_RES_NOTIMPL;
 }
 
 /* ---- Plan builder: DISTINCT ON path ----
@@ -13804,6 +13970,74 @@ static struct plan_result logical_to_physical(struct table *t,
             /* DISTINCT ON desugared: sort + keep first per key */
             return build_distinct_on(t, s, arena, db);
 
+        case L_WINDOW:
+            /* Window functions: SELECT ... OVER (...).
+             * build_window has its own guards; delegate unconditionally. */
+            return build_window(t, s, arena);
+
+        case L_SET_OP:
+            /* UNION / INTERSECT / EXCEPT */
+            if (!s->has_join && !s->has_group_by && s->aggregates_count == 0 &&
+                s->ctes_count == 0 && s->cte_sql == IDX_NONE &&
+                s->from_subquery_sql == IDX_NONE && !s->has_recursive_cte &&
+                s->select_exprs_count == 0 && !s->where.has_where &&
+                t && db && s->insert_rows_count == 0)
+                return build_set_op(t, s, arena, db);
+            return PLAN_RES_NOTIMPL;
+
+        case L_GENERATE_SERIES: {
+            /* generate_series(start, stop[, step]) — integer series only here;
+             * timestamp/date/interval series bail to legacy via PLAN_RES_NOTIMPL
+             * inside this block (mirrors the old fast-path guard logic). */
+            if (s->has_join || s->has_group_by || s->aggregates_count > 0 ||
+                s->has_set_op || s->ctes_count > 0 || s->has_distinct ||
+                s->select_exprs_count > 0 || s->where.has_where ||
+                s->has_order_by || s->parsed_columns_count > 0)
+                return PLAN_RES_NOTIMPL;
+            if (!sv_eq_cstr(s->columns, "*"))
+                return PLAN_RES_NOTIMPL;
+
+            struct cell c_start = eval_expr(s->gs_start_expr, arena, NULL, NULL, db, NULL);
+            struct cell c_stop  = eval_expr(s->gs_stop_expr,  arena, NULL, NULL, db, NULL);
+
+            if (c_start.type == COLUMN_TYPE_DATE || c_start.type == COLUMN_TYPE_TIMESTAMP ||
+                c_start.type == COLUMN_TYPE_TIMESTAMPTZ)
+                return PLAN_RES_NOTIMPL;
+            if (c_start.type == COLUMN_TYPE_INTERVAL || c_stop.type == COLUMN_TYPE_INTERVAL)
+                return PLAN_RES_NOTIMPL;
+
+            long long gs_start = (c_start.type == COLUMN_TYPE_BIGINT) ? c_start.value.as_bigint
+                               : (c_start.type == COLUMN_TYPE_FLOAT)  ? (long long)c_start.value.as_float
+                               : c_start.value.as_int;
+            long long gs_stop  = (c_stop.type == COLUMN_TYPE_BIGINT) ? c_stop.value.as_bigint
+                               : (c_stop.type == COLUMN_TYPE_FLOAT)  ? (long long)c_stop.value.as_float
+                               : c_stop.value.as_int;
+            long long gs_step  = 1;
+            if (s->gs_step_expr != IDX_NONE) {
+                struct cell c_step = eval_expr(s->gs_step_expr, arena, NULL, NULL, db, NULL);
+                if (c_step.type == COLUMN_TYPE_INTERVAL || column_type_is_text(c_step.type))
+                    return PLAN_RES_NOTIMPL;
+                gs_step = (c_step.type == COLUMN_TYPE_BIGINT) ? c_step.value.as_bigint
+                        : (c_step.type == COLUMN_TYPE_FLOAT)  ? (long long)c_step.value.as_float
+                        : c_step.value.as_int;
+            }
+            if (gs_step == 0) gs_step = 1;
+
+            int use_bigint = (c_start.type == COLUMN_TYPE_BIGINT ||
+                              c_stop.type == COLUMN_TYPE_BIGINT ||
+                              gs_start > 2147483647LL || gs_start < -2147483648LL ||
+                              gs_stop  > 2147483647LL || gs_stop  < -2147483648LL);
+
+            uint32_t gs_idx = plan_alloc_node(arena, PLAN_GENERATE_SERIES);
+            PLAN_NODE(arena, gs_idx).gen_series.start    = gs_start;
+            PLAN_NODE(arena, gs_idx).gen_series.stop     = gs_stop;
+            PLAN_NODE(arena, gs_idx).gen_series.step     = gs_step;
+            PLAN_NODE(arena, gs_idx).gen_series.use_bigint = use_bigint;
+            uint32_t gs_phys = gs_idx;
+            gs_phys = build_limit(gs_phys, s, arena);
+            return PLAN_RES_OK(gs_phys);
+        }
+
         case L_SCAN:
         case L_FILTER:
         case L_SORT:
@@ -13826,89 +14060,6 @@ static struct plan_result logical_to_physical(struct table *t,
 struct plan_result plan_build_select(struct table *t, struct query_select *s,
                                      struct query_arena *arena, struct database *db)
 {
-    /* ---- Generate series fast path ---- */
-    if (s->has_generate_series && s->gs_start_expr != IDX_NONE &&
-        s->gs_stop_expr != IDX_NONE) {
-        /* Only handle simple SELECT * integer series via plan executor */
-        if (s->has_join || s->has_group_by || s->aggregates_count > 0 ||
-            s->has_set_op || s->ctes_count > 0 || s->has_distinct ||
-            s->select_exprs_count > 0 || s->where.has_where ||
-            s->has_order_by || s->parsed_columns_count > 0)
-            return PLAN_RES_NOTIMPL;
-        if (!sv_eq_cstr(s->columns, "*"))
-            return PLAN_RES_NOTIMPL;
-
-        struct cell c_start = eval_expr(s->gs_start_expr, arena, NULL, NULL, db, NULL);
-        struct cell c_stop  = eval_expr(s->gs_stop_expr, arena, NULL, NULL, db, NULL);
-
-        /* Bail out for timestamp/date series — keep on legacy path */
-        if (c_start.type == COLUMN_TYPE_DATE || c_start.type == COLUMN_TYPE_TIMESTAMP ||
-            c_start.type == COLUMN_TYPE_TIMESTAMPTZ)
-            return PLAN_RES_NOTIMPL;
-        if (c_start.type == COLUMN_TYPE_INTERVAL || c_stop.type == COLUMN_TYPE_INTERVAL)
-            return PLAN_RES_NOTIMPL;
-
-        long long gs_start = (c_start.type == COLUMN_TYPE_BIGINT) ? c_start.value.as_bigint
-                           : (c_start.type == COLUMN_TYPE_FLOAT)  ? (long long)c_start.value.as_float
-                           : c_start.value.as_int;
-        long long gs_stop  = (c_stop.type == COLUMN_TYPE_BIGINT) ? c_stop.value.as_bigint
-                           : (c_stop.type == COLUMN_TYPE_FLOAT)  ? (long long)c_stop.value.as_float
-                           : c_stop.value.as_int;
-        long long gs_step  = 1;
-        if (s->gs_step_expr != IDX_NONE) {
-            struct cell c_step = eval_expr(s->gs_step_expr, arena, NULL, NULL, db, NULL);
-            if (c_step.type == COLUMN_TYPE_INTERVAL || column_type_is_text(c_step.type))
-                return PLAN_RES_NOTIMPL; /* timestamp step — bail to legacy */
-            gs_step = (c_step.type == COLUMN_TYPE_BIGINT) ? c_step.value.as_bigint
-                    : (c_step.type == COLUMN_TYPE_FLOAT)  ? (long long)c_step.value.as_float
-                    : c_step.value.as_int;
-        }
-        if (gs_step == 0) gs_step = 1;
-
-        int use_bigint = (c_start.type == COLUMN_TYPE_BIGINT ||
-                          c_stop.type == COLUMN_TYPE_BIGINT ||
-                          gs_start > 2147483647LL || gs_start < -2147483648LL ||
-                          gs_stop > 2147483647LL || gs_stop < -2147483648LL);
-
-        uint32_t gs_idx = plan_alloc_node(arena, PLAN_GENERATE_SERIES);
-        PLAN_NODE(arena, gs_idx).gen_series.start = gs_start;
-        PLAN_NODE(arena, gs_idx).gen_series.stop = gs_stop;
-        PLAN_NODE(arena, gs_idx).gen_series.step = gs_step;
-        PLAN_NODE(arena, gs_idx).gen_series.use_bigint = use_bigint;
-        uint32_t current = gs_idx;
-
-        current = build_limit(current, s, arena);
-
-        return PLAN_RES_OK(current);
-    }
-
-    /* ---- Window function fast path ---- */
-    if (s->select_exprs_count > 0 && !s->has_join && !s->has_group_by &&
-        s->aggregates_count == 0 && !s->has_set_op && s->ctes_count == 0 &&
-        s->cte_sql == IDX_NONE && s->from_subquery_sql == IDX_NONE &&
-        !s->has_recursive_cte && !s->has_distinct && !s->has_distinct_on &&
-        t && s->insert_rows_count == 0) {
-        return build_window(t, s, arena);
-    }
-
-    /* ---- Set operations fast path (UNION / INTERSECT / EXCEPT) ---- */
-    if (s->has_set_op && s->set_rhs_sql != IDX_NONE && !s->has_join &&
-        !s->has_group_by && s->aggregates_count == 0 && s->ctes_count == 0 &&
-        s->cte_sql == IDX_NONE && s->from_subquery_sql == IDX_NONE &&
-        !s->has_recursive_cte && s->select_exprs_count == 0 &&
-        !s->where.has_where &&
-        t && db && s->insert_rows_count == 0) {
-        return build_set_op(t, s, arena, db);
-    }
-
-    /* ---- Inline aggregate expressions (e.g. SUM(val) + 1, COALESCE(SUM(x), 0)) ---- */
-    if (s->has_expr_aggs && t) {
-        struct plan_result ea_pr = build_expr_agg(t, s, arena);
-        if (ea_pr.status == PLAN_OK) return ea_pr;
-        /* Fall through to legacy on NOTIMPL */
-        if (ea_pr.status == PLAN_ERROR) return ea_pr;
-    }
-
     /* ---- Logical IR path ----
      * Build the canonical logical tree, apply normalization rewrites,
      * then pattern-match to physical plan nodes.

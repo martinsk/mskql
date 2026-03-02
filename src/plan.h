@@ -31,6 +31,7 @@ enum plan_op {
     PLAN_HNSW_SCAN,      /* HNSW approximate nearest neighbor scan */
     PLAN_SUBQUERY,       /* inline subquery / CTE — streams rows from a sub-plan */
     PLAN_DISTINCT_ON,    /* keep first row per key group (DISTINCT ON desugaring) */
+    PLAN_LEGACY_EXEC,    /* materialise via legacy row-at-a-time executor, stream as blocks */
 };
 
 /* ---- Plan builder result ---- */
@@ -230,6 +231,11 @@ struct plan_node {
             sv            alias;   /* table alias (CTE name or FROM subquery alias) */
             uint16_t      ncols;   /* output column count (set at build time) */
         } subquery;
+        struct {
+            struct query *q;     /* heap-allocated, owns its arena; freed in plan_exec_cleanup */
+            struct table *t;     /* resolved FROM table (may be NULL) */
+            uint16_t      ncols; /* output column count (0 = infer from first row) */
+        } legacy_exec;
         struct {
             int     *key_cols;       /* bump-allocated: column indices for key */
             uint16_t nkey_cols;
@@ -505,6 +511,12 @@ struct subquery_state {
 struct distinct_on_state {
     struct cell *last_key; /* bump-allocated: last emitted key values [nkey_cols] */
     int          has_last; /* 1 after first row emitted */
+};
+
+struct legacy_exec_state {
+    struct rows rows;   /* fully materialised result from legacy executor */
+    size_t      cursor; /* next row index to emit as a block */
+    int         done;
 };
 
 /* Execution context: holds arena, database, and per-node state. */

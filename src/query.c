@@ -6575,7 +6575,7 @@ static int row_matches(struct table *t, struct where_clause *w, struct query_are
     return cell_equal(&row->cells.items[where_col], &w->where_value);
 }
 
-static int query_select_exec(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct database *db, struct bump_alloc *rb)
+int query_select_exec(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct database *db, struct bump_alloc *rb)
 {
     /* dispatch to window path if select_exprs are present */
     if (s->select_exprs_count > 0)

@@ -32,7 +32,10 @@ enum logical_op {
     L_SORT,        /* child + sort keys */
     L_LIMIT,       /* child + count + offset */
     L_SUBQUERY,    /* inline subquery / CTE: child_root is root of inner logical tree */
-    L_DISTINCT_ON, /* keep first row per key after sort: desugared from DISTINCT ON */
+    L_DISTINCT_ON,    /* keep first row per key after sort: desugared from DISTINCT ON */
+    L_WINDOW,         /* window functions (SELECT ... OVER (...)) */
+    L_SET_OP,         /* UNION / INTERSECT / EXCEPT */
+    L_GENERATE_SERIES, /* generate_series(start, stop[, step]) virtual table */
 };
 
 /* L_SCAN payload */
@@ -103,6 +106,29 @@ struct logical_subquery {
     sv       alias;    /* table alias (CTE name or FROM subquery alias) */
 };
 
+/* L_WINDOW payload — window function query.
+ * All relevant fields are carried in the outer query_select; this node is
+ * a marker that logical_to_physical routes to build_window. */
+struct logical_window {
+    int dummy; /* no extra payload needed — build_window reads query_select directly */
+};
+
+/* L_SET_OP payload — UNION / INTERSECT / EXCEPT.
+ * rhs_sql_idx is an index into arena->strings for the RHS SQL text. */
+struct logical_set_op {
+    int      set_op;      /* 0=UNION, 1=INTERSECT, 2=EXCEPT */
+    int      set_all;     /* 1 for UNION ALL / INTERSECT ALL / EXCEPT ALL */
+    uint32_t rhs_sql_idx; /* index into arena->strings for RHS SQL */
+};
+
+/* L_GENERATE_SERIES payload — generate_series(start, stop[, step]).
+ * Expression indices point into the outer query_select arena. */
+struct logical_gen_series {
+    uint32_t start_expr; /* index into arena->exprs */
+    uint32_t stop_expr;  /* index into arena->exprs */
+    uint32_t step_expr;  /* index into arena->exprs, or IDX_NONE */
+};
+
 /* L_DISTINCT_ON payload — keep first row per (key_start..key_start+key_count).
  * Desugared from DISTINCT ON (col1, col2): logical_build emits L_SORT on the
  * DISTINCT ON keys first, then L_DISTINCT_ON to strip duplicates. */
@@ -127,6 +153,9 @@ struct logical_node {
         struct logical_limit       limit;
         struct logical_subquery    subquery;
         struct logical_distinct_on distinct_on;
+        struct logical_window      window;
+        struct logical_set_op      set_op;
+        struct logical_gen_series  gen_series;
     };
 };
 

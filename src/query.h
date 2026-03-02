@@ -917,6 +917,7 @@ struct query {
 };
 
 int query_exec(struct table *t, struct query *q, struct rows *result, struct database *db, struct bump_alloc *rb);
+int query_select_exec(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct database *db, struct bump_alloc *rb);
 int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb);
 int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb, struct database *db);
 void emit_returning_row(struct table *t, struct row *src, sv returning_columns, int return_all, struct rows *result, struct bump_alloc *rb);
