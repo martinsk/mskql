@@ -2660,6 +2660,18 @@ static int flat_col_eq(const struct flat_col *a, uint32_t ai,
 {
     if (a->nulls[ai] != b->nulls[bi]) return 0;
     if (a->nulls[ai]) return 1;
+    /* Cross-type integer comparison: widen both to i64 */
+    int a_is_int = (a->type == COLUMN_TYPE_INT || a->type == COLUMN_TYPE_BIGINT || a->type == COLUMN_TYPE_SMALLINT);
+    int b_is_int = (b->type == COLUMN_TYPE_INT || b->type == COLUMN_TYPE_BIGINT || b->type == COLUMN_TYPE_SMALLINT);
+    if (a_is_int && b_is_int && a->type != b->type) {
+        int64_t av = (a->type == COLUMN_TYPE_BIGINT) ? ((int64_t *)a->data)[ai] :
+                     (a->type == COLUMN_TYPE_SMALLINT) ? (int64_t)((int16_t *)a->data)[ai] :
+                     (int64_t)((int32_t *)a->data)[ai];
+        int64_t bv = (b->type == COLUMN_TYPE_BIGINT) ? b->data.i64[bi] :
+                     (b->type == COLUMN_TYPE_SMALLINT) ? (int64_t)b->data.i16[bi] :
+                     (int64_t)b->data.i32[bi];
+        return av == bv;
+    }
     switch (a->type) {
     case COLUMN_TYPE_SMALLINT: return ((int16_t *)a->data)[ai] == b->data.i16[bi];
     case COLUMN_TYPE_BIGINT:   return ((int64_t *)a->data)[ai] == b->data.i64[bi];
@@ -2886,8 +2898,18 @@ static void hash_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
                   &ctx->arena->scratch);
 
     struct flat_col *key_fc = &st->build_cols[key_col];
+    int build_widen = (pn->hash_join.key_type == COLUMN_TYPE_BIGINT &&
+                       (key_fc->type == COLUMN_TYPE_INT || key_fc->type == COLUMN_TYPE_SMALLINT));
     for (uint32_t i = 0; i < st->build_count; i++) {
-        uint32_t h = flat_col_hash(key_fc, i);
+        uint32_t h;
+        if (build_widen) {
+            int64_t wv = (key_fc->type == COLUMN_TYPE_SMALLINT)
+                         ? (int64_t)((int16_t *)key_fc->data)[i]
+                         : (int64_t)((int32_t *)key_fc->data)[i];
+            h = block_hash_i64(wv);
+        } else {
+            h = flat_col_hash(key_fc, i);
+        }
         uint32_t bucket = h & (st->ht.nbuckets - 1);
         st->ht.hashes[i] = h;
         st->ht.nexts[i] = st->ht.buckets[bucket];
@@ -2998,7 +3020,17 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             continue;
         }
 
-        uint32_t h = block_hash_cell(outer_key_cb, oi);
+        uint32_t h;
+        if (pn->hash_join.key_type == COLUMN_TYPE_BIGINT &&
+            (outer_key_cb->type == COLUMN_TYPE_INT || outer_key_cb->type == COLUMN_TYPE_SMALLINT)) {
+            /* Widen INT probe key to i64 so hash matches BIGINT build side */
+            int64_t wv = (outer_key_cb->type == COLUMN_TYPE_SMALLINT)
+                         ? (int64_t)outer_key_cb->data.i16[oi]
+                         : (int64_t)outer_key_cb->data.i32[oi];
+            h = block_hash_i64(wv);
+        } else {
+            h = block_hash_cell(outer_key_cb, oi);
+        }
         uint32_t bucket = h & (st->ht.nbuckets - 1);
         uint32_t entry = st->ht.buckets[bucket];
         int found = 0;
@@ -9972,19 +10004,34 @@ static int extract_join_keys(struct join_info *ji, struct query_arena *arena,
     if (ji->join_on_cond != IDX_NONE) {
         struct condition *cond = &COND(arena, ji->join_on_cond);
         if (cond->type != COND_COMPARE || cond->op != CMP_EQ) return -1;
-        if (cond->lhs_expr != IDX_NONE) return -1;
-        if (cond->column.len == 0 || cond->rhs_column.len == 0) return -1;
 
-        int lhs_left = find_col_in_tables_a(cond->column, left_tables, left_offsets, left_aliases, left_ntables);
-        int lhs_right = table_find_column_sv(right_table, cond->column);
+        /* If lhs_expr is set (e.g. qualified ref os.customer_id parsed as expression),
+         * extract the column sv from the EXPR_COLUMN_REF so we can resolve it. */
+        sv lhs_col = cond->column;
+        if (cond->lhs_expr != IDX_NONE && lhs_col.len == 0) {
+            struct expr *le = &EXPR(arena, cond->lhs_expr);
+            if (le->type != EXPR_COLUMN_REF) return -1;
+            /* Use full "table.column" if table prefix present, else bare column */
+            if (le->column_ref.table.len > 0) {
+                /* reconstruct "table.column" from the original input (they're contiguous) */
+                lhs_col = sv_from(le->column_ref.table.data,
+                                  le->column_ref.table.len + 1 + le->column_ref.column.len);
+            } else {
+                lhs_col = le->column_ref.column;
+            }
+        }
+        if (lhs_col.len == 0 || cond->rhs_column.len == 0) return -1;
+
+        int lhs_left = find_col_in_tables_a(lhs_col, left_tables, left_offsets, left_aliases, left_ntables);
+        int lhs_right = table_find_column_sv(right_table, lhs_col);
         int rhs_left = find_col_in_tables_a(cond->rhs_column, left_tables, left_offsets, left_aliases, left_ntables);
         int rhs_right = table_find_column_sv(right_table, cond->rhs_column);
 
         /* Strip prefix for right-table lookup */
         if (lhs_right < 0) {
-            sv bare = cond->column;
-            for (size_t p = 0; p < cond->column.len; p++)
-                if (cond->column.data[p] == '.') { bare = sv_from(cond->column.data + p + 1, cond->column.len - p - 1); break; }
+            sv bare = lhs_col;
+            for (size_t p = 0; p < lhs_col.len; p++)
+                if (lhs_col.data[p] == '.') { bare = sv_from(lhs_col.data + p + 1, lhs_col.len - p - 1); break; }
             lhs_right = table_find_column_sv(right_table, bare);
         }
         if (rhs_right < 0) {
@@ -10093,7 +10140,9 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
         if (ji->join_type != 0 && ji->join_type != 4) has_non_inner = 1;
 
         struct table *tn = db_find_table_sv(db, ji->join_table);
-        if (!tn) return PLAN_RES_ERR;
+        if (!tn) {
+            return PLAN_RES_ERR;
+        }
         if (tn->kind == TABLE_VIEW) return PLAN_RES_NOTIMPL;
         if (table_has_mixed_types(tn)) return PLAN_RES_NOTIMPL;
 
@@ -10151,6 +10200,8 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     /* Extract join keys for each join */
     int *outer_keys = (int *)bump_alloc(&arena->scratch, s->joins_count * sizeof(int));
     int *inner_keys = (int *)bump_alloc(&arena->scratch, s->joins_count * sizeof(int));
+    int *int_widen  = (int *)bump_alloc(&arena->scratch, s->joins_count * sizeof(int));
+    memset(int_widen, 0, s->joins_count * sizeof(int));
     for (uint32_t j = 0; j < s->joins_count; j++) {
         struct join_info *ji = &arena->joins.items[s->joins_start + j];
         if (ji->join_type == 4) {
@@ -10159,8 +10210,9 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
             continue;
         }
         if (extract_join_keys(ji, arena, tables, offsets, aliases, (int)(j + 1),
-                              tables[j + 1], &outer_keys[j], &inner_keys[j]) != 0)
+                              tables[j + 1], &outer_keys[j], &inner_keys[j]) != 0) {
             return PLAN_RES_ERR;
+        }
         /* Bail out for cross-type join keys (e.g. INT vs FLOAT) */
         enum column_type inner_kt = tables[j + 1]->columns.items[inner_keys[j]].type;
         /* Find outer key's type in the cumulative column space */
@@ -10172,7 +10224,15 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
                 break;
             }
         }
-        if (outer_kt != inner_kt) return PLAN_RES_ERR;
+        if (outer_kt != inner_kt) {
+            /* Allow integer-family widening (SMALLINT/INT/BIGINT are all compatible) */
+            int outer_is_int = (outer_kt == COLUMN_TYPE_INT || outer_kt == COLUMN_TYPE_BIGINT || outer_kt == COLUMN_TYPE_SMALLINT);
+            int inner_is_int = (inner_kt == COLUMN_TYPE_INT || inner_kt == COLUMN_TYPE_BIGINT || inner_kt == COLUMN_TYPE_SMALLINT);
+            if (!(outer_is_int && inner_is_int))
+                return PLAN_RES_ERR;
+            /* Record widening needed — use BIGINT as canonical key type */
+            int_widen[j] = 1;
+        }
     }
 
     /* --- Resolve post-join operations --- */
@@ -10209,7 +10269,9 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
                 agg_col_idxs[a] = -1; /* COUNT(*) */
             } else {
                 int ci = find_col_in_tables_a(ae->column, tables, offsets, aliases, ntables);
-                if (ci < 0) return PLAN_RES_ERR;
+                if (ci < 0) {
+                    return PLAN_RES_ERR;
+                }
                 agg_col_idxs[a] = ci;
             }
         }
@@ -10641,6 +10703,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
             PLAN_NODE(arena, join_idx).hash_join.outer_key_col = outer_keys[j];
             PLAN_NODE(arena, join_idx).hash_join.inner_key_col = inner_keys[j];
             PLAN_NODE(arena, join_idx).hash_join.join_type = ji->join_type;
+            PLAN_NODE(arena, join_idx).hash_join.key_type = int_widen[j] ? COLUMN_TYPE_BIGINT : COLUMN_TYPE_INT /* unused marker */;
             current = join_idx;
         }
     }
@@ -13940,6 +14003,12 @@ static struct plan_result logical_to_physical(struct table *t,
              * Recursive CTE: fall back to legacy. */
             if (s->has_set_op || s->has_recursive_cte)
                 return PLAN_RES_NOTIMPL;
+
+            /* Expression-wrapping aggregates: COALESCE(SUM(...), 0) etc. */
+            if (s->has_expr_aggs && t) {
+                struct plan_result ea_pr = build_expr_agg(t, s, arena);
+                if (ea_pr.status == PLAN_OK) return ea_pr;
+            }
 
             /* DISTINCT-only (group_by_count==0, agg_count==0) */
             if (s->has_distinct && !s->has_group_by && s->aggregates_count == 0)

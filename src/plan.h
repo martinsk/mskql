@@ -141,6 +141,7 @@ struct plan_node {
             int inner_key_col;       /* join key column index in inner (right child) */
             int outer_key_col;       /* join key column index in outer (left child) */
             int join_type;           /* 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL */
+            enum column_type key_type; /* canonical type for hash/eq (BIGINT when int widening needed) */
         } hash_join;
         struct {
             uint32_t cond_idx;       /* join condition (IDX_NONE for CROSS JOIN) */

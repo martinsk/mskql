@@ -225,7 +225,6 @@ static void start_server(void)
     g_server_pid = fork();
     if (g_server_pid == 0) {
         setenv("MSKQL_PORT", port_str, 1);
-        /* redirect stdout/stderr to /dev/null */
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
         execl("./build/mskql", "mskql", NULL);

@@ -1842,7 +1842,15 @@ struct table *materialize_subquery(struct database *db, const char *sql,
                 }
                 struct column col = {0};
                 col.name = sv_to_cstr(col_name);
-                col.type = sq_rows.data[0].cells.items[ci].type;
+                /* Prefer schema type from source table over inferred cell type
+                 * (legacy executor stores group-key cells as FLOAT) */
+                if (src_t) {
+                    int sci = table_find_column_sv(src_t, col_name);
+                    col.type = (sci >= 0) ? src_t->columns.items[sci].type
+                                          : sq_rows.data[0].cells.items[ci].type;
+                } else {
+                    col.type = sq_rows.data[0].cells.items[ci].type;
+                }
                 da_push(&ct.columns, col);
                 ci++;
                 if (end < cols.len) { cols.data += end + 1; cols.len -= end + 1; }
@@ -1875,13 +1883,19 @@ struct table *materialize_subquery(struct database *db, const char *sql,
     /* move rows — transfer ownership, no cell_copy/strdup needed */
     for (size_t i = 0; i < sq_rows.count; i++) {
         da_push(&ct.rows, sq_rows.data[i]);
+        /* Normalize cell type tags to match schema (legacy executor may store
+         * group-key cells with wrong type tag, e.g. INT column as FLOAT) */
+        struct row *r = &ct.rows.items[ct.rows.count - 1];
+        for (size_t c = 0; c < ct.columns.count && c < r->cells.count; c++) {
+            if (!r->cells.items[c].is_null)
+                r->cells.items[c].type = ct.columns.items[c].type;
+        }
         table_flat_append_row(&ct, &ct.rows.items[ct.rows.count - 1]);
     }
     free(sq_rows.data);
     query_free(&sq);
     free(gs_rewritten);
     da_push(&db->tables, ct);
-    db->total_generation++;
     return &db->tables.items[db->tables.count - 1];
 }
 
@@ -1895,7 +1909,6 @@ void remove_temp_table(struct database *db, struct table *t)
             for (size_t j = i; j + 1 < db->tables.count; j++)
                 db->tables.items[j] = db->tables.items[j + 1];
             db->tables.count--;
-            db->total_generation++;
             return;
         }
     }
@@ -2354,6 +2367,43 @@ static int db_exec_insert(struct database *db, struct query *q, struct rows *res
                         null_cell.is_null = 1;
                         da_push(&r.cells, null_cell);
                     }
+                }
+            }
+            /* numeric type normalization: coerce cell type to match schema column type */
+            for (size_t ci = 0; ci < t->columns.count && ci < r.cells.count; ci++) {
+                struct cell *c = &r.cells.items[ci];
+                if (c->is_null) continue;
+                enum column_type ct = t->columns.items[ci].type;
+                if (c->type == ct) continue;
+                if ((c->type == COLUMN_TYPE_FLOAT || c->type == COLUMN_TYPE_NUMERIC) &&
+                    ct == COLUMN_TYPE_INT) {
+                    c->value.as_int = (int)c->value.as_float;
+                    c->type = COLUMN_TYPE_INT;
+                } else if ((c->type == COLUMN_TYPE_FLOAT || c->type == COLUMN_TYPE_NUMERIC) &&
+                           ct == COLUMN_TYPE_BIGINT) {
+                    c->value.as_bigint = (long long)c->value.as_float;
+                    c->type = COLUMN_TYPE_BIGINT;
+                } else if ((c->type == COLUMN_TYPE_FLOAT || c->type == COLUMN_TYPE_NUMERIC) &&
+                           ct == COLUMN_TYPE_SMALLINT) {
+                    c->value.as_smallint = (int16_t)c->value.as_float;
+                    c->type = COLUMN_TYPE_SMALLINT;
+                } else if ((c->type == COLUMN_TYPE_INT || c->type == COLUMN_TYPE_BIGINT ||
+                            c->type == COLUMN_TYPE_SMALLINT) &&
+                           (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)) {
+                    double v = (c->type == COLUMN_TYPE_BIGINT) ? (double)c->value.as_bigint :
+                               (c->type == COLUMN_TYPE_SMALLINT) ? (double)c->value.as_smallint :
+                               (double)c->value.as_int;
+                    c->value.as_float = v;
+                    c->type = ct;
+                } else if (c->type == COLUMN_TYPE_INT && ct == COLUMN_TYPE_BIGINT) {
+                    c->value.as_bigint = (long long)c->value.as_int;
+                    c->type = COLUMN_TYPE_BIGINT;
+                } else if (c->type == COLUMN_TYPE_BIGINT && ct == COLUMN_TYPE_INT) {
+                    c->value.as_int = (int)c->value.as_bigint;
+                    c->type = COLUMN_TYPE_INT;
+                } else if (c->type == COLUMN_TYPE_INT && ct == COLUMN_TYPE_SMALLINT) {
+                    c->value.as_smallint = (int16_t)c->value.as_int;
+                    c->type = COLUMN_TYPE_SMALLINT;
                 }
             }
             /* auto-increment SERIAL/BIGSERIAL columns */
@@ -3397,15 +3447,51 @@ static int db_exec_explain(struct database *db, struct query_explain *ex,
     int explain_len = 0;
 
     if (inner_q.query_type == QUERY_TYPE_SELECT) {
-        struct table *t = db_find_table_sv(db, inner_q.select.table);
+        struct query_select *es = &inner_q.select;
+
+        /* Materialize CTEs so plan_build_select can find the temp tables */
+        struct table *cte_temps[32] = {0};
+        size_t n_cte_temps = 0;
+        if (es->ctes_count > 0 && !es->has_recursive_cte) {
+            for (uint32_t ci = 0; ci < es->ctes_count && n_cte_temps < 32; ci++) {
+                struct cte_def *cd = &inner_q.arena.ctes.items[es->ctes_start + ci];
+                if (cd->is_recursive) break;
+                const char *cd_sql = ASTRING((&inner_q.arena), cd->sql_idx);
+                const char *cd_name = ASTRING((&inner_q.arena), cd->name_idx);
+                cte_temps[n_cte_temps] = materialize_subquery(db, cd_sql, cd_name);
+                if (!cte_temps[n_cte_temps]) break;
+                n_cte_temps++;
+            }
+            es->ctes_count = 0;
+            es->cte_name = IDX_NONE;
+            es->cte_sql = IDX_NONE;
+        } else if (es->cte_name != IDX_NONE && es->cte_sql != IDX_NONE &&
+                   !es->has_recursive_cte) {
+            const char *cd_sql = ASTRING((&inner_q.arena), es->cte_sql);
+            const char *cd_name = ASTRING((&inner_q.arena), es->cte_name);
+            cte_temps[0] = materialize_subquery(db, cd_sql, cd_name);
+            if (cte_temps[0]) {
+                n_cte_temps = 1;
+                es->cte_name = IDX_NONE;
+                es->cte_sql = IDX_NONE;
+            }
+        }
+
+        struct table *t = NULL;
+        if (es->table.len > 0)
+            t = db_find_table_sv(db, es->table);
         struct plan_result epr = { .node = IDX_NONE, .status = PLAN_NOTIMPL };
         if (t)
-            epr = plan_build_select(t, &inner_q.select, &inner_q.arena, db);
+            epr = plan_build_select(t, es, &inner_q.arena, db);
         if (epr.status == PLAN_OK) {
             explain_len = plan_explain(&inner_q.arena, epr.node, explain_buf, sizeof(explain_buf));
         } else {
             explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
         }
+
+        /* Clean up CTE temp tables */
+        for (size_t ci = n_cte_temps; ci > 0; ci--)
+            remove_temp_table(db, cte_temps[ci - 1]);
     } else {
         explain_len = snprintf(explain_buf, sizeof(explain_buf), "Legacy Row Executor");
     }

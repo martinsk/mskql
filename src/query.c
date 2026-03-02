@@ -2003,6 +2003,45 @@ static struct cell eval_binary_op(struct expr *e, struct query_arena *arena,
         return cell_make_bigint(res);
     }
 
+    /* INT/SMALLINT arithmetic — both operands are integer, preserve INT type */
+    int use_int = !use_float && !use_bigint &&
+        (lhs.type == COLUMN_TYPE_INT || lhs.type == COLUMN_TYPE_SMALLINT) &&
+        (rhs.type == COLUMN_TYPE_INT || rhs.type == COLUMN_TYPE_SMALLINT);
+    if (use_int) {
+        int la = (lhs.type == COLUMN_TYPE_SMALLINT) ? (int)lhs.value.as_smallint : lhs.value.as_int;
+        int ra = (rhs.type == COLUMN_TYPE_SMALLINT) ? (int)rhs.value.as_smallint : rhs.value.as_int;
+        cell_release_rb(&lhs, rb); cell_release_rb(&rhs, rb);
+        int res = 0;
+        switch (e->binary.op) {
+        case OP_ADD: res = la + ra; break;
+        case OP_SUB: res = la - ra; break;
+        case OP_MUL: res = la * ra; break;
+        case OP_DIV:
+            if (ra == 0) { arena_set_error(arena, "22012", "division by zero"); return cell_make_null(); }
+            res = la / ra; break;
+        case OP_MOD:
+            if (ra == 0) { arena_set_error(arena, "22012", "division by zero"); return cell_make_null(); }
+            res = la % ra; break;
+        case OP_EXP: return cell_make_float(pow((double)la, (double)ra));
+        case OP_EQ: return cell_make_bool(la == ra);
+        case OP_NE: return cell_make_bool(la != ra);
+        case OP_LT: return cell_make_bool(la < ra);
+        case OP_GT: return cell_make_bool(la > ra);
+        case OP_LE: return cell_make_bool(la <= ra);
+        case OP_GE: return cell_make_bool(la >= ra);
+        case OP_BITAND:  res = la & ra; break;
+        case OP_BITOR:   res = la | ra; break;
+        case OP_LSHIFT:  res = la << ra; break;
+        case OP_RSHIFT:  res = la >> ra; break;
+        case OP_BITXOR:  res = la ^ ra; break;
+        case OP_CONCAT: case OP_NEG: case OP_AND: case OP_OR: case OP_NOT: case OP_LIKE:
+        case OP_BITNOT:
+        case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+        case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH: break;
+        }
+        return cell_make_int(res);
+    }
+
     /* FLOAT/NUMERIC arithmetic — double is correct here */
     double lv = cell_to_double_val(&lhs);
     double rv = cell_to_double_val(&rhs);
@@ -7980,6 +8019,43 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                     break;
                 }
                 }
+            }
+        }
+        /* numeric type normalization: coerce cell type to match schema column type */
+        for (size_t i = 0; i < t->columns.count && i < copy.cells.count; i++) {
+            struct cell *c = &copy.cells.items[i];
+            if (c->is_null) continue;
+            enum column_type ct = t->columns.items[i].type;
+            if (c->type == ct) continue;
+            if ((c->type == COLUMN_TYPE_FLOAT || c->type == COLUMN_TYPE_NUMERIC) &&
+                ct == COLUMN_TYPE_INT) {
+                c->value.as_int = (int)c->value.as_float;
+                c->type = COLUMN_TYPE_INT;
+            } else if ((c->type == COLUMN_TYPE_FLOAT || c->type == COLUMN_TYPE_NUMERIC) &&
+                       ct == COLUMN_TYPE_BIGINT) {
+                c->value.as_bigint = (long long)c->value.as_float;
+                c->type = COLUMN_TYPE_BIGINT;
+            } else if ((c->type == COLUMN_TYPE_FLOAT || c->type == COLUMN_TYPE_NUMERIC) &&
+                       ct == COLUMN_TYPE_SMALLINT) {
+                c->value.as_smallint = (int16_t)c->value.as_float;
+                c->type = COLUMN_TYPE_SMALLINT;
+            } else if ((c->type == COLUMN_TYPE_INT || c->type == COLUMN_TYPE_BIGINT ||
+                        c->type == COLUMN_TYPE_SMALLINT) &&
+                       (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)) {
+                double v = (c->type == COLUMN_TYPE_BIGINT) ? (double)c->value.as_bigint :
+                           (c->type == COLUMN_TYPE_SMALLINT) ? (double)c->value.as_smallint :
+                           (double)c->value.as_int;
+                c->value.as_float = v;
+                c->type = ct;
+            } else if (c->type == COLUMN_TYPE_INT && ct == COLUMN_TYPE_BIGINT) {
+                c->value.as_bigint = (long long)c->value.as_int;
+                c->type = COLUMN_TYPE_BIGINT;
+            } else if (c->type == COLUMN_TYPE_BIGINT && ct == COLUMN_TYPE_INT) {
+                c->value.as_int = (int)c->value.as_bigint;
+                c->type = COLUMN_TYPE_INT;
+            } else if (c->type == COLUMN_TYPE_INT && ct == COLUMN_TYPE_SMALLINT) {
+                c->value.as_smallint = (int16_t)c->value.as_int;
+                c->type = COLUMN_TYPE_SMALLINT;
             }
         }
         /* auto-increment SERIAL/BIGSERIAL columns */

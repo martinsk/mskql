@@ -2811,7 +2811,9 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
             const char *cd_sql = ASTRING(qa, cd->sql_idx);
             const char *cd_name = ASTRING(qa, cd->name_idx);
             cte_temps[n_cte_temps] = materialize_subquery(db, cd_sql, cd_name);
-            if (!cte_temps[n_cte_temps]) goto cte_bail;
+            if (!cte_temps[n_cte_temps]) {
+                goto cte_bail;
+            }
             n_cte_temps++;
         }
         s->ctes_count = 0;
@@ -2883,8 +2885,9 @@ static int try_plan_send(int fd, struct database *db, struct query *q,
         }
     }
     struct plan_result pr = plan_build_select(t, s, &q->arena, db);
-    if (pr.status != PLAN_OK)
+    if (pr.status != PLAN_OK) {
         goto cte_restore_bail;
+    }
 
     plan_exec_init(&ctx, &q->arena, db, pr.node);
 
