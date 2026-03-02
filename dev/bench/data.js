@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1772380109883,
+  "lastUpdate": 1772414952493,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -9373,6 +9373,216 @@ window.BENCHMARK_DATA = {
             "value": 2.436,
             "unit": "ms",
             "extra": "iters=50  min=0.047  p50=0.047  p95=0.055  p99=0.072  max=0.072"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "35e0cc75c6fc38d3663bd01634d4d7edffbb49be",
+          "message": "add UNIQUE INDEX constraint enforcement with pre-build duplicate check, fix NOT IN NULL handling to return UNKNOWN when list contains NULL and value not found, add ISODOW date extraction field (ISO 8601 Monday=1..Sunday=7), implement bitwise XOR operator (#) and unary bitwise NOT (~), fix operator precedence to make exponentiation right-associative and unary minus lower precedence than ^, add catalog_generation tracking to skip redundant catalog_refresh calls when total_generation unchanged, parse",
+          "timestamp": "2026-03-01T17:27:06-08:00",
+          "tree_id": "c35599219b432d6a6a6c35a496e256a746eef106",
+          "url": "https://github.com/martinsk/mskql/commit/35e0cc75c6fc38d3663bd01634d4d7edffbb49be"
+        },
+        "date": 1772414951370,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 24.441,
+            "unit": "ms",
+            "extra": "iters=10000  min=0.002  p50=0.002  p95=0.004  p99=0.005  max=0.245"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 242.709,
+            "unit": "ms",
+            "extra": "iters=200  min=1.187  p50=1.207  p95=1.246  p99=1.343  max=1.403"
+          },
+          {
+            "name": "select_where",
+            "value": 304.213,
+            "unit": "ms",
+            "extra": "iters=500  min=0.586  p50=0.603  p95=0.634  p99=0.712  max=0.844"
+          },
+          {
+            "name": "aggregate",
+            "value": 88.264,
+            "unit": "ms",
+            "extra": "iters=500  min=0.171  p50=0.174  p95=0.190  p99=0.202  max=0.254"
+          },
+          {
+            "name": "order_by",
+            "value": 210.206,
+            "unit": "ms",
+            "extra": "iters=200  min=0.994  p50=1.017  p95=1.128  p99=1.632  max=1.667"
+          },
+          {
+            "name": "join",
+            "value": 37.317,
+            "unit": "ms",
+            "extra": "iters=50  min=0.725  p50=0.741  p95=0.779  p99=0.803  max=0.815"
+          },
+          {
+            "name": "update",
+            "value": 40.052,
+            "unit": "ms",
+            "extra": "iters=200  min=0.186  p50=0.197  p95=0.219  p99=0.244  max=0.259"
+          },
+          {
+            "name": "delete",
+            "value": 186.433,
+            "unit": "ms",
+            "extra": "iters=50  min=3.701  p50=3.717  p95=3.798  p99=3.836  max=3.855"
+          },
+          {
+            "name": "parser",
+            "value": 486.135,
+            "unit": "ms",
+            "extra": "iters=50000  min=0.001  p50=0.008  p95=0.029  p99=0.029  max=0.085"
+          },
+          {
+            "name": "index_lookup",
+            "value": 10.051,
+            "unit": "ms",
+            "extra": "iters=2000  min=0.005  p50=0.005  p95=0.005  p99=0.006  max=0.051"
+          },
+          {
+            "name": "transaction",
+            "value": 26.696,
+            "unit": "ms",
+            "extra": "iters=100  min=0.150  p50=0.260  p95=0.379  p99=0.425  max=0.443"
+          },
+          {
+            "name": "window_functions",
+            "value": 36.17,
+            "unit": "ms",
+            "extra": "iters=20  min=1.748  p50=1.788  p95=1.898  p99=1.996  max=2.020"
+          },
+          {
+            "name": "distinct",
+            "value": 73.884,
+            "unit": "ms",
+            "extra": "iters=500  min=0.143  p50=0.146  p95=0.157  p99=0.167  max=0.179"
+          },
+          {
+            "name": "subquery",
+            "value": 200.789,
+            "unit": "ms",
+            "extra": "iters=50  min=3.996  p50=4.004  p95=4.070  p99=4.150  max=4.160"
+          },
+          {
+            "name": "cte",
+            "value": 149.787,
+            "unit": "ms",
+            "extra": "iters=200  min=0.722  p50=0.745  p95=0.768  p99=0.832  max=1.015"
+          },
+          {
+            "name": "generate_series",
+            "value": 155.02,
+            "unit": "ms",
+            "extra": "iters=200  min=0.755  p50=0.772  p95=0.797  p99=0.843  max=0.953"
+          },
+          {
+            "name": "scalar_functions",
+            "value": 124.024,
+            "unit": "ms",
+            "extra": "iters=200  min=0.605  p50=0.618  p95=0.640  p99=0.676  max=0.756"
+          },
+          {
+            "name": "expression_agg",
+            "value": 87.466,
+            "unit": "ms",
+            "extra": "iters=500  min=0.169  p50=0.173  p95=0.184  p99=0.202  max=0.266"
+          },
+          {
+            "name": "multi_sort",
+            "value": 84.687,
+            "unit": "ms",
+            "extra": "iters=200  min=0.408  p50=0.421  p95=0.444  p99=0.486  max=0.566"
+          },
+          {
+            "name": "set_ops",
+            "value": 1179.186,
+            "unit": "ms",
+            "extra": "iters=50  min=23.314  p50=23.495  p95=23.795  p99=25.085  max=26.217"
+          },
+          {
+            "name": "multi_join",
+            "value": 756.901,
+            "unit": "ms",
+            "extra": "iters=5  min=145.911  p50=151.314  p95=156.610  p99=156.622  max=156.625"
+          },
+          {
+            "name": "analytical_cte",
+            "value": 16.97,
+            "unit": "ms",
+            "extra": "iters=20  min=0.821  p50=0.834  p95=0.912  p99=0.944  max=0.952"
+          },
+          {
+            "name": "wide_agg",
+            "value": 66.108,
+            "unit": "ms",
+            "extra": "iters=20  min=3.286  p50=3.296  p95=3.335  p99=3.423  max=3.445"
+          },
+          {
+            "name": "large_sort",
+            "value": 235.735,
+            "unit": "ms",
+            "extra": "iters=10  min=19.774  p50=23.703  p95=25.623  p99=25.878  max=25.941"
+          },
+          {
+            "name": "subquery_complex",
+            "value": 2803.36,
+            "unit": "ms",
+            "extra": "iters=20  min=139.039  p50=139.557  p95=143.017  p99=148.234  max=149.538"
+          },
+          {
+            "name": "window_rank",
+            "value": 178.257,
+            "unit": "ms",
+            "extra": "iters=5  min=33.130  p50=34.592  p95=38.509  p99=38.578  max=38.596"
+          },
+          {
+            "name": "mixed_analytical",
+            "value": 4184.127,
+            "unit": "ms",
+            "extra": "iters=5  min=828.207  p50=835.847  p95=848.192  p99=849.601  max=849.953"
+          },
+          {
+            "name": "vector_insert",
+            "value": 14.577,
+            "unit": "ms",
+            "extra": "iters=5000  min=0.003  p50=0.003  p95=0.003  p99=0.005  max=0.025"
+          },
+          {
+            "name": "vector_scan",
+            "value": 39.369,
+            "unit": "ms",
+            "extra": "iters=100  min=0.384  p50=0.393  p95=0.408  p99=0.415  max=0.441"
+          },
+          {
+            "name": "vector_wide",
+            "value": 6.559,
+            "unit": "ms",
+            "extra": "iters=20  min=0.300  p50=0.319  p95=0.367  p99=0.437  max=0.455"
+          },
+          {
+            "name": "vector_filter",
+            "value": 2.545,
+            "unit": "ms",
+            "extra": "iters=50  min=0.048  p50=0.049  p95=0.056  p99=0.081  max=0.103"
           }
         ]
       }
