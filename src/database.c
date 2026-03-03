@@ -3201,6 +3201,7 @@ static int db_exec_create(struct database *db, struct query_create_table *crt,
         da_push(&t.indexes, uq_idx);
     }
     /* If this is a disk-backed table, set up the disk storage */
+#ifndef MSKQL_WASM
     if (crt->is_disk) {
         char *dir = sv_to_cstr(crt->dir_path);
         mkdir(dir, 0755);
@@ -3229,11 +3230,14 @@ static int db_exec_create(struct database *db, struct query_create_table *crt,
         }
         t.disk.cache_valid = 1; /* flat is current (empty but valid) */
     }
+#endif /* MSKQL_WASM */
     da_push(&db->tables, t);
     db->total_generation++;
     /* Persist disk catalog after adding a disk table */
+#ifndef MSKQL_WASM
     if (crt->is_disk && db->catalog_path)
         disk_catalog_save(db->catalog_path, db);
+#endif /* MSKQL_WASM */
     return 0;
 }
 
@@ -3250,6 +3254,7 @@ static int db_exec_drop(struct database *db, struct query_drop_table *dt,
                 snapshot_cow_table(txn->snapshot, db, db->tables.items[i].name);
             was_disk = (db->tables.items[i].kind == TABLE_DISK);
             /* Remove disk files for TABLE_DISK */
+#ifndef MSKQL_WASM
             if (was_disk && db->tables.items[i].disk.dir_path) {
                 char path_buf[1024];
                 disk_path_base(db->tables.items[i].disk.dir_path, path_buf, sizeof(path_buf));
@@ -3261,6 +3266,7 @@ static int db_exec_drop(struct database *db, struct query_drop_table *dt,
                 remove(path_buf);
                 rmdir(db->tables.items[i].disk.dir_path);
             }
+#endif /* MSKQL_WASM */
             table_free(&db->tables.items[i]);
             for (size_t j = i; j + 1 < db->tables.count; j++)
                 db->tables.items[j] = db->tables.items[j + 1];
@@ -3294,8 +3300,10 @@ static int db_exec_drop(struct database *db, struct query_drop_table *dt,
         }
     }
     /* Persist disk catalog after dropping a disk table */
+#ifndef MSKQL_WASM
     if (was_disk && db->catalog_path)
         disk_catalog_save(db->catalog_path, db);
+#endif /* MSKQL_WASM */
     return 0;
 }
 
@@ -4443,6 +4451,7 @@ void db_reset(struct database *db)
     db->catalog_path = NULL;
     int had_disk_tables = 0;
     for (size_t i = 0; i < db->tables.count; i++) {
+#ifndef MSKQL_WASM
         /* Clean up disk files for TABLE_DISK before freeing */
         if (db->tables.items[i].kind == TABLE_DISK &&
             db->tables.items[i].disk.dir_path) {
@@ -4457,6 +4466,7 @@ void db_reset(struct database *db)
             remove(path_buf);
             rmdir(db->tables.items[i].disk.dir_path);
         }
+#endif /* MSKQL_WASM */
         table_free(&db->tables.items[i]);
     }
     da_free(&db->tables);
@@ -4472,8 +4482,10 @@ void db_reset(struct database *db)
     /* Mark catalog stale so the next pg_ query triggers a rebuild */
     db->catalog_generation = UINT64_MAX;
     /* Only persist catalog if there were disk tables to save */
+#ifndef MSKQL_WASM
     if (db->catalog_path && had_disk_tables)
         disk_catalog_save(db->catalog_path, db);
+#endif /* MSKQL_WASM */
 }
 
 int db_needs_compaction(struct database *db)
@@ -4493,6 +4505,7 @@ int db_compact_step(struct database *db)
         if (t->kind != TABLE_DISK || !t->disk.wal_dirty) continue;
 
         /* Ensure cache is loaded before compacting */
+#ifndef MSKQL_WASM
         if (!t->disk.cache_valid) {
             char mskd_path[1024];
             disk_path_base(t->disk.dir_path, mskd_path, sizeof(mskd_path));
@@ -4504,6 +4517,9 @@ int db_compact_step(struct database *db)
         }
 
         if (disk_compact(t->disk.dir_path, &t->flat, &t->disk.meta) == 0) {
+#else
+        if (0) {
+#endif /* MSKQL_WASM */
             t->disk.wal_dirty = 0;
             t->disk.wal_bytes = 0;
         }

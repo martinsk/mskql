@@ -108,7 +108,7 @@ WASM_LDFLAGS = -Wl,--no-entry \
                -Wl,--max-memory=268435456
 WASM_SRCS    = wasm_api.c wasm_libc.c database.c table.c query.c row.c \
                parser.c index.c column.c plan.c catalog.c datetime.c \
-               hnsw.c diskio.c logical.c explain_ast.c
+               hnsw.c logical.c explain_ast.c
 WASM_TARGET  = $(BUILDDIR)/mskql.wasm
 
 wasm: wasm-stubs $(WASM_TARGET)

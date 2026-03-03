@@ -483,6 +483,7 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
      * INSERT/UPDATE/DELETE via table_flat_append_row/update_row/delete_row).
      * For TABLE_DISK: lazy-load from .mskd file on first access. */
     struct table *t = pn->seq_scan.table;
+#ifndef MSKQL_WASM
     if (t->kind == TABLE_DISK && !t->disk.cache_valid) {
         char mskd_path[1024];
         disk_path_base(t->disk.dir_path, mskd_path, sizeof(mskd_path));
@@ -493,6 +494,7 @@ static int seq_scan_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             t->disk.cache_valid = 1;
         }
     }
+#endif /* MSKQL_WASM */
     if (!t->flat.col_data || t->flat.nrows == 0) return -1;
 
     uint16_t n = flat_table_read(&t->flat, &st->cursor, out,

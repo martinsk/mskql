@@ -576,7 +576,9 @@ void table_free(struct table *t)
         break;
     case TABLE_DISK:
         free(t->disk.dir_path);
+#ifndef MSKQL_WASM
         disk_meta_free(&t->disk.meta);
+#endif /* MSKQL_WASM */
         /* flat_table cache is freed above (shared flat field) */
         break;
     }

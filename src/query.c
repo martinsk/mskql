@@ -7293,10 +7293,12 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct que
                 t->rows.items[j] = t->rows.items[j + 1];
             t->rows.count--;
             table_flat_delete_row(t, i);
+#ifndef MSKQL_WASM
             if (t->kind == TABLE_DISK) {
                 int wb = (int)disk_wal_append_delete(t->disk.dir_path, (uint64_t)i);
                 if (wb > 0) { t->disk.wal_bytes += (uint64_t)wb; t->disk.wal_dirty = 1; }
             }
+#endif /* MSKQL_WASM */
             deleted++;
             t->generation++;
             db->total_generation++;
@@ -8236,6 +8238,7 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
     if (rows_added > 0) {
         table_flat_append_rows_bulk(t, &t->rows.items[rows_before], rows_added);
         /* For disk tables, also write to WAL */
+#ifndef MSKQL_WASM
         if (t->kind == TABLE_DISK) {
             int wb = disk_wal_append_insert(t->disk.dir_path,
                                             &t->rows.items[rows_before],
@@ -8246,6 +8249,7 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                 t->disk.wal_dirty = 1;
             }
         }
+#endif /* MSKQL_WASM */
         t->generation++;
         db->total_generation++;
     }
