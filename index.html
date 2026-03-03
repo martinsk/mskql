@@ -271,8 +271,8 @@
 <hr class="title-rule">
 
 <p>
-    mskql is an in-memory SQL database that speaks the PostgreSQL wire protocol.
-    It is fast because it is simple: one <code>.c</code> file per subsystem,
+    An in-memory SQL database that speaks the PostgreSQL wire protocol.
+    Fast because it is simple: one <code>.c</code> file per subsystem,
     six memory regions with explicit ownership, no buffer pool, no WAL, no hidden planner.
     The scan cache converts row-store to flat columnar arrays once per table write;
     subsequent queries read contiguous memory. The result cache serves repeated
@@ -313,8 +313,8 @@
 
 <p>
     93 batch workloads and 15 concurrent throughput workloads, measured on the same
-    machine. mskql is faster than PostgreSQL on every cached batch workload and 13 of 15 throughput tests.
-    Against DuckDB, mskql wins 61 of 93 workloads&mdash;aggregates
+    machine. Faster than PostgreSQL on every cached batch workload and 13 of 15 throughput tests.
+    Against DuckDB, wins 61 of 93 workloads&mdash;aggregates
     8&times;, expression aggregates 10&times;, correlated subqueries 166&times; faster than PG.
     DuckDB wins full scans (4.3&times;) and sorts (4.7&times;).
 </p>
@@ -517,9 +517,9 @@ SELECT name, embed FROM items WHERE id > 1 ORDER BY name;</code></pre>
 
 <p>
     7 vector benchmarks against PostgreSQL&nbsp;+&nbsp;pgvector on the same machine.
-    mskql wins all 7: insert 3&times;, scan 1.8&times;, wide scan 2.7&times;,
+    Wins all 7: insert 3&times;, scan 1.8&times;, wide scan 2.7&times;,
     filter 3.5&times; faster. Even without the result cache (<code>_nc</code> variants),
-    mskql is faster on every vector workload.
+    faster on every vector workload.
 </p>
 
 <p>

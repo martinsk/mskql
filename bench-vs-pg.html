@@ -168,15 +168,15 @@
 
 <p>
     <strong>93 batch workloads. 15 concurrent throughput workloads. Three databases on the same machine.</strong>
-    mskql is faster than PostgreSQL on every cached batch workload and 13 of 15 throughput tests.
-    Against DuckDB, mskql wins 61 of 93 workloads&mdash;aggregates 8&times;, expression aggregates 10&times;,
+    Faster than PostgreSQL on every cached batch workload and 13 of 15 throughput tests.
+    Against DuckDB, wins 61 of 93 workloads&mdash;aggregates 8&times;, expression aggregates 10&times;,
     correlated subqueries 166&times; faster than PG.
     DuckDB wins full scans (4.3&times;) and sorts (4.7&times;).
     PostgreSQL wins mixed read/write (0.94&times;).
 </p>
 
 <p>
-    mskql&rsquo;s advantage on cached analytical workloads traces to three architectural
+    The advantage on cached analytical workloads traces to three architectural
     properties: (1)&nbsp;zero per-query allocation after warmup&mdash;the arena rewinds,
     nothing is freed; (2)&nbsp;the scan cache converts row-store to flat columnar arrays
     once per table write, so repeated reads are a <code>memcpy</code> of contiguous
@@ -192,7 +192,7 @@
 
 <div class="caveat">
     <strong>&#9888; Important caveat.</strong>&ensp;This comparison is <em>unscientific</em>
-    and intended only as a directional indicator. As an in-memory database, mskql has
+    and intended only as a directional indicator. As an in-memory database, this engine has
     no durability, no MVCC, no WAL, no background workers, and no query optimizer.
     By contrast, PostgreSQL is a production-grade RDBMS. DuckDB is a columnar analytical engine with
     SIMD vectorization. The numbers below measure wall-clock time for identical SQL

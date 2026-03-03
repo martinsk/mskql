@@ -39,7 +39,7 @@
 </p>
 
 <p>
-    mskql is a counterexample. It is an in-memory SQL engine with no buffer pool,
+    This engine is a counterexample: an in-memory SQL engine with no buffer pool,
     no WAL, no MVCC, no query planner, and no external dependencies. Every query
     flows through four stages implemented in four files. The full execution path
     from TCP bytes to DataRow bytes is traceable in roughly 500&nbsp;lines across
@@ -62,7 +62,7 @@
 </p>
 
 <p>
-    mskql uses a bump allocator (<code>arena.h</code>) for all per-query scratch
+    The bump allocator (<code>arena.h</code>) handles all per-query scratch
     memory. After the first query warms up the slab chain, subsequent queries
     perform zero <code>malloc</code>/<code>free</code> calls.
     <code>query_arena_reset()</code> rewinds the bump pointer to zero&mdash;no
@@ -87,7 +87,7 @@
 </p>
 
 <p>
-    mskql stores data in a row-oriented format (<code>table.rows</code>) for
+    The engine stores data in a row-oriented format (<code>table.rows</code>) for
     writes, but maintains a columnar scan cache (<code>table.scan_cache</code>)
     for reads. The first scan after a write pays a one-time O(N) conversion cost
     to build flat typed arrays per column. Every subsequent scan reads contiguous
@@ -211,7 +211,7 @@
 </p>
 
 <p>
-    mskql is an existence proof in the other direction. ~45,100 lines of C11.
+    This project is an existence proof in the other direction. ~45,100 lines of C11.
     Zero external dependencies. The entire system fits in a single developer&rsquo;s
     head. It outperforms PostgreSQL on every cached analytical workload and DuckDB
     on 61 of 93 benchmarks. The performance is not the point&mdash;it is evidence
