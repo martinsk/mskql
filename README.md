@@ -1,8 +1,8 @@
 # mskql
 
-A from-scratch, in-memory SQL database written in C. It speaks the PostgreSQL wire protocol — connect with `psql`, any Postgres-compatible driver, or [try it in the browser](https://martinsk.github.io/mskql/playground.html).
+An in-memory SQL engine optimized for analytical workloads. It speaks the PostgreSQL wire protocol — connect with `psql`, any Postgres-compatible driver, or [try it in the browser](https://martinsk.github.io/mskql/playground.html).
 
-This is a hobby project. For documentation, benchmarks, supported SQL, and interactive tutorials, see the **[project website](https://martinsk.github.io/mskql)**.
+For documentation, benchmarks, supported SQL, and interactive tutorials, see the **[project website](https://martinsk.github.io/mskql)**.
 
 ## Quick start
 
@@ -22,4 +22,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for full coding guidelines.
 
 ## License
 
-This project is provided as-is for educational and experimental purposes.
+MIT License. See [LICENSE](LICENSE).
