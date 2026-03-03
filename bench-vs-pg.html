@@ -175,6 +175,17 @@
     PostgreSQL wins mixed read/write (0.94&times;).
 </p>
 
+<p>
+    mskql&rsquo;s advantage on cached analytical workloads traces to three architectural
+    properties: (1)&nbsp;zero per-query allocation after warmup&mdash;the arena rewinds,
+    nothing is freed; (2)&nbsp;the scan cache converts row-store to flat columnar arrays
+    once per table write, so repeated reads are a <code>memcpy</code> of contiguous
+    memory; (3)&nbsp;result bytes accumulate into a 64&nbsp;KB buffer before a single
+    <code>write()</code> syscall&mdash;on a 5,000-row result, 5 syscalls instead of
+    5,000. These are structural properties of the system, not tuning parameters.
+    &#8594;&ensp;<a href="design-philosophy.html">Design philosophy: why abstraction is not free</a>
+</p>
+
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--  WHAT: Setup and framing                                    -->
 <!-- ═══════════════════════════════════════════════════════════ -->

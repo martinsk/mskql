@@ -15,14 +15,30 @@
 <p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
 
 <h1>Architecture</h1>
-<span class="subtitle">Four-stage pipeline from wire to storage</span>
+<span class="subtitle">Simple by design. Fast because of it.</span>
 <hr class="title-rule">
 
 <p>
-    <strong>~45.1K lines of C. Zero dependencies. Four stages: wire protocol, parser,
-    executor, storage.</strong> Every query flows through the same pipeline.
-    The block-oriented plan executor processes 1,024-row column blocks for
-    cache-friendly, vectorized execution.
+    Most database engines accumulate abstraction layers over decades: a buffer pool to manage
+    disk pages, a WAL for durability, an MVCC layer for concurrent isolation, a query
+    planner that rewrites your joins. Each layer adds correctness surface area and
+    runtime overhead. mskql has none of these layers&mdash;not as a shortcut, but as a
+    deliberate constraint.
+</p>
+
+<p>
+    The result: zero steady-state <code>malloc</code>/<code>free</code> calls per query,
+    a scan path whose working set fits in L1 cache, a call stack shallow enough to hold
+    in your head, and benchmarks that outperform PostgreSQL on every cached workload
+    and DuckDB on 61 of 93. <strong>~45.1K lines of C. Zero external dependencies.
+    Four stages: wire protocol, parser, executor, storage.</strong>
+</p>
+
+<p>
+    When a query fails, the stack trace bottoms out at code you can read.
+    There is no planner that rewrote your join. There is no buffer pool eviction
+    racing your scan. The debuggability is a direct consequence of the same
+    design decisions that make it fast.
 </p>
 
 <h2 id="pipeline">The pipeline</h2>
@@ -331,32 +347,66 @@
     and subqueries.
 </p>
 
-<h2 id="so-what">Why this design</h2>
+<h2 id="so-what">Performance: architecture as cause</h2>
 
 <p>
-    <strong>Fast.</strong> The block-oriented executor with columnar scan caching
-    is faster than PostgreSQL on every cached batch benchmark and DuckDB on
-    61 of 93 workloads. Aggregate queries run 8&ndash;10&times; faster than both.
-    Direct columnar-to-wire serialization avoids row materialization entirely.
-    The throughput benchmark sustains 94,525&nbsp;QPS on analytical
-    workloads&mdash;190&times; PostgreSQL.
+    The benchmark numbers are a consequence of the architecture, not a separate
+    optimization effort. Each structural decision eliminates a specific overhead:
 </p>
+
+<ul>
+    <li><strong>Zero steady-state allocation.</strong>
+        After warmup, zero <code>malloc</code>/<code>free</code> calls per query.
+        The bump allocator rewinds to zero on each reset&mdash;no free, no fragmentation,
+        no allocator lock contention. Result: aggregate queries run 8&ndash;10&times; faster
+        than PostgreSQL and DuckDB.
+    </li>
+    <li><strong>Scan cache = one conversion, many reads.</strong>
+        The row store converts to flat typed columnar arrays once per table write.
+        All subsequent scans read 32&nbsp;KB of contiguous memory instead of chasing
+        5,000 individually-allocated cell pointers. Result: full-scan 32% faster than
+        PostgreSQL.
+    </li>
+    <li><strong>1,024-row blocks fit L1 cache.</strong>
+        A 4-column INT block = 16&nbsp;KB. L1 on a modern CPU is 32&ndash;48&nbsp;KB.
+        The entire filter or aggregate pass fits in L1. Result: no cache misses
+        in the inner loop.
+    </li>
+    <li><strong>Batched wire send.</strong>
+        DataRow messages accumulate into a 64&nbsp;KB buffer, then flush with one
+        <code>write()</code>. For a 5,000-row result: 5 syscalls instead of 5,000.
+        This alone closed the full-scan gap with PostgreSQL.
+    </li>
+    <li><strong>Result cache.</strong>
+        Repeated identical SELECTs skip parsing, planning, and execution entirely.
+        The analytical CTE throughput workload runs at 94,525&nbsp;QPS&mdash;
+        190&times; PostgreSQL&mdash;because results are served from cached wire bytes
+        in microseconds.
+    </li>
+</ul>
+
 <p>
-    <strong>Simple.</strong> Zero external dependencies. One <code>.c</code> file per
-    stage. The entire codebase fits in a single developer&rsquo;s head.
-    Six memory regions, each with clear ownership and lifetime rules.
+    &#8594;&ensp;<a href="bench-vs-pg.html">Full benchmark results</a>
+    &ensp;&middot;&ensp;
+    <a href="design-philosophy.html">Design philosophy: why abstraction is not free</a>
 </p>
+
+<h2 id="safety">Safety by construction</h2>
+
 <p>
-    <strong>Safe.</strong> Every test runs under AddressSanitizer. Arena allocation
-    and index-based references eliminate use-after-free and leak classes by
-    construction. The bump slab chain&rsquo;s append-only growth means pointers
-    never dangle within a query&rsquo;s lifetime.
+    Every test runs under AddressSanitizer. Arena allocation and index-based references
+    eliminate use-after-free and leak classes by construction. The bump slab chain&rsquo;s
+    append-only growth means pointers never dangle within a query&rsquo;s lifetime.
+    The <code>-Wswitch-enum</code> flag plus the no-<code>default:</code> rule means
+    adding a new enum variant produces a compile error at every unhandled dispatch
+    site&mdash;not a silent runtime skip.
 </p>
 
 <h2 id="now-what">Explore further</h2>
 
 <p>
     <a href="bench-vs-pg.html">Benchmarks</a> &ensp;&middot;&ensp;
+    <a href="design-philosophy.html">Design philosophy</a> &ensp;&middot;&ensp;
     <a href="bench-workloads.html">Benchmark workload details</a> &ensp;&middot;&ensp;
     <a href="grammar.html">SQL grammar</a> &ensp;&middot;&ensp;
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a> &ensp;&middot;&ensp;

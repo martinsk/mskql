@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>mskql &mdash; How This Project Was Built</title>
+    <title>mskql &mdash; Construction methodology</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
@@ -14,15 +14,17 @@
 <p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
 
 <h1>Construction</h1>
-<span class="subtitle">Adversarial AI collaboration &mdash; zero human code</span>
+<span class="subtitle">Adversarial correctness testing at scale</span>
 <hr class="title-rule">
 
 <p>
-    <strong>~45.1K lines of C. 1,375+ tests. Zero human code.</strong>
-    Three AI agents&mdash;Challenger, Writer, Reviewer&mdash;collaborated in
-    adversarial rounds until every test passed under AddressSanitizer.
-    The result beats PostgreSQL on every cached batch benchmark and
-    DuckDB on 61 of 93 workloads.
+    <strong>1,375+ SQL test cases. Every one runs under AddressSanitizer.
+    Every one must produce bit-identical output to PostgreSQL.</strong>
+    This was not QA after the fact&mdash;it was the development methodology.
+    Three agents worked in adversarial rounds: one writing tests designed to
+    break the system, one reviewing code for structural problems, one fixing
+    failures. The result: ~45.1K lines of C that beats PostgreSQL on every
+    cached batch benchmark and DuckDB on 61 of 93 workloads.
 </p>
 
 <div class="diagram">
@@ -69,19 +71,19 @@
   <!-- Result box -->
   <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
   <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">1,375+ tests pass</text>
-  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~45,100 lines of C &middot; zero human code</text>
+  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~45,100 lines of C &middot; 1,375+ tests &middot; all under AddressSanitizer</text>
 </svg>
 </div>
 
 <p>
-    The three agents worked in iterative rounds. The Challenger would study the current
-    codebase and produce <code>.sql</code> test files exercising corner
-    cases&mdash;empty tables, NULL handling, multi-column ordering, stale index entries
-    after deletes, and more. The Reviewer would read the source and annotate it with
-    actionable comments flagging code-quality issues, missing edge-case handling,
-    and architectural improvements. The Writer would then run the new tests, address the
-    comments, diagnose failures, and ship fixes. This continued until the full suite passed
-    cleanly.
+    The three agents worked in iterative rounds. The Challenger studied the current
+    codebase and produced <code>.sql</code> test files targeting adversarial inputs:
+    empty tables, NULL propagation through expressions, multi-column ordering with
+    mixed ASC/DESC, stale index entries after deletes, and type-cast edge cases.
+    The Reviewer read the source and annotated it with actionable comments: missing
+    error paths, redundant allocations, architectural improvements. The Writer ran the
+    full suite under ASAN, diagnosed failures, and shipped fixes. This continued until
+    every test passed with zero memory errors.
 </p>
 
 <h2 id="agents">The three agents</h2>
@@ -127,17 +129,13 @@
     <li>Repeat until all tests pass under ASAN with zero leaks.</li>
 </ol>
 
-<h2 id="result">What came out</h2>
+<h2 id="result">What the process produced</h2>
 
 <p>
-    The result: a recursive-descent parser, block-oriented columnar executor,
-    arena-based memory management with bump allocation, a result cache for
-    repeat queries, and a PostgreSQL-compatible wire protocol&mdash;all
-    without a single line of human-written C.
-</p>
-
-<p>
-    Key architectural decisions that emerged from this process:
+    The adversarial loop forced correctness properties that would be hard to
+    specify upfront. Each round of tests exposed assumptions the code had
+    silently made. The architectural decisions that emerged are direct
+    responses to what broke:
 </p>
 
 <ul>
@@ -151,12 +149,16 @@
         materialisation, batching DataRow messages into 64KB writes.</li>
     <li><strong>Native ordinal ENUMs</strong> &mdash; stored as <code>int32_t</code>
         internally, converted at I/O boundaries only.</li>
+    <li><strong>Exhaustive dispatch</strong> &mdash; <code>switch</code> on every
+        tagged union with <code>-Wswitch-enum</code> and no <code>default:</code>.
+        Adding a new type variant produces a compile error at every unhandled site.</li>
 </ul>
 
 <h2 id="now-what">Explore further</h2>
 
 <p>
     <a href="architecture.html">Architecture</a> &ensp;&middot;&ensp;
+    <a href="design-philosophy.html">Design philosophy</a> &ensp;&middot;&ensp;
     <a href="bench-vs-pg.html">Benchmarks</a> &ensp;&middot;&ensp;
     <a href="testing.html">Testing methodology</a> &ensp;&middot;&ensp;
     <a href="playground.html">Try it in the browser</a>

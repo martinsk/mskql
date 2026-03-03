@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Design philosophy</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
+
+<h1>Design philosophy</h1>
+<span class="subtitle">Why abstraction is not free</span>
+<hr class="title-rule">
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  WHAT                                                       -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<p>
+    The modern programming landscape has moved steadily toward more abstraction.
+    ORMs wrap SQL. Query builders wrap ORMs. Connection pools wrap drivers.
+    Frameworks wrap frameworks. At the database layer: buffer pools manage page
+    files, WAL layers serialize writes, MVCC layers version every row, query
+    planners rewrite your joins before executing them.
+</p>
+
+<p>
+    Each layer is individually justifiable. Together, they make it difficult to
+    answer a simple question: <em>why is this query slow?</em> The answer
+    might be in the ORM, the connection pool, the query planner, the buffer
+    pool, the WAL checkpoint, or the MVCC vacuum process. The stack is too
+    deep to hold in your head.
+</p>
+
+<p>
+    mskql is a counterexample. It is an in-memory SQL engine with no buffer pool,
+    no WAL, no MVCC, no query planner, and no external dependencies. Every query
+    flows through four stages implemented in four files. The full execution path
+    from TCP bytes to DataRow bytes is traceable in roughly 500&nbsp;lines across
+    three files. When something is slow, the answer is in the code.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  SO WHAT: The four decisions with numbers                   -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>So what: four decisions, four measured outcomes</h2>
+
+<h3>1. No allocator in the hot path</h3>
+
+<p>
+    Most database engines call <code>malloc</code>/<code>free</code> per query,
+    per row, or per expression evaluation. Each call acquires a lock, searches a
+    free list, and potentially triggers a system call. Under concurrent load, the
+    allocator becomes a bottleneck.
+</p>
+
+<p>
+    mskql uses a bump allocator (<code>arena.h</code>) for all per-query scratch
+    memory. After the first query warms up the slab chain, subsequent queries
+    perform zero <code>malloc</code>/<code>free</code> calls.
+    <code>query_arena_reset()</code> rewinds the bump pointer to zero&mdash;no
+    free, no lock, no fragmentation. Hash tables for joins and aggregation, sort
+    index arrays, and plan nodes are all bump-allocated from
+    <code>arena.scratch</code>.
+</p>
+
+<p>
+    <strong>Measured result:</strong> aggregate queries run 8&ndash;10&times; faster
+    than PostgreSQL and DuckDB. The gap is not algorithmic&mdash;the same GROUP BY
+    algorithm runs in both. The gap is allocator overhead.
+</p>
+
+<h3>2. One data layout, not two</h3>
+
+<p>
+    PostgreSQL stores rows as heap tuples: variable-length byte sequences with
+    attribute offsets. Reading a single column from 5,000 rows means jumping to
+    5,000 non-contiguous memory locations. Modern CPUs prefetch ahead, but only
+    if access is sequential. Random pointer chasing defeats prefetching.
+</p>
+
+<p>
+    mskql stores data in a row-oriented format (<code>table.rows</code>) for
+    writes, but maintains a columnar scan cache (<code>table.scan_cache</code>)
+    for reads. The first scan after a write pays a one-time O(N) conversion cost
+    to build flat typed arrays per column. Every subsequent scan reads contiguous
+    memory. For a 5,000-row, 3-column table: 32&nbsp;KB of sequential reads
+    instead of 5,000 pointer dereferences.
+</p>
+
+<p>
+    <strong>Measured result:</strong> full-scan 32% faster than PostgreSQL.
+    Parquet aggregate queries 2.8&times; faster than DuckDB on cached workloads,
+    because the result cache serves them without touching Parquet at all.
+</p>
+
+<h3>3. Block size matched to cache size</h3>
+
+<p>
+    The plan executor processes data in 1,024-row <code>col_block</code> chunks
+    (<code>block.h</code>). A 4-column INT block occupies
+    4&nbsp;&times;&nbsp;1,024&nbsp;&times;&nbsp;4&nbsp;=&nbsp;16&nbsp;KB.
+    L1 data cache on a modern CPU is 32&ndash;48&nbsp;KB. The entire working set
+    for a filter pass or aggregate accumulation fits in L1.
+</p>
+
+<p>
+    This is not a coincidence. 1,024 rows was chosen so that common analytical
+    workloads (4&ndash;8 INT columns) fit in L1. The filter inner loop runs
+    entirely from registers and L1&mdash;no cache misses during the hot path.
+</p>
+
+<p>
+    <strong>Measured result:</strong> correlated subquery 22ms vs PostgreSQL
+    3,665ms (166&times;). The subquery executes once per outer row; with L1
+    residency, each inner scan is effectively free.
+</p>
+
+<h3>4. One syscall per 64&nbsp;KB, not one per row</h3>
+
+<p>
+    A naive wire protocol implementation calls <code>write()</code> once per
+    result row. For a 5,000-row result, that is 5,000 system calls&mdash;each
+    crossing the kernel boundary, flushing registers, and returning. This was
+    the original bottleneck for ORDER BY workloads (4.65&times; slower than
+    PostgreSQL).
+</p>
+
+<p>
+    <code>try_plan_send()</code> in <code>pgwire.c</code> serializes
+    <code>col_block</code> arrays directly into a 64&nbsp;KB wire buffer, then
+    flushes with a single <code>write()</code>. For a 5,000-row result:
+    5&nbsp;syscalls instead of 5,000. The columnar data flows from scan cache
+    straight to the TCP socket with no row materialization in between.
+</p>
+
+<p>
+    <strong>Measured result:</strong> ORDER BY workload went from 4.65&times;
+    slower to 1.18&times; PostgreSQL after this change alone. Mixed analytical
+    throughput reaches 94,525&nbsp;QPS&mdash;190&times; PostgreSQL&mdash;because
+    the result cache serves subsequent identical queries as a single
+    <code>send_all()</code> of cached bytes.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  NOW WHAT                                                   -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>Now what: what this means for the codebase</h2>
+
+<p>
+    A system with fewer abstractions is not just faster&mdash;it is easier to
+    debug. The call stack for a failing query bottoms out at a function you
+    can read in full in a few minutes. There is no query planner that rewrote
+    your join. There is no buffer pool eviction racing your scan. There is no
+    MVCC garbage collection running concurrently with your transaction.
+</p>
+
+<p>
+    This has practical consequences for the code itself:
+</p>
+
+<ul>
+    <li><strong>One <code>.c</code> file per subsystem.</strong>
+        <code>pgwire.c</code> owns the wire protocol.
+        <code>parser.c</code> owns the SQL parser.
+        <code>plan.c</code> owns the block executor.
+        No function in <code>parser.c</code> calls anything in <code>plan.c</code>.
+        The dependency graph is a DAG with no cycles.
+    </li>
+    <li><strong>Exhaustive dispatch, no defaults.</strong>
+        Every <code>switch</code> on an enum covers every variant explicitly.
+        <code>-Wswitch-enum</code> is always on. <code>default:</code> is
+        forbidden on finite enums. Adding a new plan node type or column type
+        produces a compile error at every unhandled dispatch site&mdash;not a
+        silent runtime skip.
+    </li>
+    <li><strong>JPL-style ownership.</strong>
+        The module that allocates, frees. The arena owns all parser output.
+        Each table owns its rows and scan cache. No function ever frees memory
+        it did not allocate. This eliminates the class of use-after-free bugs
+        that come from shared ownership.
+    </li>
+    <li><strong>Correct or error, never silent wrong.</strong>
+        A query either returns correct results or returns a clear error
+        (<code>arena_set_error</code> with an appropriate SQLSTATE). Partial
+        output, silent empty results for queries that should match, and wrong
+        answers are all bugs with the same priority as crashes.
+    </li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  WHY NOW                                                    -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2>Why now</h2>
+
+<p>
+    The abstraction problem is getting worse, not better. Each generation of
+    tooling adds a new layer: the database driver, the ORM, the query builder,
+    the API client, the caching layer. At the database layer, production systems
+    now run planners that generate machine-readable hints that feed back into
+    planners. The stack is no longer navigable by a single engineer.
+</p>
+
+<p>
+    mskql is an existence proof in the other direction. ~45,100 lines of C11.
+    Zero external dependencies. The entire system fits in a single developer&rsquo;s
+    head. It outperforms PostgreSQL on every cached analytical workload and DuckDB
+    on 61 of 93 benchmarks. The performance is not the point&mdash;it is evidence
+    that the design works.
+</p>
+
+<p>
+    The full execution path from TCP bytes to DataRow bytes is traceable in
+    roughly 500&nbsp;lines across <code>pgwire.c</code>, <code>plan.c</code>,
+    and <code>table.c</code>. When a query fails, the answer is in those files.
+    That is the point.
+</p>
+
+<h2>Explore further</h2>
+
+<p>
+    <a href="architecture.html">Architecture</a> &ensp;&middot;&ensp;
+    <a href="bench-vs-pg.html">Benchmarks</a> &ensp;&middot;&ensp;
+    <a href="construction.html">Construction methodology</a> &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a> &ensp;&middot;&ensp;
+    <a href="playground.html">Try it in the browser</a>
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Documentation</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

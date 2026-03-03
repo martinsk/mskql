@@ -260,7 +260,7 @@
 <!-- ═══════════════════════════════════════════════════════════ -->
 
 <h1>mskql</h1>
-<span class="subtitle">An in-memory SQL engine written in C&mdash;faster than PostgreSQL and DuckDB on 61 of 93 benchmarks, built entirely by&nbsp;AI</span>
+<span class="subtitle">An analytics SQL engine in C. Faster than PostgreSQL on every cached batch workload. Faster than DuckDB on 61&nbsp;of&nbsp;93. ~45K lines. Zero dependencies.</span>
 <p class="byline">
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
@@ -271,11 +271,14 @@
 <hr class="title-rule">
 
 <p>
-    This project distills the core ideas of a database engine&mdash;wire protocol, parser,
-    query executor, storage&mdash;into ~45,100 lines of C with zero external
-    dependencies. One <code>.c</code> file per subsystem. Three AI agents built it
-    in iterative rounds: no human wrote any C code or SQL test. 1,375+ test cases,
-    every one memory-checked. Query Parquet files with standard SQL.
+    mskql is an in-memory SQL database that speaks the PostgreSQL wire protocol.
+    It is fast because it is simple: one <code>.c</code> file per subsystem,
+    six memory regions with explicit ownership, no buffer pool, no WAL, no hidden planner.
+    The scan cache converts row-store to flat columnar arrays once per table write;
+    subsequent queries read contiguous memory. The result cache serves repeated
+    queries in microseconds. The wire path serializes columnar blocks directly
+    to TCP&mdash;no row materialization. These are not optimizations layered
+    on top of a complex system. They are what happens when you remove the complexity.
     Connect with <code>psql</code> on port&nbsp;5433
     or <a href="#try-it">try it in the browser</a> via WebAssembly.
 </p>
@@ -285,15 +288,16 @@
 <!-- ═══════════════════════════════════════════════════════════ -->
 
 <nav class="toc-strip">
-<a href="#wire-compat">Wire protocol</a>
 <a href="#performance">Performance</a>
+<a href="#wire-compat">Wire protocol</a>
 <a href="#parquet">Parquet</a>
 <a href="#vectors">Vectors</a>
-<a href="#ai-built">AI-built</a>
 <a href="#try-it">Playground</a>
+<a href="#construction">Construction</a>
 <span class="toc-sep"></span>
 <a href="getting-started.html">Getting Started</a>
 <a href="architecture.html">Architecture</a>
+<a href="design-philosophy.html">Design</a>
 <a href="sql-reference.html">SQL Reference</a>
 <a href="bench-vs-pg.html">Benchmarks</a>
 <a href="testing.html">Testing</a>
@@ -302,20 +306,8 @@
 </nav>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
-<!--  SO WHAT: Three proof points                                -->
+<!--  WHAT: Performance first                                    -->
 <!-- ═══════════════════════════════════════════════════════════ -->
-
-<h2 id="wire-compat">PostgreSQL wire-protocol compatible</h2>
-
-<p>
-    The server implements PostgreSQL wire protocol&nbsp;v3: Simple Query,
-    Extended Query (prepared statements, <code>$1</code>/<code>$2</code> parameters),
-    and COPY. Connect with <code>psql</code>, pgAdmin, DBeaver, or any language driver.
-    Default port&nbsp;5433.
-</p>
-
-<pre><code class="language-bash">make && ./build/mskql                         # build & start
-psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 
 <h2 id="performance">Performance: mskql vs PostgreSQL vs DuckDB</h2>
 
@@ -325,6 +317,13 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
     Against DuckDB, mskql wins 61 of 93 workloads&mdash;aggregates
     8&times;, expression aggregates 10&times;, correlated subqueries 166&times; faster than PG.
     DuckDB wins full scans (4.3&times;) and sorts (4.7&times;).
+</p>
+
+<p>
+    The performance advantage traces to three structural facts:
+    zero per-query allocation after warmup,
+    a scan cache that converts row-store to flat columnar arrays once per table write,
+    and a wire path that batches 64&nbsp;KB before a single <code>write()</code> syscall.
 </p>
 
 <h3>Batch latency <span style="font-weight:400; font-size:0.85em; color:var(--fg-dim)">&mdash; shorter bars = faster</span></h3>
@@ -444,6 +443,22 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
+<!--  Wire protocol compatibility                                -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<h2 id="wire-compat">PostgreSQL wire-protocol compatible</h2>
+
+<p>
+    The server implements PostgreSQL wire protocol&nbsp;v3: Simple Query,
+    Extended Query (prepared statements, <code>$1</code>/<code>$2</code> parameters),
+    and COPY. Connect with <code>psql</code>, pgAdmin, DBeaver, or any language driver.
+    Default port&nbsp;5433.
+</p>
+
+<pre><code class="language-bash">make && ./build/mskql                         # build & start
+psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
 <!--  Parquet foreign tables                                     -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
@@ -511,15 +526,17 @@ SELECT name, embed FROM items WHERE id > 1 ORDER BY name;</code></pre>
     &#8594;&ensp;<a href="bench-vs-pg.html#vector"><strong>All 7 vector benchmark results</strong></a>
 </p>
 
-<h2 id="ai-built">Built entirely by AI agents</h2>
+<h2 id="construction">Construction methodology</h2>
 
 <div class="ai-split" style="display:flex; gap:2rem; align-items:flex-start; margin:1rem 0 1.4rem 0;">
 <div style="flex:1 1 50%; min-width:0;">
 <p style="margin-bottom:0.8rem;">
-    Three agents in iterative rounds. <strong>Challenger</strong> writes adversarial
-    SQL tests. <strong>Reviewer</strong> flags code-quality issues.
-    <strong>Writer</strong> fixes until all 1,375+ tests pass.
-    No human wrote any C code or SQL test cases.
+    1,375+ SQL test cases. Every one runs under AddressSanitizer and must produce
+    bit-identical output to PostgreSQL. Three agents worked in adversarial rounds:
+    <strong>Challenger</strong> writes tests designed to break the system,
+    <strong>Reviewer</strong> flags structural code issues,
+    <strong>Writer</strong> fixes until the full suite passes.
+    The adversarial model enforces correctness the same way rigorous code review does.
 </p>
 <p style="margin-bottom:0;">
     &#8594;&ensp;<a href="construction.html"><strong>Read more about the process</strong></a>
@@ -639,6 +656,9 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
 <p>
     <a href="architecture.html"><strong>Architecture</strong></a>&ensp;&mdash;&ensp;wire
     protocol, parser, vectorized executor, storage. One <code>.c</code> file per subsystem.
+    <br>
+    <a href="design-philosophy.html"><strong>Design philosophy</strong></a>&ensp;&mdash;&ensp;why
+    minimal abstraction leads to faster, more debuggable systems.
     <br>
     <a href="sql-reference.html"><strong>SQL reference</strong></a>&ensp;&mdash;&ensp;DDL,
     DML, joins, aggregation, window functions, CTEs, subqueries, 30+ built-in functions.
