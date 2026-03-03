@@ -139,6 +139,18 @@ double exp(double x);
 double sin(double x);
 double cos(double x);
 float  fabsf(float x);
+static inline float strtof(const char *s, char **e) { return (float)strtod(s, e); }
+static inline float sqrtf(float x) { return (float)sqrt((double)x); }
+static inline float logf(float x)  { return (float)log((double)x); }
+#ifndef FLT_MAX
+#define FLT_MAX 3.40282347e+38f
+#endif
+
+/* ── POSIX stubs (no-op in WASM) ─────────────────────────────────── */
+static inline int mkdir(const char *p, unsigned m) { (void)p; (void)m; return -1; }
+static inline int remove(const char *p) { (void)p; return -1; }
+static inline int rmdir(const char *p)  { (void)p; return -1; }
+static inline int rename(const char *o, const char *n) { (void)o; (void)n; return -1; }
 
 /* ── time ───────────────────────────────────────────────────────── */
 typedef long long time_t;

@@ -107,16 +107,18 @@ WASM_LDFLAGS = -Wl,--no-entry \
                -Wl,--initial-memory=16777216 \
                -Wl,--max-memory=268435456
 WASM_SRCS    = wasm_api.c wasm_libc.c database.c table.c query.c row.c \
-               parser.c index.c column.c plan.c catalog.c datetime.c
+               parser.c index.c column.c plan.c catalog.c datetime.c \
+               hnsw.c diskio.c logical.c explain_ast.c
 WASM_TARGET  = $(BUILDDIR)/mskql.wasm
 
 wasm: wasm-stubs $(WASM_TARGET)
 
 wasm-stubs: | $(BUILDDIR)
-	@mkdir -p $(WASM_INCDIR)
-	@for h in stdio.h stdlib.h string.h strings.h stddef.h stdint.h stdbool.h stdarg.h ctype.h math.h time.h signal.h; do \
+	@mkdir -p $(WASM_INCDIR) $(WASM_INCDIR)/sys
+	@for h in stdio.h stdlib.h string.h strings.h stddef.h stdint.h stdbool.h stdarg.h ctype.h math.h time.h signal.h float.h unistd.h; do \
 		echo '/* stub */' > $(WASM_INCDIR)/$$h; \
 	done
+	@echo '/* stub */' > $(WASM_INCDIR)/sys/stat.h
 
 $(WASM_TARGET): $(WASM_SRCS) | $(BUILDDIR)
 	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $(WASM_SRCS)

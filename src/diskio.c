@@ -1,3 +1,4 @@
+#ifndef MSKQL_WASM
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -978,3 +979,5 @@ fail:
     fclose(f);
     return -1;
 }
+
+#endif /* MSKQL_WASM */
