@@ -925,8 +925,7 @@ int disk_catalog_load(const char *catalog_path, struct database *db)
 
         /* Build table */
         struct table t;
-        table_init_own(&t, name);
-        free(name);
+        table_init_own(&t, name); /* table owns name now — do not free */
 
         for (uint16_t c = 0; c < ncols; c++) {
             uint8_t type_byte;

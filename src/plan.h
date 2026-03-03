@@ -297,9 +297,7 @@ struct filter_state {
 };
 
 struct parquet_scan_state {
-    void *reader;         /* carquet_reader_t* — opaque to avoid header dep */
-    void *batch_reader;   /* carquet_batch_reader_t* */
-    int   done;
+    int    done;
     /* cache-read state */
     size_t cache_cursor;  /* next row in pq_cache */
     int    using_cache;   /* 1 = serving from pq_cache */

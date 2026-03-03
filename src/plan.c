@@ -6,7 +6,7 @@
 #include "vector.h"
 #ifndef MSKQL_WASM
 #include "parquet.h"
-#include <carquet/carquet.h>
+#include "pq_reader.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -7901,32 +7901,12 @@ static int pq_cache_build(struct table *tbl)
     if (tbl->kind != TABLE_PARQUET) return -1;
     const char *path = tbl->parquet.path;
 
-    carquet_error_t err = CARQUET_ERROR_INIT;
-    carquet_reader_options_t opts;
-    carquet_reader_options_init(&opts);
-    opts.use_mmap = true;
-    opts.verify_checksums = false;
-
-    carquet_reader_t *reader = carquet_reader_open(path, &opts, &err);
+    pq_reader_t *reader = pq_open(path);
     if (!reader) return -1;
 
-    /* Resolve physical types once for FLOAT/NUMERIC distinction */
-    const carquet_schema_t *schema = carquet_reader_schema(reader);
-    int32_t num_elements = carquet_schema_num_elements(schema);
     uint16_t ncols = (uint16_t)tbl->columns.count;
-
-    carquet_physical_type_t *phys_types = (carquet_physical_type_t *)calloc(ncols, sizeof(carquet_physical_type_t));
-    {
-        int leaf = 0;
-        for (int32_t ei = 0; ei < num_elements && leaf < (int)ncols; ei++) {
-            const carquet_schema_node_t *node = carquet_schema_get_element(schema, ei);
-            if (!node || !carquet_schema_node_is_leaf(node)) continue;
-            phys_types[leaf] = carquet_schema_node_physical_type(node);
-            leaf++;
-        }
-    }
-
-    int64_t total_rows = carquet_reader_num_rows(reader);
+    int64_t total_rows = pq_num_rows(reader);
+    int32_t num_row_groups = pq_num_row_groups(reader);
 
     /* Allocate flat arrays */
     pc->ncols = ncols;
@@ -7945,30 +7925,20 @@ static int pq_cache_build(struct table *tbl)
         pc->col_nulls[c] = (uint8_t *)calloc(alloc_rows, 1);
     }
 
-    /* Read all batches with large batch size */
-    carquet_batch_reader_config_t cfg;
-    carquet_batch_reader_config_init(&cfg);
-    cfg.batch_size = 65536;
-
-    carquet_batch_reader_t *br = carquet_batch_reader_create(reader, &cfg, &err);
-    if (!br) {
-        free(phys_types);
-        carquet_reader_close(reader);
-        /* Clean up partially allocated cache */
-        for (uint16_t c = 0; c < ncols; c++) {
-            free(pc->col_data[c]);
-            free(pc->col_nulls[c]);
-        }
-        free(pc->col_data); free(pc->col_nulls); free(pc->col_types);
-        free(pc->col_str_lens);
-        memset(pc, 0, sizeof(*pc));
-        return -1;
+    /* Allocate per-column decode buffer (one row group at a time) */
+    struct pq_column *rg_cols = (struct pq_column *)calloc(ncols, sizeof(struct pq_column));
+    if (!rg_cols) {
+        pq_close(reader);
+        for (uint16_t c = 0; c < ncols; c++) { free(pc->col_data[c]); free(pc->col_nulls[c]); }
+        free(pc->col_data); free(pc->col_nulls); free(pc->col_types); free(pc->col_str_lens);
+        memset(pc, 0, sizeof(*pc)); return -1;
     }
 
-    carquet_row_batch_t *batch = NULL;
-    while (carquet_batch_reader_next(br, &batch) == CARQUET_OK && batch) {
-        int64_t batch_rows = carquet_row_batch_num_rows(batch);
-        if (batch_rows <= 0) { carquet_row_batch_free(batch); batch = NULL; continue; }
+    for (int32_t rg = 0; rg < num_row_groups; rg++) {
+        if (pq_read_row_group(reader, rg, rg_cols) < 0) continue;
+
+        int64_t batch_rows = rg_cols[0].nrows;
+        if (batch_rows <= 0) goto free_rg;
 
         size_t base = pc->nrows;
 
@@ -7983,156 +7953,92 @@ static int pq_cache_build(struct table *tbl)
         }
 
         for (uint16_t c = 0; c < ncols; c++) {
-            const void *data = NULL;
-            const uint8_t *null_bitmap = NULL;
-            int64_t num_values = 0;
-            (void)carquet_row_batch_column(batch, c, &data, &null_bitmap, &num_values);
-
             enum column_type ct = pc->col_types[c];
             uint8_t *dst_nulls = pc->col_nulls[c] + base;
             size_t br_count = (size_t)batch_rows;
 
-            /* Expand null bitmap: Carquet bit-packed → per-byte */
-            memset(dst_nulls, 0, br_count);
-            int has_nulls = 0;
-            if (null_bitmap) {
-                for (size_t r = 0; r < br_count; r++) {
-                    if (null_bitmap[r / 8] & (1 << (r % 8))) {
-                        dst_nulls[r] = 1;
-                        has_nulls = 1;
-                    }
-                }
+            /* nulls array from pq_reader is already per-byte (1=null, 0=valid) */
+            if (rg_cols[c].nulls) {
+                memcpy(dst_nulls, rg_cols[c].nulls, br_count);
+            } else {
+                memset(dst_nulls, 0, br_count);
             }
 
-            if (!data) continue;
+            if (!rg_cols[c].data) continue;
 
-            /* Copy data with null-compaction expansion and type conversion */
+            /* Copy data — already null-expanded (values at all row positions) */
             switch (ct) {
             case COLUMN_TYPE_BOOLEAN: {
                 int32_t *dst = (int32_t *)pc->col_data[c] + base;
-                const uint8_t *src = (const uint8_t *)data;
-                size_t di = 0;
-                for (size_t r = 0; r < br_count; r++) {
-                    if (dst_nulls[r]) continue;
-                    dst[r] = src[di++] ? 1 : 0;
-                }
+                const uint8_t *src = (const uint8_t *)rg_cols[c].data;
+                for (size_t r = 0; r < br_count; r++)
+                    dst[r] = dst_nulls[r] ? 0 : (src[r] ? 1 : 0);
                 break;
             }
             case COLUMN_TYPE_INT:
             case COLUMN_TYPE_SMALLINT:
             case COLUMN_TYPE_ENUM: {
                 int32_t *dst = (int32_t *)pc->col_data[c] + base;
-                const int32_t *src = (const int32_t *)data;
-                if (!has_nulls) {
-                    memcpy(dst, src, br_count * sizeof(int32_t));
-                } else {
-                    size_t di = 0;
-                    for (size_t r = 0; r < br_count; r++) {
-                        if (dst_nulls[r]) continue;
-                        dst[r] = src[di++];
-                    }
-                }
+                const int32_t *src = (const int32_t *)rg_cols[c].data;
+                memcpy(dst, src, br_count * sizeof(int32_t));
                 break;
             }
             case COLUMN_TYPE_BIGINT: {
                 int64_t *dst = (int64_t *)pc->col_data[c] + base;
-                const int64_t *src = (const int64_t *)data;
-                if (!has_nulls) {
-                    memcpy(dst, src, br_count * sizeof(int64_t));
-                } else {
-                    size_t di = 0;
-                    for (size_t r = 0; r < br_count; r++) {
-                        if (dst_nulls[r]) continue;
-                        dst[r] = src[di++];
-                    }
-                }
+                const int64_t *src = (const int64_t *)rg_cols[c].data;
+                memcpy(dst, src, br_count * sizeof(int64_t));
                 break;
             }
             case COLUMN_TYPE_DATE: {
                 int32_t *dst = (int32_t *)pc->col_data[c] + base;
-                const int32_t *src = (const int32_t *)data;
-                size_t di = 0;
-                for (size_t r = 0; r < br_count; r++) {
-                    if (has_nulls && dst_nulls[r]) continue;
-                    dst[r] = src[di++] - PQ_DATE_OFFSET;
-                }
+                const int32_t *src = (const int32_t *)rg_cols[c].data;
+                for (size_t r = 0; r < br_count; r++)
+                    dst[r] = dst_nulls[r] ? 0 : src[r] - PQ_DATE_OFFSET;
                 break;
             }
             case COLUMN_TYPE_TIME: {
                 int64_t *dst = (int64_t *)pc->col_data[c] + base;
-                const int64_t *src = (const int64_t *)data;
-                if (!has_nulls) {
-                    memcpy(dst, src, br_count * sizeof(int64_t));
-                } else {
-                    size_t di = 0;
-                    for (size_t r = 0; r < br_count; r++) {
-                        if (dst_nulls[r]) continue;
-                        dst[r] = src[di++];
-                    }
-                }
+                const int64_t *src = (const int64_t *)rg_cols[c].data;
+                memcpy(dst, src, br_count * sizeof(int64_t));
                 break;
             }
             case COLUMN_TYPE_TIMESTAMP:
             case COLUMN_TYPE_TIMESTAMPTZ: {
                 int64_t *dst = (int64_t *)pc->col_data[c] + base;
-                const int64_t *src = (const int64_t *)data;
-                size_t di = 0;
-                for (size_t r = 0; r < br_count; r++) {
-                    if (has_nulls && dst_nulls[r]) continue;
-                    dst[r] = src[di++] - PQ_USEC_OFFSET;
-                }
+                const int64_t *src = (const int64_t *)rg_cols[c].data;
+                for (size_t r = 0; r < br_count; r++)
+                    dst[r] = dst_nulls[r] ? 0 : src[r] - PQ_USEC_OFFSET;
                 break;
             }
             case COLUMN_TYPE_INTERVAL: {
                 struct interval *dst = (struct interval *)pc->col_data[c] + base;
-                const struct interval *src = (const struct interval *)data;
-                if (!has_nulls) {
-                    memcpy(dst, src, br_count * sizeof(struct interval));
-                } else {
-                    size_t di = 0;
-                    for (size_t r = 0; r < br_count; r++) {
-                        if (dst_nulls[r]) continue;
-                        dst[r] = src[di++];
-                    }
-                }
+                const struct interval *src = (const struct interval *)rg_cols[c].data;
+                memcpy(dst, src, br_count * sizeof(struct interval));
                 break;
             }
             case COLUMN_TYPE_FLOAT:
             case COLUMN_TYPE_NUMERIC: {
                 double *dst = (double *)pc->col_data[c] + base;
-                if (phys_types[c] == CARQUET_PHYSICAL_FLOAT) {
-                    const float *src = (const float *)data;
-                    size_t di = 0;
-                    for (size_t r = 0; r < br_count; r++) {
-                        if (dst_nulls[r]) continue;
-                        dst[r] = (double)src[di++];
-                    }
-                } else if (!has_nulls) {
-                    memcpy(dst, data, br_count * sizeof(double));
+                if (rg_cols[c].phys == PQ_PHYS_FLOAT) {
+                    const float *src = (const float *)rg_cols[c].data;
+                    for (size_t r = 0; r < br_count; r++)
+                        dst[r] = dst_nulls[r] ? 0.0 : (double)src[r];
                 } else {
-                    const double *src = (const double *)data;
-                    size_t di = 0;
-                    for (size_t r = 0; r < br_count; r++) {
-                        if (dst_nulls[r]) continue;
-                        dst[r] = src[di++];
-                    }
+                    const double *src = (const double *)rg_cols[c].data;
+                    memcpy(dst, src, br_count * sizeof(double));
                 }
                 break;
             }
             case COLUMN_TYPE_TEXT:
             case COLUMN_TYPE_UUID: {
                 char **dst = (char **)pc->col_data[c] + base;
-                const carquet_byte_array_t *arr = (const carquet_byte_array_t *)data;
-                size_t di = 0;
+                char **src = (char **)rg_cols[c].data;
                 for (size_t r = 0; r < br_count; r++) {
-                    if (dst_nulls[r]) {
+                    if (dst_nulls[r] || !src[r]) {
                         dst[r] = NULL;
                     } else {
-                        char *s = (char *)malloc(arr[di].length + 1);
-                        memcpy(s, arr[di].data, arr[di].length);
-                        s[arr[di].length] = '\0';
-                        dst[r] = s;
-                        di++;
+                        dst[r] = src[r];
+                        src[r] = NULL; /* transfer ownership */
                     }
                 }
                 break;
@@ -8143,13 +8049,21 @@ static int pq_cache_build(struct table *tbl)
         }
 
         pc->nrows += (size_t)batch_rows;
-        carquet_row_batch_free(batch);
-        batch = NULL;
+
+free_rg:
+        for (uint16_t c = 0; c < ncols; c++) {
+            /* For TEXT: strings were transferred above (src[r]=NULL), free any remaining */
+            if (rg_cols[c].phys == PQ_PHYS_BYTE_ARRAY || rg_cols[c].phys == PQ_PHYS_FIXED_LEN_BYTE_ARRAY) {
+                char **strs = (char **)rg_cols[c].data;
+                if (strs) { for (int64_t i = 0; i < rg_cols[c].nrows; i++) free(strs[i]); }
+            }
+            free(rg_cols[c].data); rg_cols[c].data = NULL;
+            free(rg_cols[c].nulls); rg_cols[c].nulls = NULL;
+        }
     }
 
-    free(phys_types);
-    carquet_batch_reader_free(br);
-    carquet_reader_close(reader);
+    free(rg_cols);
+    pq_close(reader);
 
     /* Pre-compute string lengths for TEXT columns — avoids strlen per cell per query */
     for (uint16_t c = 0; c < ncols; c++) {
