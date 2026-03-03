@@ -1,6 +1,6 @@
 # Auto-detect Homebrew LLVM clang on macOS (user can override with CC=...)
+UNAME_S := $(shell uname -s)
 ifeq ($(origin CC),default)
-  UNAME_S := $(shell uname -s)
   ifeq ($(UNAME_S),Darwin)
     HOMEBREW_CLANG := /opt/homebrew/opt/llvm/bin/clang
     ifeq ($(wildcard $(HOMEBREW_CLANG)),)
@@ -9,17 +9,10 @@ ifeq ($(origin CC),default)
     CC := $(HOMEBREW_CLANG)
   endif
 endif
-CFLAGS  ?= -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O1 -g -fsanitize=address -fno-omit-frame-pointer -MMD -MP
-BUILDDIR = ../build
-SRCS     = main.c database.c table.c query.c row.c parser.c pgwire.c index.c column.c plan.c catalog.c datetime.c parquet.c pq_reader.c hnsw.c diskio.c logical.c explain_ast.c
-OBJS     = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
-LIB_SRCS = database.c table.c query.c row.c parser.c index.c column.c plan.c catalog.c datetime.c parquet.c pq_reader.c hnsw.c diskio.c logical.c explain_ast.c
-LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/%.o,$(LIB_SRCS))
 
 # ── zstd/zlib system libraries ───────────────────────────────────
-UNAME_S := $(shell uname -s)
 PQ_INCFLAGS =
-PQ_LDFLAGS =
+PQ_LDFLAGS  =
 ifeq ($(UNAME_S),Darwin)
   ZSTD_PREFIX := $(shell brew --prefix zstd 2>/dev/null)
   ZLIB_PREFIX := $(shell brew --prefix zlib 2>/dev/null)
@@ -33,40 +26,40 @@ ifeq ($(UNAME_S),Darwin)
   endif
 endif
 PQ_LDFLAGS += -lzstd -lz
-CFLAGS += $(PQ_INCFLAGS)
-TARGET   = $(BUILDDIR)/mskql_debug
-BENCH    = $(BUILDDIR)/mskql_bench
-CLI_DBG  = $(BUILDDIR)/mskqlcli_debug
-CLI_REL  = $(BUILDDIR)/mskqlcli
 
-# ── Release flags (for benchmarks / production) ──────────────────
-RELEASE_CFLAGS = -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 \
+# ── Compiler flags ───────────────────────────────────────────────
+CFLAGS         ?= -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O1 -g -fsanitize=address -fno-omit-frame-pointer -MMD -MP
+CFLAGS         += $(PQ_INCFLAGS)
+RELEASE_CFLAGS  = -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 \
   -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
   -O3 -flto -DNDEBUG -g -MMD -MP \
   -march=native -ffast-math -funroll-loops $(PQ_INCFLAGS)
+
+# ── Sources and objects ──────────────────────────────────────────
+BUILDDIR         = ../build
+SRCS             = main.c database.c table.c query.c row.c parser.c pgwire.c index.c column.c plan.c catalog.c datetime.c parquet.c pq_reader.c hnsw.c diskio.c logical.c explain_ast.c
+LIB_SRCS         = database.c table.c query.c row.c parser.c index.c column.c plan.c catalog.c datetime.c parquet.c pq_reader.c hnsw.c diskio.c logical.c explain_ast.c
+OBJS             = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
 RELEASE_OBJS     = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(SRCS))
 RELEASE_LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(LIB_SRCS))
 
+# ── Targets ──────────────────────────────────────────────────────
+TARGET         = $(BUILDDIR)/mskql_debug
+RELEASE_TARGET = $(BUILDDIR)/mskql
+BENCH          = $(BUILDDIR)/mskql_bench
+CLI_DBG        = $(BUILDDIR)/mskqlcli_debug
+CLI_REL        = $(BUILDDIR)/mskqlcli
+
 all: $(TARGET) $(CLI_DBG)
 
-
-OMP_LDFLAGS =
-ifeq ($(UNAME_S),Darwin)
-  OMP_LDFLAGS = -L/opt/homebrew/opt/llvm/lib -lomp
-else
-  OMP_LDFLAGS = -lgomp
-endif
-
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) -lm $(PQ_LDFLAGS) $(OMP_LDFLAGS)
-
-RELEASE_TARGET = $(BUILDDIR)/mskql
+	$(CC) $(CFLAGS) -o $@ $(OBJS) -lm $(PQ_LDFLAGS)
 
 release: $(RELEASE_OBJS)
-	$(CC) $(RELEASE_CFLAGS) -o $(RELEASE_TARGET) $(RELEASE_OBJS) -lm $(PQ_LDFLAGS) $(OMP_LDFLAGS)
+	$(CC) $(RELEASE_CFLAGS) -o $(RELEASE_TARGET) $(RELEASE_OBJS) -lm $(PQ_LDFLAGS)
 
 bench: $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_bench.o
-	$(CC) $(RELEASE_CFLAGS) -o $(BENCH) $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_bench.o -lm $(PQ_LDFLAGS) $(OMP_LDFLAGS)
+	$(CC) $(RELEASE_CFLAGS) -o $(BENCH) $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_bench.o -lm $(PQ_LDFLAGS)
 
 $(CLI_DBG): mskqlcli.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -o $@ $<
