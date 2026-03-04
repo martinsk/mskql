@@ -56,6 +56,21 @@ class MskqlDB {
                 js_sin:   (x) => Math.sin(x),
                 js_cos:   (x) => Math.cos(x),
 
+                /* regex — returns 1 if pattern matches str, 0 otherwise.
+                 * flags: 1 = case-insensitive */
+                js_regex_test: (patPtr, patLen, strPtr, strLen, flags) => {
+                    try {
+                        const pat = this.decoder.decode(
+                            new Uint8Array(this.memory.buffer, patPtr, patLen));
+                        const str = this.decoder.decode(
+                            new Uint8Array(this.memory.buffer, strPtr, strLen));
+                        const re = new RegExp(pat, flags & 1 ? "i" : "");
+                        return re.test(str) ? 1 : 0;
+                    } catch (e) {
+                        return 0;
+                    }
+                },
+
                 /* abort */
                 js_abort: () => { throw new Error("mskql: abort() called"); },
 
