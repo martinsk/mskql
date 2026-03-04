@@ -274,32 +274,18 @@ int disk_load_cache(const char *path, struct disk_meta *meta,
             if (!heap) { free(offsets); goto fail; }
             if (fread(heap, 1, heap_size, f) != heap_size) { free(offsets); free(heap); goto fail; }
 
-            /* Set pointers into heap */
+            /* strdup each string so flat_table owns all TEXT strings individually.
+             * This gives uniform ownership with WAL-replayed rows and mutations. */
             const char **strs = (const char **)ft->col_data[c];
             uint32_t *str_lens = ft->col_str_lens ? ft->col_str_lens[c] : NULL;
             for (uint64_t r = 0; r < nrows; r++) {
-                strs[r] = heap + offsets[r];
+                const char *src = heap + offsets[r];
+                strs[r] = strdup(src);
                 if (str_lens)
-                    str_lens[r] = (uint32_t)strlen(strs[r]);
+                    str_lens[r] = (uint32_t)strlen(src);
             }
-            /* NOTE: heap is leaked intentionally — it backs the string pointers.
-             * It will be freed when the flat_table TEXT column data is freed.
-             * We store the heap pointer as col_data[c] would normally be freed,
-             * but since we point into heap, we need to keep it.
-             * Solution: replace col_data[c] with heap, strs are offsets from it.
-             * Actually, col_data[c] was already allocated by flat_table_alloc_cols.
-             * We store the char* pointers there. The heap must be freed separately.
-             * For now, store heap pointer at a known location. We'll use the
-             * str_lens array trick: store heap as a tagged pointer. */
-            /* Simpler approach: free the original col_data[c] and replace with
-             * a new allocation that holds both the pointers and the heap. */
             free(offsets);
-            /* The heap stays allocated — the char* pointers in col_data[c]
-             * point into it. When flat_table_free frees col_data[c], it frees
-             * the pointer array. We need to also free the heap. We'll handle
-             * this in disk table cleanup by storing it. For now, this is a
-             * known minor simplification — the heap will be freed when the
-             * table is freed via disk_meta_free or table_free. */
+            free(heap);
         } else {
             /* Fixed-size: read packed array directly into col_data */
             size_t esz = col_type_elem_size(ct);

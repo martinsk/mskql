@@ -2797,6 +2797,15 @@ static void hash_join_save_to_cache(struct hash_join_state *st,
             memcpy(jc->ft.col_str_lens[c], st->build_cols[c].str_lens,
                    nrows * sizeof(uint32_t));
         }
+        /* jc->ft is heap-allocated and freed via flat_table_free, which frees
+         * individual TEXT strings. strdup here so jc->ft owns its TEXT pointers. */
+        if (column_type_is_text(st->build_cols[c].type)) {
+            char **strs = (char **)jc->ft.col_data[c];
+            for (uint32_t r = 0; r < nrows; r++) {
+                if (!jc->ft.col_nulls[c][r] && strs[r])
+                    strs[r] = strdup(strs[r]);
+            }
+        }
     }
 
     jc->hashes = (uint32_t *)malloc(nrows * sizeof(uint32_t));
@@ -3323,12 +3332,14 @@ static inline void gk_store(struct flat_table *ft, uint16_t c, size_t dst_i,
     case STORE_I64: ((int64_t *)ft->col_data[c])[dst_i] = src->data.i64[src_i]; break;
     case STORE_F64: ((double *)ft->col_data[c])[dst_i] = src->data.f64[src_i]; break;
     case STORE_STR: {
-        /* Store pointer directly — source strings live in table storage or arena */
-        ((char **)ft->col_data[c])[dst_i] = src->data.str[src_i];
-        if (ft->col_str_lens && ft->col_str_lens[c] && src->data.str[src_i])
+        /* strdup so st->gk owns the string — flat_table_free will free it */
+        const char *orig = src->data.str[src_i];
+        char *dup = orig ? strdup(orig) : NULL;
+        ((char **)ft->col_data[c])[dst_i] = dup;
+        if (ft->col_str_lens && ft->col_str_lens[c] && dup)
             ft->col_str_lens[c][dst_i] = src->str_lens
                 ? src->str_lens[src_i]
-                : (uint32_t)strlen(src->data.str[src_i]);
+                : (uint32_t)strlen(dup);
         break;
     }
     case STORE_IV:   ((struct interval *)ft->col_data[c])[dst_i] = src->data.iv[src_i]; break;

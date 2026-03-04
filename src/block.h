@@ -314,11 +314,11 @@ static inline void flat_table_init(struct flat_table *ft, uint16_t ncols, size_t
     ft->ncols = ncols;
     ft->nrows = 0;
     ft->cap   = cap;
-    ft->col_data     = (void **)calloc(ncols, sizeof(void *));
-    ft->col_nulls    = (uint8_t **)calloc(ncols, sizeof(uint8_t *));
-    ft->col_types    = (enum column_type *)calloc(ncols, sizeof(enum column_type));
-    ft->col_str_lens = (uint32_t **)calloc(ncols, sizeof(uint32_t *));
-    ft->col_vec_dims = (uint16_t *)calloc(ncols, sizeof(uint16_t));
+    ft->col_data      = (void **)calloc(ncols, sizeof(void *));
+    ft->col_nulls     = (uint8_t **)calloc(ncols, sizeof(uint8_t *));
+    ft->col_types     = (enum column_type *)calloc(ncols, sizeof(enum column_type));
+    ft->col_str_lens  = (uint32_t **)calloc(ncols, sizeof(uint32_t *));
+    ft->col_vec_dims  = (uint16_t *)calloc(ncols, sizeof(uint16_t));
 }
 
 /* Allocate typed data arrays after col_types[] have been set.
@@ -338,6 +338,11 @@ static inline void flat_table_free(struct flat_table *ft)
 {
     if (!ft->col_data) return;
     for (uint16_t c = 0; c < ft->ncols; c++) {
+        if (ft->col_types[c] == COLUMN_TYPE_TEXT && ft->col_data[c]) {
+            const char **strs = (const char **)ft->col_data[c];
+            for (size_t r = 0; r < ft->nrows; r++)
+                free((char *)strs[r]);
+        }
         free(ft->col_data[c]);
         free(ft->col_nulls[c]);
         if (ft->col_str_lens) free(ft->col_str_lens[c]);

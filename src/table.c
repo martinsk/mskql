@@ -270,11 +270,15 @@ void table_flat_append_row(struct table *t, const struct row *row)
         case COLUMN_TYPE_FLOAT:     ((double *)t->flat.col_data[c])[r] = cell->value.as_float; break;
         case COLUMN_TYPE_NUMERIC:   ((double *)t->flat.col_data[c])[r] = cell->value.as_numeric; break;
         case COLUMN_TYPE_INTERVAL:  ((struct interval *)t->flat.col_data[c])[r] = cell->value.as_interval; break;
-        case COLUMN_TYPE_TEXT:
-            ((const char **)t->flat.col_data[c])[r] = cell->value.as_text;
-            if (t->flat.col_str_lens && t->flat.col_str_lens[c] && cell->value.as_text)
-                t->flat.col_str_lens[c][r] = (uint32_t)strlen(cell->value.as_text);
+        case COLUMN_TYPE_TEXT: {
+            const char *prev = ((const char **)t->flat.col_data[c])[r];
+            free((char *)prev);
+            const char *dup = cell->value.as_text ? strdup(cell->value.as_text) : NULL;
+            ((const char **)t->flat.col_data[c])[r] = dup;
+            if (t->flat.col_str_lens && t->flat.col_str_lens[c] && dup)
+                t->flat.col_str_lens[c][r] = (uint32_t)strlen(dup);
             break;
+        }
         case COLUMN_TYPE_ENUM:      ((int32_t *)t->flat.col_data[c])[r] = cell->value.as_enum; break;
         case COLUMN_TYPE_UUID:      ((struct uuid_val *)t->flat.col_data[c])[r] = cell->value.as_uuid; break;
         case COLUMN_TYPE_VECTOR: {
@@ -309,11 +313,15 @@ void table_flat_update_row(struct table *t, size_t row_idx, const struct row *ro
         case COLUMN_TYPE_FLOAT:     ((double *)t->flat.col_data[c])[row_idx] = cell->value.as_float; break;
         case COLUMN_TYPE_NUMERIC:   ((double *)t->flat.col_data[c])[row_idx] = cell->value.as_numeric; break;
         case COLUMN_TYPE_INTERVAL:  ((struct interval *)t->flat.col_data[c])[row_idx] = cell->value.as_interval; break;
-        case COLUMN_TYPE_TEXT:
-            ((const char **)t->flat.col_data[c])[row_idx] = cell->value.as_text;
-            if (t->flat.col_str_lens && t->flat.col_str_lens[c] && cell->value.as_text)
-                t->flat.col_str_lens[c][row_idx] = (uint32_t)strlen(cell->value.as_text);
+        case COLUMN_TYPE_TEXT: {
+            const char *prev = ((const char **)t->flat.col_data[c])[row_idx];
+            free((char *)prev);
+            const char *dup = cell->value.as_text ? strdup(cell->value.as_text) : NULL;
+            ((const char **)t->flat.col_data[c])[row_idx] = dup;
+            if (t->flat.col_str_lens && t->flat.col_str_lens[c] && dup)
+                t->flat.col_str_lens[c][row_idx] = (uint32_t)strlen(dup);
             break;
+        }
         case COLUMN_TYPE_ENUM:      ((int32_t *)t->flat.col_data[c])[row_idx] = cell->value.as_enum; break;
         case COLUMN_TYPE_UUID:      ((struct uuid_val *)t->flat.col_data[c])[row_idx] = cell->value.as_uuid; break;
         case COLUMN_TYPE_VECTOR: {
@@ -330,6 +338,14 @@ void table_flat_delete_row(struct table *t, size_t row_idx)
 {
     if (row_idx >= t->flat.nrows || t->flat.ncols == 0) return;
     uint16_t ncols = t->flat.ncols;
+    /* free individually-owned text strings in the row being deleted */
+    for (uint16_t c = 0; c < ncols; c++) {
+        if (t->flat.col_types[c] == COLUMN_TYPE_TEXT && !t->flat.col_nulls[c][row_idx]) {
+            const char *s = ((const char **)t->flat.col_data[c])[row_idx];
+            free((char *)s);
+            ((const char **)t->flat.col_data[c])[row_idx] = NULL;
+        }
+    }
     size_t tail = t->flat.nrows - row_idx - 1;
     if (tail > 0) {
         for (uint16_t c = 0; c < ncols; c++) {
@@ -471,9 +487,10 @@ void table_flat_append_rows_bulk(struct table *t, struct row *rows, size_t count
                 const struct cell *cell = &rows[r].cells.items[c];
                 nulls[r] = cell->is_null;
                 if (!cell->is_null) {
-                    dst[r] = cell->value.as_text;
-                    if (lens && cell->value.as_text)
-                        lens[r] = (uint32_t)strlen(cell->value.as_text);
+                    const char *dup = cell->value.as_text ? strdup(cell->value.as_text) : NULL;
+                    dst[r] = dup;
+                    if (lens && dup)
+                        lens[r] = (uint32_t)strlen(dup);
                 }
             }
             break;
