@@ -63,7 +63,7 @@
 <hr class="title-rule">
 
 <p>
-    <strong>93 batch workloads and 15 throughput workloads.</strong> Each entry
+    <strong>101 batch workloads and 15 throughput workloads.</strong> Each entry
     below shows the exact SQL, explains what database capability it exercises,
     and describes how mskql&rsquo;s architecture produces the measured result.
     For the summary numbers, see <a href="bench-vs-pg.html">Benchmarks</a>.
@@ -817,7 +817,7 @@ ORDER BY total DESC;</code></pre>
         <p>
             The CTE materializes the join result, then the outer query
             aggregates and sorts. In the throughput            this same
-            query runs at 94,525&nbsp;QPS (190&times; PostgreSQL) because
+            query runs at 96,007&nbsp;QPS (192&times; PostgreSQL) because
             the 4-row result is served from the result cache in microseconds.
         </p>
     </div>
@@ -964,7 +964,7 @@ FROM bench_data;</code></pre>
 
 <div class="workload" id="tp_point_read">
     <h3>Indexed point lookup</h3>
-    <div class="workload-meta">79,102 vs 23,461 QPS &ensp;|&ensp; <span class="faster">3.37&times;</span> &ensp;|&ensp; p50: 0.101 vs 0.254&thinsp;ms</div>
+    <div class="workload-meta">80,214 vs 23,688 QPS &ensp;|&ensp; <span class="faster">3.39&times;</span> &ensp;|&ensp; p50: 0.100 vs 0.252&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -989,7 +989,7 @@ FROM bench_data;</code></pre>
         <p>
             Each query is parsed, the index is walked, and the single
             matching row is serialized. The arena is reset between queries.
-            At 79,102 QPS, each query completes in ~101 microseconds
+            At 80,214 QPS, each query completes in ~100 microseconds
             including network round-trip.
         </p>
     </div>
@@ -1055,7 +1055,7 @@ FROM bench_data;</code></pre>
 
 <div class="workload" id="tp_insert">
     <h3>Single-row insert</h3>
-    <div class="workload-meta">63,253 vs 39,189 QPS &ensp;|&ensp; <span class="faster">1.61&times;</span> &ensp;|&ensp; p50: 0.115 vs 0.195&thinsp;ms</div>
+    <div class="workload-meta">64,102 vs 39,512 QPS &ensp;|&ensp; <span class="faster">1.62&times;</span> &ensp;|&ensp; p50: 0.114 vs 0.193&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1085,7 +1085,7 @@ FROM bench_data;</code></pre>
 
 <div class="workload" id="tp_mixed_rw">
     <h3>Mixed read/write</h3>
-    <div class="workload-meta">54,812 vs 58,001 QPS &ensp;|&ensp; <span style="color: var(--accent); font-weight: 600;">0.94&times;</span> &ensp;|&ensp; p50: 0.145 vs 0.127&thinsp;ms</div>
+    <div class="workload-meta">54,018 vs 58,712 QPS &ensp;|&ensp; <span style="color: var(--accent); font-weight: 600;">0.92&times;</span> &ensp;|&ensp; p50: 0.148 vs 0.128&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1111,7 +1111,7 @@ UPDATE tp_data SET value = $1 WHERE id = $2;</code></pre>
             This is a fundamental architectural limitation: mskql processes
             one query at a time. Adding MVCC or a concurrent executor would
             close this gap but would add significant complexity to the
-            ~45.1K-line codebase.
+            ~52.8K-line codebase.
         </p>
     </div>
 </div>
@@ -1121,7 +1121,7 @@ UPDATE tp_data SET value = $1 WHERE id = $2;</code></pre>
 
 <div class="workload" id="tp_aggregate">
     <h3>Group + sum</h3>
-    <div class="workload-meta">94,525 vs 13,929 QPS &ensp;|&ensp; <span class="faster">6.79&times;</span> &ensp;|&ensp; p50: 0.084 vs 0.652&thinsp;ms</div>
+    <div class="workload-meta">96,007 vs 14,082 QPS &ensp;|&ensp; <span class="faster">6.82&times;</span> &ensp;|&ensp; p50: 0.083 vs 0.648&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1152,7 +1152,7 @@ FROM tp_data GROUP BY category;</code></pre>
 
 <div class="workload" id="tp_wide_agg">
     <h3>Wide aggregate</h3>
-    <div class="workload-meta">8,412 vs 1,036 QPS &ensp;|&ensp; <span class="faster">8.12&times;</span> &ensp;|&ensp; p50: 0.952 vs 10.8&thinsp;ms</div>
+    <div class="workload-meta">96,514 vs 1,048 QPS &ensp;|&ensp; <span class="faster">92.1&times;</span> &ensp;|&ensp; p50: 0.083 vs 10.7&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1165,9 +1165,9 @@ FROM wide_bench GROUP BY region, product;</code></pre>
     <div class="so-what">
         <span class="section-label">So what</span>
         <p>
-            Over 8&times; throughput on a wider aggregation (50K rows,
-            7 columns). The advantage holds at scale because the columnar
-            executor and result cache both benefit from larger datasets.
+            Over 92&times; throughput on a wider aggregation (50K rows,
+            7 columns). The result cache serves the aggregated result from
+            cached wire bytes, skipping all computation after the first execution.
         </p>
     </div>
 
@@ -1217,7 +1217,7 @@ FROM wide_bench;</code></pre>
 
 <div class="workload" id="tp_join">
     <h3>Two-table join</h3>
-    <div class="workload-meta">562 vs 302 QPS &ensp;|&ensp; <span class="faster">1.86&times;</span> &ensp;|&ensp; p50: 14.1 vs 26.3&thinsp;ms</div>
+    <div class="workload-meta">569 vs 305 QPS &ensp;|&ensp; <span class="faster">1.87&times;</span> &ensp;|&ensp; p50: 14.0 vs 26.1&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1246,7 +1246,7 @@ FROM customers c JOIN orders o ON c.id = o.customer_id;</code></pre>
 
 <div class="workload" id="tp_multi_join">
     <h3>Three-table join + group</h3>
-    <div class="workload-meta">36,171 vs 462 QPS &ensp;|&ensp; <span class="faster">78.3&times;</span> &ensp;|&ensp; p50: 0.221 vs 22.3&thinsp;ms</div>
+    <div class="workload-meta">36,153 vs 467 QPS &ensp;|&ensp; <span class="faster">77.4&times;</span> &ensp;|&ensp; p50: 0.221 vs 22.1&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1260,7 +1260,7 @@ GROUP BY r.name, p.name;</code></pre>
     <div class="so-what">
         <span class="section-label">So what</span>
         <p>
-            <strong>78&times; throughput.</strong> The second-largest gap in
+            <strong>77&times; throughput.</strong> The third-largest gap in
             the entire benchmark suite. The small result set (region &times;
             product combinations) fits entirely in the result cache.
         </p>
@@ -1279,7 +1279,7 @@ GROUP BY r.name, p.name;</code></pre>
 
 <div class="workload" id="tp_cte_pipeline">
     <h3>CTE pipeline</h3>
-    <div class="workload-meta">5,606 vs 1,920 QPS &ensp;|&ensp; <span class="faster">2.92&times;</span> &ensp;|&ensp; p50: 1.430 vs 4.312&thinsp;ms</div>
+    <div class="workload-meta">5,712 vs 1,938 QPS &ensp;|&ensp; <span class="faster">2.95&times;</span> &ensp;|&ensp; p50: 1.410 vs 4.280&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1311,7 +1311,7 @@ SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
 
 <div class="workload" id="tp_subquery_complex">
     <h3>Subquery pipeline</h3>
-    <div class="workload-meta">1,170 vs 898 QPS &ensp;|&ensp; <span class="faster">1.30&times;</span> &ensp;|&ensp; p50: 6.698 vs 8.775&thinsp;ms</div>
+    <div class="workload-meta">1,189 vs 905 QPS &ensp;|&ensp; <span class="faster">1.31&times;</span> &ensp;|&ensp; p50: 6.612 vs 8.680&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1342,7 +1342,7 @@ SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
 
 <div class="workload" id="tp_large_sort">
     <h3>Large sort</h3>
-    <div class="workload-meta">30 vs 12 QPS &ensp;|&ensp; <span class="faster">2.54&times;</span> &ensp;|&ensp; p50: 212.8 vs 661.0&thinsp;ms</div>
+    <div class="workload-meta">31 vs 12 QPS &ensp;|&ensp; <span class="faster">2.58&times;</span> &ensp;|&ensp; p50: 210.5 vs 658.0&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1372,7 +1372,7 @@ SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
 
 <div class="workload" id="tp_cte_star">
     <h3>CTE star-schema</h3>
-    <div class="workload-meta">94,525 vs 496 QPS &ensp;|&ensp; <span class="faster">190&times;</span> &ensp;|&ensp; p50: 0.085 vs 18.4&thinsp;ms</div>
+    <div class="workload-meta">96,007 vs 501 QPS &ensp;|&ensp; <span class="faster">192&times;</span> &ensp;|&ensp; p50: 0.083 vs 18.2&thinsp;ms</div>
 
     <div class="what">
         <span class="section-label">What</span>
@@ -1389,11 +1389,11 @@ FROM joined GROUP BY region ORDER BY total DESC;</code></pre>
     <div class="so-what">
         <span class="section-label">So what</span>
         <p>
-            <strong>190&times; throughput&mdash;the largest gap in the entire
+            <strong>192&times; throughput&mdash;the largest gap in the entire
             benchmark suite.</strong> The 4-row result (one per region) is
-            served from the result cache in 85 microseconds. PostgreSQL
+            served from the result cache in 83 microseconds. PostgreSQL
             re-executes the full plan (planner + 2 hash joins + aggregation
-            + sort) every time, taking 18.4&nbsp;ms.
+            + sort) every time, taking 18.2&nbsp;ms.
         </p>
     </div>
 

@@ -260,7 +260,7 @@
 <!-- ═══════════════════════════════════════════════════════════ -->
 
 <h1>mskql</h1>
-<span class="subtitle">An analytics SQL engine in C. Faster than PostgreSQL on every cached batch workload. Faster than DuckDB on 61&nbsp;of&nbsp;93. ~45.1K lines. Zero dependencies.</span>
+<span class="subtitle">An analytics SQL engine in C. Faster than PostgreSQL on every cached batch workload. Faster than DuckDB on 74&nbsp;of&nbsp;101. ~52.8K lines. Zero dependencies.</span>
 <p class="byline">
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
@@ -312,11 +312,11 @@
 <h2 id="performance">Performance: mskql vs PostgreSQL vs DuckDB</h2>
 
 <p>
-    93 batch workloads and 15 concurrent throughput workloads, measured on the same
-    machine. Faster than PostgreSQL on every cached batch workload and 13 of 15 throughput tests.
-    Against DuckDB, the engine wins 61 of 93 workloads&mdash;aggregates
-    8&times;, expression aggregates 10&times;, correlated subqueries 166&times; faster than PG.
-    DuckDB wins full scans (4.3&times;) and sorts (4.7&times;).
+    101 batch workloads and 15 concurrent throughput workloads, measured on the same
+    machine. Faster than PostgreSQL on every cached batch workload and 14 of 15 throughput tests.
+    Against DuckDB, the engine wins 74 of 101 workloads&mdash;aggregates
+    20&times;, expression aggregates 21&times;, correlated subqueries 691&times; faster than PG.
+    DuckDB wins full scans (2.5&times;) and sorts (2.7&times;).
 </p>
 
 <p>
@@ -337,64 +337,64 @@
     <div class="summary-row">
         <div class="summary-name"><strong>Correlated subquery</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:1%"></div><span class="summary-bar-val">22ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">3,665ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:1%"></div><span class="summary-bar-val">38ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:1%"></div><span class="summary-bar-val">5ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">3,457ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:1%"></div><span class="summary-bar-val">37ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Expression aggregate</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:10%"></div><span class="summary-bar-val">33ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">323ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:77%"></div><span class="summary-bar-val">249ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:5%"></div><span class="summary-bar-val">15ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">313ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:77%"></div><span class="summary-bar-val">242ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Group + sum</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:12%"></div><span class="summary-bar-val">35ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">284ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:70%"></div><span class="summary-bar-val">199ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:5%"></div><span class="summary-bar-val">14ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">279ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:70%"></div><span class="summary-bar-val">196ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Bulk insert</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:17%"></div><span class="summary-bar-val">298ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:47%"></div><span class="summary-bar-val">851ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:100%"></div><span class="summary-bar-val">1,794ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:17%"></div><span class="summary-bar-val">291ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:48%"></div><span class="summary-bar-val">843ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:100%"></div><span class="summary-bar-val">1,748ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Analytical CTE</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:26%"></div><span class="summary-bar-val">20ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">78ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:41%"></div><span class="summary-bar-val">32ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:8%"></div><span class="summary-bar-val">6ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">76ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:41%"></div><span class="summary-bar-val">31ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Parquet aggregate</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:35%"></div><span class="summary-bar-val">26ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:100%"></div><span class="summary-bar-val">73ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:18%"></div><span class="summary-bar-val">13ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:100%"></div><span class="summary-bar-val">72ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Full table scan</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:67%"></div><span class="summary-bar-val">294ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">439ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:15%"></div><span class="summary-bar-val">68ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:40%"></div><span class="summary-bar-val">171ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">431ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:16%"></div><span class="summary-bar-val">68ms</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Large sort</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:65%"></div><span class="summary-bar-val">234ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">359ms</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:14%"></div><span class="summary-bar-val">50ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:39%"></div><span class="summary-bar-val">138ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:100%"></div><span class="summary-bar-val">356ms</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">Duck</span><div class="summary-bar bar-duck" style="width:14%"></div><span class="summary-bar-val">51ms</span></div>
         </div>
     </div>
 </div>
@@ -409,35 +409,35 @@
     <div class="summary-row">
         <div class="summary-name"><strong>Mixed analytical</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:100%"></div><span class="summary-bar-val">94,525 QPS</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:1%"></div><span class="summary-bar-val">496 QPS</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:100%"></div><span class="summary-bar-val">96,007 QPS</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:1%"></div><span class="summary-bar-val">501 QPS</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Multi-join</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:100%"></div><span class="summary-bar-val">36,171 QPS</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:1%"></div><span class="summary-bar-val">356 QPS</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:100%"></div><span class="summary-bar-val">36,153 QPS</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:1%"></div><span class="summary-bar-val">467 QPS</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Group + sum</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:100%"></div><span class="summary-bar-val">95,020 QPS</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:11%"></div><span class="summary-bar-val">10,140 QPS</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:100%"></div><span class="summary-bar-val">96,007 QPS</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:15%"></div><span class="summary-bar-val">14,082 QPS</span></div>
         </div>
     </div>
     <div class="summary-row">
         <div class="summary-name"><strong>Indexed point lookup</strong></div>
         <div class="summary-bars">
-            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:100%"></div><span class="summary-bar-val">111,437 QPS</span></div>
-            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:21%"></div><span class="summary-bar-val">23,256 QPS</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">mskql</span><div class="summary-bar bar-mskql" style="width:100%"></div><span class="summary-bar-val">80,214 QPS</span></div>
+            <div class="summary-bar-row"><span class="summary-bar-label">PG</span><div class="summary-bar bar-pg" style="width:30%"></div><span class="summary-bar-val">23,688 QPS</span></div>
         </div>
     </div>
 </div>
 
 <p>
-    &#8594;&ensp;<a href="bench-vs-pg.html"><strong>All 93 batch + 15 throughput results</strong></a>
+    &#8594;&ensp;<a href="bench-vs-pg.html"><strong>All 101 batch + 15 throughput results</strong></a>
     &ensp;&middot;&ensp;
     <a href="dev/bench/index.html"><strong>Historical charts</strong></a>
 </p>
@@ -478,10 +478,10 @@ FROM events
 GROUP BY event_type;</code></pre>
 
 <p>
-    9 Parquet workloads (50K&ndash;200K rows). On cached queries, mskql is faster than DuckDB on
-    all 9: aggregates 26ms vs 73ms (2.8&times;), subqueries
-    18ms vs 41ms (2.2&times;), joins 23ms vs 33ms. DuckDB wins no-cache full scans:
-    31ms vs 485ms (16&times;).
+    9 Parquet workloads (50K&ndash;200K rows). On cached queries, mskql wins 7 of 9:
+    aggregates 13ms vs 72ms (5.5&times;), subqueries
+    6ms vs 40ms (6.7&times;), joins 9ms vs 33ms. DuckDB wins no-cache full scans:
+    31ms vs 260ms (8.4&times;).
 </p>
 
 <p>
@@ -517,8 +517,8 @@ SELECT name, embed FROM items WHERE id > 1 ORDER BY name;</code></pre>
 
 <p>
     7 vector benchmarks against PostgreSQL&nbsp;+&nbsp;pgvector on the same machine.
-    Wins all 7: insert 3&times;, scan 1.8&times;, wide scan 2.7&times;,
-    filter 3.5&times; faster. Even without the result cache (<code>_nc</code> variants),
+    Wins all 7: insert 3&times;, scan 1.8&times;, wide scan 3.2&times;,
+    filter 22&times; faster. Even without the result cache (<code>_nc</code> variants),
     faster on every vector workload.
 </p>
 
@@ -531,7 +531,7 @@ SELECT name, embed FROM items WHERE id > 1 ORDER BY name;</code></pre>
 <div class="ai-split" style="display:flex; gap:2rem; align-items:flex-start; margin:1rem 0 1.4rem 0;">
 <div style="flex:1 1 50%; min-width:0;">
 <p style="margin-bottom:0.8rem;">
-    1,375+ SQL test cases. Every one runs under AddressSanitizer and must produce
+    1,470+ SQL test cases. Every one runs under AddressSanitizer and must produce
     bit-identical output to PostgreSQL. Three agents worked in adversarial rounds:
     <strong>Challenger</strong> writes tests designed to break the system,
     <strong>Reviewer</strong> flags structural code issues,
@@ -565,7 +565,7 @@ SELECT name, embed FROM items WHERE id > 1 ORDER BY name;</code></pre>
   <path d="M244,40 L214,40" stroke="#a00" stroke-width="1.2" fill="none" marker-end="url(#ah)"/>
   <path d="M288,52 C288,72 170,78 52,72 C30,71 18,66 18,52"
         stroke="#ccc" stroke-width="1" fill="none" stroke-dasharray="3,2"/>
-  <text x="170" y="90" text-anchor="middle" font-size="8.5" fill="#555" font-style="italic">iterate until all 1,375+ tests pass</text>
+  <text x="170" y="90" text-anchor="middle" font-size="8.5" fill="#555" font-style="italic">iterate until all 1,470+ tests pass</text>
 </svg>
 </div>
 </div>
@@ -640,7 +640,7 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
     </div>
     <div class="cta-card">
         <h3>Read the source</h3>
-        <p>~45,100 lines of C11. Every subsystem in a single file.</p>
+        <p>~52,800 lines of C11. Every subsystem in a single file.</p>
         <a href="https://github.com/martinsk/mskql" class="cta-link">GitHub &rarr;</a>
     </div>
 </div>
@@ -664,11 +664,11 @@ SELECT * FROM users WHERE age > 30 ORDER BY name;</textarea>
     DML, joins, aggregation, window functions, CTEs, subqueries, 30+ built-in functions.
     &ensp;<a href="grammar.html">Grammar</a>
     <br>
-    <a href="testing.html"><strong>Testing</strong></a>&ensp;&mdash;&ensp;1,375+ test cases,
+    <a href="testing.html"><strong>Testing</strong></a>&ensp;&mdash;&ensp;1,470+ test cases,
     every one under a memory-safety checker. Parallel execution across all cores.
     <br>
     <a href="bench-vs-pg.html"><strong>Benchmarks</strong></a>&ensp;&mdash;&ensp;mskql
-    vs PostgreSQL and DuckDB on 93 batch workloads and 15 throughput workloads.
+    vs PostgreSQL and DuckDB on 101 batch workloads and 15 throughput workloads.
     &ensp;<a href="dev/bench/index.html">Historical charts</a>
 </p>
 

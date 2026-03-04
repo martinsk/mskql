@@ -18,13 +18,13 @@
 <hr class="title-rule">
 
 <p>
-    <strong>1,375+ SQL test cases. Every one runs under AddressSanitizer.
+    <strong>1,470+ SQL test cases. Every one runs under AddressSanitizer.
     Every one must produce bit-identical output to PostgreSQL.</strong>
     This was not QA after the fact&mdash;it was the development methodology.
     Three agents worked in adversarial rounds: one writing tests designed to
     break the system, one reviewing code for structural problems, one fixing
-    failures. The result: ~45.1K lines of C that beats PostgreSQL on every
-    cached batch benchmark and DuckDB on 61 of 93 workloads.
+    failures. The result: ~52.8K lines of C that beats PostgreSQL on every
+    cached batch benchmark and DuckDB on 74 of 101 workloads.
 </p>
 
 <div class="diagram">
@@ -70,8 +70,8 @@
 
   <!-- Result box -->
   <rect x="160" y="165" width="300" height="48" rx="6" fill="#a00" stroke="none"/>
-  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">1,375+ tests pass</text>
-  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~45,100 lines of C &middot; 1,375+ tests &middot; all under AddressSanitizer</text>
+  <text x="310" y="186" text-anchor="middle" font-size="14" fill="#fff" font-weight="600">1,470+ tests pass</text>
+  <text x="310" y="204" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.8)">~52,800 lines of C &middot; 1,470+ tests &middot; all under AddressSanitizer</text>
 </svg>
 </div>
 
@@ -116,7 +116,7 @@
 <h2 id="feedback-loop">The feedback loop</h2>
 
 <p>
-    Write code, run 1,375+ tests, fix failures, repeat. The adversarial model
+    Write code, run 1,470+ tests, fix failures, repeat. The adversarial model
     drove correctness the same way rigorous code review does on a human
     team&mdash;except all three sides were machines. A typical round:
 </p>

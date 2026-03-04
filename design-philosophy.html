@@ -72,8 +72,9 @@
 </p>
 
 <p>
-    <strong>Measured result:</strong> aggregate queries run 8&ndash;10&times; faster
-    than PostgreSQL and DuckDB. The gap is not algorithmic&mdash;the same GROUP BY
+    <strong>Measured result:</strong> aggregate queries run 14&ndash;21&times; faster
+    than PostgreSQL. Expression aggregate: 15ms vs 313ms (21&times;).
+    The gap is not algorithmic&mdash;the same GROUP BY
     algorithm runs in both. The gap is allocator overhead.
 </p>
 
@@ -96,8 +97,8 @@
 </p>
 
 <p>
-    <strong>Measured result:</strong> full-scan 32% faster than PostgreSQL.
-    Parquet aggregate queries 2.8&times; faster than DuckDB on cached workloads,
+    <strong>Measured result:</strong> full-scan 60% faster than PostgreSQL.
+    Parquet aggregate queries 5.5&times; faster than DuckDB on cached workloads,
     because the result cache serves them without touching Parquet at all.
 </p>
 
@@ -118,8 +119,8 @@
 </p>
 
 <p>
-    <strong>Measured result:</strong> correlated subquery 22ms vs PostgreSQL
-    3,665ms (166&times;). The subquery executes once per outer row; with L1
+    <strong>Measured result:</strong> correlated subquery 5ms vs PostgreSQL
+    3,457ms (691&times;). The subquery executes once per outer row; with L1
     residency, each inner scan is effectively free.
 </p>
 
@@ -144,7 +145,7 @@
 <p>
     <strong>Measured result:</strong> ORDER BY workload went from 4.65&times;
     slower to 1.18&times; PostgreSQL after this change alone. Mixed analytical
-    throughput reaches 94,525&nbsp;QPS&mdash;190&times; PostgreSQL&mdash;because
+    throughput reaches 96,007&nbsp;QPS&mdash;192&times; PostgreSQL&mdash;because
     the result cache serves subsequent identical queries as a single
     <code>send_all()</code> of cached bytes.
 </p>
@@ -211,10 +212,10 @@
 </p>
 
 <p>
-    This project is an existence proof in the other direction. ~45,100 lines of C11.
+    This project is an existence proof in the other direction. ~52,800 lines of C11.
     Zero external dependencies. The entire system fits in a single developer&rsquo;s
     head. It outperforms PostgreSQL on every cached analytical workload and DuckDB
-    on 61 of 93 benchmarks. The performance is not the point&mdash;it is evidence
+    on 74 of 101 benchmarks. The performance is not the point&mdash;it is evidence
     that the design works.
 </p>
 

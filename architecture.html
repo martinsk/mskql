@@ -30,7 +30,7 @@
     The result: zero steady-state <code>malloc</code>/<code>free</code> calls per query,
     a scan path whose working set fits in L1 cache, a call stack shallow enough to hold
     in your head, and benchmarks that outperform PostgreSQL on every cached workload
-    and DuckDB on 61 of 93. <strong>~45.1K lines of C. Zero external dependencies.
+    and DuckDB on 74 of 101. <strong>~52.8K lines of C. Zero external dependencies.
     Four stages: wire protocol, parser, executor, storage.</strong>
 </p>
 
@@ -280,9 +280,9 @@
     <strong>Result cache.</strong>
     Repeated identical <code>SELECT</code>s skip parsing, planning, and
     execution entirely. The throughput benchmark&rsquo;s analytical CTE
-    workload runs at 94,525&nbsp;QPS (190&times; PostgreSQL) because the
+    workload runs at 96,007&nbsp;QPS (192&times; PostgreSQL) because the
     result is served from cached wire bytes in microseconds. On Parquet
-    workloads, the cache makes mskql faster than DuckDB on all 9 cached
+    workloads, the cache makes mskql faster than DuckDB on 7 of 9 cached
     queries.
 </p>
 
@@ -358,8 +358,8 @@
     <li><strong>Zero steady-state allocation.</strong>
         After warmup, zero <code>malloc</code>/<code>free</code> calls per query.
         The bump allocator rewinds to zero on each reset&mdash;no free, no fragmentation,
-        no allocator lock contention. Result: aggregate queries run 8&ndash;10&times; faster
-        than PostgreSQL and DuckDB.
+        no allocator lock contention. Result: aggregate queries run 14&ndash;21&times; faster
+        than PostgreSQL.
     </li>
     <li><strong>Scan cache = one conversion, many reads.</strong>
         The row store converts to flat typed columnar arrays once per table write.
@@ -379,8 +379,8 @@
     </li>
     <li><strong>Result cache.</strong>
         Repeated identical SELECTs skip parsing, planning, and execution entirely.
-        The analytical CTE throughput workload runs at 94,525&nbsp;QPS&mdash;
-        190&times; PostgreSQL&mdash;because results are served from cached wire bytes
+        The analytical CTE throughput workload runs at 96,007&nbsp;QPS&mdash;
+        192&times; PostgreSQL&mdash;because results are served from cached wire bytes
         in microseconds.
     </li>
 </ul>
