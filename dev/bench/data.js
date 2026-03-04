@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1772580470158,
+  "lastUpdate": 1772588289921,
   "repoUrl": "https://github.com/martinsk/mskql",
   "entries": {
     "Benchmark": [
@@ -10633,6 +10633,216 @@ window.BENCHMARK_DATA = {
             "value": 2.043,
             "unit": "ms",
             "extra": "iters=50  min=0.039  p50=0.039  p95=0.045  p99=0.083  max=0.119"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "committer": {
+            "email": "msk@ajour.io",
+            "name": "Martin Kristiansen",
+            "username": "martinsk"
+          },
+          "distinct": true,
+          "id": "9d0c70fc5b2023be8403b675bfa72e81fd5901a4",
+          "message": "fix TEXT column memory ownership by strdup'ing all TEXT strings in flat_table so each string is individually owned and freed, add TEXT string cleanup loop in flat_table_free to free each string before freeing col_data array, update disk_load_cache to strdup strings from heap buffer instead of pointing into shared heap (then free heap immediately), update hash_join_save_to_cache/gk_store/table_flat_append_row/table_flat_update_row/table_flat_append_rows_bulk to strdup TEXT values, add table_flat_delete_row TEXT",
+          "timestamp": "2026-03-03T17:36:22-08:00",
+          "tree_id": "a4d3549c8b3eb1ec6225a6eade01eba61c449da5",
+          "url": "https://github.com/martinsk/mskql/commit/9d0c70fc5b2023be8403b675bfa72e81fd5901a4"
+        },
+        "date": 1772588289055,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "insert_bulk",
+            "value": 25.152,
+            "unit": "ms",
+            "extra": "iters=10000  min=0.002  p50=0.002  p95=0.004  p99=0.005  max=0.181"
+          },
+          {
+            "name": "select_full_scan",
+            "value": 238.533,
+            "unit": "ms",
+            "extra": "iters=200  min=1.169  p50=1.187  p95=1.227  p99=1.316  max=1.436"
+          },
+          {
+            "name": "select_where",
+            "value": 305.284,
+            "unit": "ms",
+            "extra": "iters=500  min=0.586  p50=0.605  p95=0.639  p99=0.708  max=0.962"
+          },
+          {
+            "name": "aggregate",
+            "value": 89.322,
+            "unit": "ms",
+            "extra": "iters=500  min=0.167  p50=0.175  p95=0.193  p99=0.209  max=0.266"
+          },
+          {
+            "name": "order_by",
+            "value": 195.839,
+            "unit": "ms",
+            "extra": "iters=200  min=0.952  p50=0.975  p95=1.004  p99=1.064  max=1.167"
+          },
+          {
+            "name": "join",
+            "value": 35.824,
+            "unit": "ms",
+            "extra": "iters=50  min=0.706  p50=0.717  p95=0.725  p99=0.736  max=0.741"
+          },
+          {
+            "name": "update",
+            "value": 40.945,
+            "unit": "ms",
+            "extra": "iters=200  min=0.201  p50=0.202  p95=0.213  p99=0.226  max=0.243"
+          },
+          {
+            "name": "delete",
+            "value": 187.982,
+            "unit": "ms",
+            "extra": "iters=50  min=3.703  p50=3.722  p95=3.828  p99=4.487  max=4.920"
+          },
+          {
+            "name": "parser",
+            "value": 488.204,
+            "unit": "ms",
+            "extra": "iters=50000  min=0.001  p50=0.008  p95=0.029  p99=0.029  max=0.057"
+          },
+          {
+            "name": "index_lookup",
+            "value": 9.994,
+            "unit": "ms",
+            "extra": "iters=2000  min=0.005  p50=0.005  p95=0.005  p99=0.005  max=0.041"
+          },
+          {
+            "name": "transaction",
+            "value": 25.655,
+            "unit": "ms",
+            "extra": "iters=100  min=0.137  p50=0.256  p95=0.362  p99=0.374  max=0.382"
+          },
+          {
+            "name": "window_functions",
+            "value": 34.682,
+            "unit": "ms",
+            "extra": "iters=20  min=1.718  p50=1.731  p95=1.751  p99=1.778  max=1.784"
+          },
+          {
+            "name": "distinct",
+            "value": 72.16,
+            "unit": "ms",
+            "extra": "iters=500  min=0.140  p50=0.142  p95=0.153  p99=0.181  max=0.261"
+          },
+          {
+            "name": "subquery",
+            "value": 200.248,
+            "unit": "ms",
+            "extra": "iters=50  min=3.982  p50=3.998  p95=4.051  p99=4.082  max=4.097"
+          },
+          {
+            "name": "cte",
+            "value": 186.358,
+            "unit": "ms",
+            "extra": "iters=200  min=0.904  p50=0.926  p95=0.963  p99=1.023  max=1.172"
+          },
+          {
+            "name": "generate_series",
+            "value": 155.729,
+            "unit": "ms",
+            "extra": "iters=200  min=0.764  p50=0.776  p95=0.794  p99=0.848  max=0.983"
+          },
+          {
+            "name": "scalar_functions",
+            "value": 122.091,
+            "unit": "ms",
+            "extra": "iters=200  min=0.600  p50=0.611  p95=0.620  p99=0.659  max=0.694"
+          },
+          {
+            "name": "expression_agg",
+            "value": 91.522,
+            "unit": "ms",
+            "extra": "iters=500  min=0.172  p50=0.175  p95=0.261  p99=0.296  max=0.314"
+          },
+          {
+            "name": "multi_sort",
+            "value": 82.692,
+            "unit": "ms",
+            "extra": "iters=200  min=0.403  p50=0.411  p95=0.428  p99=0.458  max=0.486"
+          },
+          {
+            "name": "set_ops",
+            "value": 1091.188,
+            "unit": "ms",
+            "extra": "iters=50  min=21.697  p50=21.813  p95=21.932  p99=22.050  max=22.118"
+          },
+          {
+            "name": "multi_join",
+            "value": 625.318,
+            "unit": "ms",
+            "extra": "iters=5  min=122.871  p50=123.814  p95=128.387  p99=128.675  max=128.747"
+          },
+          {
+            "name": "analytical_cte",
+            "value": 8.02,
+            "unit": "ms",
+            "extra": "iters=20  min=0.383  p50=0.395  p95=0.434  p99=0.476  max=0.486"
+          },
+          {
+            "name": "wide_agg",
+            "value": 50.85,
+            "unit": "ms",
+            "extra": "iters=20  min=2.322  p50=2.558  p95=2.588  p99=2.591  max=2.592"
+          },
+          {
+            "name": "large_sort",
+            "value": 55.359,
+            "unit": "ms",
+            "extra": "iters=10  min=5.428  p50=5.508  p95=5.655  p99=5.659  max=5.660"
+          },
+          {
+            "name": "subquery_complex",
+            "value": 229.353,
+            "unit": "ms",
+            "extra": "iters=20  min=11.290  p50=11.434  p95=11.648  p99=11.678  max=11.686"
+          },
+          {
+            "name": "window_rank",
+            "value": 156.403,
+            "unit": "ms",
+            "extra": "iters=5  min=30.272  p50=30.799  p95=32.794  p99=33.059  max=33.125"
+          },
+          {
+            "name": "mixed_analytical",
+            "value": 29.422,
+            "unit": "ms",
+            "extra": "iters=5  min=5.805  p50=5.839  p95=6.048  p99=6.088  max=6.098"
+          },
+          {
+            "name": "vector_insert",
+            "value": 15.111,
+            "unit": "ms",
+            "extra": "iters=5000  min=0.003  p50=0.003  p95=0.003  p99=0.005  max=0.021"
+          },
+          {
+            "name": "vector_scan",
+            "value": 40.662,
+            "unit": "ms",
+            "extra": "iters=100  min=0.399  p50=0.403  p95=0.418  p99=0.432  max=0.471"
+          },
+          {
+            "name": "vector_wide",
+            "value": 9.221,
+            "unit": "ms",
+            "extra": "iters=20  min=0.436  p50=0.453  p95=0.509  p99=0.557  max=0.570"
+          },
+          {
+            "name": "vector_filter",
+            "value": 2.541,
+            "unit": "ms",
+            "extra": "iters=50  min=0.049  p50=0.049  p95=0.059  p99=0.070  max=0.080"
           }
         ]
       }
