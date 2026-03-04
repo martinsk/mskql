@@ -60,6 +60,7 @@ int  db_table_exec_query(struct database *db, sv table_name,
                          struct query *q, struct rows *result, struct bump_alloc *rb);
 int  db_exec(struct database *db, struct query *q, struct rows *result, struct bump_alloc *rb);
 int  db_exec_sql(struct database *db, const char *sql, struct rows *result);
+int  db_exec_sql_discard(struct database *db, const char *sql);
 void db_free(struct database *db);
 void db_reset(struct database *db);
 

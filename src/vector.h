@@ -7,6 +7,72 @@
 #include <stdio.h>
 #include <math.h>
 
+/* Fast float32 parser — replaces strtof() for VECTOR literal parsing.
+ * Handles: optional sign, integer part, optional fractional part, optional exponent.
+ * Sets *endptr to first unconsumed char. Returns 0.0f if no digits found. */
+static inline float fast_strtof(const char *p, const char **endptr)
+{
+    const char *start = p;
+    float sign = 1.0f;
+    if (*p == '-') { sign = -1.0f; p++; }
+    else if (*p == '+') { p++; }
+
+    /* integer part */
+    int64_t mantissa = 0;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9') {
+        mantissa = mantissa * 10 + (*p - '0');
+        digits++;
+        if (digits > 18) { return strtof(start, (char **)endptr); }
+        p++;
+    }
+
+    /* fractional part */
+    int frac_digits = 0;
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') {
+            mantissa = mantissa * 10 + (*p - '0');
+            frac_digits++;
+            digits++;
+            if (digits > 18) { return strtof(start, (char **)endptr); }
+            p++;
+        }
+    }
+
+    if (digits == 0) { *endptr = start; return 0.0f; }
+
+    /* exponent */
+    int exp = -frac_digits;
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        int esign = 1;
+        if (*p == '-') { esign = -1; p++; }
+        else if (*p == '+') { p++; }
+        int ev = 0;
+        while (*p >= '0' && *p <= '9') { ev = ev * 10 + (*p - '0'); p++; }
+        exp += esign * ev;
+    }
+
+    *endptr = p;
+
+    /* Apply exponent via lookup table for common range */
+    static const double pow10_pos[] = {
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+        1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20
+    };
+    static const double pow10_neg[] = {
+        1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10,
+        1e-11, 1e-12, 1e-13, 1e-14, 1e-15, 1e-16, 1e-17, 1e-18, 1e-19, 1e-20
+    };
+    double result = (double)mantissa;
+    if (exp > 0 && exp <= 20)       result *= pow10_pos[exp];
+    else if (exp < 0 && exp >= -20) result *= pow10_neg[-exp];
+    else if (exp != 0)              result *= pow(10.0, (double)exp);
+
+    return sign * (float)result;
+}
+
 /* Parse a pgvector-format text literal "[1.0, 2.0, 3.0]" into a float array.
  * Returns 0 on success, -1 on parse error, -2 on dimension mismatch.
  * out must point to at least expected_dim floats. */
@@ -24,8 +90,8 @@ static inline int vector_parse(const char *str, float *out, uint16_t expected_di
             while (*p == ' ') p++;
         }
         if (count >= expected_dim) return -2;
-        char *end;
-        out[count] = strtof(p, &end);
+        const char *end;
+        out[count] = fast_strtof(p, &end);
         if (end == p) return -1;
         p = end;
         count++;
@@ -52,8 +118,8 @@ static inline float *vector_parse_alloc(const char *str, uint16_t *out_dim)
             p++;
             while (*p == ' ') p++;
         }
-        char *end;
-        (void)strtof(p, &end);
+        const char *end;
+        (void)fast_strtof(p, &end);
         if (end == p) return NULL;
         p = end;
         count++;
@@ -185,14 +251,18 @@ static inline int vector_format_fast(const float *vec, uint16_t dim, char *buf, 
 {
     char *p = buf;
     char *end = buf + bufsz - 1; /* leave room for NUL */
+    if (bufsz < 3) { if (bufsz > 0) { buf[0] = '\0'; } return 0; }
     *p++ = '[';
     for (uint16_t i = 0; i < dim; i++) {
-        if (i > 0) *p++ = ',';
-        if (p >= end) break;
+        if (i > 0) {
+            if (p + 1 >= end) break;
+            *p++ = ',';
+        }
+        if (p + 18 >= end) break; /* 16 for float + comma + ']' + NUL */
         size_t n = fast_f32_to_str(vec[i], p);
         p += n;
     }
-    *p++ = ']';
+    if (p < end) *p++ = ']';
     *p = '\0';
     return (int)(p - buf); /* bytes written excluding NUL */
 }

@@ -3711,7 +3711,10 @@ static void parse_order_limit(struct lexer *l, struct query_arena *a, struct que
         int limit_neg = 0;
         if (n.type == TOK_MINUS) { limit_neg = 1; n = lexer_next(l); }
         if (n.type == TOK_NUMBER) {
-            int lv = sv_atoi(n.value);
+            char nbuf[64];
+            size_t nlen = n.value.len < sizeof(nbuf) - 1 ? n.value.len : sizeof(nbuf) - 1;
+            memcpy(nbuf, n.value.data, nlen); nbuf[nlen] = '\0';
+            int64_t lv = strtoll(nbuf, NULL, 10);
             if (limit_neg) lv = -lv;
             if (lv < 0) {
                 arena_set_error(a, "2201W", "LIMIT must not be negative");
@@ -3726,7 +3729,7 @@ static void parse_order_limit(struct lexer *l, struct query_arena *a, struct que
                 lexer_next(l); /* consume operator */
                 struct token n2 = lexer_next(l);
                 if (n2.type == TOK_NUMBER) {
-                    int rv = sv_atoi(n2.value);
+                    int64_t rv = (int64_t)sv_atoi(n2.value);
                     if (arith.type == TOK_PLUS) s->limit_count = lv + rv;
                     else if (arith.type == TOK_MINUS) s->limit_count = lv - rv;
                     else if (arith.type == TOK_STAR) s->limit_count = lv * rv;
@@ -3748,7 +3751,10 @@ static void parse_order_limit(struct lexer *l, struct query_arena *a, struct que
         int offset_neg = 0;
         if (n.type == TOK_MINUS) { offset_neg = 1; n = lexer_next(l); }
         if (n.type == TOK_NUMBER) {
-            int ov = sv_atoi(n.value);
+            char nbuf[64];
+            size_t nlen = n.value.len < sizeof(nbuf) - 1 ? n.value.len : sizeof(nbuf) - 1;
+            memcpy(nbuf, n.value.data, nlen); nbuf[nlen] = '\0';
+            int64_t ov = strtoll(nbuf, NULL, 10);
             if (offset_neg) ov = -ov;
             if (ov < 0) {
                 arena_set_error(a, "2201X", "OFFSET must not be negative");
@@ -3769,7 +3775,7 @@ static void parse_order_limit(struct lexer *l, struct query_arena *a, struct que
         if (n.type == TOK_NUMBER) {
             lexer_next(l); /* consume number */
             s->has_limit = 1;
-            int lv = sv_atoi(n.value);
+            int64_t lv = (int64_t)sv_atoi(n.value);
             s->limit_count = lv < 0 ? 0 : lv;
         } else {
             /* FETCH FIRST ROW ONLY → limit 1 */
@@ -4358,7 +4364,7 @@ static int parse_join_list(struct lexer *l, struct query_arena *a, struct query_
     uint32_t joins_count = 0;
     for (;;) {
         struct token peek = lexer_peek(l);
-        int jtype = 0; /* 0=INNER */
+        enum join_type jtype = JOIN_INNER;
         int is_natural = 0;
 
         /* NATURAL prefix */
@@ -4373,11 +4379,10 @@ static int parse_join_list(struct lexer *l, struct query_arena *a, struct query_
                                           sv_eq_ignorecase_cstr(peek.value, "FULL") ||
                                           sv_eq_ignorecase_cstr(peek.value, "INNER") ||
                                           sv_eq_ignorecase_cstr(peek.value, "CROSS"))) {
-            if (sv_eq_ignorecase_cstr(peek.value, "LEFT"))  jtype = 1;
-            if (sv_eq_ignorecase_cstr(peek.value, "RIGHT")) jtype = 2;
-            if (sv_eq_ignorecase_cstr(peek.value, "FULL"))  jtype = 3;
-            if (sv_eq_ignorecase_cstr(peek.value, "CROSS")) jtype = 4;
-            /* INNER leaves jtype = 0 */
+            if (sv_eq_ignorecase_cstr(peek.value, "LEFT"))  jtype = JOIN_LEFT;
+            if (sv_eq_ignorecase_cstr(peek.value, "RIGHT")) jtype = JOIN_RIGHT;
+            if (sv_eq_ignorecase_cstr(peek.value, "FULL"))  jtype = JOIN_FULL;
+            if (sv_eq_ignorecase_cstr(peek.value, "CROSS")) jtype = JOIN_CROSS;
             lexer_next(l);
             peek = lexer_peek(l);
             if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "OUTER")) {
@@ -5469,7 +5474,7 @@ after_table_alias:
                 lexer_next(l); /* consume LATERAL */
                 /* synthesize a CROSS JOIN LATERAL entry */
                 struct join_info ji = {0};
-                ji.join_type = 4; /* CROSS */
+                ji.join_type = JOIN_CROSS;
                 ji.is_lateral = 1;
                 ji.join_on_cond = IDX_NONE;
                 ji.lateral_subquery_sql = IDX_NONE;
@@ -5561,7 +5566,7 @@ after_table_alias:
                 s->has_join = 1;
                 s->joins_start = (uint32_t)(a->joins.count - 1);
                 s->joins_count = 1;
-                s->join_type = 4; /* CROSS */
+                s->join_type = JOIN_CROSS;
             } else if (lat_peek.type == TOK_LPAREN) {
                 /* implicit comma join with subquery: FROM (sq1) a, (sq2) b */
                 lexer_next(l); /* consume ( */
@@ -5581,7 +5586,7 @@ after_table_alias:
                 while (sq_end > sq_start && (sq_end[-1] == ' ' || sq_end[-1] == '\n')) sq_end--;
                 size_t sq_len = (size_t)(sq_end - sq_start);
                 struct join_info ji = {0};
-                ji.join_type = 4; /* CROSS */
+                ji.join_type = JOIN_CROSS;
                 ji.is_lateral = 0;
                 ji.join_on_cond = IDX_NONE;
                 ji.lateral_subquery_sql = arena_store_string(a, sq_start, sq_len);
@@ -5599,12 +5604,12 @@ after_table_alias:
                 arena_push_join(a, ji);
                 s->has_join = 1;
                 s->joins_count++;
-                s->join_type = 4; /* CROSS */
+                s->join_type = JOIN_CROSS;
             } else if (lat_peek.type == TOK_IDENTIFIER || lat_peek.type == TOK_KEYWORD) {
                 /* implicit comma join: FROM t1, t2 → CROSS JOIN t2 */
                 struct token t2_tok = lexer_next(l);
                 struct join_info ji = {0};
-                ji.join_type = 4; /* CROSS (WHERE provides the filter) */
+                ji.join_type = JOIN_CROSS;
                 ji.is_lateral = 0;
                 ji.join_on_cond = IDX_NONE;
                 ji.lateral_subquery_sql = IDX_NONE;
@@ -5637,7 +5642,7 @@ after_table_alias:
                 arena_push_join(a, ji);
                 s->has_join = 1;
                 s->joins_count++;
-                s->join_type = 4; /* CROSS */
+                s->join_type = JOIN_CROSS;
                 s->join_table = ji.join_table;
             } else {
                 /* not a table after comma — restore position */
@@ -6510,6 +6515,7 @@ static int parse_create_table(struct lexer *l, struct query *out)
                 struct token val_tok = lexer_next(l);
                 col.has_default = 1;
                 col.default_value = calloc(1, sizeof(struct cell));
+                if (!col.default_value) { fprintf(stderr, "OOM: parse_create default\n"); abort(); }
                 *col.default_value = parse_literal_value_arena(val_tok, &out->arena);
             } else if (peek.type == TOK_KEYWORD && sv_eq_ignorecase_cstr(peek.value, "UNIQUE")) {
                 lexer_next(l);
@@ -7249,6 +7255,7 @@ static int parse_alter(struct lexer *l, struct query *out)
                 struct token val_tok = lexer_next(l);
                 a->alter_new_col.has_default = 1;
                 a->alter_new_col.default_value = calloc(1, sizeof(struct cell));
+                if (!a->alter_new_col.default_value) { fprintf(stderr, "OOM: parse_alter add default\n"); abort(); }
                 *a->alter_new_col.default_value = parse_literal_value_arena(val_tok, &out->arena);
             }
         }
@@ -7316,6 +7323,7 @@ static int parse_alter(struct lexer *l, struct query *out)
                 struct token val_tok = lexer_next(l);
                 a->alter_new_col.has_default = 1;
                 a->alter_new_col.default_value = calloc(1, sizeof(struct cell));
+                if (!a->alter_new_col.default_value) { fprintf(stderr, "OOM: parse_alter set default\n"); abort(); }
                 *a->alter_new_col.default_value = parse_literal_value_arena(val_tok, &out->arena);
                 return 0;
             }
@@ -7613,17 +7621,19 @@ static int query_parse_internal(const char *sql, struct query *out)
             return -1;
         }
         out->copy.table = tok.value;
-        out->copy.col_count = 0;
+        out->copy.col_names_count = 0;
         /* optional column list: (col1, col2, ...) */
         tok = lexer_peek(&l);
         if (tok.type == TOK_LPAREN) {
             lexer_next(&l); /* consume '(' */
+            out->copy.col_names_start = (uint32_t)out->arena.svs.count;
+            out->copy.col_names_count = 0;
             for (;;) {
                 tok = lexer_next(&l);
                 if (tok.type == TOK_RPAREN || tok.type == TOK_EOF) break;
                 if (tok.type == TOK_IDENTIFIER || tok.type == TOK_KEYWORD) {
-                    if (out->copy.col_count < 16)
-                        out->copy.col_names[out->copy.col_count++] = tok.value;
+                    arena_push_sv(&out->arena, tok.value);
+                    out->copy.col_names_count++;
                 }
                 /* skip commas */
                 tok = lexer_peek(&l);

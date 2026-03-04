@@ -2556,14 +2556,39 @@ static struct cell efc_lpad_rpad(enum expr_func fn, EFC_ARGS) {
 }
 
 static struct cell efc_concat(EFC_ARGS) {
-    size_t cap = 256, wp = 0; char *buf = malloc(cap); if (!buf) return cell_make_null();
+    size_t cap = 256, wp = 0;
+    char *buf = rb ? (char *)bump_alloc(rb, cap) : (char *)malloc(cap);
+    if (!buf) return cell_make_null();
     for (uint32_t i = 0; i < nargs; i++) {
         struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
-        if (!cell_is_null(&c)) { char *txt = cell_to_text_rb(&c, rb); if (txt) { size_t tlen = strlen(txt); if (wp + tlen >= cap) { while (wp + tlen >= cap) cap *= 2; char *tmp = realloc(buf, cap); if (!tmp) { free(buf); cell_release_rb(&c, rb); if (!rb) free(txt); return cell_make_null(); } buf = tmp; } memcpy(buf + wp, txt, tlen); wp += tlen; if (!rb) free(txt); } }
+        if (!cell_is_null(&c)) {
+            char *txt = cell_to_text_rb(&c, rb);
+            if (txt) {
+                size_t tlen = strlen(txt);
+                if (wp + tlen >= cap) {
+                    while (wp + tlen >= cap) cap *= 2;
+                    if (rb) {
+                        char *nb = (char *)bump_alloc(rb, cap);
+                        if (nb) memcpy(nb, buf, wp);
+                        buf = nb;
+                    } else {
+                        buf = (char *)realloc(buf, cap);
+                    }
+                    if (!buf) { cell_release_rb(&c, rb); if (!rb) free(txt); return cell_make_null(); }
+                }
+                memcpy(buf + wp, txt, tlen);
+                wp += tlen;
+                if (!rb) free(txt);
+            }
+        }
         cell_release_rb(&c, rb);
     }
     buf[wp] = '\0';
-    struct cell r = {0}; r.type = COLUMN_TYPE_TEXT; r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf); free(buf); return r;
+    struct cell r = {0};
+    r.type = COLUMN_TYPE_TEXT;
+    r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+    if (!rb) free(buf);
+    return r;
 }
 
 static struct cell efc_concat_ws(EFC_ARGS) {
@@ -2571,15 +2596,43 @@ static struct cell efc_concat_ws(EFC_ARGS) {
     struct cell sep_c = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
     if (cell_is_null(&sep_c)) return sep_c;
     const char *sep = (column_type_is_text(sep_c.type) && sep_c.value.as_text) ? sep_c.value.as_text : "";
-    size_t sep_len = strlen(sep), cap = 256, wp = 0; char *buf = malloc(cap); if (!buf) { cell_release_rb(&sep_c, rb); return cell_make_null(); }
+    size_t sep_len = strlen(sep), cap = 256, wp = 0;
+    char *buf = rb ? (char *)bump_alloc(rb, cap) : (char *)malloc(cap);
+    if (!buf) { cell_release_rb(&sep_c, rb); return cell_make_null(); }
     int first = 1;
     for (uint32_t i = 1; i < nargs; i++) {
         struct cell c = eval_expr(FUNC_ARG(arena, args_start, i), arena, t, row, db, rb);
-        if (!cell_is_null(&c)) { char *txt = cell_to_text_rb(&c, rb); if (txt) { size_t tlen = strlen(txt), need = wp + (first ? 0 : sep_len) + tlen; if (need >= cap) { while (need >= cap) cap *= 2; char *tmp = realloc(buf, cap); if (!tmp) { free(buf); cell_release_rb(&c, rb); if (!rb) free(txt); cell_release_rb(&sep_c, rb); return cell_make_null(); } buf = tmp; } if (!first) { memcpy(buf + wp, sep, sep_len); wp += sep_len; } memcpy(buf + wp, txt, tlen); wp += tlen; first = 0; if (!rb) free(txt); } }
+        if (!cell_is_null(&c)) {
+            char *txt = cell_to_text_rb(&c, rb);
+            if (txt) {
+                size_t tlen = strlen(txt);
+                size_t need = wp + (first ? 0 : sep_len) + tlen;
+                if (need >= cap) {
+                    while (need >= cap) cap *= 2;
+                    if (rb) {
+                        char *nb = (char *)bump_alloc(rb, cap);
+                        if (nb) memcpy(nb, buf, wp);
+                        buf = nb;
+                    } else {
+                        buf = (char *)realloc(buf, cap);
+                    }
+                    if (!buf) { cell_release_rb(&c, rb); if (!rb) free(txt); cell_release_rb(&sep_c, rb); return cell_make_null(); }
+                }
+                if (!first) { memcpy(buf + wp, sep, sep_len); wp += sep_len; }
+                memcpy(buf + wp, txt, tlen); wp += tlen;
+                first = 0;
+                if (!rb) free(txt);
+            }
+        }
         cell_release_rb(&c, rb);
     }
-    buf[wp] = '\0'; cell_release_rb(&sep_c, rb);
-    struct cell r = {0}; r.type = COLUMN_TYPE_TEXT; r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf); free(buf); return r;
+    buf[wp] = '\0';
+    cell_release_rb(&sep_c, rb);
+    struct cell r = {0};
+    r.type = COLUMN_TYPE_TEXT;
+    r.value.as_text = rb ? bump_strdup(rb, buf) : strdup(buf);
+    if (!rb) free(buf);
+    return r;
 }
 
 static struct cell efc_position(EFC_ARGS) {
@@ -2775,7 +2828,7 @@ static struct cell efc_md5(EFC_ARGS) {
     static const uint32_t K[64]={0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391};
     static const int rot[64]={7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21};
     size_t msg_len=strlen(input),padded_len=((msg_len+8)/64+1)*64;
-    uint8_t *msg=calloc(padded_len,1); memcpy(msg,input,msg_len); msg[msg_len]=0x80;
+    uint8_t *msg=calloc(padded_len,1); if(!msg){fprintf(stderr,"OOM: md5\n");abort();} memcpy(msg,input,msg_len); msg[msg_len]=0x80;
     uint64_t bit_len=(uint64_t)msg_len*8; memcpy(msg+padded_len-8,&bit_len,8);
     for(size_t chunk=0;chunk<padded_len;chunk+=64){uint32_t M[16]; memcpy(M,msg+chunk,64); uint32_t aa=s0,b=s1,c=s2,d=s3; for(int i=0;i<64;i++){uint32_t F,g; if(i<16){F=(b&c)|(~b&d);g=(uint32_t)i;} else if(i<32){F=(d&b)|(~d&c);g=(5*(uint32_t)i+1)%16;} else if(i<48){F=b^c^d;g=(3*(uint32_t)i+5)%16;} else{F=c^(b|~d);g=(7*(uint32_t)i)%16;} F+=aa+K[i]+M[g]; aa=d;d=c;c=b; b+=(F<<rot[i])|(F>>(32-rot[i]));} s0+=aa;s1+=b;s2+=c;s3+=d;}
     free(msg); cell_release_rb(&a, rb);
@@ -4302,6 +4355,53 @@ static const char *cell_to_text_buf(const struct cell *cv, char *tmp, size_t tmp
     __builtin_unreachable();
 }
 
+static int agg_eval_having(struct query_select *s, struct query_arena *arena,
+                           struct row *dst, uint32_t naggs)
+{
+    int passes = 1;
+    if (s->having_expr != IDX_NONE) {
+        struct cell hv = eval_expr(s->having_expr, arena, NULL, dst, NULL, NULL);
+        passes = !cell_is_null(&hv) && hv.value.as_bool;
+        cell_release_rb(&hv, NULL);
+    } else if (s->having_cond != IDX_NONE) {
+        struct table having_t = {0};
+        da_init(&having_t.columns);
+        da_init(&having_t.indexes);
+        for (uint32_t a = 0; a < naggs; a++) {
+            struct agg_expr *ae_h = &arena->aggregates.items[s->aggregates_start + a];
+            char agg_name[256];
+            const char *fn = "?";
+            switch (ae_h->func) {
+                case AGG_COUNT: fn = "count"; break;
+                case AGG_SUM:   fn = "sum"; break;
+                case AGG_AVG:   fn = "avg"; break;
+                case AGG_MIN:   fn = "min"; break;
+                case AGG_MAX:   fn = "max"; break;
+                case AGG_STRING_AGG: fn = "string_agg"; break;
+                case AGG_ARRAY_AGG:  fn = "array_agg"; break;
+                case AGG_BOOL_AND:   fn = "bool_and"; break;
+                case AGG_BOOL_OR:    fn = "bool_or"; break;
+                case AGG_STDDEV:     fn = "stddev"; break;
+                case AGG_VARIANCE:   fn = "variance"; break;
+                case AGG_NONE: fn = "none"; break;
+            }
+            if (sv_eq_cstr(ae_h->column, "*"))
+                snprintf(agg_name, sizeof(agg_name), "%s", fn);
+            else
+                snprintf(agg_name, sizeof(agg_name), "%s", fn);
+            struct column col_h = { .name = strdup(agg_name),
+                                    .type = dst->cells.items[a].type,
+                                    .enum_type_name = NULL };
+            da_push(&having_t.columns, col_h);
+        }
+        passes = eval_condition(s->having_cond, arena, dst, &having_t, NULL);
+        for (size_t i = 0; i < having_t.columns.count; i++)
+            column_free(&having_t.columns.items[i]);
+        da_free(&having_t.columns);
+    }
+    return passes;
+}
+
 int query_aggregate(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
 {
     /* find WHERE column index if applicable (legacy path) */
@@ -4721,52 +4821,9 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
         da_push(&dst.cells, c);
     }
     /* HAVING filter (without GROUP BY): evaluate condition against result row */
-    if (s->has_having) {
-        int passes = 1;
-        if (s->having_expr != IDX_NONE) {
-            struct cell hv = eval_expr(s->having_expr, arena, NULL, &dst, NULL, NULL);
-            passes = !cell_is_null(&hv) && hv.value.as_bool;
-            cell_release_rb(&hv, NULL);
-        } else if (s->having_cond != IDX_NONE) {
-            struct table having_t = {0};
-            da_init(&having_t.columns);
-            da_init(&having_t.indexes);
-            for (uint32_t a = 0; a < naggs; a++) {
-                struct agg_expr *ae_h = &arena->aggregates.items[s->aggregates_start + a];
-                char agg_name[256];
-                const char *fn = "?";
-                switch (ae_h->func) {
-                    case AGG_COUNT: fn = "count"; break;
-                    case AGG_SUM:   fn = "sum"; break;
-                    case AGG_AVG:   fn = "avg"; break;
-                    case AGG_MIN:   fn = "min"; break;
-                    case AGG_MAX:   fn = "max"; break;
-                    case AGG_STRING_AGG: fn = "string_agg"; break;
-                    case AGG_ARRAY_AGG:  fn = "array_agg"; break;
-                    case AGG_BOOL_AND:   fn = "bool_and"; break;
-                    case AGG_BOOL_OR:    fn = "bool_or"; break;
-                    case AGG_STDDEV:     fn = "stddev"; break;
-                    case AGG_VARIANCE:   fn = "variance"; break;
-                    case AGG_NONE: fn = "none"; break;
-                }
-                if (sv_eq_cstr(ae_h->column, "*"))
-                    snprintf(agg_name, sizeof(agg_name), "%s", fn);
-                else
-                    snprintf(agg_name, sizeof(agg_name), "%s", fn);
-                struct column col_h = { .name = strdup(agg_name),
-                                        .type = dst.cells.items[a].type,
-                                        .enum_type_name = NULL };
-                da_push(&having_t.columns, col_h);
-            }
-            passes = eval_condition(s->having_cond, arena, &dst, &having_t, NULL);
-            for (size_t i = 0; i < having_t.columns.count; i++)
-                column_free(&having_t.columns.items[i]);
-            da_free(&having_t.columns);
-        }
-        if (!passes) {
-            da_free(&dst.cells);
-            return 0;
-        }
+    if (s->has_having && !agg_eval_having(s, arena, &dst, naggs)) {
+        da_free(&dst.cells);
+        return 0;
     }
 
     /* If parsed_columns exist, rebuild the row to include non-aggregate
@@ -4899,6 +4956,8 @@ static double cell_to_double(const struct cell *c)
 /* Forward declaration for parse_over_clause (defined in parser.c via query_parse_into) */
 extern int query_parse_into(const char *sql, struct query *out, struct query_arena *arena);
 
+// TODO: CONTRIBUTING.MD VIOLATION (spirit): query_window is ~900 lines. Should be
+// decomposed into init, per-window-function evaluation, and emit phases.
 static int query_window(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
 {
     size_t nrows = t->flat.nrows;
@@ -5873,6 +5932,8 @@ static int grp_find_result_col(struct table *t, int *grp_cols, size_t ngrp,
     return -1;
 }
 
+// TODO: CONTRIBUTING.MD VIOLATION (spirit): query_group_by is ~840 lines. Should be
+// decomposed into group-key resolution, accumulation, and result-row emission phases.
 int query_group_by(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb, struct database *db)
 {
     /* resolve GROUP BY column indices (grp_cols[k] = -2 means expression-based) */
@@ -6711,6 +6772,144 @@ static int row_matches(struct table *t, struct where_clause *w, struct query_are
     return cell_equal(&row->cells.items[where_col], &w->where_value);
 }
 
+static int exec_rollup_cube(struct table *t, struct query_select *s, struct query_arena *arena,
+                            struct rows *result, struct bump_alloc *rb, struct database *db)
+{
+    /* ROLLUP/CUBE: run query_group_by for each grouping set */
+    uint32_t orig_count = s->group_by_count;
+    uint32_t orig_start = s->group_by_start;
+    int orig_rollup = s->group_by_rollup;
+    int orig_cube = s->group_by_cube;
+
+    /* generate grouping sets */
+    /* ROLLUP(a,b,c): (a,b,c), (a,b), (a), () — n+1 sets */
+    /* CUBE(a,b,c): all 2^n subsets */
+    uint32_t nsets = 0;
+    uint32_t sets[256]; /* bitmask per set */
+    if (s->group_by_rollup) {
+        for (uint32_t i = 0; i <= orig_count; i++) {
+            uint32_t mask = 0;
+            for (uint32_t j = 0; j < orig_count - i; j++)
+                mask |= (1u << j);
+            sets[nsets++] = mask;
+        }
+    } else { /* CUBE */
+        uint32_t total = 1u << orig_count;
+        for (uint32_t m = total; m > 0; m--)
+            sets[nsets++] = m - 1;
+    }
+
+    /* resolve group column indices for NULL-out */
+    int grp_col_idx[32];
+    for (uint32_t k = 0; k < orig_count && k < 32; k++) {
+        sv gbcol = ASV(arena, orig_start + k);
+        grp_col_idx[k] = table_find_column_sv(t, gbcol);
+    }
+
+    s->group_by_rollup = 0;
+    s->group_by_cube = 0;
+
+    for (uint32_t si = 0; si < nsets; si++) {
+        uint32_t mask = sets[si];
+        /* build temporary sv list for this set's active columns */
+        uint32_t tmp_start = (uint32_t)arena->svs.count;
+        uint32_t tmp_count = 0;
+        for (uint32_t k = 0; k < orig_count; k++) {
+            if (mask & (1u << k)) {
+                arena_push_sv(arena, ASV(arena, orig_start + k));
+                tmp_count++;
+            }
+        }
+        if (tmp_count == 0) {
+            /* grand total: run as plain aggregate (no GROUP BY) */
+            s->has_group_by = 0;
+            struct rows sub = {0};
+            query_aggregate(t, s, arena, &sub, NULL);
+            s->has_group_by = 1;
+            /* prepend NULL group columns if agg_before_cols is 0 */
+            for (size_t r = 0; r < sub.count; r++) {
+                if (!s->agg_before_cols) {
+                    /* insert NULL cells for each group column at the front */
+                    struct row newrow = {0};
+                    da_init(&newrow.cells);
+                    for (uint32_t k = 0; k < orig_count; k++) {
+                        struct cell nc = {0};
+                        nc.type = (grp_col_idx[k] >= 0) ? t->columns.items[grp_col_idx[k]].type : COLUMN_TYPE_TEXT;
+                        nc.is_null = 1;
+                        da_push(&newrow.cells, nc);
+                    }
+                    for (size_t ci = 0; ci < sub.data[r].cells.count; ci++) {
+                        struct cell dup;
+                        if (rb) cell_copy_bump(&dup, &sub.data[r].cells.items[ci], rb);
+                        else    cell_copy(&dup, &sub.data[r].cells.items[ci]);
+                        da_push(&newrow.cells, dup);
+                    }
+                    row_free(&sub.data[r]);
+                    rows_push(result, newrow);
+                } else {
+                    rows_push(result, sub.data[r]);
+                    sub.data[r] = (struct row){0};
+                }
+            }
+            free(sub.data);
+        } else {
+            s->group_by_start = tmp_start;
+            s->group_by_count = tmp_count;
+            s->group_by_col = ASV(arena, tmp_start);
+            struct rows sub = {0};
+            query_group_by(t, s, arena, &sub, NULL, db);
+            /* NULL-out columns not in this grouping set */
+            for (size_t r = 0; r < sub.count; r++) {
+                if (!s->agg_before_cols) {
+                    /* group columns are at the front of the row */
+                    /* we need to expand to orig_count group cols, inserting NULLs for missing ones */
+                    struct row newrow = {0};
+                    da_init(&newrow.cells);
+                    size_t sub_grp_i = 0;
+                    for (uint32_t k = 0; k < orig_count; k++) {
+                        if (mask & (1u << k)) {
+                            if (sub_grp_i < sub.data[r].cells.count) {
+                                struct cell dup;
+                                if (rb) cell_copy_bump(&dup, &sub.data[r].cells.items[sub_grp_i], rb);
+                                else    cell_copy(&dup, &sub.data[r].cells.items[sub_grp_i]);
+                                da_push(&newrow.cells, dup);
+                            }
+                            sub_grp_i++;
+                        } else {
+                            struct cell nc = {0};
+                            nc.type = (grp_col_idx[k] >= 0) ? t->columns.items[grp_col_idx[k]].type : COLUMN_TYPE_TEXT;
+                            nc.is_null = 1;
+                            da_push(&newrow.cells, nc);
+                        }
+                    }
+                    /* append aggregate columns */
+                    for (size_t ci = sub_grp_i; ci < sub.data[r].cells.count; ci++) {
+                        struct cell dup;
+                        if (rb) cell_copy_bump(&dup, &sub.data[r].cells.items[ci], rb);
+                        else    cell_copy(&dup, &sub.data[r].cells.items[ci]);
+                        da_push(&newrow.cells, dup);
+                    }
+                    row_free(&sub.data[r]);
+                    rows_push(result, newrow);
+                } else {
+                    rows_push(result, sub.data[r]);
+                    sub.data[r] = (struct row){0};
+                }
+            }
+            free(sub.data);
+        }
+    }
+
+    /* restore original state */
+    s->group_by_start = orig_start;
+    s->group_by_count = orig_count;
+    s->group_by_rollup = orig_rollup;
+    s->group_by_cube = orig_cube;
+    return 0;
+}
+
+// TODO: CONTRIBUTING.MD VIOLATION (spirit): query_select_exec is ~550 lines. Should be
+// decomposed into sub-phases (WHERE, JOIN, ORDER BY, LIMIT, etc.).
 int query_select_exec(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct database *db, struct bump_alloc *rb)
 {
     /* dispatch to window path if select_exprs are present */
@@ -6734,139 +6933,8 @@ int query_select_exec(struct table *t, struct query_select *s, struct query_aren
 
     /* dispatch to GROUP BY path */
     if (s->has_group_by) {
-        if (s->group_by_rollup || s->group_by_cube) {
-            /* ROLLUP/CUBE: run query_group_by for each grouping set */
-            uint32_t orig_count = s->group_by_count;
-            uint32_t orig_start = s->group_by_start;
-            int orig_rollup = s->group_by_rollup;
-            int orig_cube = s->group_by_cube;
-
-            /* generate grouping sets */
-            /* ROLLUP(a,b,c): (a,b,c), (a,b), (a), () — n+1 sets */
-            /* CUBE(a,b,c): all 2^n subsets */
-            uint32_t nsets = 0;
-            uint32_t sets[256]; /* bitmask per set */
-            if (s->group_by_rollup) {
-                for (uint32_t i = 0; i <= orig_count; i++) {
-                    uint32_t mask = 0;
-                    for (uint32_t j = 0; j < orig_count - i; j++)
-                        mask |= (1u << j);
-                    sets[nsets++] = mask;
-                }
-            } else { /* CUBE */
-                uint32_t total = 1u << orig_count;
-                for (uint32_t m = total; m > 0; m--)
-                    sets[nsets++] = m - 1;
-            }
-
-            /* resolve group column indices for NULL-out */
-            int grp_col_idx[32];
-            for (uint32_t k = 0; k < orig_count && k < 32; k++) {
-                sv gbcol = ASV(arena, orig_start + k);
-                grp_col_idx[k] = table_find_column_sv(t, gbcol);
-            }
-
-            s->group_by_rollup = 0;
-            s->group_by_cube = 0;
-
-            for (uint32_t si = 0; si < nsets; si++) {
-                uint32_t mask = sets[si];
-                /* build temporary sv list for this set's active columns */
-                uint32_t tmp_start = (uint32_t)arena->svs.count;
-                uint32_t tmp_count = 0;
-                for (uint32_t k = 0; k < orig_count; k++) {
-                    if (mask & (1u << k)) {
-                        arena_push_sv(arena, ASV(arena, orig_start + k));
-                        tmp_count++;
-                    }
-                }
-                if (tmp_count == 0) {
-                    /* grand total: run as plain aggregate (no GROUP BY) */
-                    s->has_group_by = 0;
-                    struct rows sub = {0};
-                    query_aggregate(t, s, arena, &sub, NULL);
-                    s->has_group_by = 1;
-                    /* prepend NULL group columns if agg_before_cols is 0 */
-                    for (size_t r = 0; r < sub.count; r++) {
-                        if (!s->agg_before_cols) {
-                            /* insert NULL cells for each group column at the front */
-                            struct row newrow = {0};
-                            da_init(&newrow.cells);
-                            for (uint32_t k = 0; k < orig_count; k++) {
-                                struct cell nc = {0};
-                                nc.type = (grp_col_idx[k] >= 0) ? t->columns.items[grp_col_idx[k]].type : COLUMN_TYPE_TEXT;
-                                nc.is_null = 1;
-                                da_push(&newrow.cells, nc);
-                            }
-                            for (size_t ci = 0; ci < sub.data[r].cells.count; ci++) {
-                                struct cell dup;
-                                if (rb) cell_copy_bump(&dup, &sub.data[r].cells.items[ci], rb);
-                                else    cell_copy(&dup, &sub.data[r].cells.items[ci]);
-                                da_push(&newrow.cells, dup);
-                            }
-                            row_free(&sub.data[r]);
-                            rows_push(result, newrow);
-                        } else {
-                            rows_push(result, sub.data[r]);
-                            sub.data[r] = (struct row){0};
-                        }
-                    }
-                    free(sub.data);
-                } else {
-                    s->group_by_start = tmp_start;
-                    s->group_by_count = tmp_count;
-                    s->group_by_col = ASV(arena, tmp_start);
-                    struct rows sub = {0};
-                    query_group_by(t, s, arena, &sub, NULL, db);
-                    /* NULL-out columns not in this grouping set */
-                    for (size_t r = 0; r < sub.count; r++) {
-                        if (!s->agg_before_cols) {
-                            /* group columns are at the front of the row */
-                            /* we need to expand to orig_count group cols, inserting NULLs for missing ones */
-                            struct row newrow = {0};
-                            da_init(&newrow.cells);
-                            size_t sub_grp_i = 0;
-                            for (uint32_t k = 0; k < orig_count; k++) {
-                                if (mask & (1u << k)) {
-                                    if (sub_grp_i < sub.data[r].cells.count) {
-                                        struct cell dup;
-                                        if (rb) cell_copy_bump(&dup, &sub.data[r].cells.items[sub_grp_i], rb);
-                                        else    cell_copy(&dup, &sub.data[r].cells.items[sub_grp_i]);
-                                        da_push(&newrow.cells, dup);
-                                    }
-                                    sub_grp_i++;
-                                } else {
-                                    struct cell nc = {0};
-                                    nc.type = (grp_col_idx[k] >= 0) ? t->columns.items[grp_col_idx[k]].type : COLUMN_TYPE_TEXT;
-                                    nc.is_null = 1;
-                                    da_push(&newrow.cells, nc);
-                                }
-                            }
-                            /* append aggregate columns */
-                            for (size_t ci = sub_grp_i; ci < sub.data[r].cells.count; ci++) {
-                                struct cell dup;
-                                if (rb) cell_copy_bump(&dup, &sub.data[r].cells.items[ci], rb);
-                                else    cell_copy(&dup, &sub.data[r].cells.items[ci]);
-                                da_push(&newrow.cells, dup);
-                            }
-                            row_free(&sub.data[r]);
-                            rows_push(result, newrow);
-                        } else {
-                            rows_push(result, sub.data[r]);
-                            sub.data[r] = (struct row){0};
-                        }
-                    }
-                    free(sub.data);
-                }
-            }
-
-            /* restore original state */
-            s->group_by_start = orig_start;
-            s->group_by_count = orig_count;
-            s->group_by_rollup = orig_rollup;
-            s->group_by_cube = orig_cube;
-            return 0;
-        }
+        if (s->group_by_rollup || s->group_by_cube)
+            return exec_rollup_cube(t, s, arena, result, rb, db);
         return query_group_by(t, s, arena, result, rb, db);
     }
 
@@ -7148,31 +7216,20 @@ int query_select_exec(struct table *t, struct query_select *s, struct query_aren
         }
     }
 
-    // TODO: DISTINCT dedup is O(n^2); could sort rows first then deduplicate
-    // in a single linear pass for O(n log n) performance
-    // TODO: CONTAINER REUSE: the row-equality loop here is the same pattern used in
-    // UNION/INTERSECT/EXCEPT in database.c; extract a shared rows_equal helper into row.c
-    /* DISTINCT: deduplicate before LIMIT (SQL semantics) */
+    /* DISTINCT: sort + linear dedup — O(n log n) */
     if (s->has_distinct && tmp.count > 1) {
-        struct rows deduped = {0};
-        for (size_t i = 0; i < tmp.count; i++) {
-            int dup = 0;
-            for (size_t j = 0; j < deduped.count; j++) {
-                if (row_equal_nullsafe(&tmp.data[i], &deduped.data[j])) { dup = 1; break; }
-            }
-            if (!dup) {
-                rows_push(&deduped, tmp.data[i]);
-                tmp.data[i] = (struct row){0};
-            }
-        }
-        for (size_t i = 0; i < tmp.count; i++) {
-            if (tmp.data[i].cells.items) {
+        qsort(tmp.data, tmp.count, sizeof(struct row),
+              (int (*)(const void *, const void *))row_compare_nullsafe);
+        size_t w = 1;
+        for (size_t i = 1; i < tmp.count; i++) {
+            if (row_equal_nullsafe(&tmp.data[i], &tmp.data[w - 1])) {
                 if (rb) da_free(&tmp.data[i].cells);
                 else    row_free(&tmp.data[i]);
+            } else {
+                tmp.data[w++] = tmp.data[i];
             }
         }
-        free(tmp.data);
-        tmp = deduped;
+        tmp.count = w;
     }
 
     /* DISTINCT ON: keep first row per distinct value of the ON columns */

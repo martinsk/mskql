@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <mach/mach_time.h>
 
 #include "../src/database.h"
 #include "../src/parser.h"
@@ -35,6 +36,7 @@ static double now_sec(void)
 #define MAX_ITERS 100000
 static double g_iter_ms[MAX_ITERS];
 static int    g_niter;
+static double g_ns_per_iter;
 
 static int dbl_cmp(const void *a, const void *b)
 {
@@ -118,9 +120,7 @@ static double bench_select_full_scan(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db, "SELECT * FROM t", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db, "SELECT * FROM t");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -152,9 +152,7 @@ static double bench_select_where(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db, "SELECT * FROM t WHERE amount > 2500", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db, "SELECT * FROM t WHERE amount > 2500");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -187,10 +185,8 @@ static double bench_aggregate(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
-            "SELECT region, SUM(amount) FROM sales GROUP BY region", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db,
+            "SELECT region, SUM(amount) FROM sales GROUP BY region");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -221,9 +217,7 @@ static double bench_order_by(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db, "SELECT * FROM t ORDER BY val DESC", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db, "SELECT * FROM t ORDER BY val DESC");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -262,11 +256,9 @@ static double bench_join(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "SELECT users.name, orders.total FROM users "
-            "JOIN orders ON users.id = orders.user_id", &r);
-        rows_free(&r);
+            "JOIN orders ON users.id = orders.user_id");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -392,11 +384,9 @@ static double bench_index_lookup(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
         snprintf(sql, sizeof(sql),
                  "SELECT * FROM t WHERE id = %d", i % 10000);
-        db_exec_sql(&db, sql, &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db, sql);
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -467,11 +457,9 @@ static double bench_window_functions(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "SELECT id, grp, val, "
-            "ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) FROM t", &r);
-        rows_free(&r);
+            "ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) FROM t");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -503,9 +491,7 @@ static double bench_distinct(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db, "SELECT DISTINCT category FROM t", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db, "SELECT DISTINCT category FROM t");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -540,11 +526,9 @@ static double bench_subquery(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "SELECT * FROM t1 WHERE id IN "
-            "(SELECT id FROM t2 WHERE flag > 500)", &r);
-        rows_free(&r);
+            "(SELECT id FROM t2 WHERE flag > 500)");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -576,11 +560,9 @@ static double bench_cte(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "WITH filtered AS (SELECT * FROM t WHERE val > 500) "
-            "SELECT * FROM filtered WHERE category = 'cat_3'", &r);
-        rows_free(&r);
+            "SELECT * FROM filtered WHERE category = 'cat_3'");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -603,9 +585,7 @@ static double bench_generate_series(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db, "SELECT * FROM generate_series(1, 10000)", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db, "SELECT * FROM generate_series(1, 10000)");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -637,11 +617,9 @@ static double bench_scalar_functions(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "SELECT UPPER(name), LENGTH(name), ABS(score), "
-            "ROUND(score, 2) FROM t", &r);
-        rows_free(&r);
+            "ROUND(score, 2) FROM t");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -674,10 +652,8 @@ static double bench_expression_agg(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
-            "SELECT category, SUM(price * quantity) FROM t GROUP BY category", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db,
+            "SELECT category, SUM(price * quantity) FROM t GROUP BY category");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -709,9 +685,7 @@ static double bench_multi_sort(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db, "SELECT * FROM t ORDER BY a DESC, b ASC", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db, "SELECT * FROM t ORDER BY a DESC, b ASC");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -746,10 +720,8 @@ static double bench_set_ops(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
-            "SELECT id, val FROM t1 UNION SELECT id, val FROM t2", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db,
+            "SELECT id, val FROM t1 UNION SELECT id, val FROM t2");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -822,15 +794,13 @@ static double bench_multi_join(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "SELECT c.region, p.category, SUM(o.quantity * p.price) "
             "FROM orders o "
             "JOIN customers c ON o.customer_id = c.id "
             "JOIN products p ON o.product_id = p.id "
             "GROUP BY c.region, p.category "
-            "ORDER BY c.region, p.category", &r);
-        rows_free(&r);
+            "ORDER BY c.region, p.category");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -854,15 +824,13 @@ static double bench_analytical_cte(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "WITH user_totals AS ("
             "SELECT user_id, SUM(amount) AS total "
             "FROM events WHERE event_type = 0 "
             "GROUP BY user_id "
             "HAVING SUM(amount) > 500"
-            ") SELECT * FROM user_totals ORDER BY total DESC LIMIT 100", &r);
-        rows_free(&r);
+            ") SELECT * FROM user_totals ORDER BY total DESC LIMIT 100");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -886,11 +854,9 @@ static double bench_wide_agg(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "SELECT sensor_id, COUNT(*), AVG(v1), SUM(v2), MIN(v3), MAX(v4), AVG(v5) "
-            "FROM metrics GROUP BY sensor_id ORDER BY sensor_id", &r);
-        rows_free(&r);
+            "FROM metrics GROUP BY sensor_id ORDER BY sensor_id");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -914,10 +880,8 @@ static double bench_large_sort(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
-            "SELECT * FROM events ORDER BY score DESC, id ASC", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db,
+            "SELECT * FROM events ORDER BY score DESC, id ASC");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -941,13 +905,11 @@ static double bench_subquery_complex(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "SELECT * FROM events "
             "WHERE user_id IN (SELECT id FROM customers WHERE tier = 'premium') "
             "AND amount > 100 "
-            "ORDER BY amount DESC LIMIT 500", &r);
-        rows_free(&r);
+            "ORDER BY amount DESC LIMIT 500");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -971,12 +933,10 @@ static double bench_window_rank(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "SELECT rep_id, region_id, amount, "
             "RANK() OVER (PARTITION BY region_id ORDER BY amount DESC) "
-            "FROM sales", &r);
-        rows_free(&r);
+            "FROM sales");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -1000,16 +960,14 @@ static double bench_mixed_analytical(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
+        db_exec_sql_discard(&db,
             "WITH order_summary AS ("
             "SELECT o.customer_id, SUM(o.quantity * p.price) AS total "
             "FROM orders o JOIN products p ON o.product_id = p.id "
             "GROUP BY o.customer_id"
             ") SELECT c.region, COUNT(*) AS num_customers, SUM(os.total) AS revenue "
             "FROM order_summary os JOIN customers c ON os.customer_id = c.id "
-            "GROUP BY c.region ORDER BY revenue DESC", &r);
-        rows_free(&r);
+            "GROUP BY c.region ORDER BY revenue DESC");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -1069,9 +1027,7 @@ static double bench_vector_scan(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db, "SELECT * FROM t_vec", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db, "SELECT * FROM t_vec");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -1113,10 +1069,8 @@ static double bench_vector_wide(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
-            "SELECT id, score, v FROM t_wide ORDER BY score DESC LIMIT 100", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db,
+            "SELECT id, score, v FROM t_wide ORDER BY score DESC LIMIT 100");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -1157,10 +1111,8 @@ static double bench_vector_filter(void)
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
         double it0 = now_sec();
-        struct rows r = {0};
-        db_exec_sql(&db,
-            "SELECT id, v FROM t_vfilt WHERE category = 5", &r);
-        rows_free(&r);
+        db_exec_sql_discard(&db,
+            "SELECT id, v FROM t_vfilt WHERE category = 5");
         g_iter_ms[i] = (now_sec() - it0) * 1e3;
     }
     double elapsed_ms = (now_sec() - t0) * 1e3;
@@ -1219,6 +1171,7 @@ struct bench_result {
     double ms;
     double p_min, p50, p95, p99, p_max;
     int niter;
+    double ns_per_iter;
 };
 
 static void write_json(const char *path, struct bench_result *results, int n)
@@ -1264,10 +1217,21 @@ int main(int argc, char **argv)
         printf("  running %-30s ...", benchmarks[i].name);
         fflush(stdout);
         g_niter = 0;
+        g_ns_per_iter = 0.0;
+
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        uint64_t mach_t0 = mach_absolute_time();
         double ms = benchmarks[i].fn();
+        uint64_t mach_t1 = mach_absolute_time();
+        uint64_t mach_elapsed = mach_t1 - mach_t0;
+        double total_ns = (double)mach_elapsed * (double)tb.numer / (double)tb.denom;
+        if (g_niter > 0)
+            g_ns_per_iter = total_ns / (double)g_niter;
         results[ran].name = benchmarks[i].name;
         results[ran].ms = ms;
         results[ran].niter = g_niter;
+        results[ran].ns_per_iter = g_ns_per_iter;
         if (g_niter > 0) {
             qsort(g_iter_ms, (size_t)g_niter, sizeof(double), dbl_cmp);
             results[ran].p_min = g_iter_ms[0];
@@ -1280,6 +1244,8 @@ int main(int argc, char **argv)
         if (g_niter > 0)
             printf("  [p50=%.3f p95=%.3f p99=%.3f]",
                    results[ran].p50, results[ran].p95, results[ran].p99);
+        if (g_ns_per_iter > 0)
+            printf("  ~%.0f ns/iter", g_ns_per_iter);
         printf("\n");
         fflush(stdout);
         ran++;

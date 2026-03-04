@@ -3,6 +3,7 @@
 #include "stringview.h"
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 
 /* ---- helpers ---- */
 
@@ -24,13 +25,14 @@ static const char *agg_func_name(enum agg_func f)
     }
 }
 
-static const char *join_type_name(int jt)
+static const char *join_type_name(enum join_type jt)
 {
     switch (jt) {
-    case 0: return "INNER"; case 1: return "LEFT";
-    case 2: return "RIGHT"; case 3: return "FULL";
-    case 4: return "CROSS"; default: return "?";
+    case JOIN_INNER: return "INNER"; case JOIN_LEFT: return "LEFT";
+    case JOIN_RIGHT: return "RIGHT"; case JOIN_FULL: return "FULL";
+    case JOIN_CROSS: return "CROSS";
     }
+    __builtin_unreachable();
 }
 
 static const char *cmp_op_name(enum cmp_op op)
@@ -265,11 +267,11 @@ int query_select_print(struct query_select *s, struct query_arena *arena,
     /* LIMIT / OFFSET */
     if (s->has_limit) {
         FIELD("LIMIT:");
-        W("%d\n", s->limit_count);
+        W("%" PRId64 "\n", s->limit_count);
     }
     if (s->has_offset) {
         FIELD("OFFSET:");
-        W("%d\n", s->offset_count);
+        W("%" PRId64 "\n", s->offset_count);
     }
 
     /* CTEs */

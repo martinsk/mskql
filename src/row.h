@@ -61,5 +61,6 @@ void cell_free_text(struct cell *c);
 /* row-level equality (same cell count and all cells equal) */
 int  row_equal(const struct row *a, const struct row *b);
 int  row_equal_nullsafe(const struct row *a, const struct row *b);
+int  row_compare_nullsafe(const struct row *a, const struct row *b);
 
 #endif

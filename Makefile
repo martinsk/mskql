@@ -27,4 +27,7 @@ bench: release
 bench-throughput: release
 	$(MAKE) -C src bench-throughput
 
-.PHONY: all clean release test test-concurrent bench bench-throughput mskqlcli
+perf: bench
+	bash bench/perf_analysis.sh
+
+.PHONY: all clean release test test-concurrent bench bench-throughput perf mskqlcli

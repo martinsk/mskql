@@ -147,6 +147,7 @@ static void node_alloc_layers(struct hnsw_node *n, uint16_t level, uint16_t M, u
     n->level = level;
     n->layer_offset = (uint32_t *)calloc(level + 2, sizeof(uint32_t));
     n->neighbor_count = (uint16_t *)calloc(level + 1, sizeof(uint16_t));
+    if (!n->layer_offset || !n->neighbor_count) { fprintf(stderr, "OOM: node_alloc_layers\n"); abort(); }
     /* compute offsets: layer 0 gets M0 slots, layers 1..level get M slots */
     uint32_t total = 0;
     n->layer_offset[0] = 0;
@@ -157,6 +158,7 @@ static void node_alloc_layers(struct hnsw_node *n, uint16_t level, uint16_t M, u
     }
     n->layer_offset[level + 1] = total;
     n->neighbors = (uint32_t *)malloc(total * sizeof(uint32_t));
+    if (!n->neighbors) { fprintf(stderr, "OOM: node_alloc_layers\n"); abort(); }
 }
 
 static void node_free_layers(struct hnsw_node *n)
@@ -193,6 +195,7 @@ static void search_layer(const struct hnsw_index *idx, const float *query,
 
     /* visited set */
     uint8_t *visited = (uint8_t *)calloc(idx->count, 1);
+    if (!visited) { fprintf(stderr, "OOM: search_layer visited\n"); abort(); }
 
     /* candidates: min-heap (closest first) */
     struct hnsw_pq candidates;

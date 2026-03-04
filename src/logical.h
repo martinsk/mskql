@@ -67,7 +67,7 @@ struct logical_project {
 
 /* L_JOIN payload */
 struct logical_join {
-    int      join_type;   /* 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL, 4=CROSS */
+    enum join_type join_type;
     uint32_t joins_start; /* index into arena->joins (all joins as resolved join_info) */
     uint32_t joins_count;
 };
@@ -91,9 +91,9 @@ struct logical_sort {
 /* L_LIMIT payload */
 struct logical_limit {
     int has_limit;
-    int limit_count;
+    int64_t limit_count;
     int has_offset;
-    int offset_count;
+    int64_t offset_count;
 };
 
 /* L_SUBQUERY payload — represents an inline subquery or non-recursive CTE.
@@ -116,7 +116,7 @@ struct logical_window {
 /* L_SET_OP payload — UNION / INTERSECT / EXCEPT.
  * rhs_sql_idx is an index into arena->strings for the RHS SQL text. */
 struct logical_set_op {
-    int      set_op;      /* 0=UNION, 1=INTERSECT, 2=EXCEPT */
+    enum set_op_kind set_op;
     int      set_all;     /* 1 for UNION ALL / INTERSECT ALL / EXCEPT ALL */
     uint32_t rhs_sql_idx; /* index into arena->strings for RHS SQL */
 };

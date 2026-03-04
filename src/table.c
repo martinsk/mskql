@@ -52,6 +52,7 @@ void table_add_column(struct table *t, struct column *col)
     };
     if (col->has_default && col->default_value) {
         c.default_value = calloc(1, sizeof(struct cell));
+        if (!c.default_value) { fprintf(stderr, "OOM: table_add_column\n"); abort(); }
         c.default_value->type = col->default_value->type;
         c.default_value->is_null = col->default_value->is_null;
         if (column_type_is_text(col->default_value->type) && col->default_value->value.as_text)
@@ -93,6 +94,7 @@ void table_deep_copy(struct table *dst, const struct table *src)
         };
         if (sc->has_default && sc->default_value) {
             c.default_value = calloc(1, sizeof(struct cell));
+            if (!c.default_value) { fprintf(stderr, "OOM: table_deep_copy\n"); abort(); }
             c.default_value->type = sc->default_value->type;
             c.default_value->is_null = sc->default_value->is_null;
             if (column_type_is_text(sc->default_value->type) && sc->default_value->value.as_text)

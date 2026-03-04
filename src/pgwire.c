@@ -2266,13 +2266,22 @@ static int try_inline_cte(int fd, struct database *db, struct query *q,
  * as a temp table, then building a LEFT HASH JOIN plan.
  *
  * Returns row count on success, -1 if pattern doesn't match or can't be decorrelated. */
-static int try_decorrelate_subquery(int fd, struct database *db, struct query *q,
-                                     const char *sql, size_t sql_len)
+struct csq_detect_result {
+    struct table *outer_t;
+    struct table *inner_t;
+    int subq_col_idx;
+    int outer_key_ci;
+    char inner_ref_col[128];
+    char agg_col_name[256];
+    char agg_func[16];
+    char inner_tbl_name[256];
+};
+
+static int csq_detect(struct database *db, struct query *q, struct csq_detect_result *out)
 {
     struct query_select *s = &q->select;
     struct query_arena *qa = &q->arena;
 
-    /* Must be a single-table SELECT with parsed columns */
     if (s->has_join || s->has_set_op || s->has_group_by || s->aggregates_count > 0 ||
         s->ctes_count > 0 || s->cte_sql != IDX_NONE || s->from_subquery_sql != IDX_NONE ||
         s->has_recursive_cte || s->select_exprs_count > 0 || s->has_distinct ||
@@ -2284,7 +2293,6 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
         outer_t = db_find_table_sv(db, s->table);
     if (!outer_t || outer_t->kind == TABLE_VIEW) return -1;
 
-    /* Scan parsed columns for exactly one EXPR_SUBQUERY */
     int subq_col_idx = -1;
     uint32_t subq_expr_idx = IDX_NONE;
     int n_subq = 0;
@@ -2300,16 +2308,10 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
     }
     if (n_subq != 1 || subq_col_idx < 0) return -1;
 
-    /* Get the subquery SQL */
     struct expr *sq_expr = &EXPR(qa, subq_expr_idx);
     const char *sq_sql = ASTRING(qa, sq_expr->subquery.sql_idx);
     if (!sq_sql || !*sq_sql) return -1;
 
-    /* Parse the subquery SQL to detect the pattern:
-     *   SELECT AGG(inner.col) FROM inner WHERE inner.ref = outer.key
-     * We do lightweight string parsing since the subquery is stored as raw SQL. */
-
-    /* Find aggregate function: MAX, MIN, SUM, AVG, COUNT */
     const char *agg_name = NULL;
     const char *agg_start = NULL;
     static const char *agg_names[] = {"MAX(", "MIN(", "SUM(", "AVG(", "COUNT(", NULL};
@@ -2330,7 +2332,6 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
     }
     if (!agg_name) return -1;
 
-    /* Extract the aggregate argument (column name inside the parens) */
     const char *arg_begin = agg_start + strlen(agg_name);
     const char *arg_end = strchr(arg_begin, ')');
     if (!arg_end || arg_end - arg_begin > 200) return -1;
@@ -2338,13 +2339,10 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
     size_t arg_len = (size_t)(arg_end - arg_begin);
     memcpy(agg_arg, arg_begin, arg_len);
     agg_arg[arg_len] = '\0';
-    /* Strip table prefix from agg arg (e.g. "csq_detail.score" → "score") */
     char *dot = strchr(agg_arg, '.');
-    const char *agg_col_name = dot ? dot + 1 : agg_arg;
-    /* Trim whitespace */
-    while (*agg_col_name == ' ') agg_col_name++;
+    const char *agg_col_name_p = dot ? dot + 1 : agg_arg;
+    while (*agg_col_name_p == ' ') agg_col_name_p++;
 
-    /* Find FROM clause to get inner table name */
     const char *from_pos = strstr(sq_upper, "FROM ");
     if (!from_pos) return -1;
     const char *tbl_start = sq_sql + (from_pos - sq_upper) + 5;
@@ -2359,17 +2357,14 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
     struct table *inner_t = db_find_table(db, inner_tbl_name);
     if (!inner_t || inner_t->kind == TABLE_VIEW) return -1;
 
-    /* Find WHERE clause to extract correlation: inner.ref = outer.key */
     const char *where_pos = strstr(sq_upper, "WHERE ");
     if (!where_pos) return -1;
     const char *cond_start = sq_sql + (where_pos - sq_upper) + 6;
     while (*cond_start == ' ') cond_start++;
 
-    /* Parse "inner.ref_col = outer.key_col" or "outer.key_col = inner.ref_col" */
     const char *eq_pos = strchr(cond_start, '=');
     if (!eq_pos) return -1;
 
-    /* Extract LHS and RHS of the = */
     char lhs[256], rhs[256];
     {
         const char *l = cond_start;
@@ -2390,22 +2385,17 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
         rhs[re - r] = '\0';
     }
 
-    /* Determine which side is the inner table ref and which is the outer table ref.
-     * Pattern: "inner_table.col = outer_table.col" or vice versa */
     char inner_ref_col[128] = {0}, outer_ref_col[128] = {0};
     size_t inner_name_len = strlen(inner_tbl_name);
     size_t outer_name_len = strlen(outer_t->name);
 
-    /* Check LHS */
     if (strncasecmp(lhs, inner_tbl_name, inner_name_len) == 0 && lhs[inner_name_len] == '.') {
         strncpy(inner_ref_col, lhs + inner_name_len + 1, sizeof(inner_ref_col) - 1);
     } else if (strncasecmp(lhs, outer_t->name, outer_name_len) == 0 && lhs[outer_name_len] == '.') {
         strncpy(outer_ref_col, lhs + outer_name_len + 1, sizeof(outer_ref_col) - 1);
     } else {
-        /* Try without table prefix — check if it's a column in inner or outer */
         dot = strchr(lhs, '.');
         if (dot) {
-            /* Has a prefix but doesn't match either table — could be an alias */
             const char *col_part = dot + 1;
             if (table_find_column(inner_t, col_part) >= 0)
                 strncpy(inner_ref_col, col_part, sizeof(inner_ref_col) - 1);
@@ -2421,12 +2411,11 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
         }
     }
 
-    /* Check RHS */
     if (strncasecmp(rhs, inner_tbl_name, inner_name_len) == 0 && rhs[inner_name_len] == '.') {
-        if (inner_ref_col[0]) return -1; /* both sides are inner? */
+        if (inner_ref_col[0]) return -1;
         strncpy(inner_ref_col, rhs + inner_name_len + 1, sizeof(inner_ref_col) - 1);
     } else if (strncasecmp(rhs, outer_t->name, outer_name_len) == 0 && rhs[outer_name_len] == '.') {
-        if (outer_ref_col[0]) return -1; /* both sides are outer? */
+        if (outer_ref_col[0]) return -1;
         strncpy(outer_ref_col, rhs + outer_name_len + 1, sizeof(outer_ref_col) - 1);
     } else {
         dot = strchr(rhs, '.');
@@ -2448,22 +2437,41 @@ static int try_decorrelate_subquery(int fd, struct database *db, struct query *q
 
     if (!inner_ref_col[0] || !outer_ref_col[0]) return -1;
 
-    /* Validate columns exist */
     int inner_ref_ci = table_find_column(inner_t, inner_ref_col);
-    int inner_agg_ci = table_find_column(inner_t, agg_col_name);
+    int inner_agg_ci = table_find_column(inner_t, agg_col_name_p);
     int outer_key_ci = table_find_column(outer_t, outer_ref_col);
     if (inner_ref_ci < 0 || inner_agg_ci < 0 || outer_key_ci < 0) return -1;
 
-    /* Build the aggregate SQL: SELECT ref_col, AGG(agg_col) FROM inner GROUP BY ref_col */
-    char agg_func[16];
-    size_t agg_name_len = strlen(agg_name) - 1; /* strip trailing '(' */
-    memcpy(agg_func, agg_name, agg_name_len);
-    agg_func[agg_name_len] = '\0';
+    out->outer_t = outer_t;
+    out->inner_t = inner_t;
+    out->subq_col_idx = subq_col_idx;
+    out->outer_key_ci = outer_key_ci;
+    strncpy(out->inner_ref_col, inner_ref_col, sizeof(out->inner_ref_col) - 1);
+    strncpy(out->agg_col_name, agg_col_name_p, sizeof(out->agg_col_name) - 1);
+    strncpy(out->inner_tbl_name, inner_tbl_name, sizeof(out->inner_tbl_name) - 1);
+    size_t agg_name_len = strlen(agg_name) - 1;
+    memcpy(out->agg_func, agg_name, agg_name_len);
+    out->agg_func[agg_name_len] = '\0';
+    return 0;
+}
+
+static int try_decorrelate_subquery(int fd, struct database *db, struct query *q,
+                                     const char *sql, size_t sql_len)
+{
+    struct query_select *s = &q->select;
+    struct query_arena *qa = &q->arena;
+
+    struct csq_detect_result det;
+    if (csq_detect(db, q, &det) != 0) return -1;
+
+    struct table *outer_t = det.outer_t;
+    int subq_col_idx = det.subq_col_idx;
+    int outer_key_ci = det.outer_key_ci;
 
     char mat_sql[1024];
     snprintf(mat_sql, sizeof(mat_sql),
              "SELECT %s, %s(%s) FROM %s GROUP BY %s",
-             inner_ref_col, agg_func, agg_col_name, inner_tbl_name, inner_ref_col);
+             det.inner_ref_col, det.agg_func, det.agg_col_name, det.inner_tbl_name, det.inner_ref_col);
 
     struct table *agg_temp = materialize_subquery(db, mat_sql, "__csq_agg_temp");
     if (!agg_temp) return -1;
@@ -3065,10 +3073,10 @@ static int handle_copy_to_stdout(int fd, struct database *db, struct query *q,
     /* Resolve column list to indices */
     int col_idxs[64];
     uint16_t ncols;
-    if (q->copy.col_count > 0) {
-        ncols = (uint16_t)q->copy.col_count;
-        for (int ci = 0; ci < q->copy.col_count; ci++) {
-            col_idxs[ci] = table_find_column_sv(ct, q->copy.col_names[ci]);
+    if (q->copy.col_names_count > 0) {
+        ncols = (uint16_t)q->copy.col_names_count;
+        for (uint32_t ci = 0; ci < q->copy.col_names_count; ci++) {
+            col_idxs[ci] = table_find_column_sv(ct, q->arena.svs.items[q->copy.col_names_start + ci]);
             if (col_idxs[ci] < 0) {
                 send_error(fd, m, "ERROR", "42703", "column not found in table");
                 return -1;
@@ -3835,6 +3843,7 @@ static int handle_bind(struct client_state *c, struct database *db,
     if (nparams > 0) {
         param_values = calloc(nparams, sizeof(char *));
         param_lengths = calloc(nparams, sizeof(int));
+        if (!param_values || !param_lengths) { fprintf(stderr, "OOM: bind params\n"); abort(); }
     }
 
     for (uint16_t i = 0; i < nparams; i++) {
@@ -3959,6 +3968,7 @@ static int handle_describe(struct client_state *c, struct database *db,
         const char **dummy_vals = NULL;
         if (ps->nparams > 0) {
             dummy_vals = calloc(ps->nparams, sizeof(char *));
+            if (!dummy_vals) { fprintf(stderr, "OOM: describe dummy_vals\n"); abort(); }
             for (uint16_t i = 0; i < ps->nparams; i++)
                 dummy_vals[i] = "0"; /* dummy value for type inference */
         }

@@ -140,12 +140,12 @@ struct plan_node {
         struct {
             int inner_key_col;       /* join key column index in inner (right child) */
             int outer_key_col;       /* join key column index in outer (left child) */
-            int join_type;           /* 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL */
+            enum join_type join_type;
             enum column_type key_type; /* canonical type for hash/eq (BIGINT when int widening needed) */
         } hash_join;
         struct {
             uint32_t cond_idx;       /* join condition (IDX_NONE for CROSS JOIN) */
-            int      join_type;      /* 4=CROSS */
+            enum join_type join_type;
             uint16_t left_ncols;     /* columns from left child */
             uint16_t right_ncols;    /* columns from right child */
         } nested_loop;
@@ -195,7 +195,7 @@ struct plan_node {
             int outer_key_col;       /* join key column index in outer (left child) */
         } hash_semi_join;
         struct {
-            int      set_op;         /* 0=UNION, 1=INTERSECT, 2=EXCEPT */
+            enum set_op_kind set_op;
             int      set_all;        /* 1 for UNION ALL etc. */
             uint16_t ncols;          /* number of output columns */
         } set_op;
@@ -550,6 +550,10 @@ int plan_next_block(struct plan_exec_ctx *ctx, uint32_t node_idx,
  * This is the main entry point for the plan executor. */
 int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
                       struct rows *result, struct bump_alloc *rb);
+
+/* Execute a full plan tree, discarding all output blocks.
+ * Measures pure execution cost without block_to_rows / malloc overhead. */
+int plan_exec_discard(struct plan_exec_ctx *ctx, uint32_t root_node);
 
 /* Free heap-allocated state (e.g. flat_table group keys) after plan execution. */
 void plan_exec_cleanup(struct plan_exec_ctx *ctx);

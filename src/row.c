@@ -304,6 +304,21 @@ int row_equal_nullsafe(const struct row *a, const struct row *b)
     return 1;
 }
 
+int row_compare_nullsafe(const struct row *a, const struct row *b)
+{
+    size_t n = a->cells.count < b->cells.count ? a->cells.count : b->cells.count;
+    for (size_t i = 0; i < n; i++) {
+        int a_null = a->cells.items[i].is_null;
+        int b_null = b->cells.items[i].is_null;
+        if (a_null && b_null) continue;
+        if (a_null) return 1;   /* NULLs sort last */
+        if (b_null) return -1;
+        int cmp = cell_compare(&a->cells.items[i], &b->cells.items[i]);
+        if (cmp != 0) return cmp;
+    }
+    return (a->cells.count > b->cells.count) - (a->cells.count < b->cells.count);
+}
+
 void rows_push(struct rows *rows, struct row row)
 {
     if (rows->count >= rows->capacity) {

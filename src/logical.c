@@ -3,6 +3,7 @@
 #include "database.h"
 #include <string.h>
 #include <stdio.h>
+#include <inttypes.h>
 
 /* ---- Allocator ---- */
 
@@ -371,7 +372,7 @@ static const char *lcmp_op_str(enum cmp_op op)
     case CMP_SIMILAR_TO:   return "SIMILAR TO";
     case CMP_NOT_SIMILAR_TO: return "NOT SIMILAR TO";
     }
-    return "?";
+    __builtin_unreachable();
 }
 
 /* Print a condition as a human-readable predicate into buf. Returns bytes written. */
@@ -447,25 +448,24 @@ static int lcond_to_str(struct query_arena *arena, uint32_t cond_idx,
             return snprintf(buf, buflen, SV_FMT " %s ?",
                             (int)c->column.len, c->column.data, op);
         }
-        return snprintf(buf, buflen, SV_FMT " %s ?",
-                        (int)c->column.len, c->column.data, op);
+        __builtin_unreachable();
     }
     case COND_MULTI_IN:
         return snprintf(buf, buflen, "(multi-col) IN (...)");
     }
-    return snprintf(buf, buflen, "(?)");
+    __builtin_unreachable();
 }
 
-static const char *ljoin_type_str(int jt)
+static const char *ljoin_type_str(enum join_type jt)
 {
     switch (jt) {
-    case 0: return "INNER";
-    case 1: return "LEFT";
-    case 2: return "RIGHT";
-    case 3: return "FULL";
-    case 4: return "CROSS";
-    default: return "?";
+    case JOIN_INNER: return "INNER";
+    case JOIN_LEFT:  return "LEFT";
+    case JOIN_RIGHT: return "RIGHT";
+    case JOIN_FULL:  return "FULL";
+    case JOIN_CROSS: return "CROSS";
     }
+    __builtin_unreachable();
 }
 
 static int logical_explain_node(struct query_arena *arena, uint32_t idx,
@@ -593,12 +593,12 @@ static int logical_explain_node(struct query_arena *arena, uint32_t idx,
 
     case L_LIMIT: {
         if (n->limit.has_limit && n->limit.has_offset)
-            r = snprintf(buf+written, buflen-written, "Limit (%d offset %d)\n",
+            r = snprintf(buf+written, buflen-written, "Limit (%" PRId64 " offset %" PRId64 ")\n",
                          n->limit.limit_count, n->limit.offset_count);
         else if (n->limit.has_limit)
-            r = snprintf(buf+written, buflen-written, "Limit (%d)\n", n->limit.limit_count);
+            r = snprintf(buf+written, buflen-written, "Limit (%" PRId64 ")\n", n->limit.limit_count);
         else
-            r = snprintf(buf+written, buflen-written, "Offset (%d)\n", n->limit.offset_count);
+            r = snprintf(buf+written, buflen-written, "Offset (%" PRId64 ")\n", n->limit.offset_count);
         if (r > 0) written += r;
         r = logical_explain_node(arena, n->child, buf+written, buflen-written, depth+1);
         if (r > 0) written += r;

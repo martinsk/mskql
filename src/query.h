@@ -558,8 +558,8 @@ struct query_copy {
     int is_from;        /* 1 = COPY FROM, 0 = COPY TO */
     int is_csv;         /* WITH CSV */
     int has_header;     /* WITH CSV HEADER */
-    sv col_names[16];   /* optional column list (max 16 columns) */
-    int col_count;      /* 0 = all columns */
+    uint32_t col_names_start; /* index into arena.svs */
+    uint32_t col_names_count;  /* 0 = all columns */
     sv file_path;       /* non-empty = COPY FROM/TO 'file' instead of STDIN/STDOUT */
 };
 
@@ -580,8 +580,22 @@ enum alter_action {
     ALTER_DROP_NOT_NULL
 };
 
+enum join_type {
+    JOIN_INNER = 0,
+    JOIN_LEFT  = 1,
+    JOIN_RIGHT = 2,
+    JOIN_FULL  = 3,
+    JOIN_CROSS = 4
+};
+
+enum set_op_kind {
+    SET_OP_UNION     = 0,
+    SET_OP_INTERSECT = 1,
+    SET_OP_EXCEPT    = 2
+};
+
 struct join_info {
-    int join_type; /* 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL, 4=CROSS */
+    enum join_type join_type;
     sv join_table;
     sv join_alias;
     sv join_left_col;
@@ -635,7 +649,7 @@ struct query_select {
     struct where_clause where;
     /* JOIN */
     int has_join;
-    int join_type; /* 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL */
+    enum join_type join_type;
     sv join_table;
     sv join_left_col;
     sv join_right_col;
@@ -661,9 +675,9 @@ struct query_select {
     uint32_t order_by_count;
     /* LIMIT / OFFSET */
     int has_limit;
-    int limit_count;
+    int64_t limit_count;
     int has_offset;
-    int offset_count;
+    int64_t offset_count;
     /* aggregates & window functions */
     uint32_t aggregates_start; /* index into arena.aggregates (consecutive) */
     uint32_t aggregates_count;
@@ -673,7 +687,7 @@ struct query_select {
     uint32_t select_exprs_count;
     /* set operations: UNION / INTERSECT / EXCEPT */
     int has_set_op;
-    int set_op;       /* 0=UNION, 1=INTERSECT, 2=EXCEPT */
+    enum set_op_kind set_op;
     int set_all;      /* UNION ALL etc. */
     uint32_t set_rhs_sql;   /* index into arena.strings, or IDX_NONE */
     uint32_t set_order_by;  /* index into arena.strings, or IDX_NONE */
@@ -888,8 +902,8 @@ static inline int query_is_read_only(enum query_type qt)
     case QUERY_TYPE_TRUNCATE:
     case QUERY_TYPE_COPY:
     case QUERY_TYPE_CREATE_FOREIGN_TABLE:
-        return 0;
     case QUERY_TYPE_ALTER_SEQUENCE:
+        return 0;
     case QUERY_TYPE_SAVEPOINT:
         return 1;
     case QUERY_TYPE_VALUES:

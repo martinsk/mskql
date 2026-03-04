@@ -155,6 +155,7 @@ static inline uint32_t block_hash_i64(int64_t v)
 /* FNV-1a hash for double */
 static inline uint32_t block_hash_f64(double v)
 {
+    if (v == 0.0) v = 0.0; /* canonicalize -0.0 → +0.0 */
     uint32_t h = FNV_OFFSET;
     uint8_t *p = (uint8_t *)&v;
     for (int i = 0; i < (int)sizeof(double); i++) {
@@ -319,6 +320,9 @@ static inline void flat_table_init(struct flat_table *ft, uint16_t ncols, size_t
     ft->col_types     = (enum column_type *)calloc(ncols, sizeof(enum column_type));
     ft->col_str_lens  = (uint32_t **)calloc(ncols, sizeof(uint32_t *));
     ft->col_vec_dims  = (uint16_t *)calloc(ncols, sizeof(uint16_t));
+    if (!ft->col_data || !ft->col_nulls || !ft->col_types || !ft->col_str_lens || !ft->col_vec_dims) {
+        fprintf(stderr, "OOM: flat_table_init\n"); abort();
+    }
 }
 
 /* Allocate typed data arrays after col_types[] have been set.
@@ -330,6 +334,7 @@ static inline void flat_table_alloc_cols(struct flat_table *ft)
         size_t mul = (ft->col_types[c] == COLUMN_TYPE_VECTOR) ? ft->col_vec_dims[c] : 1;
         ft->col_data[c]  = calloc(ft->cap ? ft->cap : 1, esz * mul);
         ft->col_nulls[c] = (uint8_t *)calloc(ft->cap ? ft->cap : 1, 1);
+        if (!ft->col_data[c] || !ft->col_nulls[c]) { fprintf(stderr, "OOM: flat_table_alloc_cols\n"); abort(); }
     }
 }
 
@@ -372,21 +377,18 @@ static inline void flat_table_grow(struct flat_table *ft, size_t new_cap)
         size_t mul = (ft->col_types[c] == COLUMN_TYPE_VECTOR) ? ft->col_vec_dims[c] : 1;
         size_t row_sz = esz * mul;
         void *nd = realloc(ft->col_data[c], new_cap * row_sz);
-        if (nd) {
-            memset((char *)nd + ft->cap * row_sz, 0, (new_cap - ft->cap) * row_sz);
-            ft->col_data[c] = nd;
-        }
+        if (!nd) { fprintf(stderr, "OOM: flat_table_grow\n"); abort(); }
+        memset((char *)nd + ft->cap * row_sz, 0, (new_cap - ft->cap) * row_sz);
+        ft->col_data[c] = nd;
         uint8_t *nn = (uint8_t *)realloc(ft->col_nulls[c], new_cap);
-        if (nn) {
-            memset(nn + ft->cap, 0, new_cap - ft->cap);
-            ft->col_nulls[c] = nn;
-        }
+        if (!nn) { fprintf(stderr, "OOM: flat_table_grow\n"); abort(); }
+        memset(nn + ft->cap, 0, new_cap - ft->cap);
+        ft->col_nulls[c] = nn;
         if (ft->col_str_lens && ft->col_str_lens[c]) {
             uint32_t *nl = (uint32_t *)realloc(ft->col_str_lens[c], new_cap * sizeof(uint32_t));
-            if (nl) {
-                memset(nl + ft->cap, 0, (new_cap - ft->cap) * sizeof(uint32_t));
-                ft->col_str_lens[c] = nl;
-            }
+            if (!nl) { fprintf(stderr, "OOM: flat_table_grow\n"); abort(); }
+            memset(nl + ft->cap, 0, (new_cap - ft->cap) * sizeof(uint32_t));
+            ft->col_str_lens[c] = nl;
         }
     }
     ft->cap = new_cap;

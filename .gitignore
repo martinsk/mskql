@@ -6,3 +6,5 @@ bench/parquet_fixtures/
 .DS_Store
 bench/__pycache__
 mskql_data/
+reports/
+*.trace

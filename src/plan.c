@@ -406,36 +406,54 @@ uint32_t plan_alloc_node(struct query_arena *arena, enum plan_op op)
 void block_to_rows(const struct row_block *blk, struct rows *result, struct bump_alloc *rb)
 {
     uint16_t active = row_block_active_count(blk);
+    if (active == 0) return;
+
+    /* Pre-grow result->data to avoid per-row realloc in rows_push */
+    size_t need = result->count + active;
+    if (need > result->capacity) {
+        size_t new_cap = result->capacity == 0 ? 8 : result->capacity;
+        while (new_cap < need) new_cap *= 2;
+        void *tmp = realloc(result->data, new_cap * sizeof(struct row));
+        if (!tmp) { fprintf(stderr, "block_to_rows: out of memory\n"); abort(); }
+        result->data = tmp;
+        result->capacity = new_cap;
+    }
+
+    uint16_t ncols = blk->ncols;
     for (uint16_t i = 0; i < active; i++) {
         uint16_t ri = row_block_row_idx(blk, i);
-        struct row dst = {0};
-        da_init(&dst.cells);
-        for (uint16_t c = 0; c < blk->ncols; c++) {
+        struct row *dst = &result->data[result->count++];
+
+        /* Allocate all cells for this row in one shot */
+        dst->cells.items = (struct cell *)malloc(ncols * sizeof(struct cell));
+        dst->cells.count = ncols;
+        dst->cells.capacity = ncols;
+
+        for (uint16_t c = 0; c < ncols; c++) {
             const struct col_block *cb = &blk->cols[c];
-            struct cell cell = {0};
-            cell.type = cb->type;
+            struct cell *cell = &dst->cells.items[c];
+            memset(cell, 0, sizeof(*cell));
+            cell->type = cb->type;
             if (cb->nulls[ri]) {
-                cell.is_null = 1;
+                cell->is_null = 1;
             } else {
-                cb_to_cell_at(cb, ri, &cell);
-                if (column_type_is_text(cb->type) && cell.value.as_text)
-                    cell.value.as_text = rb ? bump_strdup(rb, cell.value.as_text) : strdup(cell.value.as_text);
-                if (cb->type == COLUMN_TYPE_VECTOR && cell.value.as_vector && cb->vec_dim > 0) {
+                cb_to_cell_at(cb, ri, cell);
+                if (column_type_is_text(cb->type) && cell->value.as_text)
+                    cell->value.as_text = rb ? bump_strdup(rb, cell->value.as_text) : strdup(cell->value.as_text);
+                if (cb->type == COLUMN_TYPE_VECTOR && cell->value.as_vector && cb->vec_dim > 0) {
                     size_t vbytes = (size_t)cb->vec_dim * sizeof(float);
                     if (rb) {
                         float *copy = (float *)bump_alloc(rb, vbytes);
-                        memcpy(copy, cell.value.as_vector, vbytes);
-                        cell.value.as_vector = copy;
+                        memcpy(copy, cell->value.as_vector, vbytes);
+                        cell->value.as_vector = copy;
                     } else {
                         float *copy = (float *)malloc(vbytes);
-                        memcpy(copy, cell.value.as_vector, vbytes);
-                        cell.value.as_vector = copy;
+                        memcpy(copy, cell->value.as_vector, vbytes);
+                        cell->value.as_vector = copy;
                     }
                 }
             }
-            da_push(&dst.cells, cell);
         }
-        rows_push(result, dst);
     }
 }
 
@@ -1125,6 +1143,50 @@ static uint16_t filter_eval_cond_columnar(struct query_arena *arena,
                              cand, cand_count, sel);
 }
 
+static void filter_coerce_enum(struct plan_exec_ctx *ctx, struct plan_node *pn)
+{
+    struct table *et_tbl = NULL;
+    uint32_t ew = pn->left;
+    while (ew != IDX_NONE) {
+        struct plan_node *ewn = &PLAN_NODE(ctx->arena, ew);
+        if (ewn->op == PLAN_SEQ_SCAN) { et_tbl = ewn->seq_scan.table; break; }
+        if (ewn->op == PLAN_INDEX_SCAN) { et_tbl = ewn->index_scan.table; break; }
+        ew = ewn->left;
+    }
+    if (!et_tbl || pn->filter.col_idx >= (int)et_tbl->columns.count) return;
+    const char *etn = et_tbl->columns.items[pn->filter.col_idx].enum_type_name;
+    if (!etn) return;
+    struct enum_type *et = db_find_type(ctx->db, etn);
+    if (!et) return;
+    int ord = enum_ordinal(et, pn->filter.cmp_val.value.as_text);
+    if (ord >= 0) {
+        pn->filter.cmp_val.type = COLUMN_TYPE_ENUM;
+        pn->filter.cmp_val.value.as_enum = ord;
+    }
+    if (pn->filter.between_high.type == COLUMN_TYPE_TEXT
+        && !pn->filter.between_high.is_null
+        && pn->filter.between_high.value.as_text) {
+        int ord2 = enum_ordinal(et, pn->filter.between_high.value.as_text);
+        if (ord2 >= 0) {
+            pn->filter.between_high.type = COLUMN_TYPE_ENUM;
+            pn->filter.between_high.value.as_enum = ord2;
+        }
+    }
+    if (pn->filter.in_values && pn->filter.in_count > 0) {
+        for (uint32_t iv = 0; iv < pn->filter.in_count; iv++) {
+            if (pn->filter.in_values[iv].type == COLUMN_TYPE_TEXT
+                && !pn->filter.in_values[iv].is_null
+                && pn->filter.in_values[iv].value.as_text) {
+                int ov = enum_ordinal(et, pn->filter.in_values[iv].value.as_text);
+                if (ov >= 0) {
+                    pn->filter.in_values[iv].type = COLUMN_TYPE_ENUM;
+                    pn->filter.in_values[iv].value.as_enum = ov;
+                }
+            }
+        }
+    }
+}
+
 static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                        struct row_block *out)
 {
@@ -1214,54 +1276,8 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
         /* Coerce TEXT comparison values to ENUM ordinal */
         if (cb->type == COLUMN_TYPE_ENUM && pn->filter.cmp_val.type == COLUMN_TYPE_TEXT
-            && !pn->filter.cmp_val.is_null && pn->filter.cmp_val.value.as_text && ctx->db) {
-            /* Walk child chain to find the table for enum_type_name lookup */
-            struct table *et_tbl = NULL;
-            uint32_t ew = pn->left;
-            while (ew != IDX_NONE) {
-                struct plan_node *ewn = &PLAN_NODE(ctx->arena, ew);
-                if (ewn->op == PLAN_SEQ_SCAN) { et_tbl = ewn->seq_scan.table; break; }
-                if (ewn->op == PLAN_INDEX_SCAN) { et_tbl = ewn->index_scan.table; break; }
-                ew = ewn->left;
-            }
-            if (et_tbl && pn->filter.col_idx < (int)et_tbl->columns.count) {
-                const char *etn = et_tbl->columns.items[pn->filter.col_idx].enum_type_name;
-                if (etn) {
-                    struct enum_type *et = db_find_type(ctx->db, etn);
-                    if (et) {
-                        int ord = enum_ordinal(et, pn->filter.cmp_val.value.as_text);
-                        if (ord >= 0) {
-                            pn->filter.cmp_val.type = COLUMN_TYPE_ENUM;
-                            pn->filter.cmp_val.value.as_enum = ord;
-                        }
-                        /* Also coerce between_high if present */
-                        if (pn->filter.between_high.type == COLUMN_TYPE_TEXT
-                            && !pn->filter.between_high.is_null
-                            && pn->filter.between_high.value.as_text) {
-                            int ord2 = enum_ordinal(et, pn->filter.between_high.value.as_text);
-                            if (ord2 >= 0) {
-                                pn->filter.between_high.type = COLUMN_TYPE_ENUM;
-                                pn->filter.between_high.value.as_enum = ord2;
-                            }
-                        }
-                        /* Also coerce IN values if present */
-                        if (pn->filter.in_values && pn->filter.in_count > 0) {
-                            for (uint32_t iv = 0; iv < pn->filter.in_count; iv++) {
-                                if (pn->filter.in_values[iv].type == COLUMN_TYPE_TEXT
-                                    && !pn->filter.in_values[iv].is_null
-                                    && pn->filter.in_values[iv].value.as_text) {
-                                    int ov = enum_ordinal(et, pn->filter.in_values[iv].value.as_text);
-                                    if (ov >= 0) {
-                                        pn->filter.in_values[iv].type = COLUMN_TYPE_ENUM;
-                                        pn->filter.in_values[iv].value.as_enum = ov;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+            && !pn->filter.cmp_val.is_null && pn->filter.cmp_val.value.as_text && ctx->db)
+            filter_coerce_enum(ctx, pn);
 
         /* Macro: iterate over candidate rows */
         #define FILTER_LOOP(COND) \
@@ -1561,7 +1577,13 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         case CMP_GT: FILTER_LOOP(!nulls[r] && (double)vals[r] >  cv); break;
                         case CMP_LE: FILTER_LOOP(!nulls[r] && (double)vals[r] <= cv); break;
                         case CMP_GE: FILTER_LOOP(!nulls[r] && (double)vals[r] >= cv); break;
-                        default: break;
+                        case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                        case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                        case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                        case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                        case CMP_REGEX_ICASE_MATCH: case CMP_REGEX_ICASE_NOT_MATCH:
+                        case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE:
+                        case CMP_SIMILAR_TO: case CMP_NOT_SIMILAR_TO: break;
                     }
                     goto done;
                 }
@@ -1586,7 +1608,13 @@ static int filter_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         case CMP_GT: FILTER_LOOP(!nulls[r] && (double)vals[r] >  cv); break;
                         case CMP_LE: FILTER_LOOP(!nulls[r] && (double)vals[r] <= cv); break;
                         case CMP_GE: FILTER_LOOP(!nulls[r] && (double)vals[r] >= cv); break;
-                        default: break;
+                        case CMP_IS_NULL: case CMP_IS_NOT_NULL: case CMP_IN: case CMP_NOT_IN:
+                        case CMP_BETWEEN: case CMP_LIKE: case CMP_ILIKE: case CMP_IS_DISTINCT:
+                        case CMP_IS_NOT_DISTINCT: case CMP_EXISTS: case CMP_NOT_EXISTS:
+                        case CMP_REGEX_MATCH: case CMP_REGEX_NOT_MATCH:
+                        case CMP_REGEX_ICASE_MATCH: case CMP_REGEX_ICASE_NOT_MATCH:
+                        case CMP_IS_NOT_TRUE: case CMP_IS_NOT_FALSE:
+                        case CMP_SIMILAR_TO: case CMP_NOT_SIMILAR_TO: break;
                     }
                     goto done;
                 }
@@ -1940,6 +1968,9 @@ static int expr_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
 /* ---- Vectorized projection: evaluate simple expressions on columnar arrays ---- */
 
+// TODO: CONTRIBUTING.MD VIOLATION (spirit): vec_project_next is ~590 lines. Should
+// extract per-expression-type evaluation into helpers (EXPR_COLUMN_REF, EXPR_BINOP,
+// EXPR_CAST, EXPR_FUNC_CALL sub-paths are each >50 lines).
 static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                             struct row_block *out)
 {
@@ -2948,10 +2979,10 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     if (!st->build_done)
         hash_join_build(ctx, node_idx);
 
-    int join_type = pn->hash_join.join_type; /* 0=INNER,1=LEFT,2=RIGHT,3=FULL */
+    enum join_type join_type = pn->hash_join.join_type;
 
     /* Allocate matched bitmap for RIGHT/FULL on first call */
-    if ((join_type == 2 || join_type == 3) && !st->matched && st->build_count > 0) {
+    if ((join_type == JOIN_RIGHT || join_type == JOIN_FULL) && !st->matched && st->build_count > 0) {
         st->matched = (uint8_t *)bump_calloc(&ctx->arena->scratch,
                                               st->build_count, sizeof(uint8_t));
     }
@@ -2961,7 +2992,7 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
     /* ---- Phase 2: emit unmatched inner rows (RIGHT/FULL) ---- */
     if (st->outer_done) {
-        if (join_type != 2 && join_type != 3) return -1;
+        if (join_type != JOIN_RIGHT && join_type != JOIN_FULL) return -1;
         row_block_reset(out);
         uint16_t out_count = 0;
         while (st->right_emit_cursor < st->build_count && out_count < BLOCK_CAPACITY) {
@@ -2993,7 +3024,7 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     if (rc != 0) {
         /* Outer exhausted — transition to phase 2 for RIGHT/FULL */
         st->outer_done = 1;
-        if (join_type == 2 || join_type == 3)
+        if (join_type == JOIN_RIGHT || join_type == JOIN_FULL)
             return hash_join_next(ctx, node_idx, out); /* re-enter for phase 2 */
         return -1;
     }
@@ -3014,7 +3045,7 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         /* NULL key: no match possible */
         if (outer_key_cb->nulls[oi]) {
             /* LEFT/FULL: emit outer row with NULL inner columns */
-            if (join_type == 1 || join_type == 3) {
+            if (join_type == JOIN_LEFT || join_type == JOIN_FULL) {
                 for (uint16_t c = 0; c < outer_ncols; c++) {
                     out->cols[c].type = outer_block.cols[c].type;
                     cb_ensure_vec(&out->cols[c], &outer_block.cols[c], &ctx->arena->scratch);
@@ -3069,7 +3100,7 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         }
 
         /* LEFT/FULL: emit outer row with NULL inner columns when no match */
-        if (!found && (join_type == 1 || join_type == 3) && out_count < BLOCK_CAPACITY) {
+        if (!found && (join_type == JOIN_LEFT || join_type == JOIN_FULL) && out_count < BLOCK_CAPACITY) {
             for (uint16_t c = 0; c < outer_ncols; c++) {
                 out->cols[c].type = outer_block.cols[c].type;
                 cb_ensure_vec(&out->cols[c], &outer_block.cols[c], &ctx->arena->scratch);
@@ -3654,6 +3685,247 @@ static void hash_agg_int_consume(struct hash_agg_state *st,
     }
 }
 
+static int hash_agg_emit(struct plan_exec_ctx *ctx, struct plan_node *pn,
+                         struct hash_agg_state *st, struct row_block *out)
+{
+    if (st->emit_cursor >= st->ngroups) return -1;
+
+    row_block_reset(out);
+    uint16_t ngrp = pn->hash_agg.ngroup_cols;
+    uint32_t agg_n = pn->hash_agg.agg_count;
+    uint16_t out_count = 0;
+
+    while (st->emit_cursor < st->ngroups && out_count < BLOCK_CAPACITY) {
+        uint32_t g = st->emit_cursor++;
+
+        if (!pn->hash_agg.agg_before_cols) {
+            for (uint16_t k = 0; k < ngrp; k++) {
+                out->cols[k].type = st->gk.col_types[k];
+                if (st->gk.col_types[k] == COLUMN_TYPE_VECTOR) {
+                    uint16_t dim = st->gk.col_vec_dims[k];
+                    if (!out->cols[k].data.vec)
+                        out->cols[k].data.vec = (float *)bump_alloc(&ctx->arena->scratch, BLOCK_CAPACITY * dim * sizeof(float));
+                    out->cols[k].vec_dim = dim;
+                }
+                gk_emit(&out->cols[k], out_count, &st->gk, k, g);
+            }
+        }
+
+        uint16_t agg_offset = pn->hash_agg.agg_before_cols ? 0 : ngrp;
+        for (uint32_t a = 0; a < agg_n; a++) {
+            struct agg_expr *ae = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
+            struct col_block *dst = &out->cols[agg_offset + a];
+            size_t idx = a * st->group_cap + g;
+
+            switch (ae->func) {
+                case AGG_COUNT:
+                    dst->type = COLUMN_TYPE_INT;
+                    dst->nulls[out_count] = 0;
+                    if (pn->hash_agg.agg_col_indices &&
+                        pn->hash_agg.agg_col_indices[a] == -1 &&
+                        ae->filter_cond == IDX_NONE)
+                        dst->data.i32[out_count] = (int32_t)st->grp_counts[g];
+                    else
+                        dst->data.i32[out_count] = (int32_t)st->nonnull[idx];
+                    break;
+                case AGG_SUM: {
+                    int src_col = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
+                    int src_is_float = 0;
+                    if (src_col >= 0) {
+                        enum column_type sct = pn->hash_agg.agg_col_types
+                            ? pn->hash_agg.agg_col_types[a]
+                            : (pn->hash_agg.table ? pn->hash_agg.table->columns.items[src_col].type : COLUMN_TYPE_INT);
+                        if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
+                            src_is_float = 1;
+                    }
+                    if ((src_col == -2 || src_col == -3) && st->sums[idx] != 0.0)
+                        src_is_float = 1;
+                    if (src_col == -3) src_is_float = 1;
+                    if (src_is_float) {
+                        dst->type = COLUMN_TYPE_FLOAT;
+                        if (st->nonnull[idx] == 0) {
+                            dst->nulls[out_count] = 1;
+                        } else {
+                            dst->nulls[out_count] = 0;
+                            dst->data.f64[out_count] = st->sums[idx];
+                        }
+                    } else {
+                        dst->type = COLUMN_TYPE_BIGINT;
+                        if (st->nonnull[idx] == 0) {
+                            dst->nulls[out_count] = 1;
+                        } else {
+                            dst->nulls[out_count] = 0;
+                            dst->data.i64[out_count] = st->i64_sums[idx];
+                        }
+                    }
+                    break;
+                }
+                case AGG_AVG:
+                    dst->type = COLUMN_TYPE_FLOAT;
+                    if (st->nonnull[idx] == 0) {
+                        dst->nulls[out_count] = 1;
+                    } else {
+                        int src_col_avg = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
+                        int avg_is_float = 0;
+                        if (src_col_avg >= 0) {
+                            enum column_type sct = pn->hash_agg.agg_col_types
+                                ? pn->hash_agg.agg_col_types[a]
+                                : (pn->hash_agg.table ? pn->hash_agg.table->columns.items[src_col_avg].type : COLUMN_TYPE_INT);
+                            if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
+                                avg_is_float = 1;
+                        }
+                        if ((src_col_avg == -2 || src_col_avg == -3) && st->sums[idx] != 0.0)
+                            avg_is_float = 1;
+                        if (src_col_avg == -3) avg_is_float = 1;
+                        dst->nulls[out_count] = 0;
+                        if (avg_is_float)
+                            dst->data.f64[out_count] = st->sums[idx] / (double)st->nonnull[idx];
+                        else
+                            dst->data.f64[out_count] = (double)st->i64_sums[idx] / (double)st->nonnull[idx];
+                    }
+                    break;
+                case AGG_MIN:
+                case AGG_MAX: {
+                    int src_col_mm = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
+                    enum column_type src_type_mm = COLUMN_TYPE_INT;
+                    if (src_col_mm >= 0) {
+                        src_type_mm = pn->hash_agg.agg_col_types
+                            ? pn->hash_agg.agg_col_types[a]
+                            : (pn->hash_agg.table ? pn->hash_agg.table->columns.items[src_col_mm].type : COLUMN_TYPE_INT);
+                    }
+                    if (src_col_mm == -3) src_type_mm = COLUMN_TYPE_FLOAT;
+                    agg_emit_minmax(dst, out_count, src_type_mm,
+                                    ae->func == AGG_MIN,
+                                    st->mins, st->maxs,
+                                    st->text_mins, st->text_maxs,
+                                    st->nonnull, idx);
+                    break;
+                }
+                case AGG_BOOL_AND:
+                    dst->type = COLUMN_TYPE_BOOLEAN;
+                    if (st->nonnull[idx] == 0) { dst->nulls[out_count] = 1; break; }
+                    dst->nulls[out_count] = 0;
+                    dst->data.i32[out_count] = (st->mins[idx] != 0.0) ? 1 : 0;
+                    break;
+                case AGG_BOOL_OR:
+                    dst->type = COLUMN_TYPE_BOOLEAN;
+                    if (st->nonnull[idx] == 0) { dst->nulls[out_count] = 1; break; }
+                    dst->nulls[out_count] = 0;
+                    dst->data.i32[out_count] = (st->maxs[idx] != 0.0) ? 1 : 0;
+                    break;
+                case AGG_STDDEV:
+                case AGG_VARIANCE: {
+                    dst->type = COLUMN_TYPE_FLOAT;
+                    if (st->nonnull[idx] < 2) { dst->nulls[out_count] = 1; break; }
+                    double n_d = (double)st->nonnull[idx];
+                    double sum_d = st->sums[idx] + (double)st->i64_sums[idx];
+                    double sumsq_d = st->sumsq[idx];
+                    double var = (sumsq_d - sum_d*sum_d/n_d) / (n_d - 1.0);
+                    dst->nulls[out_count] = 0;
+                    dst->data.f64[out_count] = (ae->func == AGG_VARIANCE) ? var : sqrt(var);
+                    break;
+                }
+                case AGG_STRING_AGG:
+                case AGG_ARRAY_AGG: {
+                    dst->type = COLUMN_TYPE_TEXT;
+                    if (st->nonnull[idx] == 0) {
+                        dst->nulls[out_count] = 1;
+                    } else if (st->str_ord_count[idx] > 0) {
+                        uint32_t n = st->str_ord_count[idx];
+                        double *keys = st->str_ord_keys[idx];
+                        char **skeys = st->str_ord_skeys[idx];
+                        char **vals = st->str_ord_vals[idx];
+                        int desc = pn->hash_agg.agg_order_desc ? pn->hash_agg.agg_order_desc[a] : 0;
+                        int use_text = (skeys && n > 0 && skeys[0] != NULL);
+                        for (uint32_t ii = 1; ii < n; ii++) {
+                            double kk = keys[ii]; char *sk = skeys ? skeys[ii] : NULL; char *vv = vals[ii];
+                            uint32_t jj = ii;
+                            for (;;) {
+                                if (jj == 0) break;
+                                int cmp;
+                                if (use_text) cmp = strcmp(skeys[jj-1], sk);
+                                else cmp = (keys[jj-1] > kk) ? 1 : (keys[jj-1] < kk) ? -1 : 0;
+                                if (desc ? cmp < 0 : cmp > 0) {
+                                    keys[jj] = keys[jj-1]; vals[jj] = vals[jj-1];
+                                    if (skeys) skeys[jj] = skeys[jj-1];
+                                    jj--;
+                                } else break;
+                            }
+                            keys[jj] = kk; vals[jj] = vv;
+                            if (skeys) skeys[jj] = sk;
+                        }
+                        const char *sep = "";
+                        size_t slen = 0;
+                        if (ae->func == AGG_STRING_AGG && ae->separator.len > 0) {
+                            sep = ae->separator.data; slen = ae->separator.len;
+                        } else if (ae->func == AGG_ARRAY_AGG) {
+                            sep = ","; slen = 1;
+                        }
+                        size_t total = 0;
+                        for (uint32_t ii = 0; ii < n; ii++) total += strlen(vals[ii]);
+                        total += (n > 1 ? (n - 1) * slen : 0) + 1;
+                        char *buf = (char *)bump_alloc(&ctx->arena->scratch, total);
+                        size_t pos = 0;
+                        for (uint32_t ii = 0; ii < n; ii++) {
+                            if (ii > 0 && slen > 0) { memcpy(buf + pos, sep, slen); pos += slen; }
+                            size_t vl = strlen(vals[ii]);
+                            memcpy(buf + pos, vals[ii], vl); pos += vl;
+                        }
+                        buf[pos] = '\0';
+                        dst->nulls[out_count] = 0;
+                        if (ae->func == AGG_ARRAY_AGG) {
+                            char *wrapped = (char *)bump_alloc(&ctx->arena->scratch, pos + 3);
+                            wrapped[0] = '{'; memcpy(wrapped + 1, buf, pos);
+                            wrapped[pos + 1] = '}'; wrapped[pos + 2] = '\0';
+                            dst->data.str[out_count] = wrapped;
+                        } else {
+                            dst->data.str[out_count] = buf;
+                        }
+                    } else {
+                        dst->nulls[out_count] = 0;
+                        if (ae->func == AGG_ARRAY_AGG) {
+                            size_t slen = st->str_accum_len[idx];
+                            char *wrapped = (char *)bump_alloc(&ctx->arena->scratch, slen + 3);
+                            wrapped[0] = '{';
+                            memcpy(wrapped + 1, st->str_accum[idx], slen);
+                            wrapped[slen + 1] = '}';
+                            wrapped[slen + 2] = '\0';
+                            dst->data.str[out_count] = wrapped;
+                        } else {
+                            dst->data.str[out_count] = st->str_accum[idx];
+                        }
+                    }
+                    break;
+                }
+                case AGG_NONE:
+                    break;
+            }
+        }
+
+        if (pn->hash_agg.agg_before_cols) {
+            uint16_t grp_offset = (uint16_t)agg_n;
+            for (uint16_t k = 0; k < ngrp; k++) {
+                out->cols[grp_offset + k].type = st->gk.col_types[k];
+                if (st->gk.col_types[k] == COLUMN_TYPE_VECTOR) {
+                    uint16_t dim = st->gk.col_vec_dims[k];
+                    if (!out->cols[grp_offset + k].data.vec)
+                        out->cols[grp_offset + k].data.vec = (float *)bump_alloc(&ctx->arena->scratch, BLOCK_CAPACITY * dim * sizeof(float));
+                    out->cols[grp_offset + k].vec_dim = dim;
+                }
+                gk_emit(&out->cols[grp_offset + k], out_count, &st->gk, k, g);
+            }
+        }
+
+        out_count++;
+    }
+
+    out->count = out_count;
+    for (uint16_t c = 0; c < out->ncols; c++)
+        out->cols[c].count = out_count;
+
+    return 0;
+}
+
 static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                          struct row_block *out)
 {
@@ -4110,254 +4382,207 @@ static int hash_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     }
 
     emit_phase:
-    /* Phase 2: emit results */
-    if (st->emit_cursor >= st->ngroups) return -1;
-
-    row_block_reset(out);
-    uint16_t ngrp = pn->hash_agg.ngroup_cols;
-    uint32_t agg_n = pn->hash_agg.agg_count;
-    uint16_t out_count = 0;
-
-    while (st->emit_cursor < st->ngroups && out_count < BLOCK_CAPACITY) {
-        uint32_t g = st->emit_cursor++;
-
-        if (!pn->hash_agg.agg_before_cols) {
-            /* Group key columns first */
-            for (uint16_t k = 0; k < ngrp; k++) {
-                out->cols[k].type = st->gk.col_types[k];
-                if (st->gk.col_types[k] == COLUMN_TYPE_VECTOR) {
-                    uint16_t dim = st->gk.col_vec_dims[k];
-                    if (!out->cols[k].data.vec)
-                        out->cols[k].data.vec = (float *)bump_alloc(&ctx->arena->scratch, BLOCK_CAPACITY * dim * sizeof(float));
-                    out->cols[k].vec_dim = dim;
-                }
-                gk_emit(&out->cols[k], out_count, &st->gk, k, g);
-            }
-        }
-
-        uint16_t agg_offset = pn->hash_agg.agg_before_cols ? 0 : ngrp;
-        for (uint32_t a = 0; a < agg_n; a++) {
-            struct agg_expr *ae = &ctx->arena->aggregates.items[pn->hash_agg.agg_start + a];
-            struct col_block *dst = &out->cols[agg_offset + a];
-            size_t idx = a * st->group_cap + g;
-
-            switch (ae->func) {
-                case AGG_COUNT:
-                    dst->type = COLUMN_TYPE_INT;
-                    dst->nulls[out_count] = 0;
-                    if (pn->hash_agg.agg_col_indices &&
-                        pn->hash_agg.agg_col_indices[a] == -1 &&
-                        ae->filter_cond == IDX_NONE)
-                        dst->data.i32[out_count] = (int32_t)st->grp_counts[g];
-                    else
-                        dst->data.i32[out_count] = (int32_t)st->nonnull[idx];
-                    break;
-                case AGG_SUM: {
-                    /* Determine source column type for correct output type */
-                    int src_col = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
-                    int src_is_float = 0;
-                    if (src_col >= 0) {
-                        enum column_type sct = pn->hash_agg.agg_col_types
-                            ? pn->hash_agg.agg_col_types[a]
-                            : (pn->hash_agg.table ? pn->hash_agg.table->columns.items[src_col].type : COLUMN_TYPE_INT);
-                        if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
-                            src_is_float = 1;
-                    }
-                    /* Expression aggregates: detect float if sums[] was used */
-                    if ((src_col == -2 || src_col == -3) && st->sums[idx] != 0.0)
-                        src_is_float = 1;
-                    /* Vectorized binop always accumulates as double */
-                    if (src_col == -3) src_is_float = 1;
-                    if (src_is_float) {
-                        dst->type = COLUMN_TYPE_FLOAT;
-                        if (st->nonnull[idx] == 0) {
-                            dst->nulls[out_count] = 1;
-                        } else {
-                            dst->nulls[out_count] = 0;
-                            dst->data.f64[out_count] = st->sums[idx];
-                        }
-                    } else {
-                        dst->type = COLUMN_TYPE_BIGINT;
-                        if (st->nonnull[idx] == 0) {
-                            dst->nulls[out_count] = 1;
-                        } else {
-                            dst->nulls[out_count] = 0;
-                            dst->data.i64[out_count] = st->i64_sums[idx];
-                        }
-                    }
-                    break;
-                }
-                case AGG_AVG:
-                    dst->type = COLUMN_TYPE_FLOAT;
-                    if (st->nonnull[idx] == 0) {
-                        dst->nulls[out_count] = 1;
-                    } else {
-                        int src_col_avg = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
-                        int avg_is_float = 0;
-                        if (src_col_avg >= 0) {
-                            enum column_type sct = pn->hash_agg.agg_col_types
-                                ? pn->hash_agg.agg_col_types[a]
-                                : (pn->hash_agg.table ? pn->hash_agg.table->columns.items[src_col_avg].type : COLUMN_TYPE_INT);
-                            if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
-                                avg_is_float = 1;
-                        }
-                        if ((src_col_avg == -2 || src_col_avg == -3) && st->sums[idx] != 0.0)
-                            avg_is_float = 1;
-                        if (src_col_avg == -3) avg_is_float = 1;
-                        dst->nulls[out_count] = 0;
-                        if (avg_is_float)
-                            dst->data.f64[out_count] = st->sums[idx] / (double)st->nonnull[idx];
-                        else
-                            dst->data.f64[out_count] = (double)st->i64_sums[idx] / (double)st->nonnull[idx];
-                    }
-                    break;
-                case AGG_MIN:
-                case AGG_MAX: {
-                    int src_col_mm = pn->hash_agg.agg_col_indices ? pn->hash_agg.agg_col_indices[a] : -1;
-                    enum column_type src_type_mm = COLUMN_TYPE_INT;
-                    if (src_col_mm >= 0) {
-                        src_type_mm = pn->hash_agg.agg_col_types
-                            ? pn->hash_agg.agg_col_types[a]
-                            : (pn->hash_agg.table ? pn->hash_agg.table->columns.items[src_col_mm].type : COLUMN_TYPE_INT);
-                    }
-                    if (src_col_mm == -3) src_type_mm = COLUMN_TYPE_FLOAT;
-                    agg_emit_minmax(dst, out_count, src_type_mm,
-                                    ae->func == AGG_MIN,
-                                    st->mins, st->maxs,
-                                    st->text_mins, st->text_maxs,
-                                    st->nonnull, idx);
-                    break;
-                }
-                case AGG_BOOL_AND:
-                    dst->type = COLUMN_TYPE_BOOLEAN;
-                    if (st->nonnull[idx] == 0) { dst->nulls[out_count] = 1; break; }
-                    dst->nulls[out_count] = 0;
-                    /* BOOL_AND = true iff min value is 1 (all true) */
-                    dst->data.i32[out_count] = (st->mins[idx] != 0.0) ? 1 : 0;
-                    break;
-                case AGG_BOOL_OR:
-                    dst->type = COLUMN_TYPE_BOOLEAN;
-                    if (st->nonnull[idx] == 0) { dst->nulls[out_count] = 1; break; }
-                    dst->nulls[out_count] = 0;
-                    /* BOOL_OR = true iff max value is 1 (any true) */
-                    dst->data.i32[out_count] = (st->maxs[idx] != 0.0) ? 1 : 0;
-                    break;
-                case AGG_STDDEV:
-                case AGG_VARIANCE: {
-                    dst->type = COLUMN_TYPE_FLOAT;
-                    if (st->nonnull[idx] < 2) { dst->nulls[out_count] = 1; break; }
-                    double n_d = (double)st->nonnull[idx];
-                    double sum_d = st->sums[idx] + (double)st->i64_sums[idx];
-                    double sumsq_d = st->sumsq[idx];
-                    double var = (sumsq_d - sum_d*sum_d/n_d) / (n_d - 1.0);
-                    dst->nulls[out_count] = 0;
-                    dst->data.f64[out_count] = (ae->func == AGG_VARIANCE) ? var : sqrt(var);
-                    break;
-                }
-                case AGG_STRING_AGG:
-                case AGG_ARRAY_AGG: {
-                    dst->type = COLUMN_TYPE_TEXT;
-                    if (st->nonnull[idx] == 0) {
-                        dst->nulls[out_count] = 1;
-                    } else if (st->str_ord_count[idx] > 0) {
-                        /* STRING_AGG ORDER BY: sort collected values by key, then concat */
-                        uint32_t n = st->str_ord_count[idx];
-                        double *keys = st->str_ord_keys[idx];
-                        char **skeys = st->str_ord_skeys[idx];
-                        char **vals = st->str_ord_vals[idx];
-                        int desc = pn->hash_agg.agg_order_desc ? pn->hash_agg.agg_order_desc[a] : 0;
-                        int use_text = (skeys && n > 0 && skeys[0] != NULL);
-                        for (uint32_t ii = 1; ii < n; ii++) {
-                            double kk = keys[ii]; char *sk = skeys ? skeys[ii] : NULL; char *vv = vals[ii];
-                            uint32_t jj = ii;
-                            for (;;) {
-                                if (jj == 0) break;
-                                int cmp;
-                                if (use_text) cmp = strcmp(skeys[jj-1], sk);
-                                else cmp = (keys[jj-1] > kk) ? 1 : (keys[jj-1] < kk) ? -1 : 0;
-                                if (desc ? cmp < 0 : cmp > 0) {
-                                    keys[jj] = keys[jj-1]; vals[jj] = vals[jj-1];
-                                    if (skeys) skeys[jj] = skeys[jj-1];
-                                    jj--;
-                                } else break;
-                            }
-                            keys[jj] = kk; vals[jj] = vv;
-                            if (skeys) skeys[jj] = sk;
-                        }
-                        const char *sep = "";
-                        size_t slen = 0;
-                        if (ae->func == AGG_STRING_AGG && ae->separator.len > 0) {
-                            sep = ae->separator.data; slen = ae->separator.len;
-                        } else if (ae->func == AGG_ARRAY_AGG) {
-                            sep = ","; slen = 1;
-                        }
-                        size_t total = 0;
-                        for (uint32_t ii = 0; ii < n; ii++) total += strlen(vals[ii]);
-                        total += (n > 1 ? (n - 1) * slen : 0) + 1;
-                        char *buf = (char *)bump_alloc(&ctx->arena->scratch, total);
-                        size_t pos = 0;
-                        for (uint32_t ii = 0; ii < n; ii++) {
-                            if (ii > 0 && slen > 0) { memcpy(buf + pos, sep, slen); pos += slen; }
-                            size_t vl = strlen(vals[ii]);
-                            memcpy(buf + pos, vals[ii], vl); pos += vl;
-                        }
-                        buf[pos] = '\0';
-                        dst->nulls[out_count] = 0;
-                        if (ae->func == AGG_ARRAY_AGG) {
-                            char *wrapped = (char *)bump_alloc(&ctx->arena->scratch, pos + 3);
-                            wrapped[0] = '{'; memcpy(wrapped + 1, buf, pos);
-                            wrapped[pos + 1] = '}'; wrapped[pos + 2] = '\0';
-                            dst->data.str[out_count] = wrapped;
-                        } else {
-                            dst->data.str[out_count] = buf;
-                        }
-                    } else {
-                        dst->nulls[out_count] = 0;
-                        if (ae->func == AGG_ARRAY_AGG) {
-                            /* Wrap in {}: "{val1,val2,...}" */
-                            size_t slen = st->str_accum_len[idx];
-                            char *wrapped = (char *)bump_alloc(&ctx->arena->scratch, slen + 3);
-                            wrapped[0] = '{';
-                            memcpy(wrapped + 1, st->str_accum[idx], slen);
-                            wrapped[slen + 1] = '}';
-                            wrapped[slen + 2] = '\0';
-                            dst->data.str[out_count] = wrapped;
-                        } else {
-                            dst->data.str[out_count] = st->str_accum[idx];
-                        }
-                    }
-                    break;
-                }
-                case AGG_NONE:
-                    break;
-            }
-        }
-
-        if (pn->hash_agg.agg_before_cols) {
-            uint16_t grp_offset = (uint16_t)agg_n;
-            for (uint16_t k = 0; k < ngrp; k++) {
-                out->cols[grp_offset + k].type = st->gk.col_types[k];
-                if (st->gk.col_types[k] == COLUMN_TYPE_VECTOR) {
-                    uint16_t dim = st->gk.col_vec_dims[k];
-                    if (!out->cols[grp_offset + k].data.vec)
-                        out->cols[grp_offset + k].data.vec = (float *)bump_alloc(&ctx->arena->scratch, BLOCK_CAPACITY * dim * sizeof(float));
-                    out->cols[grp_offset + k].vec_dim = dim;
-                }
-                gk_emit(&out->cols[grp_offset + k], out_count, &st->gk, k, g);
-            }
-        }
-
-        out_count++;
-    }
-
-    out->count = out_count;
-    for (uint16_t c = 0; c < out->ncols; c++)
-        out->cols[c].count = out_count;
-
-    return 0;
+    return hash_agg_emit(ctx, pn, st, out);
 }
 
 /* ---- Simple Aggregate (no GROUP BY) ---- */
+
+static int simple_agg_emit(struct plan_exec_ctx *ctx, struct plan_node *pn,
+                           struct simple_agg_state *st, uint32_t agg_n,
+                           struct row_block *out)
+{
+    row_block_reset(out);
+    for (uint32_t a = 0; a < agg_n; a++) {
+        struct agg_expr *ae = &ctx->arena->aggregates.items[pn->simple_agg.agg_start + a];
+        struct col_block *dst = &out->cols[a];
+
+        switch (ae->func) {
+            case AGG_COUNT:
+                dst->type = COLUMN_TYPE_INT;
+                dst->nulls[0] = 0;
+                if (pn->simple_agg.agg_col_indices[a] == -1 &&
+                    ae->filter_cond == IDX_NONE)
+                    dst->data.i32[0] = (int32_t)st->total_rows;
+                else
+                    dst->data.i32[0] = (int32_t)st->nonnull[a];
+                break;
+            case AGG_SUM: {
+                int src_col = pn->simple_agg.agg_col_indices[a];
+                int src_is_float = 0;
+                if (src_col >= 0 && pn->simple_agg.table) {
+                    enum column_type sct = pn->simple_agg.table->columns.items[src_col].type;
+                    if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
+                        src_is_float = 1;
+                }
+                if ((src_col == -2 || src_col == -3) && st->sums[a] != 0.0)
+                    src_is_float = 1;
+                if (src_col == -3) src_is_float = 1;
+                if (st->nonnull[a] == 0) {
+                    dst->type = src_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_BIGINT;
+                    dst->nulls[0] = 1;
+                } else if (src_is_float) {
+                    dst->type = COLUMN_TYPE_FLOAT;
+                    dst->nulls[0] = 0;
+                    dst->data.f64[0] = st->sums[a];
+                } else {
+                    int64_t sv = st->i64_sums[a];
+                    if (sv >= INT32_MIN && sv <= INT32_MAX) {
+                        dst->type = COLUMN_TYPE_INT;
+                        dst->nulls[0] = 0;
+                        dst->data.i32[0] = (int32_t)sv;
+                    } else {
+                        dst->type = COLUMN_TYPE_BIGINT;
+                        dst->nulls[0] = 0;
+                        dst->data.i64[0] = sv;
+                    }
+                }
+                break;
+            }
+            case AGG_AVG:
+                dst->type = COLUMN_TYPE_FLOAT;
+                if (st->nonnull[a] == 0) {
+                    dst->nulls[0] = 1;
+                } else {
+                    int src_col_avg = pn->simple_agg.agg_col_indices[a];
+                    int avg_is_float = 0;
+                    if (src_col_avg >= 0 && pn->simple_agg.table) {
+                        enum column_type sct = pn->simple_agg.table->columns.items[src_col_avg].type;
+                        if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
+                            avg_is_float = 1;
+                    }
+                    if ((src_col_avg == -2 || src_col_avg == -3) && st->sums[a] != 0.0)
+                        avg_is_float = 1;
+                    if (src_col_avg == -3) avg_is_float = 1;
+                    dst->nulls[0] = 0;
+                    if (avg_is_float)
+                        dst->data.f64[0] = st->sums[a] / (double)st->nonnull[a];
+                    else
+                        dst->data.f64[0] = (double)st->i64_sums[a] / (double)st->nonnull[a];
+                }
+                break;
+            case AGG_MIN:
+            case AGG_MAX: {
+                int src_col_mm = pn->simple_agg.agg_col_indices[a];
+                enum column_type src_type_mm = COLUMN_TYPE_INT;
+                if (src_col_mm >= 0 && pn->simple_agg.table)
+                    src_type_mm = pn->simple_agg.table->columns.items[src_col_mm].type;
+                if (src_col_mm == -3) src_type_mm = COLUMN_TYPE_FLOAT;
+                agg_emit_minmax(dst, 0, src_type_mm,
+                                ae->func == AGG_MIN,
+                                st->mins, st->maxs,
+                                st->text_mins, st->text_maxs,
+                                st->nonnull, a);
+                break;
+            }
+            case AGG_STRING_AGG:
+            case AGG_ARRAY_AGG: {
+                dst->type = COLUMN_TYPE_TEXT;
+                if (st->nonnull[a] == 0) {
+                    dst->nulls[0] = 1;
+                } else if (st->str_ord_count[a] > 0) {
+                    /* STRING_AGG ORDER BY: sort collected values by key, then concat */
+                    uint32_t n = st->str_ord_count[a];
+                    double *keys = st->str_ord_keys[a];
+                    char **skeys = st->str_ord_skeys[a];
+                    char **vals = st->str_ord_vals[a];
+                    int desc = pn->simple_agg.agg_order_desc ? pn->simple_agg.agg_order_desc[a] : 0;
+                    int use_text = (skeys && n > 0 && skeys[0] != NULL);
+                    /* insertion sort (stable, fine for typical cardinalities) */
+                    for (uint32_t i = 1; i < n; i++) {
+                        double kk = keys[i]; char *sk = skeys ? skeys[i] : NULL; char *vv = vals[i];
+                        uint32_t j = i;
+                        for (;;) {
+                            if (j == 0) break;
+                            int cmp;
+                            if (use_text) cmp = strcmp(skeys[j-1], sk);
+                            else cmp = (keys[j-1] > kk) ? 1 : (keys[j-1] < kk) ? -1 : 0;
+                            if (desc ? cmp < 0 : cmp > 0) {
+                                keys[j] = keys[j-1]; vals[j] = vals[j-1];
+                                if (skeys) skeys[j] = skeys[j-1];
+                                j--;
+                            } else break;
+                        }
+                        keys[j] = kk; vals[j] = vv;
+                        if (skeys) skeys[j] = sk;
+                    }
+                    /* concatenate */
+                    const char *sep = "";
+                    size_t slen = 0;
+                    if (ae->func == AGG_STRING_AGG && ae->separator.len > 0) {
+                        sep = ae->separator.data; slen = ae->separator.len;
+                    } else if (ae->func == AGG_ARRAY_AGG) {
+                        sep = ","; slen = 1;
+                    }
+                    size_t total = 0;
+                    for (uint32_t i = 0; i < n; i++) total += strlen(vals[i]);
+                    total += (n > 1 ? (n - 1) * slen : 0) + 1;
+                    char *buf = (char *)bump_alloc(&ctx->arena->scratch, total);
+                    size_t pos = 0;
+                    for (uint32_t i = 0; i < n; i++) {
+                        if (i > 0 && slen > 0) { memcpy(buf + pos, sep, slen); pos += slen; }
+                        size_t vl = strlen(vals[i]);
+                        memcpy(buf + pos, vals[i], vl); pos += vl;
+                    }
+                    buf[pos] = '\0';
+                    dst->nulls[0] = 0;
+                    if (ae->func == AGG_ARRAY_AGG) {
+                        char *wrapped = (char *)bump_alloc(&ctx->arena->scratch, pos + 3);
+                        wrapped[0] = '{'; memcpy(wrapped + 1, buf, pos);
+                        wrapped[pos + 1] = '}'; wrapped[pos + 2] = '\0';
+                        dst->data.str[0] = wrapped;
+                    } else {
+                        dst->data.str[0] = buf;
+                    }
+                } else {
+                    dst->nulls[0] = 0;
+                    if (ae->func == AGG_ARRAY_AGG) {
+                        size_t slen = st->str_accum_len[a];
+                        char *wrapped = (char *)bump_alloc(&ctx->arena->scratch, slen + 3);
+                        wrapped[0] = '{';
+                        memcpy(wrapped + 1, st->str_accum[a], slen);
+                        wrapped[slen + 1] = '}';
+                        wrapped[slen + 2] = '\0';
+                        dst->data.str[0] = wrapped;
+                    } else {
+                        dst->data.str[0] = st->str_accum[a];
+                    }
+                }
+                break;
+            }
+            case AGG_BOOL_AND:
+                dst->type = COLUMN_TYPE_BOOLEAN;
+                if (st->nonnull[a] == 0) { dst->nulls[0] = 1; break; }
+                dst->nulls[0] = 0;
+                dst->data.i32[0] = (st->mins[a] != 0.0) ? 1 : 0;
+                break;
+            case AGG_BOOL_OR:
+                dst->type = COLUMN_TYPE_BOOLEAN;
+                if (st->nonnull[a] == 0) { dst->nulls[0] = 1; break; }
+                dst->nulls[0] = 0;
+                dst->data.i32[0] = (st->maxs[a] != 0.0) ? 1 : 0;
+                break;
+            case AGG_STDDEV:
+            case AGG_VARIANCE: {
+                dst->type = COLUMN_TYPE_FLOAT;
+                if (st->nonnull[a] < 2) { dst->nulls[0] = 1; break; }
+                double n_sd = (double)st->nonnull[a];
+                double sum_sd = st->sums[a] + (double)st->i64_sums[a];
+                double sumsq_sd = st->sumsq[a];
+                double var_sd = (sumsq_sd - sum_sd*sum_sd/n_sd) / (n_sd - 1.0);
+                dst->nulls[0] = 0;
+                dst->data.f64[0] = (ae->func == AGG_VARIANCE) ? var_sd : sqrt(var_sd);
+                break;
+            }
+            case AGG_NONE:
+                break;
+        }
+    }
+
+    out->count = 1;
+    for (uint16_t c = 0; c < out->ncols; c++)
+        out->cols[c].count = 1;
+    return 0;
+}
 
 static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                            struct row_block *out)
@@ -4707,197 +4932,7 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     /* Phase 2: emit exactly one row */
     if (st->emit_done) return -1;
     st->emit_done = 1;
-    row_block_reset(out);
-    for (uint32_t a = 0; a < agg_n; a++) {
-        struct agg_expr *ae = &ctx->arena->aggregates.items[pn->simple_agg.agg_start + a];
-        struct col_block *dst = &out->cols[a];
-
-        switch (ae->func) {
-            case AGG_COUNT:
-                dst->type = COLUMN_TYPE_INT;
-                dst->nulls[0] = 0;
-                if (pn->simple_agg.agg_col_indices[a] == -1 &&
-                    ae->filter_cond == IDX_NONE)
-                    dst->data.i32[0] = (int32_t)st->total_rows;
-                else
-                    dst->data.i32[0] = (int32_t)st->nonnull[a];
-                break;
-            case AGG_SUM: {
-                int src_col = pn->simple_agg.agg_col_indices[a];
-                int src_is_float = 0;
-                if (src_col >= 0 && pn->simple_agg.table) {
-                    enum column_type sct = pn->simple_agg.table->columns.items[src_col].type;
-                    if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
-                        src_is_float = 1;
-                }
-                if ((src_col == -2 || src_col == -3) && st->sums[a] != 0.0)
-                    src_is_float = 1;
-                if (src_col == -3) src_is_float = 1;
-                if (st->nonnull[a] == 0) {
-                    dst->type = src_is_float ? COLUMN_TYPE_FLOAT : COLUMN_TYPE_BIGINT;
-                    dst->nulls[0] = 1;
-                } else if (src_is_float) {
-                    dst->type = COLUMN_TYPE_FLOAT;
-                    dst->nulls[0] = 0;
-                    dst->data.f64[0] = st->sums[a];
-                } else {
-                    int64_t sv = st->i64_sums[a];
-                    if (sv >= INT32_MIN && sv <= INT32_MAX) {
-                        dst->type = COLUMN_TYPE_INT;
-                        dst->nulls[0] = 0;
-                        dst->data.i32[0] = (int32_t)sv;
-                    } else {
-                        dst->type = COLUMN_TYPE_BIGINT;
-                        dst->nulls[0] = 0;
-                        dst->data.i64[0] = sv;
-                    }
-                }
-                break;
-            }
-            case AGG_AVG:
-                dst->type = COLUMN_TYPE_FLOAT;
-                if (st->nonnull[a] == 0) {
-                    dst->nulls[0] = 1;
-                } else {
-                    int src_col_avg = pn->simple_agg.agg_col_indices[a];
-                    int avg_is_float = 0;
-                    if (src_col_avg >= 0 && pn->simple_agg.table) {
-                        enum column_type sct = pn->simple_agg.table->columns.items[src_col_avg].type;
-                        if (sct == COLUMN_TYPE_FLOAT || sct == COLUMN_TYPE_NUMERIC)
-                            avg_is_float = 1;
-                    }
-                    if ((src_col_avg == -2 || src_col_avg == -3) && st->sums[a] != 0.0)
-                        avg_is_float = 1;
-                    if (src_col_avg == -3) avg_is_float = 1;
-                    dst->nulls[0] = 0;
-                    if (avg_is_float)
-                        dst->data.f64[0] = st->sums[a] / (double)st->nonnull[a];
-                    else
-                        dst->data.f64[0] = (double)st->i64_sums[a] / (double)st->nonnull[a];
-                }
-                break;
-            case AGG_MIN:
-            case AGG_MAX: {
-                int src_col_mm = pn->simple_agg.agg_col_indices[a];
-                enum column_type src_type_mm = COLUMN_TYPE_INT;
-                if (src_col_mm >= 0 && pn->simple_agg.table)
-                    src_type_mm = pn->simple_agg.table->columns.items[src_col_mm].type;
-                if (src_col_mm == -3) src_type_mm = COLUMN_TYPE_FLOAT;
-                agg_emit_minmax(dst, 0, src_type_mm,
-                                ae->func == AGG_MIN,
-                                st->mins, st->maxs,
-                                st->text_mins, st->text_maxs,
-                                st->nonnull, a);
-                break;
-            }
-            case AGG_STRING_AGG:
-            case AGG_ARRAY_AGG: {
-                dst->type = COLUMN_TYPE_TEXT;
-                if (st->nonnull[a] == 0) {
-                    dst->nulls[0] = 1;
-                } else if (st->str_ord_count[a] > 0) {
-                    /* STRING_AGG ORDER BY: sort collected values by key, then concat */
-                    uint32_t n = st->str_ord_count[a];
-                    double *keys = st->str_ord_keys[a];
-                    char **skeys = st->str_ord_skeys[a];
-                    char **vals = st->str_ord_vals[a];
-                    int desc = pn->simple_agg.agg_order_desc ? pn->simple_agg.agg_order_desc[a] : 0;
-                    int use_text = (skeys && n > 0 && skeys[0] != NULL);
-                    /* insertion sort (stable, fine for typical cardinalities) */
-                    for (uint32_t i = 1; i < n; i++) {
-                        double kk = keys[i]; char *sk = skeys ? skeys[i] : NULL; char *vv = vals[i];
-                        uint32_t j = i;
-                        for (;;) {
-                            if (j == 0) break;
-                            int cmp;
-                            if (use_text) cmp = strcmp(skeys[j-1], sk);
-                            else cmp = (keys[j-1] > kk) ? 1 : (keys[j-1] < kk) ? -1 : 0;
-                            if (desc ? cmp < 0 : cmp > 0) {
-                                keys[j] = keys[j-1]; vals[j] = vals[j-1];
-                                if (skeys) skeys[j] = skeys[j-1];
-                                j--;
-                            } else break;
-                        }
-                        keys[j] = kk; vals[j] = vv;
-                        if (skeys) skeys[j] = sk;
-                    }
-                    /* concatenate */
-                    const char *sep = "";
-                    size_t slen = 0;
-                    if (ae->func == AGG_STRING_AGG && ae->separator.len > 0) {
-                        sep = ae->separator.data; slen = ae->separator.len;
-                    } else if (ae->func == AGG_ARRAY_AGG) {
-                        sep = ","; slen = 1;
-                    }
-                    size_t total = 0;
-                    for (uint32_t i = 0; i < n; i++) total += strlen(vals[i]);
-                    total += (n > 1 ? (n - 1) * slen : 0) + 1;
-                    char *buf = (char *)bump_alloc(&ctx->arena->scratch, total);
-                    size_t pos = 0;
-                    for (uint32_t i = 0; i < n; i++) {
-                        if (i > 0 && slen > 0) { memcpy(buf + pos, sep, slen); pos += slen; }
-                        size_t vl = strlen(vals[i]);
-                        memcpy(buf + pos, vals[i], vl); pos += vl;
-                    }
-                    buf[pos] = '\0';
-                    dst->nulls[0] = 0;
-                    if (ae->func == AGG_ARRAY_AGG) {
-                        char *wrapped = (char *)bump_alloc(&ctx->arena->scratch, pos + 3);
-                        wrapped[0] = '{'; memcpy(wrapped + 1, buf, pos);
-                        wrapped[pos + 1] = '}'; wrapped[pos + 2] = '\0';
-                        dst->data.str[0] = wrapped;
-                    } else {
-                        dst->data.str[0] = buf;
-                    }
-                } else {
-                    dst->nulls[0] = 0;
-                    if (ae->func == AGG_ARRAY_AGG) {
-                        size_t slen = st->str_accum_len[a];
-                        char *wrapped = (char *)bump_alloc(&ctx->arena->scratch, slen + 3);
-                        wrapped[0] = '{';
-                        memcpy(wrapped + 1, st->str_accum[a], slen);
-                        wrapped[slen + 1] = '}';
-                        wrapped[slen + 2] = '\0';
-                        dst->data.str[0] = wrapped;
-                    } else {
-                        dst->data.str[0] = st->str_accum[a];
-                    }
-                }
-                break;
-            }
-            case AGG_BOOL_AND:
-                dst->type = COLUMN_TYPE_BOOLEAN;
-                if (st->nonnull[a] == 0) { dst->nulls[0] = 1; break; }
-                dst->nulls[0] = 0;
-                dst->data.i32[0] = (st->mins[a] != 0.0) ? 1 : 0;
-                break;
-            case AGG_BOOL_OR:
-                dst->type = COLUMN_TYPE_BOOLEAN;
-                if (st->nonnull[a] == 0) { dst->nulls[0] = 1; break; }
-                dst->nulls[0] = 0;
-                dst->data.i32[0] = (st->maxs[a] != 0.0) ? 1 : 0;
-                break;
-            case AGG_STDDEV:
-            case AGG_VARIANCE: {
-                dst->type = COLUMN_TYPE_FLOAT;
-                if (st->nonnull[a] < 2) { dst->nulls[0] = 1; break; }
-                double n_sd = (double)st->nonnull[a];
-                double sum_sd = st->sums[a] + (double)st->i64_sums[a];
-                double sumsq_sd = st->sumsq[a];
-                double var_sd = (sumsq_sd - sum_sd*sum_sd/n_sd) / (n_sd - 1.0);
-                dst->nulls[0] = 0;
-                dst->data.f64[0] = (ae->func == AGG_VARIANCE) ? var_sd : sqrt(var_sd);
-                break;
-            }
-            case AGG_NONE:
-                break;
-        }
-    }
-
-    out->count = 1;
-    for (uint16_t c = 0; c < out->ncols; c++)
-        out->cols[c].count = 1;
-    return 0;
+    return simple_agg_emit(ctx, pn, st, agg_n, out);
 }
 
 /* ---- pdqsort: pattern-defeating quicksort ----
@@ -5129,14 +5164,27 @@ static void radix_sort_u64(uint32_t *indices, uint32_t count,
 
     if (nn > 1) {
         uint64_t *sort_keys = (uint64_t *)bump_alloc(scratch, nn * sizeof(uint64_t));
-        for (uint32_t i = 0; i < nn; i++)
-            sort_keys[i] = (uint64_t)keys[non_null[i]] ^ 0x8000000000000000ULL;
+        uint64_t or_all = 0, and_all = ~(uint64_t)0;
+        for (uint32_t i = 0; i < nn; i++) {
+            uint64_t k = (uint64_t)keys[non_null[i]] ^ 0x8000000000000000ULL;
+            sort_keys[i] = k;
+            or_all |= k;
+            and_all &= k;
+        }
+
+        /* Skip bytes where all keys are identical */
+        uint64_t vary_mask = or_all ^ and_all;
 
         uint32_t *buf = (uint32_t *)bump_alloc(scratch, nn * sizeof(uint32_t));
         uint64_t *key_buf = (uint64_t *)bump_alloc(scratch, nn * sizeof(uint64_t));
 
+        uint32_t *orig_non_null = non_null;
+        int passes_done = 0;
+
         for (int pass = 0; pass < 8; pass++) {
             int shift = pass * 8;
+            if (((vary_mask >> shift) & 0xFF) == 0) continue;
+
             uint32_t counts[256] = {0};
             for (uint32_t i = 0; i < nn; i++)
                 counts[(sort_keys[i] >> shift) & 0xFF]++;
@@ -5152,7 +5200,100 @@ static void radix_sort_u64(uint32_t *indices, uint32_t count,
             }
             uint32_t *t1 = non_null; non_null = buf; buf = t1;
             uint64_t *t2 = sort_keys; sort_keys = key_buf; key_buf = t2;
+            passes_done++;
         }
+
+        if ((passes_done & 1) && non_null != orig_non_null)
+            memcpy(orig_non_null, non_null, nn * sizeof(uint32_t));
+        non_null = orig_non_null;
+    }
+
+    uint32_t out = 0;
+    if (desc) {
+        if (nulls_first) {
+            for (uint32_t i = 0; i < null_n; i++) indices[out++] = null_idx[i];
+            for (uint32_t i = nn; i > 0; i--) indices[out++] = non_null[i - 1];
+        } else {
+            for (uint32_t i = nn; i > 0; i--) indices[out++] = non_null[i - 1];
+            for (uint32_t i = 0; i < null_n; i++) indices[out++] = null_idx[i];
+        }
+    } else {
+        if (nulls_first) {
+            for (uint32_t i = 0; i < null_n; i++) indices[out++] = null_idx[i];
+            for (uint32_t i = 0; i < nn; i++) indices[out++] = non_null[i];
+        } else {
+            for (uint32_t i = 0; i < nn; i++) indices[out++] = non_null[i];
+            for (uint32_t i = 0; i < null_n; i++) indices[out++] = null_idx[i];
+        }
+    }
+}
+/* IEEE 754 double radix sort — same algorithm as radix_sort_u64 but with
+ * float-to-uint64 transformation: positive doubles get sign bit flipped,
+ * negative doubles get all bits flipped. Result sorts in double order. */
+static void radix_sort_f64(uint32_t *indices, uint32_t count,
+                            const double *keys, const uint8_t *nulls,
+                            int desc, int nulls_first,
+                            struct bump_alloc *scratch)
+{
+    uint32_t *tmp = (uint32_t *)bump_alloc(scratch, count * sizeof(uint32_t));
+    uint32_t nn = 0, null_n = 0;
+    uint32_t *non_null = tmp;
+    uint32_t *null_idx = (uint32_t *)bump_alloc(scratch, count * sizeof(uint32_t));
+    for (uint32_t i = 0; i < count; i++) {
+        if (nulls[indices[i]]) null_idx[null_n++] = indices[i];
+        else non_null[nn++] = indices[i];
+    }
+
+    if (nn > 1) {
+        uint64_t *sort_keys = (uint64_t *)bump_alloc(scratch, nn * sizeof(uint64_t));
+        uint64_t or_all = 0, and_all = ~(uint64_t)0;
+        for (uint32_t i = 0; i < nn; i++) {
+            uint64_t bits;
+            memcpy(&bits, &keys[non_null[i]], sizeof(bits));
+            /* Transform so unsigned order matches double order:
+             * positive: flip sign bit; negative: flip all bits */
+            if (bits & 0x8000000000000000ULL)
+                bits = ~bits;
+            else
+                bits ^= 0x8000000000000000ULL;
+            sort_keys[i] = bits;
+            or_all |= bits;
+            and_all &= bits;
+        }
+
+        uint64_t vary_mask = or_all ^ and_all;
+
+        uint32_t *buf = (uint32_t *)bump_alloc(scratch, nn * sizeof(uint32_t));
+        uint64_t *key_buf = (uint64_t *)bump_alloc(scratch, nn * sizeof(uint64_t));
+
+        uint32_t *orig_non_null = non_null;
+        int passes_done = 0;
+
+        for (int pass = 0; pass < 8; pass++) {
+            int shift = pass * 8;
+            if (((vary_mask >> shift) & 0xFF) == 0) continue;
+
+            uint32_t counts[256] = {0};
+            for (uint32_t i = 0; i < nn; i++)
+                counts[(sort_keys[i] >> shift) & 0xFF]++;
+            uint32_t offsets[256];
+            offsets[0] = 0;
+            for (int b = 1; b < 256; b++)
+                offsets[b] = offsets[b - 1] + counts[b - 1];
+            for (uint32_t i = 0; i < nn; i++) {
+                uint32_t byte = (sort_keys[i] >> shift) & 0xFF;
+                uint32_t pos = offsets[byte]++;
+                buf[pos] = non_null[i];
+                key_buf[pos] = sort_keys[i];
+            }
+            uint32_t *t1 = non_null; non_null = buf; buf = t1;
+            uint64_t *t2 = sort_keys; sort_keys = key_buf; key_buf = t2;
+            passes_done++;
+        }
+
+        if ((passes_done & 1) && non_null != orig_non_null)
+            memcpy(orig_non_null, non_null, nn * sizeof(uint32_t));
+        non_null = orig_non_null;
     }
 
     uint32_t out = 0;
@@ -5192,7 +5333,7 @@ static int sort_key_bits(enum column_type t)
     case COLUMN_TYPE_TIMESTAMP:
     case COLUMN_TYPE_TIMESTAMPTZ: return 64;
     case COLUMN_TYPE_FLOAT:
-    case COLUMN_TYPE_NUMERIC:
+    case COLUMN_TYPE_NUMERIC:     return 64;
     case COLUMN_TYPE_TEXT:
     case COLUMN_TYPE_ENUM:
     case COLUMN_TYPE_INTERVAL:
@@ -5261,12 +5402,26 @@ static int build_composite_keys(uint64_t *out, uint8_t *any_null,
             break;
         }
         case 64: {
-            const int64_t *vals = (const int64_t *)flat_keys[k];
-            for (uint32_t i = 0; i < total; i++) {
-                if (any_null[i]) continue;
-                uint64_t u = (uint64_t)vals[i] ^ 0x8000000000000000ULL;
-                if (desc) u = ~u;
-                out[i] |= u; /* shift is 0 for 64-bit single key */
+            enum column_type kt = key_types[k];
+            if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC) {
+                const double *vals = (const double *)flat_keys[k];
+                for (uint32_t i = 0; i < total; i++) {
+                    if (any_null[i]) continue;
+                    uint64_t u;
+                    memcpy(&u, &vals[i], sizeof(u));
+                    if (u & 0x8000000000000000ULL) u = ~u;
+                    else u ^= 0x8000000000000000ULL;
+                    if (desc) u = ~u;
+                    out[i] |= u << shift;
+                }
+            } else {
+                const int64_t *vals = (const int64_t *)flat_keys[k];
+                for (uint32_t i = 0; i < total; i++) {
+                    if (any_null[i]) continue;
+                    uint64_t u = (uint64_t)vals[i] ^ 0x8000000000000000ULL;
+                    if (desc) u = ~u;
+                    out[i] |= u << shift;
+                }
             }
             break;
         }
@@ -5285,15 +5440,30 @@ static void radix_sort_composite(uint32_t *indices, uint32_t count,
 
     /* Build sort keys array indexed by position in indices[] */
     uint64_t *sort_keys = (uint64_t *)bump_alloc(scratch, count * sizeof(uint64_t));
-    for (uint32_t i = 0; i < count; i++)
-        sort_keys[i] = composite_keys[indices[i]];
+    uint64_t or_all = 0, and_all = ~(uint64_t)0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t k = composite_keys[indices[i]];
+        sort_keys[i] = k;
+        or_all |= k;
+        and_all &= k;
+    }
+
+    /* Bytes where all keys are identical can be skipped — bits that differ
+     * are set in vary_mask. A byte with no varying bits is uniform. */
+    uint64_t vary_mask = or_all ^ and_all;
 
     uint32_t *buf = (uint32_t *)bump_alloc(scratch, count * sizeof(uint32_t));
     uint64_t *key_buf = (uint64_t *)bump_alloc(scratch, count * sizeof(uint64_t));
 
-    /* 8-pass radix sort, 8 bits per pass */
+    /* Save original pointer so we can detect if result ended up in buf */
+    uint32_t *orig_indices = indices;
+    int passes_done = 0;
+
     for (int pass = 0; pass < 8; pass++) {
         int s = pass * 8;
+        /* Skip passes where all keys have the same byte value */
+        if (((vary_mask >> s) & 0xFF) == 0) continue;
+
         uint32_t counts[256] = {0};
         for (uint32_t i = 0; i < count; i++)
             counts[(sort_keys[i] >> s) & 0xFF]++;
@@ -5309,11 +5479,13 @@ static void radix_sort_composite(uint32_t *indices, uint32_t count,
         }
         uint32_t *t1 = indices; indices = buf; buf = t1;
         uint64_t *t2 = sort_keys; sort_keys = key_buf; key_buf = t2;
+        passes_done++;
     }
 
-    /* After even number of passes (8), result is in the original indices array.
-     * Radix sort swaps pointers each pass: after 8 passes, indices points to
-     * the original buffer (since 8 is even). No copy needed. */
+    /* If an odd number of passes executed, result is in buf (not orig_indices).
+     * Copy back so the caller's pointer is correct. */
+    if ((passes_done & 1) && indices != orig_indices)
+        memcpy(orig_indices, indices, count * sizeof(uint32_t));
 }
 
 /* ---- Sort ---- */
@@ -5334,6 +5506,10 @@ struct block_sort_ctx {
     uint8_t         **flat_col_nulls;    /* [ncols] contiguous null bitmaps */
     enum column_type *flat_col_types;    /* [ncols] column types */
     uint32_t        **flat_col_str_lens; /* [ncols] TEXT col lengths for emit, NULL for non-TEXT */
+    /* Deferred VECTOR gather: skip flatten for VECTOR cols, gather from original blocks at emit */
+    struct row_block *collected;          /* original collected blocks (NULL if not deferred) */
+    uint32_t          nblocks;
+    uint16_t         *vec_dims;           /* [ncols] VECTOR dimension per col (0 for non-VECTOR) */
 };
 static struct block_sort_ctx _bsort_ctx;
 
@@ -5400,6 +5576,64 @@ static int sort_flat_cmp(const void *a, const void *b)
     }
     return 0;
 }
+
+/* Type-specialized single-key comparators — no type dispatch per call.
+ * Each reads key data/nulls from _bsort_ctx slot 0 directly. */
+
+#define SORT_SPEC_NULLS_PREAMBLE                                              \
+    uint32_t ia = *(const uint32_t *)a;                                       \
+    uint32_t ib = *(const uint32_t *)b;                                       \
+    uint8_t na = _bsort_ctx.flat_nulls[0][ia];                               \
+    uint8_t nb = _bsort_ctx.flat_nulls[0][ib];                               \
+    if (na || nb) {                                                           \
+        if (na && nb) return 0;                                               \
+        int nf = _bsort_ctx.sort_nulls_first ? _bsort_ctx.sort_nulls_first[0] : -1; \
+        int nfirst = (nf == 1) || (nf == -1 && _bsort_ctx.sort_descs[0]);    \
+        if (na) return nfirst ? -1 : 1;                                       \
+        return nfirst ? 1 : -1;                                                \
+    }
+
+static int sort_cmp_i32(const void *a, const void *b)
+{
+    SORT_SPEC_NULLS_PREAMBLE
+    int32_t va = ((const int32_t *)_bsort_ctx.flat_keys[0])[ia];
+    int32_t vb = ((const int32_t *)_bsort_ctx.flat_keys[0])[ib];
+    int cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+    return _bsort_ctx.sort_descs[0] ? -cmp : cmp;
+}
+
+static int sort_cmp_i64(const void *a, const void *b)
+{
+    SORT_SPEC_NULLS_PREAMBLE
+    int64_t va = ((const int64_t *)_bsort_ctx.flat_keys[0])[ia];
+    int64_t vb = ((const int64_t *)_bsort_ctx.flat_keys[0])[ib];
+    int cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+    return _bsort_ctx.sort_descs[0] ? -cmp : cmp;
+}
+
+static int sort_cmp_f64(const void *a, const void *b)
+{
+    SORT_SPEC_NULLS_PREAMBLE
+    double va = ((const double *)_bsort_ctx.flat_keys[0])[ia];
+    double vb = ((const double *)_bsort_ctx.flat_keys[0])[ib];
+    int cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+    return _bsort_ctx.sort_descs[0] ? -cmp : cmp;
+}
+
+static int sort_cmp_text(const void *a, const void *b)
+{
+    SORT_SPEC_NULLS_PREAMBLE
+    const char *sa = ((const char **)_bsort_ctx.flat_keys[0])[ia];
+    const char *sb = ((const char **)_bsort_ctx.flat_keys[0])[ib];
+    int cmp;
+    if (!sa && !sb) cmp = 0;
+    else if (!sa) cmp = -1;
+    else if (!sb) cmp = 1;
+    else cmp = strcmp(sa, sb);
+    return _bsort_ctx.sort_descs[0] ? -cmp : cmp;
+}
+
+#undef SORT_SPEC_NULLS_PREAMBLE
 
 static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                      struct row_block *out)
@@ -5481,11 +5715,32 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                                             child_ncols * sizeof(uint8_t *));
         _bsort_ctx.flat_col_types = (enum column_type *)bump_alloc(&ctx->arena->scratch,
                                                                     child_ncols * sizeof(enum column_type));
+        _bsort_ctx.vec_dims = (uint16_t *)bump_calloc(&ctx->arena->scratch,
+                                                        child_ncols, sizeof(uint16_t));
+        _bsort_ctx.collected = st->collected;
+        _bsort_ctx.nblocks = st->nblocks;
         for (uint16_t ci = 0; ci < child_ncols; ci++) {
             enum column_type kt = COLUMN_TYPE_INT;
             if (st->nblocks > 0)
                 kt = st->collected[0].cols[ci].type;
             _bsort_ctx.flat_col_types[ci] = kt;
+
+            /* Defer VECTOR columns: skip flatten, gather from original blocks at emit */
+            if (kt == COLUMN_TYPE_VECTOR) {
+                uint16_t dim = (st->nblocks > 0) ? st->collected[0].cols[ci].vec_dim : 0;
+                _bsort_ctx.vec_dims[ci] = dim;
+                _bsort_ctx.flat_col_data[ci] = NULL;
+                _bsort_ctx.flat_col_nulls[ci] = (uint8_t *)bump_alloc(&ctx->arena->scratch,
+                                                                       (total ? total : 1));
+                uint32_t fi = 0;
+                for (uint32_t b = 0; b < st->nblocks; b++) {
+                    struct col_block *src = &st->collected[b].cols[ci];
+                    uint16_t cnt = st->collected[b].count;
+                    memcpy(_bsort_ctx.flat_col_nulls[ci] + fi, src->nulls, cnt);
+                    fi += cnt;
+                }
+                continue;
+            }
 
             size_t elem_sz = (st->nblocks > 0)
                              ? cb_elem_size(&st->collected[0].cols[ci])
@@ -5577,6 +5832,12 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                                    _bsort_ctx.flat_col_nulls[sci],
                                    desc, nulls_first_flag, &ctx->arena->scratch);
                     used_radix = 1;
+                } else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC) {
+                    radix_sort_f64(st->sorted_indices, total,
+                                   (const double *)_bsort_ctx.flat_col_data[sci],
+                                   _bsort_ctx.flat_col_nulls[sci],
+                                   desc, nulls_first_flag, &ctx->arena->scratch);
+                    used_radix = 1;
                 }
             }
             /* Multi-key composite radix sort: pack integer keys into uint64 */
@@ -5592,8 +5853,24 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     used_radix = 1;
                 }
             }
-            if (!used_radix)
-                pdqsort(st->sorted_indices, total, sizeof(uint32_t), sort_flat_cmp);
+            if (!used_radix) {
+                /* Pick type-specialized comparator for single-key sorts */
+                int (*cmp_fn)(const void *, const void *) = sort_flat_cmp;
+                if (nsk == 1) {
+                    enum column_type kt = _bsort_ctx.key_types[0];
+                    if (kt == COLUMN_TYPE_INT || kt == COLUMN_TYPE_BOOLEAN ||
+                        kt == COLUMN_TYPE_DATE || kt == COLUMN_TYPE_ENUM)
+                        cmp_fn = sort_cmp_i32;
+                    else if (kt == COLUMN_TYPE_BIGINT || kt == COLUMN_TYPE_TIMESTAMP ||
+                             kt == COLUMN_TYPE_TIMESTAMPTZ || kt == COLUMN_TYPE_TIME)
+                        cmp_fn = sort_cmp_i64;
+                    else if (kt == COLUMN_TYPE_FLOAT || kt == COLUMN_TYPE_NUMERIC)
+                        cmp_fn = sort_cmp_f64;
+                    else if (kt == COLUMN_TYPE_TEXT)
+                        cmp_fn = sort_cmp_text;
+                }
+                pdqsort(st->sorted_indices, total, sizeof(uint32_t), cmp_fn);
+            }
         }
 
         st->input_done = 1;
@@ -5610,7 +5887,7 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     const uint32_t *idx = st->sorted_indices + st->emit_cursor;
 
     /* Column-oriented gather emit — switch on type once per column,
-     * tight typed loop for the block.  Prefetch 16 elements ahead to
+     * tight typed loop for the block.  Prefetch 48 elements ahead to
      * hide cache-miss latency on the random-access gather pattern. */
     for (uint16_t c = 0; c < child_ncols; c++) {
         struct col_block *ocb = &out->cols[c];
@@ -5621,8 +5898,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         ocb->count = out_count;
 
         for (uint16_t r = 0; r < out_count; r++) {
-            if (r + 16 < out_count)
-                __builtin_prefetch(&src_nulls[idx[r + 16]], 0, 0);
+            if (r + 48 < out_count)
+                __builtin_prefetch(&src_nulls[idx[r + 48]], 0, 1);
             ocb->nulls[r] = src_nulls[idx[r]];
         }
 
@@ -5630,8 +5907,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         case COLUMN_TYPE_SMALLINT: {
             const int16_t *s = (const int16_t *)src_data;
             for (uint16_t r = 0; r < out_count; r++) {
-                if (r + 16 < out_count)
-                    __builtin_prefetch(&s[idx[r + 16]], 0, 0);
+                if (r + 48 < out_count)
+                    __builtin_prefetch(&s[idx[r + 48]], 0, 1);
                 ocb->data.i16[r] = s[idx[r]];
             }
             break;
@@ -5641,8 +5918,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         case COLUMN_TYPE_DATE: {
             const int32_t *s = (const int32_t *)src_data;
             for (uint16_t r = 0; r < out_count; r++) {
-                if (r + 16 < out_count)
-                    __builtin_prefetch(&s[idx[r + 16]], 0, 0);
+                if (r + 48 < out_count)
+                    __builtin_prefetch(&s[idx[r + 48]], 0, 1);
                 ocb->data.i32[r] = s[idx[r]];
             }
             break;
@@ -5653,8 +5930,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         case COLUMN_TYPE_TIMESTAMPTZ: {
             const int64_t *s = (const int64_t *)src_data;
             for (uint16_t r = 0; r < out_count; r++) {
-                if (r + 16 < out_count)
-                    __builtin_prefetch(&s[idx[r + 16]], 0, 0);
+                if (r + 48 < out_count)
+                    __builtin_prefetch(&s[idx[r + 48]], 0, 1);
                 ocb->data.i64[r] = s[idx[r]];
             }
             break;
@@ -5663,8 +5940,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         case COLUMN_TYPE_NUMERIC: {
             const double *s = (const double *)src_data;
             for (uint16_t r = 0; r < out_count; r++) {
-                if (r + 16 < out_count)
-                    __builtin_prefetch(&s[idx[r + 16]], 0, 0);
+                if (r + 48 < out_count)
+                    __builtin_prefetch(&s[idx[r + 48]], 0, 1);
                 ocb->data.f64[r] = s[idx[r]];
             }
             break;
@@ -5672,8 +5949,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         case COLUMN_TYPE_TEXT: {
             char *const *s = (char *const *)src_data;
             for (uint16_t r = 0; r < out_count; r++) {
-                if (r + 16 < out_count)
-                    __builtin_prefetch(&s[idx[r + 16]], 0, 0);
+                if (r + 48 < out_count)
+                    __builtin_prefetch(&s[idx[r + 48]], 0, 1);
                 ocb->data.str[r] = s[idx[r]];
             }
             /* Populate str_lens from flat_col_str_lens (column-indexed) if available, else clear */
@@ -5683,8 +5960,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     ocb->str_lens = (uint32_t *)bump_alloc(&ctx->arena->scratch,
                                                            BLOCK_CAPACITY * sizeof(uint32_t));
                 for (uint16_t r = 0; r < out_count; r++) {
-                    if (r + 16 < out_count)
-                        __builtin_prefetch(&fsl[idx[r + 16]], 0, 0);
+                    if (r + 48 < out_count)
+                        __builtin_prefetch(&fsl[idx[r + 48]], 0, 1);
                     ocb->str_lens[r] = fsl[idx[r]];
                 }
             } else {
@@ -5695,8 +5972,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         case COLUMN_TYPE_ENUM: {
             const int32_t *s = (const int32_t *)src_data;
             for (uint16_t r = 0; r < out_count; r++) {
-                if (r + 16 < out_count)
-                    __builtin_prefetch(&s[idx[r + 16]], 0, 0);
+                if (r + 48 < out_count)
+                    __builtin_prefetch(&s[idx[r + 48]], 0, 1);
                 ocb->data.i32[r] = s[idx[r]];
             }
             break;
@@ -5704,8 +5981,8 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         case COLUMN_TYPE_UUID: {
             const struct uuid_val *s = (const struct uuid_val *)src_data;
             for (uint16_t r = 0; r < out_count; r++) {
-                if (r + 16 < out_count)
-                    __builtin_prefetch(&s[idx[r + 16]], 0, 0);
+                if (r + 48 < out_count)
+                    __builtin_prefetch(&s[idx[r + 48]], 0, 1);
                 ocb->data.uuid[r] = s[idx[r]];
             }
             break;
@@ -5713,22 +5990,32 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         case COLUMN_TYPE_INTERVAL: {
             const struct interval *s = (const struct interval *)src_data;
             for (uint16_t r = 0; r < out_count; r++) {
-                if (r + 16 < out_count)
-                    __builtin_prefetch(&s[idx[r + 16]], 0, 0);
+                if (r + 48 < out_count)
+                    __builtin_prefetch(&s[idx[r + 48]], 0, 1);
                 ocb->data.iv[r] = s[idx[r]];
             }
             break;
         }
         case COLUMN_TYPE_VECTOR: {
-            uint16_t dim = 0;
-            if (st->nblocks > 0) dim = st->collected[0].cols[c].vec_dim;
-            if (dim > 0) {
-                const float *s = (const float *)src_data;
+            uint16_t dim = _bsort_ctx.vec_dims ? _bsort_ctx.vec_dims[c] : 0;
+            if (dim > 0 && _bsort_ctx.collected) {
                 ocb->vec_dim = dim;
                 ocb->data.vec = (float *)bump_alloc(&ctx->arena->scratch,
                                                      out_count * dim * sizeof(float));
-                for (uint16_t r = 0; r < out_count; r++)
-                    memcpy(&ocb->data.vec[r * dim], &s[idx[r] * dim], dim * sizeof(float));
+                /* Gather from original collected blocks (deferred — no flat copy) */
+                for (uint16_t r = 0; r < out_count; r++) {
+                    uint32_t fi = idx[r];
+                    uint32_t b = 0, off = 0;
+                    for (; b < _bsort_ctx.nblocks; b++) {
+                        uint16_t cnt = _bsort_ctx.collected[b].count;
+                        if (fi < off + cnt) break;
+                        off += cnt;
+                    }
+                    uint16_t ri = (uint16_t)(fi - off);
+                    const struct col_block *src_cb = &_bsort_ctx.collected[b].cols[c];
+                    memcpy(&ocb->data.vec[r * dim],
+                           &src_cb->data.vec[ri * dim], dim * sizeof(float));
+                }
             }
             break;
         }
@@ -5855,6 +6142,95 @@ static void top_n_grow_flat(struct top_n_state *st, uint32_t new_cap,
         st->flat_nulls[c] = new_nulls;
     }
     st->flat_cap = new_cap;
+}
+
+static int top_n_emit(struct plan_exec_ctx *ctx, struct top_n_state *st,
+                       struct row_block *out)
+{
+    if (st->emit_cursor >= st->sorted_count) return -1;
+
+    row_block_reset(out);
+    uint32_t remain = st->sorted_count - st->emit_cursor;
+    uint16_t out_count = (remain < BLOCK_CAPACITY) ? (uint16_t)remain : BLOCK_CAPACITY;
+    const uint32_t *idx = st->sorted + st->emit_cursor;
+
+    for (uint16_t c = 0; c < st->ncols; c++) {
+        struct col_block *ocb = &out->cols[c];
+        enum column_type ct = st->flat_types[c];
+        const uint8_t *src_nulls = st->flat_nulls[c];
+        const void *src_data = st->flat_data[c];
+        ocb->type = ct;
+        ocb->count = out_count;
+
+        for (uint16_t r = 0; r < out_count; r++)
+            ocb->nulls[r] = src_nulls[idx[r]];
+
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT: {
+            const int16_t *s = (const int16_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.i16[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_DATE: {
+            const int32_t *s = (const int32_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.i32[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_BIGINT:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            const int64_t *s = (const int64_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.i64[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC: {
+            const double *s = (const double *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.f64[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_TEXT: {
+            char *const *s = (char *const *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.str[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_ENUM: {
+            const int32_t *s = (const int32_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.i32[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            const struct uuid_val *s = (const struct uuid_val *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.uuid[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_INTERVAL: {
+            const struct interval *s = (const struct interval *)src_data;
+            for (uint16_t r = 0; r < out_count; r++) ocb->data.iv[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_VECTOR: {
+            size_t elem_sz = st->flat_elem_sizes[c];
+            uint16_t dim = (uint16_t)(elem_sz / sizeof(float));
+            if (dim > 0) {
+                const float *s = (const float *)src_data;
+                ocb->vec_dim = dim;
+                ocb->data.vec = (float *)bump_alloc(&ctx->arena->scratch,
+                                                     out_count * dim * sizeof(float));
+                for (uint16_t r = 0; r < out_count; r++)
+                    memcpy(&ocb->data.vec[r * dim], &s[idx[r] * dim], dim * sizeof(float));
+            }
+            break;
+        }
+        }
+    }
+
+    st->emit_cursor += out_count;
+    out->count = out_count;
+    return 0;
 }
 
 static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -6037,80 +6413,7 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         st->emit_cursor = 0;
     }
 
-    /* Emit phase */
-    if (st->emit_cursor >= st->sorted_count) return -1;
-
-    row_block_reset(out);
-    uint32_t remain = st->sorted_count - st->emit_cursor;
-    uint16_t out_count = (remain < BLOCK_CAPACITY) ? (uint16_t)remain : BLOCK_CAPACITY;
-    const uint32_t *idx = st->sorted + st->emit_cursor;
-
-    for (uint16_t c = 0; c < st->ncols; c++) {
-        struct col_block *ocb = &out->cols[c];
-        enum column_type ct = st->flat_types[c];
-        const uint8_t *src_nulls = st->flat_nulls[c];
-        const void *src_data = st->flat_data[c];
-        ocb->type = ct;
-        ocb->count = out_count;
-
-        for (uint16_t r = 0; r < out_count; r++)
-            ocb->nulls[r] = src_nulls[idx[r]];
-
-        switch (ct) {
-        case COLUMN_TYPE_SMALLINT: {
-            const int16_t *s = (const int16_t *)src_data;
-            for (uint16_t r = 0; r < out_count; r++) ocb->data.i16[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_INT:
-        case COLUMN_TYPE_BOOLEAN:
-        case COLUMN_TYPE_DATE: {
-            const int32_t *s = (const int32_t *)src_data;
-            for (uint16_t r = 0; r < out_count; r++) ocb->data.i32[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_BIGINT:
-        case COLUMN_TYPE_TIME:
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ: {
-            const int64_t *s = (const int64_t *)src_data;
-            for (uint16_t r = 0; r < out_count; r++) ocb->data.i64[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_FLOAT:
-        case COLUMN_TYPE_NUMERIC: {
-            const double *s = (const double *)src_data;
-            for (uint16_t r = 0; r < out_count; r++) ocb->data.f64[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_TEXT: {
-            char *const *s = (char *const *)src_data;
-            for (uint16_t r = 0; r < out_count; r++) ocb->data.str[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_ENUM: {
-            const int32_t *s = (const int32_t *)src_data;
-            for (uint16_t r = 0; r < out_count; r++) ocb->data.i32[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_UUID: {
-            const struct uuid_val *s = (const struct uuid_val *)src_data;
-            for (uint16_t r = 0; r < out_count; r++) ocb->data.uuid[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_INTERVAL: {
-            const struct interval *s = (const struct interval *)src_data;
-            for (uint16_t r = 0; r < out_count; r++) ocb->data.iv[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_VECTOR:
-            break;
-        }
-    }
-
-    st->emit_cursor += out_count;
-    out->count = out_count;
-    return 0;
+    return top_n_emit(ctx, st, out);
 }
 
 /* ---- Window function executor ---- */
@@ -6311,6 +6614,139 @@ static int window_filter_passes(struct plan_exec_ctx *ctx, struct window_state *
     case COLUMN_TYPE_VECTOR:   return 1;
     }
     return 1;
+}
+
+static int window_emit(struct plan_exec_ctx *ctx, struct plan_node *pn,
+                       struct window_state *st, struct row_block *out)
+{
+    if (st->emit_cursor >= st->total_rows) return -1;
+
+    uint16_t n_pass = pn->window.n_pass;
+    uint16_t nw = pn->window.n_win;
+    row_block_reset(out);
+
+    uint32_t remain = st->total_rows - st->emit_cursor;
+    uint16_t out_count = (remain < BLOCK_CAPACITY) ? (uint16_t)remain : BLOCK_CAPACITY;
+    const uint32_t *idx = st->sorted + st->emit_cursor;
+
+    /* Column-oriented gather emit for passthrough columns */
+    for (uint16_t c = 0; c < n_pass; c++) {
+        int sci = pn->window.pass_cols[c];
+        struct col_block *ocb = &out->cols[c];
+        enum column_type ct = st->flat_types[sci];
+        const uint8_t *src_nulls = st->flat_nulls[sci];
+        const void *src_data = st->flat_data[sci];
+        ocb->type = ct;
+        ocb->count = out_count;
+
+        for (uint16_t r = 0; r < out_count; r++)
+            ocb->nulls[r] = src_nulls[idx[r]];
+
+        switch (ct) {
+        case COLUMN_TYPE_SMALLINT: {
+            const int16_t *s = (const int16_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i16[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_INT:
+        case COLUMN_TYPE_BOOLEAN:
+        case COLUMN_TYPE_DATE: {
+            const int32_t *s = (const int32_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i32[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_BIGINT:
+        case COLUMN_TYPE_TIME:
+        case COLUMN_TYPE_TIMESTAMP:
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            const int64_t *s = (const int64_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i64[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC: {
+            const double *s = (const double *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.f64[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_TEXT: {
+            char *const *s = (char *const *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.str[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_ENUM: {
+            const int32_t *s = (const int32_t *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.i32[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_UUID: {
+            const struct uuid_val *s = (const struct uuid_val *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.uuid[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_INTERVAL: {
+            const struct interval *s = (const struct interval *)src_data;
+            for (uint16_t r = 0; r < out_count; r++)
+                ocb->data.iv[r] = s[idx[r]];
+            break;
+        }
+        case COLUMN_TYPE_VECTOR:
+            break;
+        }
+    }
+
+    /* Window result columns — indexed by original row index */
+    for (uint16_t w = 0; w < nw; w++) {
+        uint16_t oc = n_pass + w;
+        struct col_block *ocb = &out->cols[oc];
+        ocb->type = st->win_is_str[w] ? COLUMN_TYPE_TEXT
+                  : st->win_is_dbl[w] ? COLUMN_TYPE_FLOAT
+                  : st->win_is_i64[w] ? COLUMN_TYPE_BIGINT
+                  : COLUMN_TYPE_INT;
+        ocb->count = out_count;
+
+        if (st->win_is_str[w]) {
+            ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                    BLOCK_CAPACITY, sizeof(uint32_t));
+            for (uint16_t r = 0; r < out_count; r++) {
+                uint32_t fi = idx[r];
+                ocb->nulls[r] = st->win_null[fi * nw + w];
+                ocb->data.str[r] = st->win_str[fi * nw + w];
+                if (!ocb->nulls[r] && ocb->data.str[r])
+                    ocb->str_lens[r] = (uint32_t)strlen(ocb->data.str[r]);
+            }
+        } else if (st->win_is_dbl[w]) {
+            for (uint16_t r = 0; r < out_count; r++) {
+                uint32_t fi = idx[r];
+                ocb->nulls[r] = st->win_null[fi * nw + w];
+                ocb->data.f64[r] = st->win_f64[fi * nw + w];
+            }
+        } else if (st->win_is_i64[w]) {
+            for (uint16_t r = 0; r < out_count; r++) {
+                uint32_t fi = idx[r];
+                ocb->nulls[r] = st->win_null[fi * nw + w];
+                ocb->data.i64[r] = st->win_i64[fi * nw + w];
+            }
+        } else {
+            for (uint16_t r = 0; r < out_count; r++) {
+                uint32_t fi = idx[r];
+                ocb->nulls[r] = st->win_null[fi * nw + w];
+                ocb->data.i32[r] = st->win_i32[fi * nw + w];
+            }
+        }
+    }
+
+    st->emit_cursor += out_count;
+    out->count = out_count;
+
+    return 0;
 }
 
 static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
@@ -6915,135 +7351,7 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         st->emit_cursor = 0;
     }
 
-    /* Emit phase: output blocks with passthrough + window columns */
-    if (st->emit_cursor >= st->total_rows) return -1;
-
-    uint16_t n_pass = pn->window.n_pass;
-    uint16_t nw = pn->window.n_win;
-    row_block_reset(out);
-
-    uint32_t remain = st->total_rows - st->emit_cursor;
-    uint16_t out_count = (remain < BLOCK_CAPACITY) ? (uint16_t)remain : BLOCK_CAPACITY;
-    const uint32_t *idx = st->sorted + st->emit_cursor;
-
-    /* Column-oriented gather emit for passthrough columns */
-    for (uint16_t c = 0; c < n_pass; c++) {
-        int sci = pn->window.pass_cols[c];
-        struct col_block *ocb = &out->cols[c];
-        enum column_type ct = st->flat_types[sci];
-        const uint8_t *src_nulls = st->flat_nulls[sci];
-        const void *src_data = st->flat_data[sci];
-        ocb->type = ct;
-        ocb->count = out_count;
-
-        for (uint16_t r = 0; r < out_count; r++)
-            ocb->nulls[r] = src_nulls[idx[r]];
-
-        switch (ct) {
-        case COLUMN_TYPE_SMALLINT: {
-            const int16_t *s = (const int16_t *)src_data;
-            for (uint16_t r = 0; r < out_count; r++)
-                ocb->data.i16[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_INT:
-        case COLUMN_TYPE_BOOLEAN:
-        case COLUMN_TYPE_DATE: {
-            const int32_t *s = (const int32_t *)src_data;
-            for (uint16_t r = 0; r < out_count; r++)
-                ocb->data.i32[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_BIGINT:
-        case COLUMN_TYPE_TIME:
-        case COLUMN_TYPE_TIMESTAMP:
-        case COLUMN_TYPE_TIMESTAMPTZ: {
-            const int64_t *s = (const int64_t *)src_data;
-            for (uint16_t r = 0; r < out_count; r++)
-                ocb->data.i64[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_FLOAT:
-        case COLUMN_TYPE_NUMERIC: {
-            const double *s = (const double *)src_data;
-            for (uint16_t r = 0; r < out_count; r++)
-                ocb->data.f64[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_TEXT: {
-            char *const *s = (char *const *)src_data;
-            for (uint16_t r = 0; r < out_count; r++)
-                ocb->data.str[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_ENUM: {
-            const int32_t *s = (const int32_t *)src_data;
-            for (uint16_t r = 0; r < out_count; r++)
-                ocb->data.i32[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_UUID: {
-            const struct uuid_val *s = (const struct uuid_val *)src_data;
-            for (uint16_t r = 0; r < out_count; r++)
-                ocb->data.uuid[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_INTERVAL: {
-            const struct interval *s = (const struct interval *)src_data;
-            for (uint16_t r = 0; r < out_count; r++)
-                ocb->data.iv[r] = s[idx[r]];
-            break;
-        }
-        case COLUMN_TYPE_VECTOR:
-            break;
-        }
-    }
-
-    /* Window result columns — indexed by original row index */
-    for (uint16_t w = 0; w < nw; w++) {
-        uint16_t oc = n_pass + w;
-        struct col_block *ocb = &out->cols[oc];
-        ocb->type = st->win_is_str[w] ? COLUMN_TYPE_TEXT
-                  : st->win_is_dbl[w] ? COLUMN_TYPE_FLOAT
-                  : st->win_is_i64[w] ? COLUMN_TYPE_BIGINT
-                  : COLUMN_TYPE_INT;
-        ocb->count = out_count;
-
-        if (st->win_is_str[w]) {
-            ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
-                                                    BLOCK_CAPACITY, sizeof(uint32_t));
-            for (uint16_t r = 0; r < out_count; r++) {
-                uint32_t fi = idx[r];
-                ocb->nulls[r] = st->win_null[fi * nw + w];
-                ocb->data.str[r] = st->win_str[fi * nw + w];
-                if (!ocb->nulls[r] && ocb->data.str[r])
-                    ocb->str_lens[r] = (uint32_t)strlen(ocb->data.str[r]);
-            }
-        } else if (st->win_is_dbl[w]) {
-            for (uint16_t r = 0; r < out_count; r++) {
-                uint32_t fi = idx[r];
-                ocb->nulls[r] = st->win_null[fi * nw + w];
-                ocb->data.f64[r] = st->win_f64[fi * nw + w];
-            }
-        } else if (st->win_is_i64[w]) {
-            for (uint16_t r = 0; r < out_count; r++) {
-                uint32_t fi = idx[r];
-                ocb->nulls[r] = st->win_null[fi * nw + w];
-                ocb->data.i64[r] = st->win_i64[fi * nw + w];
-            }
-        } else {
-            for (uint16_t r = 0; r < out_count; r++) {
-                uint32_t fi = idx[r];
-                ocb->nulls[r] = st->win_null[fi * nw + w];
-                ocb->data.i32[r] = st->win_i32[fi * nw + w];
-            }
-        }
-    }
-
-    st->emit_cursor += out_count;
-    out->count = out_count;
-
-    return 0;
+    return window_emit(ctx, pn, st, out);
 }
 
 /* ---- Hash semi-join (for WHERE col IN (SELECT ...)) ---- */
@@ -7502,6 +7810,53 @@ static int set_op_ht_insert(struct set_op_state *st, uint32_t row_idx)
     return 1;
 }
 
+/* Shared emit helper for set_op_next and distinct_next: copy rows from flat
+ * columnar arrays into an output block.  If 'matched' is non-NULL and
+ * match_mode != 0, rows are filtered: match_mode==1 emits only matched rows
+ * (INTERSECT), match_mode==2 emits only unmatched rows (EXCEPT). */
+static int flat_emit_block(struct set_op_state *st, struct row_block *out,
+                           int match_mode)
+{
+    if (st->emit_cursor >= st->row_count) return -1;
+
+    row_block_reset(out);
+    uint16_t out_count = 0;
+
+    for (uint16_t c = 0; c < st->ncols; c++)
+        out->cols[c].type = st->col_types[c];
+
+    while (st->emit_cursor < st->row_count && out_count < BLOCK_CAPACITY) {
+        uint32_t fi = st->emit_cursor++;
+
+        /* For INTERSECT: only emit matched rows */
+        if (match_mode == 1 && !st->matched[fi]) continue;
+        /* For EXCEPT: only emit unmatched rows */
+        if (match_mode == 2 && st->matched[fi]) continue;
+
+        for (uint16_t c = 0; c < st->ncols; c++) {
+            out->cols[c].nulls[out_count] = st->col_nulls[c][fi];
+            enum column_type ct = st->col_types[c];
+            if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
+                out->cols[c].data.i32[out_count] = ((int32_t *)st->col_data[c])[fi];
+            else if (ct == COLUMN_TYPE_BIGINT)
+                out->cols[c].data.i64[out_count] = ((int64_t *)st->col_data[c])[fi];
+            else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+                out->cols[c].data.f64[out_count] = ((double *)st->col_data[c])[fi];
+            else
+                out->cols[c].data.str[out_count] = ((char **)st->col_data[c])[fi];
+        }
+        out_count++;
+    }
+
+    if (out_count == 0) return -1;
+
+    out->count = out_count;
+    for (uint16_t c = 0; c < st->ncols; c++)
+        out->cols[c].count = out_count;
+
+    return 0;
+}
+
 static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                        struct row_block *out)
 {
@@ -7526,7 +7881,7 @@ static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         }
 
         /* For INTERSECT/EXCEPT, allocate matched flags */
-        if (pn->set_op.set_op == 1 || pn->set_op.set_op == 2)
+        if (pn->set_op.set_op == SET_OP_INTERSECT || pn->set_op.set_op == SET_OP_EXCEPT)
             st->matched = (uint8_t *)bump_calloc(&ctx->arena->scratch, st->row_cap, 1);
 
         block_ht_init(&st->ht, st->row_cap, &ctx->arena->scratch);
@@ -7557,12 +7912,12 @@ static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 uint32_t di = st->row_count;
                 set_op_copy_from_block(st, &lhs_block, ri, di);
 
-                if (pn->set_op.set_op == 0 && !pn->set_op.set_all) {
+                if (pn->set_op.set_op == SET_OP_UNION && !pn->set_op.set_all) {
                     /* UNION (not ALL): dedup LHS rows */
                     st->row_count++;
                     if (!set_op_ht_insert(st, di))
                         st->row_count--;
-                } else if (pn->set_op.set_op == 0) {
+                } else if (pn->set_op.set_op == SET_OP_UNION) {
                     /* UNION ALL: just collect, no hash table needed */
                     st->row_count++;
                 } else {
@@ -7700,46 +8055,7 @@ static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     }
 
     /* Phase 2: emit results */
-    if (st->emit_cursor >= st->row_count) return -1;
-
-    int op = pn->set_op.set_op;
-    row_block_reset(out);
-    uint16_t out_count = 0;
-
-    /* Set column types */
-    for (uint16_t c = 0; c < st->ncols; c++)
-        out->cols[c].type = st->col_types[c];
-
-    while (st->emit_cursor < st->row_count && out_count < BLOCK_CAPACITY) {
-        uint32_t fi = st->emit_cursor++;
-
-        /* For INTERSECT: only emit matched rows */
-        if (op == 1 && !st->matched[fi]) continue;
-        /* For EXCEPT: only emit unmatched rows */
-        if (op == 2 && st->matched[fi]) continue;
-
-        for (uint16_t c = 0; c < st->ncols; c++) {
-            out->cols[c].nulls[out_count] = st->col_nulls[c][fi];
-            enum column_type ct = st->col_types[c];
-            if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
-                out->cols[c].data.i32[out_count] = ((int32_t *)st->col_data[c])[fi];
-            else if (ct == COLUMN_TYPE_BIGINT)
-                out->cols[c].data.i64[out_count] = ((int64_t *)st->col_data[c])[fi];
-            else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
-                out->cols[c].data.f64[out_count] = ((double *)st->col_data[c])[fi];
-            else
-                out->cols[c].data.str[out_count] = ((char **)st->col_data[c])[fi];
-        }
-        out_count++;
-    }
-
-    if (out_count == 0) return -1;
-
-    out->count = out_count;
-    for (uint16_t c = 0; c < st->ncols; c++)
-        out->cols[c].count = out_count;
-
-    return 0;
+    return flat_emit_block(st, out, pn->set_op.set_op);
 }
 
 /* ---- Hash-based DISTINCT ---- */
@@ -7802,40 +8118,8 @@ static int distinct_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         st->emit_cursor = 0;
     }
 
-    /* Phase 1: emit unique rows */
-    if (st->emit_cursor >= st->row_count) return -1;
-
-    row_block_reset(out);
-    uint16_t out_count = 0;
-
-    for (uint16_t c = 0; c < st->ncols; c++)
-        out->cols[c].type = st->col_types[c];
-
-    while (st->emit_cursor < st->row_count && out_count < BLOCK_CAPACITY) {
-        uint32_t fi = st->emit_cursor++;
-
-        for (uint16_t c = 0; c < st->ncols; c++) {
-            out->cols[c].nulls[out_count] = st->col_nulls[c][fi];
-            enum column_type ct = st->col_types[c];
-            if (ct == COLUMN_TYPE_INT || ct == COLUMN_TYPE_BOOLEAN)
-                out->cols[c].data.i32[out_count] = ((int32_t *)st->col_data[c])[fi];
-            else if (ct == COLUMN_TYPE_BIGINT)
-                out->cols[c].data.i64[out_count] = ((int64_t *)st->col_data[c])[fi];
-            else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
-                out->cols[c].data.f64[out_count] = ((double *)st->col_data[c])[fi];
-            else
-                out->cols[c].data.str[out_count] = ((char **)st->col_data[c])[fi];
-        }
-        out_count++;
-    }
-
-    if (out_count == 0) return -1;
-
-    out->count = out_count;
-    for (uint16_t c = 0; c < st->ncols; c++)
-        out->cols[c].count = out_count;
-
-    return 0;
+    /* Phase 1: emit unique rows (match_mode=0: no filtering) */
+    return flat_emit_block(st, out, 0);
 }
 
 /* ---- Parquet Scan ---- */
@@ -7928,6 +8212,9 @@ static int pq_cache_build(struct table *tbl)
     pc->col_nulls = (uint8_t **)calloc(ncols, sizeof(uint8_t *));
     pc->col_types = (enum column_type *)calloc(ncols, sizeof(enum column_type));
     pc->col_str_lens = (uint32_t **)calloc(ncols, sizeof(uint32_t *));
+    if (!pc->col_data || !pc->col_nulls || !pc->col_types || !pc->col_str_lens) {
+        fprintf(stderr, "OOM: parquet cache\n"); abort();
+    }
 
     size_t alloc_rows = total_rows > 0 ? (size_t)total_rows : 1;
     for (uint16_t c = 0; c < ncols; c++) {
@@ -7936,6 +8223,7 @@ static int pq_cache_build(struct table *tbl)
         size_t elem_sz = col_type_elem_size(ct);
         pc->col_data[c] = calloc(alloc_rows, elem_sz);
         pc->col_nulls[c] = (uint8_t *)calloc(alloc_rows, 1);
+        if (!pc->col_data[c] || !pc->col_nulls[c]) { fprintf(stderr, "OOM: parquet cache col\n"); abort(); }
     }
 
     /* Allocate per-column decode buffer (one row group at a time) */
@@ -8563,8 +8851,6 @@ static void rows_slice_to_block(const struct rows *rows, size_t offset,
                 if (r < BLOCK_CAPACITY)
                     cb->data.str[r] = (char *)cell->value.as_vector;
                 break;
-            default:
-                cb->nulls[r] = 1; break;
             }
         }
     }
@@ -8797,6 +9083,23 @@ int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
     return 0;
 }
 
+/* ---- Discard execution (benchmark use) ---- */
+
+int plan_exec_discard(struct plan_exec_ctx *ctx, uint32_t root_node)
+{
+    uint16_t ncols = plan_node_ncols(ctx->arena, root_node);
+    if (ncols == 0) return -1;
+
+    struct row_block block;
+    row_block_alloc(&block, ncols, &ctx->arena->scratch);
+
+    while (plan_next_block(ctx, root_node, &block) == 0)
+        row_block_reset(&block);
+
+    plan_exec_cleanup(ctx);
+    return 0;
+}
+
 void plan_exec_cleanup(struct plan_exec_ctx *ctx)
 {
     if (!ctx->node_states || ctx->nnodes == 0) return;
@@ -8999,9 +9302,9 @@ static int explain_limit(struct plan_node *pn, char *buf, int buflen)
 static int explain_set_op(struct plan_node *pn, char *buf, int buflen)
 {
     const char *opname = "SetOp";
-    if (pn->set_op.set_op == 0) opname = pn->set_op.set_all ? "Append (UNION ALL)" : "HashSetOp Union";
-    else if (pn->set_op.set_op == 1) opname = "HashSetOp Intersect";
-    else if (pn->set_op.set_op == 2) opname = "HashSetOp Except";
+    if (pn->set_op.set_op == SET_OP_UNION) opname = pn->set_op.set_all ? "Append (UNION ALL)" : "HashSetOp Union";
+    else if (pn->set_op.set_op == SET_OP_INTERSECT) opname = "HashSetOp Intersect";
+    else if (pn->set_op.set_op == SET_OP_EXCEPT) opname = "HashSetOp Except";
     return snprintf(buf, buflen, "%s\n", opname);
 }
 
@@ -10015,6 +10318,8 @@ static int extract_join_keys(struct join_info *ji, struct query_arena *arena,
 
 /* Try to build a plan for a join query (single or multi-table).
  * Supports: INNER equi-joins, post-join GROUP BY + aggregates, ORDER BY. */
+// TODO: CONTRIBUTING.MD VIOLATION (spirit): build_join is ~840 lines. Should
+// decompose into join-type detection, condition building, and node emission.
 static struct plan_result build_join(struct table *t, struct query_select *s,
                                      struct query_arena *arena, struct database *db)
 {
@@ -10085,9 +10390,9 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     int has_cross = 0;
     for (uint32_t j = 0; j < s->joins_count; j++) {
         struct join_info *ji = &arena->joins.items[s->joins_start + j];
-        if (ji->join_type == 4) has_cross = 1;
+        if (ji->join_type == JOIN_CROSS) has_cross = 1;
         if (ji->is_lateral)     return PLAN_RES_NOTIMPL;
-        if (ji->join_type != 0 && ji->join_type != 4) has_non_inner = 1;
+        if (ji->join_type != JOIN_INNER && ji->join_type != JOIN_CROSS) has_non_inner = 1;
 
         struct table *tn = db_find_table_sv(db, ji->join_table);
         if (!tn) {
@@ -10154,7 +10459,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     memset(int_widen, 0, s->joins_count * sizeof(int));
     for (uint32_t j = 0; j < s->joins_count; j++) {
         struct join_info *ji = &arena->joins.items[s->joins_start + j];
-        if (ji->join_type == 4) {
+        if (ji->join_type == JOIN_CROSS) {
             outer_keys[j] = -1; /* no key for CROSS JOIN */
             inner_keys[j] = -1;
             continue;
@@ -10377,10 +10682,11 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     if (ntables == 2) {
         struct join_info *ji0 = &arena->joins.items[s->joins_start];
         switch (ji0->join_type) {
-        case 0: /* INNER */ table_pushable[0] = 1; table_pushable[1] = 1; break;
-        case 1: /* LEFT  */ table_pushable[0] = 1; table_pushable[1] = 0; break;
-        case 2: /* RIGHT */ table_pushable[0] = 0; table_pushable[1] = 1; break;
-        case 3: /* FULL  */ break; /* neither side pushable */
+        case JOIN_INNER: table_pushable[0] = 1; table_pushable[1] = 1; break;
+        case JOIN_LEFT:  table_pushable[0] = 1; table_pushable[1] = 0; break;
+        case JOIN_RIGHT: table_pushable[0] = 0; table_pushable[1] = 1; break;
+        case JOIN_FULL:  break; /* neither side pushable */
+        case JOIN_CROSS: table_pushable[0] = 1; table_pushable[1] = 1; break;
         }
     } else {
         /* Multi-table: all INNER (enforced above), all pushable */
@@ -10440,7 +10746,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     /* Mark join key columns */
     for (uint32_t j = 0; j < s->joins_count; j++) {
         struct join_info *ji2 = &arena->joins.items[s->joins_start + j];
-        if (ji2->join_type == 4) continue; /* CROSS JOIN — no key */
+        if (ji2->join_type == JOIN_CROSS) continue; /* CROSS JOIN — no key */
         if (outer_keys[j] >= 0) MARK_NEEDED(outer_keys[j]);
         if (inner_keys[j] >= 0)
             needed[j + 1][inner_keys[j]] = 1; /* inner_key is local to table j+1 */
@@ -10634,7 +10940,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     for (uint32_t j = 0; j < s->joins_count; j++) {
         struct join_info *ji = &arena->joins.items[s->joins_start + j];
 
-        if (ji->join_type == 4) {
+        if (ji->join_type == JOIN_CROSS) {
             /* CROSS JOIN → nested loop (Cartesian product) */
             uint16_t lnc = plan_node_ncols(arena, current);
             uint16_t rnc = plan_node_ncols(arena, scan_nodes[j + 1]);
@@ -10642,7 +10948,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
             PLAN_NODE(arena, nl_idx).left = current;
             PLAN_NODE(arena, nl_idx).right = scan_nodes[j + 1];
             PLAN_NODE(arena, nl_idx).nested_loop.cond_idx = IDX_NONE;
-            PLAN_NODE(arena, nl_idx).nested_loop.join_type = 4;
+            PLAN_NODE(arena, nl_idx).nested_loop.join_type = JOIN_CROSS;
             PLAN_NODE(arena, nl_idx).nested_loop.left_ncols = lnc;
             PLAN_NODE(arena, nl_idx).nested_loop.right_ncols = rnc;
             current = nl_idx;
@@ -11517,6 +11823,8 @@ static uint32_t clone_expr_replace_aggs(struct query_arena *arena, uint32_t expr
 /* Build a plan for queries with inline aggregate expressions (has_expr_aggs).
  * Extracts FUNC_AGG_* from parsed_columns expressions, builds the aggregate
  * plan, then appends PLAN_EXPR_PROJECT to evaluate the wrapping expressions. */
+// TODO: CONTRIBUTING.MD VIOLATION (spirit): build_expr_agg is ~380 lines. Should
+// decompose aggregate extraction and expression rewriting into separate helpers.
 static struct plan_result build_expr_agg(struct table *t, struct query_select *s,
                                          struct query_arena *arena)
 {
@@ -12330,6 +12638,8 @@ static enum plan_status validate_agg_columns(struct table *t, struct query_selec
 }
 
 /* Try to build a plan for a GROUP BY + aggregates query. */
+// TODO: CONTRIBUTING.MD VIOLATION (spirit): build_aggregate is ~370 lines. Should
+// decompose into group-key resolution, agg-node setup, and post-agg projection helpers.
 static struct plan_result build_aggregate(struct table *t, struct query_select *s,
                                           struct query_arena *arena)
 {
@@ -12846,6 +13156,8 @@ static struct plan_result build_semi_join(struct table *t, struct query_select *
  * no set operations, no aggregates).  Handles simple WHERE filters,
  * IN-subquery semi-joins, index scans, ORDER BY, projection, DISTINCT,
  * and LIMIT/OFFSET. */
+// TODO: CONTRIBUTING.MD VIOLATION (spirit): build_single_table is ~890 lines. Should
+// decompose into scan, filter, aggregate, sort, and limit node-building helpers.
 static struct plan_result build_single_table(struct table *t, struct query_select *s,
                                              struct query_arena *arena, struct database *db)
 {
