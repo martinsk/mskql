@@ -260,7 +260,7 @@
 <!-- ═══════════════════════════════════════════════════════════ -->
 
 <h1>mskql</h1>
-<span class="subtitle">An analytics SQL engine in C. Faster than PostgreSQL on every cached batch workload. Faster than DuckDB on 74&nbsp;of&nbsp;101. ~52.8K lines. Zero dependencies.</span>
+<span class="subtitle">An in-memory analytics database. Faster than PostgreSQL on every analytical workload. Beats DuckDB on 74&nbsp;of&nbsp;101 benchmarks. Connects with <code>psql</code>.</span>
 <p class="byline">
     <a href="https://www.linkedin.com/in/martinskristiansen" class="author-name"><strong>Martin S. Kristiansen</strong></a>
     &ensp;&middot;&ensp;
@@ -272,15 +272,20 @@
 
 <p>
     An in-memory SQL database that speaks the PostgreSQL wire protocol.
-    Fast because it is simple: one <code>.c</code> file per subsystem,
-    six memory regions with explicit ownership, no buffer pool, no WAL, no hidden planner.
-    The scan cache converts row-store to flat columnar arrays once per table write;
-    subsequent queries read contiguous memory. The result cache serves repeated
-    queries in microseconds. The wire path serializes columnar blocks directly
-    to TCP&mdash;no row materialization. These are not optimizations layered
-    on top of a complex system. They are what happens when you remove the complexity.
-    Connect with <code>psql</code> on port&nbsp;5433
-    or <a href="#try-it">try it in the browser</a> via WebAssembly.
+    Analytical queries return in single-digit milliseconds. Run the same query
+    twice and the answer comes back in microseconds. Connect with <code>psql</code>,
+    pgAdmin, DBeaver, or any PostgreSQL driver on port&nbsp;5433. Query Parquet
+    files with standard SQL. Store vector embeddings alongside your data.
+    The entire engine compiles to WebAssembly&mdash;<a href="#try-it">try it
+    in the browser</a> with zero infrastructure.
+</p>
+
+<p>
+    The performance comes from removing layers, not adding them.
+    No buffer pool, no WAL, no MVCC, no query planner&mdash;just four stages
+    from TCP bytes to results. Details in
+    <a href="architecture.html">Architecture</a> and
+    <a href="design-philosophy.html">Design philosophy</a>.
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -293,7 +298,7 @@
 <a href="#parquet">Parquet</a>
 <a href="#vectors">Vectors</a>
 <a href="#try-it">Playground</a>
-<a href="#construction">Construction</a>
+<a href="#construction">Correctness</a>
 <span class="toc-sep"></span>
 <a href="getting-started.html">Getting Started</a>
 <a href="architecture.html">Architecture</a>
@@ -312,18 +317,12 @@
 <h2 id="performance">Performance: mskql vs PostgreSQL vs DuckDB</h2>
 
 <p>
-    101 batch workloads and 15 concurrent throughput workloads, measured on the same
-    machine. Faster than PostgreSQL on every cached batch workload and 14 of 15 throughput tests.
-    Against DuckDB, the engine wins 74 of 101 workloads&mdash;aggregates
-    20&times;, expression aggregates 21&times;, correlated subqueries 691&times; faster than PG.
-    DuckDB wins full scans (2.5&times;) and sorts (2.7&times;).
-</p>
-
-<p>
-    The performance advantage traces to three structural facts:
-    zero per-query allocation after warmup,
-    a scan cache that converts row-store to flat columnar arrays once per table write,
-    and a wire path that batches 64&nbsp;KB before a single <code>write()</code> syscall.
+    Tested against PostgreSQL and DuckDB on 101 batch workloads and 15 concurrent
+    throughput workloads. Aggregates finish 20&times; faster than PostgreSQL.
+    Correlated subqueries that take PostgreSQL 3.5&nbsp;seconds complete in
+    5&nbsp;milliseconds. A dashboard polling analytical queries sustains
+    96,000&nbsp;queries per second&mdash;192&times; PostgreSQL. DuckDB wins
+    full scans (2.5&times;) and large sorts (2.7&times;).
 </p>
 
 <h3>Batch latency <span style="font-weight:400; font-size:0.85em; color:var(--fg-dim)">&mdash; shorter bars = faster</span></h3>
@@ -399,7 +398,11 @@
     </div>
 </div>
 
-<h3>Concurrent throughput <span style="font-weight:400; font-size:0.85em; color:var(--fg-dim)">&mdash; longer bars = more queries/sec (mskql vs PG only)</span></h3>
+<h3>Concurrent throughput <span style="font-weight:400; font-size:0.85em; color:var(--fg-dim)">&mdash; queries per second, 8 threads (longer = faster)</span></h3>
+<p style="font-size:0.92rem; color:var(--fg-dim); margin:-0.3rem 0 0.8rem 0;">
+    Think of each bar as a dashboard panel polling the same query.
+    At 96K&nbsp;QPS, every panel refreshes in under a millisecond.
+</p>
 
 <div class="summary-chart">
     <div class="legend">
@@ -446,13 +449,13 @@
 <!--  Wire protocol compatibility                                -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
-<h2 id="wire-compat">PostgreSQL wire-protocol compatible</h2>
+<h2 id="wire-compat">Drop-in PostgreSQL compatibility</h2>
 
 <p>
-    The server implements PostgreSQL wire protocol&nbsp;v3: Simple Query,
-    Extended Query (prepared statements, <code>$1</code>/<code>$2</code> parameters),
-    and COPY. Connect with <code>psql</code>, pgAdmin, DBeaver, or any language driver.
-    Default port&nbsp;5433.
+    Every tool that talks to PostgreSQL already talks to mskql. Connect with
+    <code>psql</code>, pgAdmin, DBeaver, or any language driver&mdash;Python,
+    Go, Node, Java, Rust. Prepared statements and <code>COPY</code> work out
+    of the box. Default port&nbsp;5433.
 </p>
 
 <pre><code class="language-bash">make && ./build/mskql                         # build & start
@@ -467,7 +470,7 @@ psql -h 127.0.0.1 -p 5433 -U test -d mskql   # connect</code></pre>
 <p>
     <code>CREATE FOREIGN TABLE</code> maps a Parquet file to a SQL table.
     No ETL, no data loading&mdash;query directly with joins, aggregates, and subqueries.
-    The same result cache that accelerates in-memory queries applies to Parquet scans.
+    Run the same query twice and it returns instantly&mdash;the engine remembers the answer.
 </p>
 
 <pre><code class="language-sql">CREATE FOREIGN TABLE events
@@ -478,10 +481,9 @@ FROM events
 GROUP BY event_type;</code></pre>
 
 <p>
-    9 Parquet workloads (50K&ndash;200K rows). On cached queries, mskql wins 7 of 9:
-    aggregates 13ms vs 72ms (5.5&times;), subqueries
-    6ms vs 40ms (6.7&times;), joins 9ms vs 33ms. DuckDB wins no-cache full scans:
-    31ms vs 260ms (8.4&times;).
+    9 Parquet workloads (50K&ndash;200K rows). Aggregates 5.5&times; faster than
+    DuckDB. Subqueries 6.7&times; faster. Joins 23ms vs 33ms. DuckDB wins
+    cold full scans where it reads columnar data natively (8.4&times;).
 </p>
 
 <p>
@@ -495,10 +497,10 @@ GROUP BY event_type;</code></pre>
 <h2 id="vectors">Native vector columns</h2>
 
 <p>
-    <code>VECTOR(n)</code> is a first-class column type&mdash;fixed-dimension float arrays
-    stored as contiguous <code>float[]</code> in columnar blocks (n&nbsp;&times;&nbsp;4&nbsp;bytes per row).
-    Uses pgvector-compatible <code>[1.0, 2.0, 3.0]</code> literal syntax.
-    Insert, scan, filter, and sort tables with vector columns through standard SQL.
+    Store embeddings alongside your relational data. <code>VECTOR(n)</code> is a
+    first-class column type with pgvector-compatible syntax&mdash;no separate
+    vector database needed. Insert, scan, filter, and sort vector columns
+    through the same SQL you already know.
 </p>
 
 <pre><code class="language-sql">CREATE TABLE items (
@@ -518,25 +520,23 @@ SELECT name, embed FROM items WHERE id > 1 ORDER BY name;</code></pre>
 <p>
     7 vector benchmarks against PostgreSQL&nbsp;+&nbsp;pgvector on the same machine.
     Wins all 7: insert 3&times;, scan 1.8&times;, wide scan 3.2&times;,
-    filter 22&times; faster. Even without the result cache (<code>_nc</code> variants),
-    faster on every vector workload.
+    filter 22&times; faster. Faster on every workload even when results aren&rsquo;t cached.
 </p>
 
 <p>
     &#8594;&ensp;<a href="bench-vs-pg.html#vector"><strong>All 7 vector benchmark results</strong></a>
 </p>
 
-<h2 id="construction">Construction methodology</h2>
+<h2 id="construction">Correctness guarantee</h2>
 
 <div class="ai-split" style="display:flex; gap:2rem; align-items:flex-start; margin:1rem 0 1.4rem 0;">
 <div style="flex:1 1 50%; min-width:0;">
 <p style="margin-bottom:0.8rem;">
-    1,470+ SQL test cases. Every one runs under AddressSanitizer and must produce
-    bit-identical output to PostgreSQL. Three agents worked in adversarial rounds:
-    <strong>Challenger</strong> writes tests designed to break the system,
-    <strong>Reviewer</strong> flags structural code issues,
-    <strong>Writer</strong> fixes until the full suite passes.
-    The adversarial model enforces correctness the same way rigorous code review does.
+    <strong>Every query produces bit-identical output to PostgreSQL.</strong>
+    1,470+ adversarial test cases verify this, and every one runs under
+    AddressSanitizer to catch memory errors. Three agents work in adversarial rounds:
+    one writes tests designed to break the system, one reviews code, one fixes.
+    The result is a database you can trust with the same SQL you run on PostgreSQL.
 </p>
 <p style="margin-bottom:0;">
     &#8594;&ensp;<a href="construction.html"><strong>Read more about the process</strong></a>

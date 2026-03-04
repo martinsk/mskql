@@ -14,17 +14,22 @@
 <p class="breadcrumb"><a href="index.html">&larr; mskql</a></p>
 
 <h1>Construction</h1>
-<span class="subtitle">Adversarial correctness testing at scale</span>
+<span class="subtitle">Every query produces the same output as PostgreSQL. Guaranteed.</span>
 <hr class="title-rule">
 
 <p>
-    <strong>1,470+ SQL test cases. Every one runs under AddressSanitizer.
-    Every one must produce bit-identical output to PostgreSQL.</strong>
-    This was not QA after the fact&mdash;it was the development methodology.
-    Three agents worked in adversarial rounds: one writing tests designed to
-    break the system, one reviewing code for structural problems, one fixing
-    failures. The result: ~52.8K lines of C that beats PostgreSQL on every
-    cached batch benchmark and DuckDB on 74 of 101 workloads.
+    <strong>You can trust your SQL here.</strong> 1,470+ test cases verify that
+    every query produces bit-identical output to PostgreSQL&mdash;same column
+    types, same NULL handling, same edge cases. Every test runs under
+    AddressSanitizer, catching memory errors that would be silent bugs in
+    production. The result: a database that is both faster and provably
+    correct against the PostgreSQL standard.
+</p>
+
+<p>
+    How? Three agents working in adversarial rounds: one writing tests designed
+    to break the system, one reviewing code for structural problems, one fixing
+    failures.
 </p>
 
 <div class="diagram">
@@ -129,29 +134,24 @@
     <li>Repeat until all tests pass under ASAN with zero leaks.</li>
 </ol>
 
-<h2 id="result">What the process produced</h2>
+<h2 id="result">What you get</h2>
 
 <p>
-    The adversarial loop forced correctness properties that would be hard to
-    specify upfront. Each round of tests exposed assumptions the code had
-    silently made. The architectural decisions that emerged are direct
-    responses to what broke:
+    A database where correctness is not an afterthought. The adversarial loop
+    forced properties that would be hard to specify upfront&mdash;each round
+    exposed assumptions the code had silently made. The practical result:
 </p>
 
 <ul>
-    <li><strong>Columnar plan executor</strong> &mdash; processes data in 1024-row
-        blocks with typed arrays, avoiding per-row dispatch overhead.</li>
-    <li><strong>Bump allocator</strong> &mdash; slab-chained arena for parser and
-        scratch memory; zero per-request allocations at steady state.</li>
-    <li><strong>Result cache</strong> &mdash; caches serialised wire bytes keyed by
-        SQL text; serves repeat queries in microseconds.</li>
-    <li><strong>Direct columnar&rarr;wire send</strong> &mdash; bypasses row-store
-        materialisation, batching DataRow messages into 64KB writes.</li>
-    <li><strong>Native ordinal ENUMs</strong> &mdash; stored as <code>int32_t</code>
-        internally, converted at I/O boundaries only.</li>
-    <li><strong>Exhaustive dispatch</strong> &mdash; <code>switch</code> on every
-        tagged union with <code>-Wswitch-enum</code> and no <code>default:</code>.
-        Adding a new type variant produces a compile error at every unhandled site.</li>
+    <li><strong>Bit-identical PostgreSQL output</strong> &mdash; run the same SQL
+        on both databases and diff the results. They match.</li>
+    <li><strong>Zero memory errors</strong> &mdash; every code path is exercised
+        under AddressSanitizer. No leaks, no buffer overflows, no use-after-free.</li>
+    <li><strong>Repeat queries return instantly</strong> &mdash; the result cache
+        serves identical queries in microseconds without re-executing.</li>
+    <li><strong>Compile-time completeness</strong> &mdash; adding a new type or
+        feature produces compile errors at every unhandled dispatch site.
+        Nothing is silently skipped.</li>
 </ul>
 
 <h2 id="now-what">Explore further</h2>

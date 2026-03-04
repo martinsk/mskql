@@ -59,13 +59,13 @@
 <p class="breadcrumb"><a href="bench-vs-pg.html">&larr; Benchmarks</a></p>
 
 <h1>Benchmark Workload Details</h1>
-<span class="subtitle">What each workload tests, why it matters, and how mskql handles it</span>
+<span class="subtitle">What each benchmark measures, why it matters for your queries, and why mskql is fast</span>
 <hr class="title-rule">
 
 <p>
     <strong>101 batch workloads and 15 throughput workloads.</strong> Each entry
-    below shows the exact SQL, explains what database capability it exercises,
-    and describes how mskql&rsquo;s architecture produces the measured result.
+    below shows the exact SQL, explains what real-world query pattern it
+    represents, and why mskql delivers the measured result.
     For the summary numbers, see <a href="bench-vs-pg.html">Benchmarks</a>.
 </p>
 
@@ -107,7 +107,7 @@
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             mskql&rsquo;s scan cache converts the row store to flat columnar
             arrays once (O(N), ~0.1&nbsp;ms for 5K rows). Subsequent scans
@@ -142,7 +142,7 @@
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The plan executor&rsquo;s <code>PLAN_FILTER</code> node produces
             a selection vector (array of matching row indices) instead of
@@ -177,7 +177,7 @@
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             mskql&rsquo;s <code>PLAN_INDEX_SCAN</code> walks the B-tree to
             find the matching row, then serializes it directly. The result
@@ -210,7 +210,7 @@
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The <code>PLAN_SORT</code> node collects all blocks from its
             child, builds a flat index array, and sorts it with
@@ -245,7 +245,7 @@
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The sort node stores parallel arrays of sort columns and direction
             flags, all bump-allocated. The comparator loops through columns
@@ -278,7 +278,7 @@
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The <code>DISTINCT</code> path uses the hash aggregation
             path with no aggregate functions. The hash table is bump-allocated,
@@ -312,7 +312,7 @@
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Each insert appends a row to the table&rsquo;s dynamic array and
             bumps the table generation (invalidating the scan cache). The
@@ -348,7 +348,7 @@
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Rows are updated in place&mdash;no tuple versioning, no dead
             tuple cleanup. The scan cache is invalidated by the generation
@@ -379,7 +379,7 @@ DELETE FROM bench_data WHERE id % 2 = 0;
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Deletes remove rows from the dynamic array and bump the table
             generation. No dead tuple tracking, no vacuum. The 3&times;
@@ -411,7 +411,7 @@ COMMIT;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             <code>BEGIN</code> records table names and generation numbers
             in O(1). The first write to a table triggers
@@ -451,7 +451,7 @@ FROM bench_data GROUP BY category;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             <code>PLAN_HASH_AGG</code> builds a hash table keyed by group
             columns. For each 1,024-row block, it looks up the group and
@@ -484,7 +484,7 @@ FROM bench_data GROUP BY category;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The <code>PLAN_EXPR_PROJECT</code> node evaluates expressions
             in columnar batches, feeding results into the hash aggregator.
@@ -516,7 +516,7 @@ FROM wide_bench GROUP BY region, product;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Each column is stored as a contiguous typed array in the scan
             cache. The hash aggregator processes each column independently,
@@ -546,7 +546,7 @@ FROM bench_data;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The <code>PLAN_WINDOW</code> node sorts all input blocks by
             partition key + order key, then walks the sorted data to compute
@@ -576,7 +576,7 @@ FROM wide_bench;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Same window node, but with RANK semantics: equal order values
             get the same rank, and the next rank skips ahead. The 10&times;
@@ -609,7 +609,7 @@ JOIN orders o ON c.id = o.customer_id;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             <code>PLAN_HASH_JOIN</code> builds a hash table from the smaller
             (inner) table, then probes it for each block of the larger
@@ -644,7 +644,7 @@ GROUP BY r.name, p.name;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Two hash joins are chained, feeding into a hash aggregation
             node. All three hash tables are bump-allocated. The result
@@ -677,7 +677,7 @@ WHERE customer_id IN (
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             <code>PLAN_HASH_SEMI_JOIN</code> builds a hash set from the
             subquery result, then probes it for each row of the outer
@@ -710,7 +710,7 @@ WHERE customer_id IN (
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The plan is a chain: <code>SeqScan &rarr; Filter &rarr; Sort
             &rarr; Limit</code>. Each node pulls blocks from its child
@@ -743,7 +743,7 @@ GROUP BY category ORDER BY COUNT(*) DESC;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The CTE is materialized into a temporary table, then the
             outer query runs against it. The scan cache is built for the
@@ -777,7 +777,7 @@ SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The CTE materializes the aggregation result, then the outer
             query sorts and limits it. Both stages use the block executor.
@@ -813,12 +813,12 @@ ORDER BY total DESC;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The CTE materializes the join result, then the outer query
-            aggregates and sorts. In the throughput            this same
-            query runs at 96,007&nbsp;QPS (192&times; PostgreSQL) because
-            the 4-row result is served from the result cache in microseconds.
+            aggregates and sorts. In the throughput test, this same query
+            runs at 96,007&nbsp;QPS (192&times; PostgreSQL) because the
+            4-row result is served from the result cache in microseconds.
         </p>
     </div>
 </div>
@@ -844,7 +844,7 @@ SELECT id, category, value FROM bench_data_b;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             <code>PLAN_SET_OP</code> pulls blocks from both children and
             uses a hash table for deduplication. The hash table is
@@ -876,7 +876,7 @@ SELECT id, category, value FROM bench_data_b;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             <code>PLAN_GENERATE_SERIES</code> produces 1,024-row blocks of
             contiguous <code>int32_t</code> arrays in a tight loop&mdash;zero
@@ -907,7 +907,7 @@ FROM bench_data;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             <code>PLAN_EXPR_PROJECT</code> evaluates all 4 functions per
             row within each 1,024-row block, writing results into output
@@ -940,7 +940,7 @@ FROM bench_data;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The sort node collects all ~49 blocks (50K / 1024), builds a
             flat index array, and sorts with <code>qsort</code>. The
@@ -985,7 +985,7 @@ FROM bench_data;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Each query is parsed, the index is walked, and the single
             matching row is serialized. The arena is reset between queries.
@@ -1015,7 +1015,7 @@ FROM bench_data;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Both databases spend most of their time in <code>write()</code>
             system calls. The mskql batched 64&nbsp;KB buffer helps in
@@ -1044,7 +1044,7 @@ FROM bench_data;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The selection vector avoids copying non-matching rows, but the
             result set (~50 rows) is small enough that serialization time
@@ -1073,7 +1073,7 @@ FROM bench_data;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Each insert appends to the row dynamic array and bumps the
             generation counter. The single-threaded executor
@@ -1106,7 +1106,7 @@ UPDATE tp_data SET value = $1 WHERE id = $2;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             This is a fundamental architectural limitation: mskql processes
             one query at a time. Adding MVCC or a concurrent executor would
@@ -1139,7 +1139,7 @@ FROM tp_data GROUP BY category;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             First execution: hash aggregation on columnar blocks (~0.13&nbsp;ms).
             Subsequent executions: result cache hit, single
@@ -1172,7 +1172,7 @@ FROM wide_bench GROUP BY region, product;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Same mechanism as the simple aggregate: first execution builds
             the result via columnar hash aggregation, subsequent executions
@@ -1203,7 +1203,7 @@ FROM wide_bench;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             Each execution sorts 50K rows and computes RANK values. The
             columnar sort is slightly faster due to contiguous sort key
@@ -1235,7 +1235,7 @@ FROM customers c JOIN orders o ON c.id = o.customer_id;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The hash join builds a hash table from the 500-row customers
             table and probes it for each block of the 2K-row orders table.
@@ -1267,7 +1267,7 @@ GROUP BY r.name, p.name;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             First execution: two hash joins + hash aggregation on columnar
             blocks (~0.35&nbsp;ms). All subsequent executions: result cache
@@ -1300,7 +1300,7 @@ SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             First execution materializes the CTE, aggregates, sorts, and
             limits. The 5-row result is cached. Subsequent executions skip
@@ -1331,7 +1331,7 @@ SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The plan chain (scan &rarr; filter &rarr; sort &rarr; limit)
             runs in the block executor. The limit node stops pulling after
@@ -1360,7 +1360,7 @@ SELECT * FROM summary ORDER BY total DESC LIMIT 5;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             First execution: sort 50K rows (~213&nbsp;ms). Subsequent
             executions: result cache hit. The 50K-row serialized result
@@ -1398,7 +1398,7 @@ FROM joined GROUP BY region ORDER BY total DESC;</code></pre>
     </div>
 
     <div class="now-what">
-        <span class="section-label">Now what</span>
+        <span class="section-label">Why it&rsquo;s fast</span>
         <p>
             The result cache is the key: the 4-row result is ~200 bytes of
             serialized wire data. After the first execution, every subsequent

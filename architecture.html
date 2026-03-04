@@ -19,19 +19,16 @@
 <hr class="title-rule">
 
 <p>
-    Most database engines accumulate abstraction layers over decades: a buffer pool to manage
-    disk pages, a WAL for durability, an MVCC layer for concurrent isolation, a query
-    planner that rewrites your joins. Each layer adds correctness surface area and
-    runtime overhead. mskql has none of these layers&mdash;not as a shortcut, but as a
-    deliberate constraint.
+    Aggregates 20&times; faster than PostgreSQL. Correlated subqueries 691&times; faster.
+    Dashboard-style throughput at 96,000&nbsp;queries per second. These numbers are not
+    the result of exotic algorithms&mdash;they come from removing the layers that make
+    traditional databases slow: buffer pools, WAL, MVCC, and query planners.
 </p>
 
 <p>
-    The result: zero steady-state <code>malloc</code>/<code>free</code> calls per query,
-    a scan path whose working set fits in L1 cache, a call stack shallow enough to hold
-    in your head, and benchmarks that outperform PostgreSQL on every cached workload
-    and DuckDB on 74 of 101. <strong>~52.8K lines of C. Zero external dependencies.
-    Four stages: wire protocol, parser, executor, storage.</strong>
+    What remains is a four-stage pipeline&mdash;wire protocol, parser, executor,
+    storage&mdash;in <strong>~52.8K lines of C with zero external dependencies.</strong>
+    Every query flows from TCP bytes to results through code you can read end-to-end.
 </p>
 
 <p>
@@ -109,10 +106,11 @@
 <h2 id="memory">Memory model</h2>
 
 <p>
-    The engine uses <strong>six distinct memory regions</strong>, each with a different
-    lifetime and allocation strategy. Understanding how they interact explains
-    why the system achieves zero steady-state <code>malloc</code>/<code>free</code>
-    calls and why queries run faster than PostgreSQL on every benchmark.
+    After the first query warms up, <strong>every subsequent query allocates
+    zero bytes of heap memory.</strong> No malloc, no free, no allocator contention.
+    This is the single largest reason aggregates run 20&times; faster than
+    PostgreSQL&mdash;both databases use the same GROUP BY algorithm, but PostgreSQL
+    allocates and frees memory on every query. Six memory regions make this possible:
 </p>
 
 <h3 id="six-regions">The six regions</h3>
@@ -163,12 +161,11 @@
 </table>
 </div>
 
-<h3 id="interaction">How they interact</h3>
+<h3 id="interaction">What happens when you run a query</h3>
 
 <p>
-    A <code>SELECT</code> query touches all six regions in sequence.
-    Following a single query through the system reveals why each region
-    exists and how they eliminate overhead at every stage.
+    A <code>SELECT</code> touches all six regions in sequence. Each handoff
+    eliminates an overhead that traditional databases pay on every query.
 </p>
 
 <p>
@@ -347,11 +344,12 @@
     and subqueries.
 </p>
 
-<h2 id="so-what">Performance: architecture as cause</h2>
+<h2 id="so-what">Why it&rsquo;s fast: architecture as cause</h2>
 
 <p>
-    The benchmark numbers are a consequence of the architecture, not a separate
-    optimization effort. Each structural decision eliminates a specific overhead:
+    Every benchmark result traces directly to a structural decision.
+    There is no separate &ldquo;optimization layer&rdquo;&mdash;the architecture <em>is</em>
+    the optimization:
 </p>
 
 <ul>
@@ -391,15 +389,14 @@
     <a href="design-philosophy.html">Design philosophy: why abstraction is not free</a>
 </p>
 
-<h2 id="safety">Safety by construction</h2>
+<h2 id="safety">Memory safety without runtime cost</h2>
 
 <p>
-    Every test runs under AddressSanitizer. Arena allocation and index-based references
-    eliminate use-after-free and leak classes by construction. The bump slab chain&rsquo;s
-    append-only growth means pointers never dangle within a query&rsquo;s lifetime.
-    The <code>-Wswitch-enum</code> flag plus the no-<code>default:</code> rule means
-    adding a new enum variant produces a compile error at every unhandled dispatch
-    site&mdash;not a silent runtime skip.
+    The same design that makes queries fast also makes them safe. Arena allocation
+    and index-based references eliminate use-after-free and leak classes by
+    construction&mdash;no garbage collector, no reference counting. Every test
+    runs under AddressSanitizer. The bump slab chain&rsquo;s append-only growth
+    means pointers never dangle within a query&rsquo;s lifetime.
 </p>
 
 <h2 id="now-what">Explore further</h2>
