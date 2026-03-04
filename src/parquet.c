@@ -53,8 +53,8 @@ void parquet_info_free(struct parquet_table_info *info)
 int parquet_materialize(struct table *t)
 {
     if (!t || t->kind != TABLE_PARQUET) return -1;
-    /* Idempotent: skip if rows already loaded */
-    if (t->rows.count > 0) return 0;
+    /* Idempotent: skip if already materialized into flat storage */
+    if (t->flat.nrows > 0) return 0;
 
     pq_reader_t *r = pq_open(t->parquet.path);
     if (!r) return -1;
@@ -145,7 +145,8 @@ int parquet_materialize(struct table *t)
                 }
                 da_push(&row.cells, cell);
             }
-            da_push(&t->rows, row);
+            table_flat_append_row(t, &row);
+            row_free(&row);
         }
 
         /* Free decoded column data for this row group */

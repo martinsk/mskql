@@ -3,6 +3,7 @@
 #include "row.h"
 #include "stringview.h"
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 
 void table_init(struct table *t, const char *name)
@@ -12,7 +13,6 @@ void table_init(struct table *t, const char *name)
     t->name = strdup(name);
     da_init(&t->columns);
     t->generation = 0;
-    da_init(&t->rows);
     da_init(&t->indexes);
     memset(&t->flat, 0, sizeof(t->flat));
     memset(&t->join_cache, 0, sizeof(t->join_cache));
@@ -25,7 +25,6 @@ void table_init_own(struct table *t, char *name)
     t->name = name;
     da_init(&t->columns);
     t->generation = 0;
-    da_init(&t->rows);
     da_init(&t->indexes);
     memset(&t->flat, 0, sizeof(t->flat));
     memset(&t->join_cache, 0, sizeof(t->join_cache));
@@ -104,29 +103,30 @@ void table_deep_copy(struct table *dst, const struct table *src)
         da_push(&dst->columns, c);
     }
 
-    /* deep-copy shared row/columnar storage (used by TABLE_MEMORY natively,
-     * and by TABLE_PARQUET after legacy-executor materialization). */
-    da_init(&dst->rows);
+    /* deep-copy flat columnar storage */
     da_init(&dst->indexes);
     memset(&dst->flat, 0, sizeof(dst->flat));
     memset(&dst->join_cache, 0, sizeof(dst->join_cache));
-    for (size_t i = 0; i < src->rows.count; i++) {
-        struct row r = {0};
-        da_init(&r.cells);
-        for (size_t j = 0; j < src->rows.items[i].cells.count; j++) {
-            struct cell *sc = &src->rows.items[i].cells.items[j];
-            struct cell c = { .type = sc->type, .is_null = sc->is_null };
-            if (column_type_is_text(sc->type) && sc->value.as_text)
-                c.value.as_text = strdup(sc->value.as_text);
-            else if (sc->type == COLUMN_TYPE_VECTOR && sc->value.as_vector && !sc->is_null) {
-                uint16_t dim = src->columns.items[j].vector_dim;
-                c.value.as_vector = (float *)malloc(dim * sizeof(float));
-                memcpy(c.value.as_vector, sc->value.as_vector, dim * sizeof(float));
-            } else
-                c.value = sc->value;
-            da_push(&r.cells, c);
+    if (src->flat.nrows > 0 && src->flat.ncols > 0) {
+        table_flat_init_schema(dst);
+        for (size_t ri = 0; ri < src->flat.nrows; ri++) {
+            struct row r = {0};
+            da_init(&r.cells);
+            for (uint16_t c = 0; c < src->flat.ncols; c++) {
+                struct cell cv = flat_cell_at_pub(&src->flat, c, ri);
+                struct cell owned = cv;
+                if (column_type_is_text(cv.type) && cv.value.as_text)
+                    owned.value.as_text = strdup(cv.value.as_text);
+                else if (cv.type == COLUMN_TYPE_VECTOR && cv.value.as_vector && !cv.is_null) {
+                    uint16_t dim = src->columns.items[c].vector_dim;
+                    owned.value.as_vector = (float *)malloc(dim * sizeof(float));
+                    memcpy(owned.value.as_vector, cv.value.as_vector, dim * sizeof(float));
+                }
+                da_push(&r.cells, owned);
+            }
+            table_flat_append_row(dst, &r);
+            row_free(&r);
         }
-        da_push(&dst->rows, r);
     }
     /* skip indexes — they will be rebuilt if needed */
 
@@ -258,10 +258,19 @@ void table_flat_append_row(struct table *t, const struct row *row)
             continue;
         }
         t->flat.col_nulls[c][r] = 0;
+        /* Coerce TEXT "true"/"false" → BOOLEAN when schema expects BOOLEAN */
+        int32_t coerced_bool = 0;
+        if (ct == COLUMN_TYPE_BOOLEAN && cell->type == COLUMN_TYPE_TEXT && cell->value.as_text) {
+            const char *tv = cell->value.as_text;
+            coerced_bool = (strcasecmp(tv, "true") == 0 || strcasecmp(tv, "t") == 0 ||
+                            strcmp(tv, "1") == 0) ? 1 : 0;
+        }
         switch (ct) {
         case COLUMN_TYPE_SMALLINT:  ((int16_t *)t->flat.col_data[c])[r] = cell->value.as_smallint; break;
         case COLUMN_TYPE_INT:       ((int32_t *)t->flat.col_data[c])[r] = cell->value.as_int; break;
-        case COLUMN_TYPE_BOOLEAN:   ((int32_t *)t->flat.col_data[c])[r] = cell->value.as_bool; break;
+        case COLUMN_TYPE_BOOLEAN:
+            ((int32_t *)t->flat.col_data[c])[r] = (cell->type == COLUMN_TYPE_BOOLEAN)
+                ? cell->value.as_bool : coerced_bool; break;
         case COLUMN_TYPE_DATE:      ((int32_t *)t->flat.col_data[c])[r] = cell->value.as_date; break;
         case COLUMN_TYPE_BIGINT:    ((int64_t *)t->flat.col_data[c])[r] = cell->value.as_bigint; break;
         case COLUMN_TYPE_TIME:      ((int64_t *)t->flat.col_data[c])[r] = cell->value.as_time; break;
@@ -301,10 +310,18 @@ void table_flat_update_row(struct table *t, size_t row_idx, const struct row *ro
         enum column_type ct = t->flat.col_types[c];
         if (cell->is_null) { t->flat.col_nulls[c][row_idx] = 1; continue; }
         t->flat.col_nulls[c][row_idx] = 0;
+        int32_t coerced_bool2 = 0;
+        if (ct == COLUMN_TYPE_BOOLEAN && cell->type == COLUMN_TYPE_TEXT && cell->value.as_text) {
+            const char *tv = cell->value.as_text;
+            coerced_bool2 = (strcasecmp(tv, "true") == 0 || strcasecmp(tv, "t") == 0 ||
+                             strcmp(tv, "1") == 0) ? 1 : 0;
+        }
         switch (ct) {
         case COLUMN_TYPE_SMALLINT:  ((int16_t *)t->flat.col_data[c])[row_idx] = cell->value.as_smallint; break;
         case COLUMN_TYPE_INT:       ((int32_t *)t->flat.col_data[c])[row_idx] = cell->value.as_int; break;
-        case COLUMN_TYPE_BOOLEAN:   ((int32_t *)t->flat.col_data[c])[row_idx] = cell->value.as_bool; break;
+        case COLUMN_TYPE_BOOLEAN:
+            ((int32_t *)t->flat.col_data[c])[row_idx] = (cell->type == COLUMN_TYPE_BOOLEAN)
+                ? cell->value.as_bool : coerced_bool2; break;
         case COLUMN_TYPE_DATE:      ((int32_t *)t->flat.col_data[c])[row_idx] = cell->value.as_date; break;
         case COLUMN_TYPE_BIGINT:    ((int64_t *)t->flat.col_data[c])[row_idx] = cell->value.as_bigint; break;
         case COLUMN_TYPE_TIME:      ((int64_t *)t->flat.col_data[c])[row_idx] = cell->value.as_time; break;
@@ -520,13 +537,33 @@ void table_flat_append_rows_bulk(struct table *t, struct row *rows, size_t count
     t->flat.nrows += count;
 }
 
-void table_flat_rebuild_from_rows(struct table *t)
+struct cell flat_cell_at_pub(const struct flat_table *ft, uint16_t c, size_t ri)
 {
-    flat_table_free(&t->flat);
-    if (t->rows.count == 0 || t->columns.count == 0) return;
-    table_flat_init_schema(t);
-    for (size_t r = 0; r < t->rows.count; r++)
-        table_flat_append_row(t, &t->rows.items[r]);
+    struct cell cell = {0};
+    if (c >= ft->ncols || ri >= ft->nrows) return cell;
+    cell.type = ft->col_types[c];
+    if (ft->col_nulls[c][ri]) { cell.is_null = 1; return cell; }
+    switch (ft->col_types[c]) {
+    case COLUMN_TYPE_SMALLINT:  cell.value.as_smallint = ((int16_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_INT:       cell.value.as_int      = ((int32_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_BOOLEAN:   cell.value.as_bool     = ((int32_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_DATE:      cell.value.as_date     = ((int32_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_BIGINT:    cell.value.as_bigint   = ((int64_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_TIME:      cell.value.as_time     = ((int64_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+        cell.value.as_timestamp = ((int64_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_FLOAT:     cell.value.as_float    = ((double *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_NUMERIC:   cell.value.as_numeric  = ((double *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_INTERVAL:  cell.value.as_interval = ((struct interval *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_TEXT:      cell.value.as_text     = ((char **)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_ENUM:      cell.value.as_enum     = ((int32_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_UUID:      cell.value.as_uuid     = ((struct uuid_val *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_VECTOR: {
+        uint16_t dim = ft->col_vec_dims ? ft->col_vec_dims[c] : 0;
+        cell.value.as_vector = dim ? &((float *)ft->col_data[c])[ri * dim] : NULL; break;
+    }
+    }
+    return cell;
 }
 
 void table_free(struct table *t)
@@ -547,11 +584,6 @@ void table_free(struct table *t)
     }
     da_free(&t->columns);
 
-    /* Free shared row/columnar storage (used by TABLE_MEMORY natively,
-     * and by TABLE_PARQUET after legacy-executor materialization). */
-    for (size_t i = 0; i < t->rows.count; i++)
-        row_free(&t->rows.items[i]);
-    da_free(&t->rows);
     for (size_t i = 0; i < t->indexes.count; i++)
         index_free(&t->indexes.items[i]);
     da_free(&t->indexes);

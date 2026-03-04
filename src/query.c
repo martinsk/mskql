@@ -2893,6 +2893,10 @@ static struct cell efc_strpos(EFC_ARGS) {
     cell_release_rb(&haystack,rb);cell_release_rb(&needle,rb); return cell_make_int(pos);
 }
 
+/* Forward declarations for flat-table helpers defined later in this file */
+static struct cell flat_cell_at(const struct flat_table *ft, uint16_t c, size_t ri);
+static struct flat_row_ref flat_row_ref_make(const struct table *t, size_t ri);
+
 static struct cell efc_regexp_replace(EFC_ARGS) {
     if (nargs < 3) return cell_make_null();
     struct cell src  = eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, row, db, rb);
@@ -2909,7 +2913,7 @@ static struct cell efc_regexp_replace(EFC_ARGS) {
 
 static struct cell efc_agg_bool(enum expr_func fn, EFC_ARGS) {
     if (!t) return cell_make_null();
-    if (t->rows.count == 0 && row && t->columns.count > 0) {
+    if (t->flat.nrows == 0 && row && t->columns.count > 0) {
         const char *agg_name = (fn == FUNC_AGG_BOOL_AND) ? "bool_and" : "bool_or";
         for (size_t ci = 0; ci < t->columns.count; ci++) {
             if (t->columns.items[ci].name && strcasecmp(t->columns.items[ci].name, agg_name) == 0 && ci < row->cells.count)
@@ -2917,8 +2921,9 @@ static struct cell efc_agg_bool(enum expr_func fn, EFC_ARGS) {
         }
     }
     int result_bool = (fn == FUNC_AGG_BOOL_AND) ? 1 : 0, has_val = 0;
-    for (size_t i = 0; i < t->rows.count; i++) {
-        struct cell v = (nargs > 0) ? eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, &t->rows.items[i], db, NULL) : cell_make_null();
+    for (size_t i = 0; i < t->flat.nrows; i++) {
+        struct flat_row_ref _efr = flat_row_ref_make(t, i);
+        struct cell v = (nargs > 0) ? eval_expr_flat(FUNC_ARG(arena, args_start, 0), arena, t, &_efr, db, NULL) : cell_make_null();
         if (cell_is_null(&v)) continue;
         has_val = 1;
         int bv = (v.type == COLUMN_TYPE_BOOLEAN) ? v.value.as_bool : (cell_to_double_val(&v) != 0.0);
@@ -2933,8 +2938,9 @@ static struct cell efc_agg_stddev_variance(enum expr_func fn, EFC_ARGS) {
     (void)row; (void)rb;
     if (!t) return cell_make_null();
     double sum2 = 0, sum_sq = 0; size_t n = 0;
-    for (size_t i = 0; i < t->rows.count; i++) {
-        struct cell v = (nargs > 0) ? eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, &t->rows.items[i], db, NULL) : cell_make_null();
+    for (size_t i = 0; i < t->flat.nrows; i++) {
+        struct flat_row_ref _efr2 = flat_row_ref_make(t, i);
+        struct cell v = (nargs > 0) ? eval_expr_flat(FUNC_ARG(arena, args_start, 0), arena, t, &_efr2, db, NULL) : cell_make_null();
         if (cell_is_null(&v)) continue;
         double dv = cell_to_double_val(&v); sum2 += dv; sum_sq += dv * dv; n++;
     }
@@ -2945,7 +2951,7 @@ static struct cell efc_agg_stddev_variance(enum expr_func fn, EFC_ARGS) {
 
 static struct cell efc_agg_basic(enum expr_func fn, EFC_ARGS) {
     if (!t) return cell_make_null();
-    if (t->rows.count == 0 && row && t->columns.count > 0) {
+    if (t->flat.nrows == 0 && row && t->columns.count > 0) {
         const char *agg_name = NULL;
         if (fn == FUNC_AGG_SUM) agg_name = "sum"; else if (fn == FUNC_AGG_COUNT) agg_name = "count";
         else if (fn == FUNC_AGG_AVG) agg_name = "avg"; else if (fn == FUNC_AGG_MIN) agg_name = "min";
@@ -2958,8 +2964,9 @@ static struct cell efc_agg_basic(enum expr_func fn, EFC_ARGS) {
         }
     }
     double sum = 0; size_t nonnull = 0; struct cell min_c = {0}, max_c = {0}; int minmax_init = 0;
-    for (size_t i = 0; i < t->rows.count; i++) {
-        struct cell v = (nargs > 0) ? eval_expr(FUNC_ARG(arena, args_start, 0), arena, t, &t->rows.items[i], db, NULL) : cell_make_null();
+    for (size_t i = 0; i < t->flat.nrows; i++) {
+        struct flat_row_ref _efr3 = flat_row_ref_make(t, i);
+        struct cell v = (nargs > 0) ? eval_expr_flat(FUNC_ARG(arena, args_start, 0), arena, t, &_efr3, db, NULL) : cell_make_null();
         if (fn == FUNC_AGG_COUNT && nargs == 0) { nonnull++; continue; }
         if (cell_is_null(&v)) continue;
         nonnull++;
@@ -3848,6 +3855,56 @@ int eval_condition_col(uint32_t cond_idx, struct query_arena *arena,
     return eval_condition(cond_idx, arena, &tmp, t, db);
 }
 
+/* ---- Flat-table helpers ----
+ * flat_cell_at: read a struct cell by value from flat_table column c, row ri.
+ * No allocation — numeric/date values are copied directly; text/vector return
+ * a pointer into the flat_table's own storage (do NOT free the result).
+ * flat_row_ref_make: build a flat_row_ref from t->flat for a given row index. */
+
+static struct cell flat_cell_at(const struct flat_table *ft, uint16_t c, size_t ri)
+{
+    struct cell cell = {0};
+    cell.type = ft->col_types[c];
+    if (ft->col_nulls[c][ri]) {
+        cell.is_null = 1;
+        return cell;
+    }
+    switch (ft->col_types[c]) {
+    case COLUMN_TYPE_SMALLINT:  cell.value.as_smallint  = ((int16_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_INT:       cell.value.as_int       = ((int32_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_BOOLEAN:   cell.value.as_bool      = ((int32_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_DATE:      cell.value.as_date      = ((int32_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_BIGINT:    cell.value.as_bigint    = ((int64_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_TIME:      cell.value.as_time      = ((int64_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_TIMESTAMP:
+    case COLUMN_TYPE_TIMESTAMPTZ: cell.value.as_timestamp = ((int64_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_FLOAT:     cell.value.as_float     = ((double *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_NUMERIC:   cell.value.as_numeric   = ((double *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_INTERVAL:  cell.value.as_interval  = ((struct interval *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_TEXT:      cell.value.as_text      = ((char **)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_ENUM:      cell.value.as_enum      = ((int32_t *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_UUID:      cell.value.as_uuid      = ((struct uuid_val *)ft->col_data[c])[ri]; break;
+    case COLUMN_TYPE_VECTOR: {
+        uint16_t dim = ft->col_vec_dims ? ft->col_vec_dims[c] : 0;
+        cell.value.as_vector = dim ? &((float *)ft->col_data[c])[ri * dim] : NULL;
+        break;
+    }
+    }
+    return cell;
+}
+
+static struct flat_row_ref flat_row_ref_make(const struct table *t, size_t ri)
+{
+    struct flat_row_ref ref;
+    ref.col_data     = t->flat.col_data;
+    ref.col_nulls    = t->flat.col_nulls;
+    ref.col_types    = t->flat.col_types;
+    ref.col_vec_dims = t->flat.col_vec_dims;
+    ref.ncols        = t->flat.ncols;
+    ref.ri           = ri;
+    return ref;
+}
+
 /* ---- Flat-table variants of eval_expr / eval_condition ----
  * Build a temporary struct row from a flat_row_ref (bump-allocated cells),
  * then delegate to the row-based functions.  The temporary row lives on the
@@ -4315,14 +4372,15 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
     struct cell *max_cells = min_cells + _nagg;
     size_t row_count = 0;
 
-    for (size_t i = 0; i < t->rows.count; i++) {
+    for (size_t i = 0; i < t->flat.nrows; i++) {
+        struct flat_row_ref _ref = flat_row_ref_make(t, i);
         if (s->where.has_where) {
             if (s->where.where_cond != IDX_NONE) {
-                if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
+                if (!eval_condition_flat(s->where.where_cond, arena, &_ref, t, NULL, &arena->scratch))
                     continue;
             } else if (where_col >= 0) {
-                if (!cell_equal(&t->rows.items[i].cells.items[where_col],
-                                &s->where.where_value))
+                struct cell _wc = flat_cell_at(&t->flat, (uint16_t)where_col, i);
+                if (!cell_equal(&_wc, &s->where.where_value))
                     continue;
             }
         }
@@ -4331,16 +4389,17 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
             struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
             /* FILTER (WHERE ...) — skip this row for this aggregate if filter doesn't match */
             if (ae->filter_cond != IDX_NONE) {
-                if (!eval_condition(ae->filter_cond, arena, &t->rows.items[i], t, NULL))
+                if (!eval_condition_flat(ae->filter_cond, arena, &_ref, t, NULL, &arena->scratch))
                     continue;
             }
             struct cell cv;
             struct cell *c;
             if (agg_col[a] == -2) {
-                cv = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL);
+                cv = eval_expr_flat(ae->expr_idx, arena, t, &_ref, NULL, NULL);
                 c = &cv;
             } else if (agg_col[a] >= 0) {
-                c = &t->rows.items[i].cells.items[agg_col[a]];
+                cv = flat_cell_at(&t->flat, (uint16_t)agg_col[a], i);
+                c = &cv;
             } else {
                 /* COUNT(*) with FILTER — count this row */
                 nonnull_count[a]++;
@@ -4381,23 +4440,26 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                     struct cell *seen = NULL;
                     if (nonnull_count[a] > 0)
                         seen = bump_calloc(&arena->scratch, nonnull_count[a], sizeof(struct cell));
-                    for (size_t i = 0; i < t->rows.count; i++) {
+                    for (size_t i = 0; i < t->flat.nrows; i++) {
+                        struct flat_row_ref _ref2 = flat_row_ref_make(t, i);
                         if (s->where.has_where) {
                             if (s->where.where_cond != IDX_NONE) {
-                                if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
+                                if (!eval_condition_flat(s->where.where_cond, arena, &_ref2, t, NULL, &arena->scratch))
                                     continue;
                             } else if (where_col >= 0) {
-                                if (!cell_equal(&t->rows.items[i].cells.items[where_col], &s->where.where_value))
+                                struct cell _wc2 = flat_cell_at(&t->flat, (uint16_t)where_col, i);
+                                if (!cell_equal(&_wc2, &s->where.where_value))
                                     continue;
                             }
                         }
                         struct cell ev;
                         struct cell *cv;
                         if (agg_col[a] == -2) {
-                            ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL);
+                            ev = eval_expr_flat(ae->expr_idx, arena, t, &_ref2, NULL, NULL);
                             cv = &ev;
                         } else {
-                            cv = &t->rows.items[i].cells.items[agg_col[a]];
+                            ev = flat_cell_at(&t->flat, (uint16_t)agg_col[a], i);
+                            cv = &ev;
                         }
                         if (cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text))
                             continue;
@@ -4425,27 +4487,30 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                     struct cell *seen_d = nonnull_count[a] > 0
                         ? bump_calloc(&arena->scratch, nonnull_count[a], sizeof(struct cell)) : NULL;
                     int nseen_d = 0;
-                    for (size_t i = 0; i < t->rows.count; i++) {
+                    for (size_t i = 0; i < t->flat.nrows; i++) {
+                        struct flat_row_ref _ref3 = flat_row_ref_make(t, i);
                         if (s->where.has_where) {
                             if (s->where.where_cond != IDX_NONE) {
-                                if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
+                                if (!eval_condition_flat(s->where.where_cond, arena, &_ref3, t, NULL, &arena->scratch))
                                     continue;
                             } else if (where_col >= 0) {
-                                if (!cell_equal(&t->rows.items[i].cells.items[where_col], &s->where.where_value))
+                                struct cell _wc3 = flat_cell_at(&t->flat, (uint16_t)where_col, i);
+                                if (!cell_equal(&_wc3, &s->where.where_value))
                                     continue;
                             }
                         }
                         if (ae->filter_cond != IDX_NONE) {
-                            if (!eval_condition(ae->filter_cond, arena, &t->rows.items[i], t, NULL))
+                            if (!eval_condition_flat(ae->filter_cond, arena, &_ref3, t, NULL, &arena->scratch))
                                 continue;
                         }
                         struct cell ev;
                         struct cell *cv;
                         if (agg_col[a] == -2) {
-                            ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL);
+                            ev = eval_expr_flat(ae->expr_idx, arena, t, &_ref3, NULL, NULL);
                             cv = &ev;
                         } else {
-                            cv = &t->rows.items[i].cells.items[agg_col[a]];
+                            ev = flat_cell_at(&t->flat, (uint16_t)agg_col[a], i);
+                            cv = &ev;
                         }
                         if (cv->is_null || (column_type_is_text(cv->type) && !cv->value.as_text))
                             continue;
@@ -4520,23 +4585,26 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                     int seen_count = 0;
                     if (ae->has_distinct && nonnull_count[a] > 0)
                         seen_vals = bump_calloc(&arena->scratch, nonnull_count[a], sizeof(struct cell));
-                    for (size_t i = 0; i < t->rows.count; i++) {
+                    for (size_t i = 0; i < t->flat.nrows; i++) {
+                        struct flat_row_ref _ref4 = flat_row_ref_make(t, i);
                         if (s->where.has_where) {
                             if (s->where.where_cond != IDX_NONE) {
-                                if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
+                                if (!eval_condition_flat(s->where.where_cond, arena, &_ref4, t, NULL, &arena->scratch))
                                     continue;
                             } else if (where_col >= 0) {
-                                if (!cell_equal(&t->rows.items[i].cells.items[where_col], &s->where.where_value))
+                                struct cell _wc4 = flat_cell_at(&t->flat, (uint16_t)where_col, i);
+                                if (!cell_equal(&_wc4, &s->where.where_value))
                                     continue;
                             }
                         }
                         struct cell ev;
                         struct cell *cv;
                         if (agg_col[a] == -2) {
-                            ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL);
+                            ev = eval_expr_flat(ae->expr_idx, arena, t, &_ref4, NULL, NULL);
                             cv = &ev;
                         } else if (agg_col[a] >= 0) {
-                            cv = &t->rows.items[i].cells.items[agg_col[a]];
+                            ev = flat_cell_at(&t->flat, (uint16_t)agg_col[a], i);
+                            cv = &ev;
                         } else {
                             continue;
                         }
@@ -4596,17 +4664,20 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                 c.type = COLUMN_TYPE_BOOLEAN;
                 if (nonnull_count[a] == 0) { c.is_null = 1; break; }
                 int result_b = (ae->func == AGG_BOOL_AND) ? 1 : 0;
-                for (size_t i = 0; i < t->rows.count; i++) {
+                for (size_t i = 0; i < t->flat.nrows; i++) {
+                    struct flat_row_ref _ref5 = flat_row_ref_make(t, i);
                     if (s->where.has_where) {
                         if (s->where.where_cond != IDX_NONE) {
-                            if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL)) continue;
+                            if (!eval_condition_flat(s->where.where_cond, arena, &_ref5, t, NULL, &arena->scratch)) continue;
                         } else if (where_col >= 0) {
-                            if (!cell_equal(&t->rows.items[i].cells.items[where_col], &s->where.where_value)) continue;
+                            struct cell _wc5 = flat_cell_at(&t->flat, (uint16_t)where_col, i);
+                            if (!cell_equal(&_wc5, &s->where.where_value)) continue;
                         }
                     }
-                    struct cell ev; struct cell *cv;
-                    if (agg_col[a] == -2) { ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL); cv = &ev; }
-                    else if (agg_col[a] >= 0) { cv = &t->rows.items[i].cells.items[agg_col[a]]; }
+                    struct cell ev; struct cell cv2;
+                    struct cell *cv;
+                    if (agg_col[a] == -2) { ev = eval_expr_flat(ae->expr_idx, arena, t, &_ref5, NULL, NULL); cv = &ev; }
+                    else if (agg_col[a] >= 0) { cv2 = flat_cell_at(&t->flat, (uint16_t)agg_col[a], i); cv = &cv2; }
                     else continue;
                     if (cv->is_null) continue;
                     int bv = (cv->type == COLUMN_TYPE_BOOLEAN) ? cv->value.as_bool : (cell_to_double_val(cv) != 0.0);
@@ -4621,17 +4692,19 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
                 c.type = COLUMN_TYPE_FLOAT;
                 if (nonnull_count[a] < 2) { c.is_null = 1; break; }
                 double s2 = 0, sq = 0; size_t n2 = 0;
-                for (size_t i = 0; i < t->rows.count; i++) {
+                for (size_t i = 0; i < t->flat.nrows; i++) {
+                    struct flat_row_ref _ref6 = flat_row_ref_make(t, i);
                     if (s->where.has_where) {
                         if (s->where.where_cond != IDX_NONE) {
-                            if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL)) continue;
+                            if (!eval_condition_flat(s->where.where_cond, arena, &_ref6, t, NULL, &arena->scratch)) continue;
                         } else if (where_col >= 0) {
-                            if (!cell_equal(&t->rows.items[i].cells.items[where_col], &s->where.where_value)) continue;
+                            struct cell _wc6 = flat_cell_at(&t->flat, (uint16_t)where_col, i);
+                            if (!cell_equal(&_wc6, &s->where.where_value)) continue;
                         }
                     }
-                    struct cell ev2; struct cell *cv2;
-                    if (agg_col[a] == -2) { ev2 = eval_expr(ae->expr_idx, arena, t, &t->rows.items[i], NULL, NULL); cv2 = &ev2; }
-                    else if (agg_col[a] >= 0) { cv2 = &t->rows.items[i].cells.items[agg_col[a]]; }
+                    struct cell ev2; struct cell cv2b; struct cell *cv2;
+                    if (agg_col[a] == -2) { ev2 = eval_expr_flat(ae->expr_idx, arena, t, &_ref6, NULL, NULL); cv2 = &ev2; }
+                    else if (agg_col[a] >= 0) { cv2b = flat_cell_at(&t->flat, (uint16_t)agg_col[a], i); cv2 = &cv2b; }
                     else continue;
                     if (cv2->is_null) continue;
                     double dv2 = cell_to_double_val(cv2);
@@ -4657,7 +4730,6 @@ int query_aggregate(struct table *t, struct query_select *s, struct query_arena 
         } else if (s->having_cond != IDX_NONE) {
             struct table having_t = {0};
             da_init(&having_t.columns);
-            da_init(&having_t.rows);
             da_init(&having_t.indexes);
             for (uint32_t a = 0; a < naggs; a++) {
                 struct agg_expr *ae_h = &arena->aggregates.items[s->aggregates_start + a];
@@ -4774,7 +4846,7 @@ static int cmp_rows_multi(const void *a, const void *b)
     return 0;
 }
 
-/* qsort comparator: compare two size_t indices into _sort_ctx.table->rows */
+/* qsort comparator: compare two size_t indices into _sort_ctx.table->flat */
 static int cmp_indices_multi(const void *a, const void *b)
 {
     size_t ia = *(const size_t *)a;
@@ -4783,10 +4855,10 @@ static int cmp_indices_multi(const void *a, const void *b)
     for (size_t k = 0; k < _sort_ctx.ncols; k++) {
         int ci = _sort_ctx.cols[k];
         if (ci < 0) continue;
-        const struct cell *ca = &t->rows.items[ia].cells.items[ci];
-        const struct cell *cb = &t->rows.items[ib].cells.items[ci];
-        int a_null = ca->is_null || (column_type_is_text(ca->type) && !ca->value.as_text);
-        int b_null = cb->is_null || (column_type_is_text(cb->type) && !cb->value.as_text);
+        struct cell ca = flat_cell_at(&t->flat, (uint16_t)ci, ia);
+        struct cell cb = flat_cell_at(&t->flat, (uint16_t)ci, ib);
+        int a_null = ca.is_null || (column_type_is_text(ca.type) && !ca.value.as_text);
+        int b_null = cb.is_null || (column_type_is_text(cb.type) && !cb.value.as_text);
         if (a_null || b_null) {
             if (a_null && b_null) continue;
             int nf = _sort_ctx.nulls_first ? _sort_ctx.nulls_first[k] : -1;
@@ -4794,7 +4866,7 @@ static int cmp_indices_multi(const void *a, const void *b)
             if (a_null) return nulls_go_first ? -1 : 1;
             else        return nulls_go_first ? 1 : -1;
         }
-        int cmp = cell_compare(ca, cb);
+        int cmp = cell_compare(&ca, &cb);
         if (_sort_ctx.descs[k]) cmp = -cmp;
         if (cmp != 0) return cmp;
     }
@@ -4829,7 +4901,7 @@ extern int query_parse_into(const char *sql, struct query *out, struct query_are
 
 static int query_window(struct table *t, struct query_select *s, struct query_arena *arena, struct rows *result, struct bump_alloc *rb)
 {
-    size_t nrows = t->rows.count;
+    size_t nrows = t->flat.nrows;
     size_t nexprs = s->select_exprs_count;
 
     /* resolve named window references: OVER w → look up WINDOW w AS (...) definition */
@@ -4959,7 +5031,10 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                                (nrows ? nrows : 1) * sizeof(size_t));
     size_t nmatch = 0;
     for (size_t i = 0; i < nrows; i++) {
-        if (!row_matches(t, &s->where, arena, &t->rows.items[i], NULL))
+        struct flat_row_ref _wref = flat_row_ref_make(t, i);
+        struct row _wtmp = {0};
+        flat_row_ref_to_row(&_wref, &_wtmp, &arena->scratch);
+        if (!row_matches(t, &s->where, arena, &_wtmp, NULL))
             continue;
         sorted_idx[nmatch++] = i;
     }
@@ -5059,9 +5134,9 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
         if (multi_part_ncols > 0) {
             int differ = 0;
             for (int pc = 0; pc < multi_part_ncols; pc++) {
-                struct cell *ca = &t->rows.items[sorted_idx[i - 1]].cells.items[multi_part_cols[pc]];
-                struct cell *cb = &t->rows.items[sorted_idx[i]].cells.items[multi_part_cols[pc]];
-                if (!cell_equal_nullsafe(ca, cb)) { differ = 1; break; }
+                struct cell _wca = flat_cell_at(&t->flat, (uint16_t)multi_part_cols[pc], sorted_idx[i - 1]);
+                struct cell _wcb = flat_cell_at(&t->flat, (uint16_t)multi_part_cols[pc], sorted_idx[i]);
+                if (!cell_equal_nullsafe(&_wca, &_wcb)) { differ = 1; break; }
             }
             if (differ) part_starts[nparts++] = i;
         }
@@ -5109,9 +5184,9 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
             expr_nparts = 0;
             expr_part_starts[expr_nparts++] = 0;
             for (size_t i = 1; i < nmatch; i++) {
-                struct cell *ca = &t->rows.items[sorted_idx[i - 1]].cells.items[part_idx[e]];
-                struct cell *cb_c = &t->rows.items[sorted_idx[i]].cells.items[part_idx[e]];
-                if (!cell_equal_nullsafe(ca, cb_c))
+                struct cell _wca2 = flat_cell_at(&t->flat, (uint16_t)part_idx[e], sorted_idx[i - 1]);
+                struct cell _wcb2 = flat_cell_at(&t->flat, (uint16_t)part_idx[e], sorted_idx[i]);
+                if (!cell_equal_nullsafe(&_wca2, &_wcb2))
                     expr_part_starts[expr_nparts++] = i;
             }
             expr_part_starts[expr_nparts] = nmatch;
@@ -5138,9 +5213,9 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                     int rank = 1;
                     for (size_t i = ps; i < pe; i++) {
                         if (i > ps && ord_idx[e] >= 0) {
-                            int cmp = cell_compare(
-                                &t->rows.items[sorted_idx[i]].cells.items[ord_idx[e]],
-                                &t->rows.items[sorted_idx[i - 1]].cells.items[ord_idx[e]]);
+                            struct cell _wra = flat_cell_at(&t->flat, (uint16_t)ord_idx[e], sorted_idx[i]);
+                            struct cell _wrb = flat_cell_at(&t->flat, (uint16_t)ord_idx[e], sorted_idx[i-1]);
+                            int cmp = cell_compare(&_wra, &_wrb);
                             if (cmp != 0) rank = (int)(i - ps + 1);
                         }
                         win_int_vals[sorted_idx[i] * nexprs + e] = rank;
@@ -5152,9 +5227,9 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                     int rank = 1;
                     for (size_t i = ps; i < pe; i++) {
                         if (i > ps && ord_idx[e] >= 0) {
-                            int cmp = cell_compare(
-                                &t->rows.items[sorted_idx[i]].cells.items[ord_idx[e]],
-                                &t->rows.items[sorted_idx[i - 1]].cells.items[ord_idx[e]]);
+                            struct cell _wdra = flat_cell_at(&t->flat, (uint16_t)ord_idx[e], sorted_idx[i]);
+                            struct cell _wdrb = flat_cell_at(&t->flat, (uint16_t)ord_idx[e], sorted_idx[i-1]);
+                            int cmp = cell_compare(&_wdra, &_wdrb);
                             if (cmp != 0) rank++;
                         }
                         win_int_vals[sorted_idx[i] * nexprs + e] = rank;
@@ -5181,9 +5256,9 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                         int rank = 1;
                         for (size_t i = ps; i < pe; i++) {
                             if (i > ps && ord_idx[e] >= 0) {
-                                int cmp = cell_compare(
-                                    &t->rows.items[sorted_idx[i]].cells.items[ord_idx[e]],
-                                    &t->rows.items[sorted_idx[i - 1]].cells.items[ord_idx[e]]);
+                                struct cell _wpra = flat_cell_at(&t->flat, (uint16_t)ord_idx[e], sorted_idx[i]);
+                                struct cell _wprb = flat_cell_at(&t->flat, (uint16_t)ord_idx[e], sorted_idx[i-1]);
+                                int cmp = cell_compare(&_wpra, &_wprb);
                                 if (cmp != 0) rank = (int)(i - ps + 1);
                             }
                             win_dbl_vals[sorted_idx[i] * nexprs + e] = (double)(rank - 1) / (double)(psize - 1);
@@ -5201,10 +5276,12 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                         while (i < pe) {
                             /* find end of tie group */
                             size_t j = i + 1;
-                            while (j < pe && cell_compare(
-                                &t->rows.items[sorted_idx[j]].cells.items[ord_idx[e]],
-                                &t->rows.items[sorted_idx[i]].cells.items[ord_idx[e]]) == 0)
+                            struct cell _wcdi = flat_cell_at(&t->flat, (uint16_t)ord_idx[e], sorted_idx[i]);
+                            while (j < pe) {
+                                struct cell _wcdj = flat_cell_at(&t->flat, (uint16_t)ord_idx[e], sorted_idx[j]);
+                                if (cell_compare(&_wcdj, &_wcdi) != 0) break;
                                 j++;
+                            }
                             double cd = (double)(j - ps) / (double)psize;
                             for (size_t k = i; k < j; k++)
                                 win_dbl_vals[sorted_idx[k] * nexprs + e] = cd;
@@ -5231,11 +5308,11 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                             if (target < pe) in_range = 1;
                         }
                         if (in_range && arg_idx[e] >= 0) {
-                            struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
-                            if (ac->is_null || (column_type_is_text(ac->type) && !ac->value.as_text)) {
+                            struct cell _wll = flat_cell_at(&t->flat, (uint16_t)arg_idx[e], sorted_idx[target]);
+                            if (_wll.is_null || (column_type_is_text(_wll.type) && !_wll.value.as_text)) {
                                 win_is_null[sorted_idx[i] * nexprs + e] = 1;
                             } else {
-                                win_dbl_vals[sorted_idx[i] * nexprs + e] = cell_to_double(ac);
+                                win_dbl_vals[sorted_idx[i] * nexprs + e] = cell_to_double(&_wll);
                                 win_is_dbl[e] = 1;
                             }
                         } else {
@@ -5259,11 +5336,11 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                     for (size_t i = ps; i < pe; i++) {
                         size_t target = (se->win.func == WIN_FIRST_VALUE) ? ps : (pe - 1);
                         if (arg_idx[e] >= 0) {
-                            struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
-                            if (ac->is_null || (column_type_is_text(ac->type) && !ac->value.as_text)) {
+                            struct cell _wfl = flat_cell_at(&t->flat, (uint16_t)arg_idx[e], sorted_idx[target]);
+                            if (_wfl.is_null || (column_type_is_text(_wfl.type) && !_wfl.value.as_text)) {
                                 win_is_null[sorted_idx[i] * nexprs + e] = 1;
                             } else {
-                                win_dbl_vals[sorted_idx[i] * nexprs + e] = cell_to_double(ac);
+                                win_dbl_vals[sorted_idx[i] * nexprs + e] = cell_to_double(&_wfl);
                                 win_is_dbl[e] = 1;
                             }
                         } else {
@@ -5278,11 +5355,11 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                     for (size_t i = ps; i < pe; i++) {
                         if (nth >= 1 && (size_t)nth <= psize && arg_idx[e] >= 0) {
                             size_t target = ps + (size_t)(nth - 1);
-                            struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
-                            if (ac->is_null || (column_type_is_text(ac->type) && !ac->value.as_text)) {
+                            struct cell _wnv = flat_cell_at(&t->flat, (uint16_t)arg_idx[e], sorted_idx[target]);
+                            if (_wnv.is_null || (column_type_is_text(_wnv.type) && !_wnv.value.as_text)) {
                                 win_is_null[sorted_idx[i] * nexprs + e] = 1;
                             } else {
-                                win_dbl_vals[sorted_idx[i] * nexprs + e] = cell_to_double(ac);
+                                win_dbl_vals[sorted_idx[i] * nexprs + e] = cell_to_double(&_wnv);
                                 win_is_dbl[e] = 1;
                             }
                         } else {
@@ -5302,9 +5379,9 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                         int part_count = (int)psize;
                         for (size_t i = ps; i < pe; i++) {
                             if (arg_idx[e] >= 0) {
-                                struct cell *ac = &t->rows.items[sorted_idx[i]].cells.items[arg_idx[e]];
-                                if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text)) {
-                                    part_sum += cell_to_double(ac);
+                                struct cell _wsc = flat_cell_at(&t->flat, (uint16_t)arg_idx[e], sorted_idx[i]);
+                                if (!_wsc.is_null && !(column_type_is_text(_wsc.type) && !_wsc.value.as_text)) {
+                                    part_sum += cell_to_double(&_wsc);
                                     part_nn++;
                                 }
                             }
@@ -5341,15 +5418,16 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                             /* FILTER (WHERE expr): check if this row passes */
                             int filter_pass = 1;
                             if (se->win.has_filter && se->win.filter_expr_idx != IDX_NONE) {
-                                struct cell fc = eval_expr(se->win.filter_expr_idx, arena, t, &t->rows.items[sorted_idx[i]], NULL, rb);
+                                struct flat_row_ref _wfref = flat_row_ref_make(t, sorted_idx[i]);
+                                struct cell fc = eval_expr_flat(se->win.filter_expr_idx, arena, t, &_wfref, NULL, rb);
                                 filter_pass = (!fc.is_null && fc.type == COLUMN_TYPE_BOOLEAN && fc.value.as_bool != 0);
                                 cell_release_rb(&fc, rb);
                             }
                             if (filter_pass) {
                                 if (arg_idx[e] >= 0) {
-                                    struct cell *ac = &t->rows.items[sorted_idx[i]].cells.items[arg_idx[e]];
-                                    if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text)) {
-                                        running_sum += cell_to_double(ac);
+                                    struct cell _wrc = flat_cell_at(&t->flat, (uint16_t)arg_idx[e], sorted_idx[i]);
+                                    if (!_wrc.is_null && !(column_type_is_text(_wrc.type) && !_wrc.value.as_text)) {
+                                        running_sum += cell_to_double(&_wrc);
                                         running_nn++;
                                     }
                                 }
@@ -5393,9 +5471,9 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                             size_t g = 0;
                             group_of[0] = 0;
                             for (size_t i = 1; i < psize; i++) {
-                                struct cell *ca = &t->rows.items[sorted_idx[ps + i - 1]].cells.items[ord_idx[e]];
-                                struct cell *cb = &t->rows.items[sorted_idx[ps + i]].cells.items[ord_idx[e]];
-                                if (!cell_equal_nullsafe(ca, cb)) g++;
+                                struct cell _wgca = flat_cell_at(&t->flat, (uint16_t)ord_idx[e], sorted_idx[ps + i - 1]);
+                                struct cell _wgcb = flat_cell_at(&t->flat, (uint16_t)ord_idx[e], sorted_idx[ps + i]);
+                                if (!cell_equal_nullsafe(&_wgca, &_wgcb)) g++;
                                 group_of[i] = g;
                             }
                             ngroups = (psize > 0) ? group_of[psize - 1] + 1 : 0;
@@ -5462,16 +5540,17 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                                 size_t j = sorted_idx[ps + fi];
                                 /* FILTER (WHERE expr): skip rows that don't match */
                                 if (se->win.has_filter && se->win.filter_expr_idx != IDX_NONE) {
-                                    struct cell fc = eval_expr(se->win.filter_expr_idx, arena, t, &t->rows.items[j], NULL, rb);
+                                    struct flat_row_ref _wffref = flat_row_ref_make(t, j);
+                                    struct cell fc = eval_expr_flat(se->win.filter_expr_idx, arena, t, &_wffref, NULL, rb);
                                     int passes = (!fc.is_null && fc.type == COLUMN_TYPE_BOOLEAN && fc.value.as_bool != 0);
                                     cell_release_rb(&fc, rb);
                                     if (!passes) continue;
                                 }
                                 frame_count++;
                                 if (arg_idx[e] >= 0) {
-                                    struct cell *ac = &t->rows.items[j].cells.items[arg_idx[e]];
-                                    if (!ac->is_null && !(column_type_is_text(ac->type) && !ac->value.as_text)) {
-                                        frame_sum += cell_to_double(ac);
+                                    struct cell _wfc = flat_cell_at(&t->flat, (uint16_t)arg_idx[e], j);
+                                    if (!_wfc.is_null && !(column_type_is_text(_wfc.type) && !_wfc.value.as_text)) {
+                                        frame_sum += cell_to_double(&_wfc);
                                         frame_nn++;
                                     }
                                 }
@@ -5530,7 +5609,6 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
     /* emit result rows in sorted order */
     for (size_t ri = 0; ri < nmatch; ri++) {
         size_t row_i = sorted_idx[ri];
-        struct row *src = &t->rows.items[row_i];
         struct row dst = {0};
         da_init(&dst.cells);
 
@@ -5539,8 +5617,9 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
             struct cell c = {0};
 
             if (se->kind == SEL_COLUMN) {
-                if (rb) cell_copy_bump(&c, &src->cells.items[col_idx[e]], rb);
-                else    cell_copy(&c, &src->cells.items[col_idx[e]]);
+                struct cell _esrc = flat_cell_at(&t->flat, (uint16_t)col_idx[e], row_i);
+                if (rb) cell_copy_bump(&c, &_esrc, rb);
+                else    cell_copy(&c, &_esrc);
             } else if (se->kind == SEL_EXPR_WIN) {
                 /* expression with embedded window function — substitute window
                  * result into the expression text and evaluate via SELECT */
@@ -5609,7 +5688,10 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                         if (sub_q.select.parsed_columns_count > 0) {
                             struct select_column *sc = &sub_q.arena.select_cols.items[sub_q.select.parsed_columns_start];
                             if (sc->expr_idx != IDX_NONE) {
-                                c = eval_expr(sc->expr_idx, &sub_q.arena, t, src, NULL, rb);
+                                struct flat_row_ref _emit_ref = flat_row_ref_make(t, row_i);
+                                struct row _emit_tmp = {0};
+                                flat_row_ref_to_row(&_emit_ref, &_emit_tmp, &arena->scratch);
+                                c = eval_expr(sc->expr_idx, &sub_q.arena, t, &_emit_tmp, NULL, rb);
                             }
                         }
                     }
@@ -5659,12 +5741,12 @@ static int query_window(struct table *t, struct query_select *s, struct query_ar
                     int nth = se->win.offset;
                     target = (nth >= 1 && (size_t)nth <= psize) ? ps + (size_t)(nth - 1) : ri;
                 }
-                struct cell *ac = &t->rows.items[sorted_idx[target]].cells.items[arg_idx[e]];
-                if (column_type_is_text(ac->type)) {
+                struct cell _wac = flat_cell_at(&t->flat, (uint16_t)arg_idx[e], sorted_idx[target]);
+                if (column_type_is_text(_wac.type)) {
                     c.type = COLUMN_TYPE_INT; /* reset */
                     c.is_null = 0;
-                    if (rb) cell_copy_bump(&c, ac, rb);
-                    else    cell_copy(&c, ac);
+                    if (rb) cell_copy_bump(&c, &_wac, rb);
+                    else    cell_copy(&c, &_wac);
                 }
             }
 
@@ -5913,12 +5995,13 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
     if (ngrp > 32) ngrp = 32;
 
     /* collect matching rows (scratch-allocated) */
-    size_t max_rows = t->rows.count ? t->rows.count : 1;
+    size_t max_rows = t->flat.nrows ? t->flat.nrows : 1;
     size_t *matching = (size_t *)bump_alloc(&arena->scratch, max_rows * sizeof(size_t));
     size_t matching_count = 0;
-    for (size_t i = 0; i < t->rows.count; i++) {
+    for (size_t i = 0; i < t->flat.nrows; i++) {
         if (s->where.has_where && s->where.where_cond != IDX_NONE) {
-            if (!eval_condition(s->where.where_cond, arena, &t->rows.items[i], t, NULL))
+            struct flat_row_ref _ref = flat_row_ref_make(t, i);
+            if (!eval_condition_flat(s->where.where_cond, arena, &_ref, t, NULL, &arena->scratch))
                 continue;
         }
         matching[matching_count++] = i;
@@ -5935,9 +6018,10 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
         grp_vals = (struct cell *)bump_calloc(&arena->scratch, matching_count * ngrp, sizeof(struct cell));
         for (size_t m = 0; m < matching_count; m++) {
             size_t ri = matching[m];
+            struct flat_row_ref _ref = flat_row_ref_make(t, ri);
             for (size_t k = 0; k < ngrp; k++) {
                 if (grp_cols[k] == -2) {
-                    grp_vals[m * ngrp + k] = eval_expr(grp_expr[k], arena, t, &t->rows.items[ri], NULL, rb);
+                    grp_vals[m * ngrp + k] = eval_expr_flat(grp_expr[k], arena, t, &_ref, NULL, rb);
                 }
             }
         }
@@ -5960,8 +6044,9 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                         eq = 0; break;
                     }
                 } else {
-                    if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
-                                    &t->rows.items[gi].cells.items[grp_cols[k]])) {
+                    struct cell _ca = flat_cell_at(&t->flat, (uint16_t)grp_cols[k], ri);
+                    struct cell _cb = flat_cell_at(&t->flat, (uint16_t)grp_cols[k], gi);
+                    if (!cell_equal_nullsafe(&_ca, &_cb)) {
                         eq = 0; break;
                     }
                 }
@@ -6011,7 +6096,6 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
     if (s->has_having && (s->having_cond != IDX_NONE || s->having_expr != IDX_NONE)) {
         has_having_t = 1;
         da_init(&having_t.columns);
-        da_init(&having_t.rows);
         da_init(&having_t.indexes);
         if (!s->agg_before_cols) {
             for (size_t k = 0; k < ngrp; k++) {
@@ -6106,24 +6190,27 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                         eq = 0; break;
                     }
                 } else {
-                    if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
-                                    &t->rows.items[first_ri].cells.items[grp_cols[k]])) {
+                    struct cell _ca = flat_cell_at(&t->flat, (uint16_t)grp_cols[k], ri);
+                    struct cell _cb = flat_cell_at(&t->flat, (uint16_t)grp_cols[k], first_ri);
+                    if (!cell_equal_nullsafe(&_ca, &_cb)) {
                         eq = 0; break;
                     }
                 }
             }
             if (!eq) continue;
             grp_count++;
+            struct flat_row_ref _ref = flat_row_ref_make(t, ri);
             for (size_t a = 0; a < agg_n; a++) {
                 struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
                 int ac = gagg_cols[a];
-                struct cell ev;
+                struct cell ev; struct cell evc;
                 struct cell *gc;
                 if (ac == -2) {
-                    ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[ri], NULL, &arena->scratch);
+                    ev = eval_expr_flat(ae->expr_idx, arena, t, &_ref, NULL, &arena->scratch);
                     gc = &ev;
                 } else if (ac >= 0) {
-                    gc = &t->rows.items[ri].cells.items[ac];
+                    evc = flat_cell_at(&t->flat, (uint16_t)ac, ri);
+                    gc = &evc;
                 } else {
                     continue; /* COUNT(*) — no column value needed */
                 }
@@ -6143,8 +6230,9 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                     if (rb) cell_copy_bump(&gc, &grp_vals[group_starts[g] * ngrp + k], rb);
                     else    cell_copy(&gc, &grp_vals[group_starts[g] * ngrp + k]);
                 } else {
-                    if (rb) cell_copy_bump(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]], rb);
-                    else    cell_copy(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]]);
+                    struct cell _src1 = flat_cell_at(&t->flat, (uint16_t)grp_cols[k], first_ri);
+                    if (rb) cell_copy_bump(&gc, &_src1, rb);
+                    else    cell_copy(&gc, &_src1);
                 }
                 da_push(&dst.cells, gc);
             }
@@ -6187,16 +6275,18 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                                     if (!cell_equal_nullsafe(&grp_vals[m2 * ngrp + k2],
                                                     &grp_vals[group_starts[g] * ngrp + k2])) { eq2 = 0; break; }
                                 } else {
-                                    if (!cell_equal_nullsafe(&t->rows.items[ri2].cells.items[grp_cols[k2]],
-                                                    &t->rows.items[first_ri].cells.items[grp_cols[k2]])) { eq2 = 0; break; }
+                                    struct cell _ca2 = flat_cell_at(&t->flat, (uint16_t)grp_cols[k2], ri2);
+                                    struct cell _cb2 = flat_cell_at(&t->flat, (uint16_t)grp_cols[k2], first_ri);
+                                    if (!cell_equal_nullsafe(&_ca2, &_cb2)) { eq2 = 0; break; }
                                 }
                             }
                             if (!eq2) continue;
+                            struct cell cv2tmp;
                             struct cell *cv2;
                             struct cell ev2;
                             int ac2 = gagg_cols[a];
-                            if (ac2 == -2) { ev2 = eval_expr(ae->expr_idx, arena, t, &t->rows.items[ri2], NULL, NULL); cv2 = &ev2; }
-                            else { cv2 = &t->rows.items[ri2].cells.items[ac2]; }
+                            if (ac2 == -2) { struct flat_row_ref _r2 = flat_row_ref_make(t, ri2); ev2 = eval_expr_flat(ae->expr_idx, arena, t, &_r2, NULL, NULL); cv2 = &ev2; }
+                            else { cv2tmp = flat_cell_at(&t->flat, (uint16_t)ac2, ri2); cv2 = &cv2tmp; }
                             if (cv2->is_null || (column_type_is_text(cv2->type) && !cv2->value.as_text)) continue;
                             int dup2 = 0;
                             for (int d2 = 0; d2 < dc; d2++) { if (cell_compare(cv2, &seen_d[d2]) == 0) { dup2 = 1; break; } }
@@ -6237,8 +6327,9 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                                     size_t key = sorted[si];
                                     size_t sj = si;
                                     while (sj > 0) {
-                                        int cmp = cell_compare(&t->rows.items[key].cells.items[ob_ci],
-                                                               &t->rows.items[sorted[sj-1]].cells.items[ob_ci]);
+                                        struct cell _ck  = flat_cell_at(&t->flat, (uint16_t)ob_ci, key);
+                                        struct cell _cprev = flat_cell_at(&t->flat, (uint16_t)ob_ci, sorted[sj-1]);
+                                        int cmp = cell_compare(&_ck, &_cprev);
                                         if (ae->order_by_desc) cmp = -cmp;
                                         if (cmp >= 0) break;
                                         sorted[sj] = sorted[sj-1];
@@ -6253,19 +6344,22 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                             size_t ri = sorted[m];
                             int eq = 1;
                             for (size_t k = 0; k < ngrp; k++) {
-                                if (!cell_equal_nullsafe(&t->rows.items[ri].cells.items[grp_cols[k]],
-                                                &t->rows.items[first_ri].cells.items[grp_cols[k]])) {
+                                struct cell _cri = flat_cell_at(&t->flat, (uint16_t)grp_cols[k], ri);
+                                struct cell _cfr = flat_cell_at(&t->flat, (uint16_t)grp_cols[k], first_ri);
+                                if (!cell_equal_nullsafe(&_cri, &_cfr)) {
                                     eq = 0; break;
                                 }
                             }
                             if (!eq) continue;
-                            struct cell ev;
+                            struct flat_row_ref _refsa = flat_row_ref_make(t, ri);
+                            struct cell ev; struct cell evc;
                             struct cell *cv;
                             if (ac_idx == -2) {
-                                ev = eval_expr(ae->expr_idx, arena, t, &t->rows.items[ri], NULL, &arena->scratch);
+                                ev = eval_expr_flat(ae->expr_idx, arena, t, &_refsa, NULL, &arena->scratch);
                                 cv = &ev;
                             } else if (ac_idx >= 0) {
-                                cv = &t->rows.items[ri].cells.items[ac_idx];
+                                evc = flat_cell_at(&t->flat, (uint16_t)ac_idx, ri);
+                                cv = &evc;
                             } else {
                                 continue;
                             }
@@ -6311,9 +6405,9 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                     int rb2 = (ae->func == AGG_BOOL_AND) ? 1 : 0;
                     for (size_t m3 = 0; m3 < matching_count; m3++) {
                         size_t ri3 = matching[m3];
-                        struct cell ev3; struct cell *cv3;
-                        if (ac_idx == -2) { ev3 = eval_expr(ae->expr_idx, arena, t, &t->rows.items[ri3], NULL, NULL); cv3 = &ev3; }
-                        else if (ac_idx >= 0) { cv3 = &t->rows.items[ri3].cells.items[ac_idx]; }
+                        struct cell ev3; struct cell evc3; struct cell *cv3;
+                        if (ac_idx == -2) { struct flat_row_ref _r3 = flat_row_ref_make(t, ri3); ev3 = eval_expr_flat(ae->expr_idx, arena, t, &_r3, NULL, NULL); cv3 = &ev3; }
+                        else if (ac_idx >= 0) { evc3 = flat_cell_at(&t->flat, (uint16_t)ac_idx, ri3); cv3 = &evc3; }
                         else continue;
                         if (cv3->is_null) continue;
                         int bv3 = (cv3->type == COLUMN_TYPE_BOOLEAN) ? cv3->value.as_bool : (cell_to_double_val(cv3) != 0.0);
@@ -6330,9 +6424,9 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                     double s3 = 0, sq3 = 0; size_t n3 = 0;
                     for (size_t m4 = 0; m4 < matching_count; m4++) {
                         size_t ri4 = matching[m4];
-                        struct cell ev4; struct cell *cv4;
-                        if (ac_idx == -2) { ev4 = eval_expr(ae->expr_idx, arena, t, &t->rows.items[ri4], NULL, NULL); cv4 = &ev4; }
-                        else if (ac_idx >= 0) { cv4 = &t->rows.items[ri4].cells.items[ac_idx]; }
+                        struct cell ev4; struct cell evc4; struct cell *cv4;
+                        if (ac_idx == -2) { struct flat_row_ref _r4 = flat_row_ref_make(t, ri4); ev4 = eval_expr_flat(ae->expr_idx, arena, t, &_r4, NULL, NULL); cv4 = &ev4; }
+                        else if (ac_idx >= 0) { evc4 = flat_cell_at(&t->flat, (uint16_t)ac_idx, ri4); cv4 = &evc4; }
                         else continue;
                         if (cv4->is_null) continue;
                         double dv4 = cell_to_double_val(cv4);
@@ -6357,8 +6451,9 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                     if (rb) cell_copy_bump(&gc, &grp_vals[group_starts[g] * ngrp + k], rb);
                     else    cell_copy(&gc, &grp_vals[group_starts[g] * ngrp + k]);
                 } else {
-                    if (rb) cell_copy_bump(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]], rb);
-                    else    cell_copy(&gc, &t->rows.items[first_ri].cells.items[grp_cols[k]]);
+                    struct cell _src3 = flat_cell_at(&t->flat, (uint16_t)grp_cols[k], first_ri);
+                    if (rb) cell_copy_bump(&gc, &_src3, rb);
+                    else    cell_copy(&gc, &_src3);
                 }
                 da_push(&dst.cells, gc);
             }
@@ -6406,8 +6501,9 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                         if (!cell_equal_nullsafe(&grp_vals[m2 * ngrp + k2],
                                         &grp_vals[group_starts[g] * ngrp + k2])) { eq2 = 0; break; }
                     } else {
-                        if (!cell_equal_nullsafe(&t->rows.items[ri2].cells.items[grp_cols[k2]],
-                                        &t->rows.items[first_ri].cells.items[grp_cols[k2]])) { eq2 = 0; break; }
+                        struct cell _eca = flat_cell_at(&t->flat, (uint16_t)grp_cols[k2], ri2);
+                        struct cell _ecb = flat_cell_at(&t->flat, (uint16_t)grp_cols[k2], first_ri);
+                        if (!cell_equal_nullsafe(&_eca, &_ecb)) { eq2 = 0; break; }
                     }
                 }
                 if (eq2) grp_row_count++;
@@ -6422,14 +6518,17 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
                         if (!cell_equal_nullsafe(&grp_vals[m2 * ngrp + k2],
                                         &grp_vals[group_starts[g] * ngrp + k2])) { eq2 = 0; break; }
                     } else {
-                        if (!cell_equal_nullsafe(&t->rows.items[ri2].cells.items[grp_cols[k2]],
-                                        &t->rows.items[first_ri].cells.items[grp_cols[k2]])) { eq2 = 0; break; }
+                        struct cell _eca2 = flat_cell_at(&t->flat, (uint16_t)grp_cols[k2], ri2);
+                        struct cell _ecb2 = flat_cell_at(&t->flat, (uint16_t)grp_cols[k2], first_ri);
+                        if (!cell_equal_nullsafe(&_eca2, &_ecb2)) { eq2 = 0; break; }
                     }
                 }
-                if (eq2) grp_row_arr[gi++] = t->rows.items[ri2];
+                if (eq2) {
+                    struct flat_row_ref _gref = flat_row_ref_make(t, ri2);
+                    flat_row_ref_to_row(&_gref, &grp_row_arr[gi], &arena->scratch);
+                    gi++;
+                }
             }
-            grp_t.rows.items = grp_row_arr;
-            grp_t.rows.count = grp_row_count;
             /* Save aggregate cells from original dst before rebuilding.
              * Layout of dst: [grp0..grpN, agg0..aggN] (or reversed if agg_before_cols).
              * Aggregate placeholders in parsed_columns (expr_idx==IDX_NONE) map
@@ -6447,7 +6546,7 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             dst = (struct row){0};
             da_init(&dst.cells);
             size_t agg_placeholder = 0;
-            struct row *grp_row_ptr = (grp_t.rows.count > 0) ? &grp_t.rows.items[0] : NULL;
+            struct row *grp_row_ptr = (grp_row_count > 0) ? &grp_row_arr[0] : NULL;
             for (uint32_t pc = 0; pc < s->parsed_columns_count; pc++) {
                 struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + pc];
                 if (sc->expr_idx != IDX_NONE) {
@@ -6476,10 +6575,8 @@ int query_group_by(struct table *t, struct query_select *s, struct query_arena *
             int passes = 1;
             if (s->having_expr != IDX_NONE) {
                 /* evaluate expression against having_t (named agg columns) */
-                da_push(&having_t.rows, dst);
                 struct cell hv = eval_expr(s->having_expr, arena, &having_t,
-                                           &having_t.rows.items[having_t.rows.count - 1], NULL, rb);
-                having_t.rows.count--; /* pop without freeing */
+                                           &dst, NULL, rb);
                 passes = !cell_is_null(&hv) && hv.value.as_bool;
                 cell_release_rb(&hv, rb);
             } else {
@@ -6873,8 +6970,12 @@ int query_select_exec(struct table *t, struct query_select *s, struct query_aren
                 size_t id_count = 0;
                 index_lookup(ix, composite, &ids, &id_count);
                 for (size_t k = 0; k < id_count; k++) {
-                    if (ids[k] < t->rows.count)
-                        emit_row(t, s, arena, &t->rows.items[ids[k]], result, select_all, db, rb);
+                    if (ids[k] < t->flat.nrows) {
+                        struct flat_row_ref _iref = flat_row_ref_make(t, ids[k]);
+                        struct row _itmp = {0};
+                        flat_row_ref_to_row(&_iref, &_itmp, &arena->scratch);
+                        emit_row(t, s, arena, &_itmp, result, select_all, db, rb);
+                    }
                 }
                 return 0;
             }
@@ -6883,10 +6984,13 @@ int query_select_exec(struct table *t, struct query_select *s, struct query_aren
 
     /* full scan — collect matching row indices (scratch-allocated) */
     size_t *match_items = (size_t *)bump_alloc(&arena->scratch,
-                           (t->rows.count ? t->rows.count : 1) * sizeof(size_t));
+                           (t->flat.nrows ? t->flat.nrows : 1) * sizeof(size_t));
     size_t match_count = 0;
-    for (size_t i = 0; i < t->rows.count; i++) {
-        if (!row_matches(t, &s->where, arena, &t->rows.items[i], db)) {
+    for (size_t i = 0; i < t->flat.nrows; i++) {
+        struct flat_row_ref _fsref = flat_row_ref_make(t, i);
+        struct row _fstmp = {0};
+        flat_row_ref_to_row(&_fsref, &_fstmp, &arena->scratch);
+        if (!row_matches(t, &s->where, arena, &_fstmp, db)) {
             /* check if row_matches failed due to unknown column error */
             if (arena->errmsg[0]) return -1;
             continue;
@@ -6996,7 +7100,10 @@ int query_select_exec(struct table *t, struct query_select *s, struct query_aren
     /* project into result rows */
     struct rows tmp = {0};
     for (size_t i = 0; i < match_count; i++) {
-        emit_row(t, s, arena, &t->rows.items[match_items[i]], &tmp, select_all, db, rb);
+        struct flat_row_ref _pref = flat_row_ref_make(t, match_items[i]);
+        struct row _ptmp = {0};
+        flat_row_ref_to_row(&_pref, &_ptmp, &arena->scratch);
+        emit_row(t, s, arena, &_ptmp, &tmp, select_all, db, rb);
         if (arena->errmsg[0]) {
             for (size_t ri = 0; ri < tmp.count; ri++)
                 if (!rb) row_free(&tmp.data[ri]);
@@ -7016,8 +7123,10 @@ int query_select_exec(struct table *t, struct query_select *s, struct query_aren
                     /* append expression value as temp column to each result row */
                     int temp_col = (int)(tmp.count > 0 ? tmp.data[0].cells.count : 0);
                     for (size_t ri = 0; ri < match_count && ri < tmp.count; ri++) {
-                        struct cell val = eval_expr(obi->expr_idx, arena, t,
-                                                    &t->rows.items[match_items[ri]], db, rb);
+                        struct flat_row_ref _oref = flat_row_ref_make(t, match_items[ri]);
+                        struct row _otmp = {0};
+                        flat_row_ref_to_row(&_oref, &_otmp, &arena->scratch);
+                        struct cell val = eval_expr(obi->expr_idx, arena, t, &_otmp, db, rb);
                         da_push(&tmp.data[ri].cells, val);
                     }
                     result_ord_cols[k] = temp_col;
@@ -7161,15 +7270,15 @@ static void rebuild_indexes(struct table *t)
         struct index *ix = &t->indexes.items[idx];
         index_reset(ix);
         /* re-insert all rows */
-        for (size_t r = 0; r < t->rows.count; r++) {
+        for (size_t r = 0; r < t->flat.nrows; r++) {
             switch (ix->type) {
             case INDEX_BTREE: {
                 struct cell composite[MAX_INDEX_COLS];
                 int ok = 1;
                 for (int c = 0; c < ix->ncols; c++) {
                     int ci = ix->column_indices[c];
-                    if ((size_t)ci < t->rows.items[r].cells.count)
-                        composite[c] = t->rows.items[r].cells.items[ci];
+                    if (ci >= 0 && (uint16_t)ci < t->flat.ncols)
+                        composite[c] = flat_cell_at(&t->flat, (uint16_t)ci, r);
                     else
                         ok = 0;
                 }
@@ -7178,10 +7287,11 @@ static void rebuild_indexes(struct table *t)
             }
             case INDEX_HNSW: {
                 int ci = ix->hnsw->col_idx;
-                if ((size_t)ci < t->rows.items[r].cells.count &&
-                    !t->rows.items[r].cells.items[ci].is_null &&
-                    t->rows.items[r].cells.items[ci].value.as_vector)
-                    hnsw_insert(ix->hnsw, t->rows.items[r].cells.items[ci].value.as_vector, r);
+                if (ci >= 0 && (uint16_t)ci < t->flat.ncols) {
+                    struct cell _hc = flat_cell_at(&t->flat, (uint16_t)ci, r);
+                    if (!_hc.is_null && _hc.value.as_vector)
+                        hnsw_insert(ix->hnsw, _hc.value.as_vector, r);
+                }
                 break;
             }
             }
@@ -7280,18 +7390,17 @@ static int query_delete_exec(struct table *t, struct query_delete *d, struct que
     int has_ret = (d->has_returning && d->returning_columns.len > 0);
     int return_all = has_ret && sv_eq_cstr(d->returning_columns, "*");
     size_t deleted = 0;
-    for (size_t i = 0; i < t->rows.count; ) {
-        if (row_matches(t, &d->where, arena, &t->rows.items[i], NULL)) {
+    for (size_t i = 0; i < t->flat.nrows; ) {
+        struct flat_row_ref _dref = flat_row_ref_make(t, i);
+        struct row _dtmp = {0};
+        flat_row_ref_to_row(&_dref, &_dtmp, &arena->scratch);
+        if (row_matches(t, &d->where, arena, &_dtmp, NULL)) {
             /* enforce FK constraints before deleting */
-            if (fk_enforce_delete(db, t, &t->rows.items[i], arena) != 0)
+            if (fk_enforce_delete(db, t, &_dtmp, arena) != 0)
                 return -1;
             /* capture row for RETURNING before freeing */
             if (has_ret && result)
-                emit_returning_row(t, &t->rows.items[i], d->returning_columns, return_all, result, rb);
-            row_free(&t->rows.items[i]);
-            for (size_t j = i; j + 1 < t->rows.count; j++)
-                t->rows.items[j] = t->rows.items[j + 1];
-            t->rows.count--;
+                emit_returning_row(t, &_dtmp, d->returning_columns, return_all, result, rb);
             table_flat_delete_row(t, i);
 #ifndef MSKQL_WASM
             if (t->kind == TABLE_DISK) {
@@ -7372,11 +7481,14 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
         }
     }
 
-    size_t scan_count = use_index_scan ? idx_row_count : t->rows.count;
+    size_t scan_count = use_index_scan ? idx_row_count : t->flat.nrows;
     for (size_t si = 0; si < scan_count; si++) {
         size_t i = use_index_scan ? idx_row_ids[si] : si;
-        if (i >= t->rows.count) continue;
-        if (!use_index_scan && !row_matches(t, &u->where, arena, &t->rows.items[i], db))
+        if (i >= t->flat.nrows) continue;
+        struct flat_row_ref _uref = flat_row_ref_make(t, i);
+        struct row _utmp = {0};
+        flat_row_ref_to_row(&_uref, &_utmp, &arena->scratch);
+        if (!use_index_scan && !row_matches(t, &u->where, arena, &_utmp, db))
             continue;
         updated++;
         /* evaluate all SET expressions against the pre-update row snapshot
@@ -7403,7 +7515,7 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                     new_vals[sc].is_null = 1;
                 }
             } else if (scp->expr_idx != IDX_NONE) {
-                new_vals[sc] = eval_expr(scp->expr_idx, arena, t, &t->rows.items[i], db, NULL);
+                new_vals[sc] = eval_expr(scp->expr_idx, arena, t, &_utmp, db, NULL);
             } else {
                 cell_copy(&new_vals[sc], &scp->value);
             }
@@ -7461,8 +7573,8 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                 }
             }
             /* referenced side: if another table references this column, enforce FK action */
-            struct cell *old_val = &t->rows.items[i].cells.items[ci];
-            if (fk_enforce_update(db, t, old_val, &new_vals[sc],
+            struct cell _uold = flat_cell_at(&t->flat, (uint16_t)ci, i);
+            if (fk_enforce_update(db, t, &_uold, &new_vals[sc],
                                    t->columns.items[ci].name, arena) != 0) {
                 for (size_t k = 0; k < nsc; k++) {
                     if (column_type_is_text(new_vals[k].type) && new_vals[k].value.as_text)
@@ -7487,7 +7599,7 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                 /* build old composite key from current row */
                 struct cell old_key[MAX_INDEX_COLS];
                 for (int c = 0; c < idx->ncols; c++)
-                    old_key[c] = t->rows.items[i].cells.items[idx->column_indices[c]];
+                    old_key[c] = flat_cell_at(&t->flat, (uint16_t)idx->column_indices[c], i);
                 index_remove(idx, old_key, i);
                 /* build new composite key: use new_vals where updated, old values otherwise */
                 struct cell new_key[MAX_INDEX_COLS];
@@ -7501,7 +7613,7 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                         }
                     }
                     if (!found)
-                        new_key[c] = t->rows.items[i].cells.items[idx->column_indices[c]];
+                        new_key[c] = flat_cell_at(&t->flat, (uint16_t)idx->column_indices[c], i);
                 }
                 index_insert(idx, new_key, i);
                 break;
@@ -7518,43 +7630,48 @@ static int query_update_exec(struct table *t, struct query_update *u, struct que
                         break;
                     }
                 }
-                if (!new_vec && (size_t)hci < t->rows.items[i].cells.count &&
-                    !t->rows.items[i].cells.items[hci].is_null &&
-                    t->rows.items[i].cells.items[hci].value.as_vector)
-                    new_vec = t->rows.items[i].cells.items[hci].value.as_vector;
+                if (!new_vec && hci >= 0 && (uint16_t)hci < t->flat.ncols) {
+                    struct cell _uhc = flat_cell_at(&t->flat, (uint16_t)hci, i);
+                    if (!_uhc.is_null && _uhc.value.as_vector)
+                        new_vec = _uhc.value.as_vector;
+                }
                 if (new_vec)
                     hnsw_insert(idx->hnsw, new_vec, i);
                 break;
             }
             }
         }
-        /* now apply all new values */
-        for (size_t sc = 0; sc < nsc; sc++) {
-            if (col_idxs[sc] < 0) continue;
-            struct cell *dst = &t->rows.items[i].cells.items[col_idxs[sc]];
-            if (column_type_is_text(dst->type) && dst->value.as_text)
-                free(dst->value.as_text);
-            *dst = new_vals[sc];
+        /* (new values already in new_vals[]; applied to flat below) */
+        /* Build a temporary row from new_vals and patch flat directly */
+        {
+            struct row _upatch = {0};
+            da_init(&_upatch.cells);
+            for (uint16_t c2 = 0; c2 < t->flat.ncols; c2++) {
+                struct cell cv = flat_cell_at(&t->flat, c2, i);
+                for (size_t sc = 0; sc < nsc; sc++) {
+                    if (col_idxs[sc] == (int)c2) { cv = new_vals[sc]; break; }
+                }
+                da_push(&_upatch.cells, cv);
+            }
+            table_flat_update_row(t, i, &_upatch);
+            if (!rb) row_free(&_upatch); else da_free(&_upatch.cells);
         }
         /* enforce CHECK constraints on the updated row */
-        if (check_constraints_ok(t, &t->rows.items[i], arena, db) != 0)
+        { struct flat_row_ref _uchk = flat_row_ref_make(t, i); flat_row_ref_to_row(&_uchk, &_utmp, &arena->scratch); }
+        if (check_constraints_ok(t, &_utmp, arena, db) != 0)
             return -1;
         /* capture row for RETURNING after SET */
-        if (has_ret && result)
-            emit_returning_row(t, &t->rows.items[i], u->returning_columns, return_all, result, rb);
+        if (has_ret && result) {
+            struct flat_row_ref _ufref = flat_row_ref_make(t, i);
+            struct row _ufrow = {0};
+            flat_row_ref_to_row(&_ufref, &_ufrow, &arena->scratch);
+            emit_returning_row(t, &_ufrow, u->returning_columns, return_all, result, rb);
+        }
     }
-    /* bump generation (no full index rebuild needed — indexes updated incrementally) */
+    /* bump generation */
     if (updated > 0) {
         t->generation++;
         db->total_generation++;
-        /* patch flat storage and scan cache in-place for each updated row */
-        size_t scan2_count = use_index_scan ? idx_row_count : t->rows.count;
-        for (size_t si2 = 0; si2 < scan2_count; si2++) {
-            size_t ri = use_index_scan ? idx_row_ids[si2] : si2;
-            if (ri < t->rows.count) {
-                table_flat_update_row(t, ri, &t->rows.items[ri]);
-            }
-        }
         /* Mark disk table dirty so compaction rewrites the base file */
         if (t->kind == TABLE_DISK)
             t->disk.wal_dirty = 1;
@@ -7591,8 +7708,9 @@ static int fk_check_value_exists(struct database *db, const char *ref_table_name
         }
     }
     if (col_idx < 0) return 0;
-    for (size_t r = 0; r < ref_t->rows.count; r++) {
-        if (cell_compare(value, &ref_t->rows.items[r].cells.items[col_idx]) == 0)
+    for (size_t r = 0; r < ref_t->flat.nrows; r++) {
+        struct cell cv = flat_cell_at(&ref_t->flat, (uint16_t)col_idx, r);
+        if (cell_compare(value, &cv) == 0)
             return 1;
     }
     return 0;
@@ -7625,9 +7743,9 @@ static int fk_enforce_delete(struct database *db, struct table *parent_t,
             enum fk_action action = col->fk_on_delete;
 
             /* Scan child rows for matches */
-            for (size_t r = 0; r < child_t->rows.count; ) {
-                struct cell *child_val = &child_t->rows.items[r].cells.items[ci];
-                if (child_val->is_null || cell_compare(parent_val, child_val) != 0) {
+            for (size_t r = 0; r < child_t->flat.nrows; ) {
+                struct cell child_cv = flat_cell_at(&child_t->flat, (uint16_t)ci, r);
+                if (child_cv.is_null || cell_compare(parent_val, &child_cv) != 0) {
                     r++;
                     continue;
                 }
@@ -7640,37 +7758,44 @@ static int fk_enforce_delete(struct database *db, struct table *parent_t,
                             parent_t->name, child_t->name);
                         return -1;
                     case FK_CASCADE:
-                        row_free(&child_t->rows.items[r]);
-                        memmove(&child_t->rows.items[r],
-                                &child_t->rows.items[r + 1],
-                                (child_t->rows.count - r - 1) * sizeof(struct row));
-                        child_t->rows.count--;
                         table_flat_delete_row(child_t, r);
                         child_t->generation++;
                         db->total_generation++;
                         continue; /* don't increment r */
-                    case FK_SET_NULL:
-                        cell_free_text(child_val);
-                        memset(&child_val->value, 0, sizeof(child_val->value));
-                        child_val->is_null = 1;
-                        table_flat_update_row(child_t, r, &child_t->rows.items[r]);
-                        child_t->generation++;
-                        db->total_generation++;
-                        r++;
-                        break;
-                    case FK_SET_DEFAULT:
-                        cell_free_text(child_val);
-                        if (col->has_default && col->default_value) {
-                            cell_copy(child_val, col->default_value);
-                        } else {
-                            memset(&child_val->value, 0, sizeof(child_val->value));
-                            child_val->is_null = 1;
+                    case FK_SET_NULL: {
+                        struct row _fkr = {0};
+                        da_init(&_fkr.cells);
+                        for (uint16_t fc = 0; fc < child_t->flat.ncols; fc++) {
+                            struct cell fv = flat_cell_at(&child_t->flat, fc, r);
+                            if (fc == (uint16_t)ci) { fv.is_null = 1; memset(&fv.value, 0, sizeof(fv.value)); }
+                            da_push(&_fkr.cells, fv);
                         }
-                        table_flat_update_row(child_t, r, &child_t->rows.items[r]);
+                        table_flat_update_row(child_t, r, &_fkr);
+                        da_free(&_fkr.cells);
                         child_t->generation++;
                         db->total_generation++;
                         r++;
                         break;
+                    }
+                    case FK_SET_DEFAULT: {
+                        struct row _fkr = {0};
+                        da_init(&_fkr.cells);
+                        for (uint16_t fc = 0; fc < child_t->flat.ncols; fc++) {
+                            struct cell fv = flat_cell_at(&child_t->flat, fc, r);
+                            if (fc == (uint16_t)ci) {
+                                if (col->has_default && col->default_value)
+                                    cell_copy(&fv, col->default_value);
+                                else { fv.is_null = 1; memset(&fv.value, 0, sizeof(fv.value)); }
+                            }
+                            da_push(&_fkr.cells, fv);
+                        }
+                        table_flat_update_row(child_t, r, &_fkr);
+                        da_free(&_fkr.cells);
+                        child_t->generation++;
+                        db->total_generation++;
+                        r++;
+                        break;
+                    }
                 }
             }
         }
@@ -7699,11 +7824,11 @@ static int fk_enforce_update(struct database *db, struct table *parent_t,
 
             enum fk_action action = col->fk_on_update;
 
-            for (size_t r = 0; r < child_t->rows.count; r++) {
-                struct cell *child_val = &child_t->rows.items[r].cells.items[ci];
-                if (child_val->is_null || cell_compare(old_val, child_val) != 0)
+            for (size_t r = 0; r < child_t->flat.nrows; r++) {
+                struct cell child_cv = flat_cell_at(&child_t->flat, (uint16_t)ci, r);
+                if (child_cv.is_null || cell_compare(old_val, &child_cv) != 0)
                     continue;
-                /* Match found — apply action */
+                /* Match found — build patched row and apply action */
                 switch (action) {
                     case FK_NO_ACTION:
                     case FK_RESTRICT:
@@ -7712,32 +7837,32 @@ static int fk_enforce_update(struct database *db, struct table *parent_t,
                             parent_t->name, child_t->name);
                         return -1;
                     case FK_CASCADE:
-                        cell_free_text(child_val);
-                        cell_copy(child_val, new_val);
-                        table_flat_update_row(child_t, r, &child_t->rows.items[r]);
-                        child_t->generation++;
-                        db->total_generation++;
-                        break;
                     case FK_SET_NULL:
-                        cell_free_text(child_val);
-                        memset(&child_val->value, 0, sizeof(child_val->value));
-                        child_val->is_null = 1;
-                        table_flat_update_row(child_t, r, &child_t->rows.items[r]);
-                        child_t->generation++;
-                        db->total_generation++;
-                        break;
-                    case FK_SET_DEFAULT:
-                        cell_free_text(child_val);
-                        if (col->has_default && col->default_value) {
-                            cell_copy(child_val, col->default_value);
-                        } else {
-                            memset(&child_val->value, 0, sizeof(child_val->value));
-                            child_val->is_null = 1;
+                    case FK_SET_DEFAULT: {
+                        struct row _fkr = {0};
+                        da_init(&_fkr.cells);
+                        for (uint16_t fc = 0; fc < child_t->flat.ncols; fc++) {
+                            struct cell fv = flat_cell_at(&child_t->flat, fc, r);
+                            if (fc == (uint16_t)ci) {
+                                if (action == FK_CASCADE)
+                                    cell_copy(&fv, new_val);
+                                else if (action == FK_SET_NULL) {
+                                    fv.is_null = 1;
+                                    memset(&fv.value, 0, sizeof(fv.value));
+                                } else {
+                                    if (col->has_default && col->default_value)
+                                        cell_copy(&fv, col->default_value);
+                                    else { fv.is_null = 1; memset(&fv.value, 0, sizeof(fv.value)); }
+                                }
+                            }
+                            da_push(&_fkr.cells, fv);
                         }
-                        table_flat_update_row(child_t, r, &child_t->rows.items[r]);
+                        table_flat_update_row(child_t, r, &_fkr);
+                        da_free(&_fkr.cells);
                         child_t->generation++;
                         db->total_generation++;
                         break;
+                    }
                 }
             }
         }
@@ -7798,17 +7923,6 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
     int has_returning = (ins->returning_columns.len > 0);
     int return_all = has_returning && sv_eq_cstr(ins->returning_columns, "*");
 
-    /* Pre-grow rows DA to avoid per-row reallocation */
-    if (ins->insert_rows_count > 1) {
-        size_t needed = t->rows.count + ins->insert_rows_count;
-        if (needed > t->rows.capacity) {
-            size_t new_cap = t->rows.capacity ? t->rows.capacity : 8;
-            while (new_cap < needed) new_cap *= 2;
-            t->rows.items = realloc(t->rows.items, new_cap * sizeof(t->rows.items[0]));
-            t->rows.capacity = new_cap;
-        }
-    }
-
     /* Pre-grow flat_table to avoid per-row reallocs in table_flat_append_row */
     if (ins->insert_rows_count > 1) {
         if (t->flat.ncols == 0 && t->columns.count > 0)
@@ -7820,9 +7934,6 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
             flat_table_grow(&t->flat, new_cap);
         }
     }
-
-    /* Track start of newly inserted rows for deferred bulk flat append */
-    size_t rows_before = t->rows.count;
 
     /* Validate column count vs value count */
     if (ins->insert_rows_count > 0 && !ins->is_default_values) {
@@ -8121,9 +8232,9 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                     }
                 }
                 if (!used_index) {
-                    for (size_t ri = 0; ri < t->rows.count; ri++) {
-                        struct cell *existing = &t->rows.items[ri].cells.items[i];
-                        if (cell_compare(new_c, existing) == 0) {
+                    for (size_t ri = 0; ri < t->flat.nrows; ri++) {
+                        struct cell existing = flat_cell_at(&t->flat, (uint16_t)i, ri);
+                        if (cell_compare(new_c, &existing) == 0) {
                             arena_set_error(arena, "23505", "UNIQUE constraint violated for column '%s'", t->columns.items[i].name);
                             row_free(&copy);
                             return -1;
@@ -8198,10 +8309,12 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
             row_free(&copy);
             return -1;
         }
-        da_push(&t->rows, copy);
+        /* append to flat storage and free the heap-owned copy */
+        table_flat_append_row(t, &copy);
+        size_t new_row_id = t->flat.nrows - 1;
+        row_free(&copy);
 
         /* update indexes */
-        size_t new_row_id = t->rows.count - 1;
         for (size_t ix = 0; ix < t->indexes.count; ix++) {
             struct index *idx = &t->indexes.items[ix];
             switch (idx->type) {
@@ -8210,8 +8323,8 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
                 int ok = 1;
                 for (int c = 0; c < idx->ncols; c++) {
                     int ci2 = idx->column_indices[c];
-                    if (ci2 >= 0 && (size_t)ci2 < t->rows.items[new_row_id].cells.count)
-                        composite[c] = t->rows.items[new_row_id].cells.items[ci2];
+                    if (ci2 >= 0 && (uint16_t)ci2 < t->flat.ncols)
+                        composite[c] = flat_cell_at(&t->flat, (uint16_t)ci2, new_row_id);
                     else
                         ok = 0;
                 }
@@ -8220,29 +8333,32 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
             }
             case INDEX_HNSW: {
                 int hci = idx->hnsw->col_idx;
-                if (hci >= 0 && (size_t)hci < t->rows.items[new_row_id].cells.count &&
-                    !t->rows.items[new_row_id].cells.items[hci].is_null &&
-                    t->rows.items[new_row_id].cells.items[hci].value.as_vector)
-                    hnsw_insert(idx->hnsw, t->rows.items[new_row_id].cells.items[hci].value.as_vector, new_row_id);
+                if (hci >= 0 && (uint16_t)hci < t->flat.ncols) {
+                    struct cell hcv = flat_cell_at(&t->flat, (uint16_t)hci, new_row_id);
+                    if (!hcv.is_null && hcv.value.as_vector)
+                        hnsw_insert(idx->hnsw, hcv.value.as_vector, new_row_id);
+                }
                 break;
             }
             }
         }
 
-        if (has_returning && result)
-            emit_returning_row(t, &t->rows.items[t->rows.count - 1], ins->returning_columns, return_all, result, rb);
-    }
+        if (has_returning && result) {
+            struct flat_row_ref _rref = flat_row_ref_make(t, new_row_id);
+            struct row _rrow = {0};
+            flat_row_ref_to_row(&_rref, &_rrow, &arena->scratch);
+            emit_returning_row(t, &_rrow, ins->returning_columns, return_all, result, rb);
+        }
 
-    /* Batch flat append — single bulk operation for all newly inserted rows */
-    size_t rows_added = t->rows.count - rows_before;
-    if (rows_added > 0) {
-        table_flat_append_rows_bulk(t, &t->rows.items[rows_before], rows_added);
-        /* For disk tables, also write to WAL */
+        /* For disk tables, write to WAL per-row */
 #ifndef MSKQL_WASM
         if (t->kind == TABLE_DISK) {
+            struct flat_row_ref _wref = flat_row_ref_make(t, new_row_id);
+            struct row _wrow = {0};
+            flat_row_ref_to_row(&_wref, &_wrow, &arena->scratch);
             int wb = disk_wal_append_insert(t->disk.dir_path,
-                                            &t->rows.items[rows_before],
-                                            rows_added, t->columns.items,
+                                            &_wrow, 1,
+                                            t->columns.items,
                                             (uint16_t)t->columns.count);
             if (wb > 0) {
                 t->disk.wal_bytes += (uint64_t)wb;
@@ -8250,6 +8366,9 @@ static int query_insert_exec(struct table *t, struct query_insert *ins, struct q
             }
         }
 #endif /* MSKQL_WASM */
+    }
+
+    if (ins->insert_rows_count > 0) {
         t->generation++;
         db->total_generation++;
     }

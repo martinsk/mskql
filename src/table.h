@@ -61,9 +61,6 @@ struct table {
     DYNAMIC_ARRAY(struct column) columns; /* schema — shared by all non-view kinds */
     uint64_t generation;       /* bumped on every INSERT/UPDATE/DELETE for scan cache invalidation */
 
-    /* Row/columnar storage — used by TABLE_MEMORY natively and by TABLE_PARQUET
-     * after legacy-executor materialization (parquet_materialize). */
-    DYNAMIC_ARRAY(struct row) rows;
     DYNAMIC_ARRAY(struct index) indexes;
     struct flat_table flat;    /* primary columnar storage */
     struct join_cache join_cache;
@@ -112,8 +109,9 @@ void table_flat_delete_row(struct table *t, size_t row_idx);
  * rows[0..count) must each have cells.count >= t->columns.count. */
 void table_flat_append_rows_bulk(struct table *t, struct row *rows, size_t count);
 
-/* Rebuild t->flat entirely from t->rows (used after schema changes like ALTER). */
-void table_flat_rebuild_from_rows(struct table *t);
+/* Read one cell from the flat store at (col, row_idx).
+ * Returns a struct cell by value; caller owns nothing (text ptr aliases flat). */
+struct cell flat_cell_at_pub(const struct flat_table *ft, uint16_t c, size_t ri);
 
 /* column lookup — exact match first, then strips "table." prefix and retries */
 #include "stringview.h"

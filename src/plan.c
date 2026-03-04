@@ -8153,40 +8153,69 @@ static int gen_series_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
     uint16_t count = 0;
     long long v = st->current;
 
+    /* generate_series never produces NULLs — zero the null array once up front
+     * so the fill loops below are free of interleaved null stores, allowing the
+     * compiler to auto-vectorize the arithmetic fill. */
+    memset(out->cols[0].nulls, 0, BLOCK_CAPACITY);
+
     if (use_bigint) {
         int64_t *dst = out->cols[0].data.i64;
-        uint8_t *nul = out->cols[0].nulls;
         if (step > 0) {
-            while (v <= stop && count < BLOCK_CAPACITY) {
-                dst[count] = (int64_t)v;
-                nul[count] = 0;
-                count++;
-                v += step;
+            /* Full-block fast path: when this block will be completely filled,
+             * skip the per-iteration bound check (common case for long series). */
+            if (v + (long long)BLOCK_CAPACITY * step <= stop + step) {
+                for (uint16_t i = 0; i < BLOCK_CAPACITY; i++) {
+                    dst[i] = (int64_t)v;
+                    v += step;
+                }
+                count = BLOCK_CAPACITY;
+            } else {
+                while (v <= stop && count < BLOCK_CAPACITY) {
+                    dst[count++] = (int64_t)v;
+                    v += step;
+                }
             }
         } else {
-            while (v >= stop && count < BLOCK_CAPACITY) {
-                dst[count] = (int64_t)v;
-                nul[count] = 0;
-                count++;
-                v += step;
+            if (v + (long long)BLOCK_CAPACITY * step >= stop + step) {
+                for (uint16_t i = 0; i < BLOCK_CAPACITY; i++) {
+                    dst[i] = (int64_t)v;
+                    v += step;
+                }
+                count = BLOCK_CAPACITY;
+            } else {
+                while (v >= stop && count < BLOCK_CAPACITY) {
+                    dst[count++] = (int64_t)v;
+                    v += step;
+                }
             }
         }
     } else {
         int32_t *dst = out->cols[0].data.i32;
-        uint8_t *nul = out->cols[0].nulls;
         if (step > 0) {
-            while (v <= stop && count < BLOCK_CAPACITY) {
-                dst[count] = (int32_t)v;
-                nul[count] = 0;
-                count++;
-                v += step;
+            if (v + (long long)BLOCK_CAPACITY * step <= stop + step) {
+                for (uint16_t i = 0; i < BLOCK_CAPACITY; i++) {
+                    dst[i] = (int32_t)v;
+                    v += step;
+                }
+                count = BLOCK_CAPACITY;
+            } else {
+                while (v <= stop && count < BLOCK_CAPACITY) {
+                    dst[count++] = (int32_t)v;
+                    v += step;
+                }
             }
         } else {
-            while (v >= stop && count < BLOCK_CAPACITY) {
-                dst[count] = (int32_t)v;
-                nul[count] = 0;
-                count++;
-                v += step;
+            if (v + (long long)BLOCK_CAPACITY * step >= stop + step) {
+                for (uint16_t i = 0; i < BLOCK_CAPACITY; i++) {
+                    dst[i] = (int32_t)v;
+                    v += step;
+                }
+                count = BLOCK_CAPACITY;
+            } else {
+                while (v >= stop && count < BLOCK_CAPACITY) {
+                    dst[count++] = (int32_t)v;
+                    v += step;
+                }
             }
         }
     }
@@ -9180,14 +9209,8 @@ static uint32_t build_limit(uint32_t current, struct query_select *s,
  * Returns 1 if mixed types detected, 0 if safe for plan executor. */
 static int table_has_mixed_types(struct table *tbl)
 {
-    if (tbl->rows.count == 0) return 0;
-    struct row *first = &tbl->rows.items[0];
-    for (size_t c = 0; c < first->cells.count && c < tbl->columns.count; c++) {
-        if (!first->cells.items[c].is_null &&
-            first->cells.items[c].type != tbl->columns.items[c].type)
-            return 1;
-    }
-    return 0;
+    (void)tbl;
+    return 0; /* flat storage always uses canonical column types */
 }
 
 /* Append a PLAN_PROJECT node with a pre-resolved column map.
@@ -9225,7 +9248,7 @@ static uint32_t build_seq_scan(struct table *tbl, struct query_arena *arena)
     PLAN_NODE(arena, scan_idx).seq_scan.table = tbl;
     PLAN_NODE(arena, scan_idx).seq_scan.ncols = ncols;
     PLAN_NODE(arena, scan_idx).seq_scan.col_map = col_map;
-    PLAN_NODE(arena, scan_idx).est_rows = (double)tbl->rows.count;
+    PLAN_NODE(arena, scan_idx).est_rows = (double)tbl->flat.nrows;
     return scan_idx;
 }
 
@@ -10576,7 +10599,7 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
                 PLAN_NODE(arena, scan_nodes[ti]).seq_scan.table = tables[ti];
                 PLAN_NODE(arena, scan_nodes[ti]).seq_scan.ncols = new_ncols[ti];
                 PLAN_NODE(arena, scan_nodes[ti]).seq_scan.col_map = col_map;
-                PLAN_NODE(arena, scan_nodes[ti]).est_rows = (double)tables[ti]->rows.count;
+                PLAN_NODE(arena, scan_nodes[ti]).est_rows = (double)tables[ti]->flat.nrows;
             }
         } else {
             scan_nodes[ti] = build_seq_scan(tables[ti], arena);
@@ -12419,7 +12442,7 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
             PLAN_NODE(arena, scan_idx).seq_scan.table = t;
             PLAN_NODE(arena, scan_idx).seq_scan.ncols = needed_count;
             PLAN_NODE(arena, scan_idx).seq_scan.col_map = col_map;
-            PLAN_NODE(arena, scan_idx).est_rows = (double)t->rows.count;
+            PLAN_NODE(arena, scan_idx).est_rows = (double)t->flat.nrows;
         }
 
         /* Remap group key column indices */

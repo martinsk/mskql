@@ -522,8 +522,16 @@ static char *substitute_params(const char *sql, const char **param_values,
                     is_numeric = 0;
                 }
                 if (!has_digit) is_numeric = 0;
-                /* also treat 't'/'f' as boolean literals */
-                int is_bool = (vlen == 1 && (val[0] == 't' || val[0] == 'f'));
+                /* also treat 't'/'f'/'true'/'false'/'yes'/'no' as boolean literals */
+                int is_bool = (vlen == 1 && (val[0] == 't' || val[0] == 'f')) ||
+                              (vlen == 4 && strncasecmp(val, "true", 4) == 0) ||
+                              (vlen == 5 && strncasecmp(val, "false", 5) == 0) ||
+                              (vlen == 3 && strncasecmp(val, "yes", 3) == 0) ||
+                              (vlen == 2 && strncasecmp(val, "no", 2) == 0);
+                int bool_true = is_bool && !(
+                    (vlen == 1 && val[0] == 'f') ||
+                    (vlen == 5 && strncasecmp(val, "false", 5) == 0) ||
+                    (vlen == 2 && strncasecmp(val, "no", 2) == 0));
 
                 if (is_numeric && vlen > 0 && !(vlen == 1 && val[0] == '-')) {
                     /* numeric — insert without quotes */
@@ -532,8 +540,8 @@ static char *substitute_params(const char *sql, const char **param_values,
                     pos += vlen;
                 } else if (is_bool) {
                     /* boolean — insert as TRUE/FALSE */
-                    const char *bval = (val[0] == 't') ? "TRUE" : "FALSE";
-                    size_t blen = (val[0] == 't') ? 4 : 5;
+                    const char *bval = bool_true ? "TRUE" : "FALSE";
+                    size_t blen = bool_true ? 4 : 5;
                     if (pos + blen + 1 > est) { est = (pos + blen + 1) * 2; char *tmp = realloc(out, est); if (!tmp) { free(out); return NULL; } out = tmp; }
                     memcpy(out + pos, bval, blen);
                     pos += blen;
@@ -3089,14 +3097,15 @@ static int handle_copy_to_stdout(int fd, struct database *db, struct query *q,
         msg_send(fd, 'd', m);
     }
     /* Data rows */
-    for (size_t r = 0; r < ct->rows.count; r++) {
-        struct row *row = &ct->rows.items[r];
+    for (size_t r = 0; r < ct->flat.nrows; r++) {
         m->len = 0;
         for (uint16_t c = 0; c < ncols; c++) {
             if (c > 0) msgbuf_push_byte(m, (uint8_t)delim);
             int ci = col_idxs[c];
-            struct cell *cell = (ci < (int)row->cells.count) ? &row->cells.items[ci] : NULL;
-            if (!cell) cell = &row->cells.items[0]; /* fallback — shouldn't happen */
+            struct cell _cv = (ci >= 0 && (uint16_t)ci < ct->flat.ncols)
+                ? flat_cell_at_pub(&ct->flat, (uint16_t)ci, r)
+                : (struct cell){.is_null = 1};
+            struct cell *cell = &_cv;
             if (cell->is_null || (column_type_is_text(cell->type) && !cell->value.as_text)) {
                 if (q->copy.is_csv) {
                     /* CSV: empty field for NULL */
@@ -3158,7 +3167,7 @@ static int handle_copy_to_stdout(int fd, struct database *db, struct query *q,
     m->len = 0;
     msg_send(fd, 'c', m);
     char tag[128];
-    snprintf(tag, sizeof(tag), "COPY %zu", ct->rows.count);
+    snprintf(tag, sizeof(tag), "COPY %zu", ct->flat.nrows);
     send_command_complete(fd, m, tag);
     return 0;
 }
@@ -3608,8 +3617,8 @@ static void copy_in_process_line(struct client_state *c, struct database *db, co
         }
         da_push(&new_row.cells, cell);
     }
-    da_push(&ct->rows, new_row);
-    table_flat_append_row(ct, &ct->rows.items[ct->rows.count - 1]);
+    table_flat_append_row(ct, &new_row);
+    row_free(&new_row);
     ct->generation++;
     db->total_generation++;
     c->copy_in_row_count++;

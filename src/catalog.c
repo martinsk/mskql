@@ -87,8 +87,8 @@ static void push_row(struct table *t, struct cell *cells, size_t ncols)
     struct row r = {0};
     for (size_t i = 0; i < ncols; i++)
         da_push(&r.cells, cells[i]);
-    da_push(&t->rows, r);
-    table_flat_append_row(t, &t->rows.items[t->rows.count - 1]);
+    table_flat_append_row(t, &r);
+    da_free(&r.cells);
 }
 
 /* Remove existing catalog table by name if it exists */
@@ -222,7 +222,7 @@ static void build_pg_class(struct database *db)
             int_cell(2200), /* public namespace */
             text_cell(rk),
             int_cell(10), /* owner */
-            int_cell((int)ut->rows.count),
+            int_cell((int)ut->flat.nrows),
             bool_cell(has_idx),
             int_cell((int)ut->columns.count),
             int_cell(2), /* relam: heap */

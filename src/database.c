@@ -99,8 +99,8 @@ int db_table_exec_query(struct database *db, sv table_name,
         snapshot_cow_table(db->active_txn->snapshot, db, t->name);
     }
 #ifndef MSKQL_WASM
-    /* Materialize Parquet data for legacy executor fallback */
-    if (t->kind == TABLE_PARQUET && t->rows.count == 0)
+    /* Materialize Parquet data into flat storage */
+    if (t->kind == TABLE_PARQUET && t->flat.nrows == 0)
         parquet_materialize(t);
 #endif
     return query_exec(t, q, result, db, rb);
@@ -158,6 +158,42 @@ static int cmp_rows_join(const void *a, const void *b)
 }
 
 /* cells_equal → use shared cell_equal from row.h */
+
+/* Materialise t->flat into a heap-owned array of struct row.
+ * Falls back to t->rows when flat is empty (e.g. virtual merged_t in join chains).
+ * Returns a malloc'd array of *nrows_out rows; caller must call
+ * flat_snap_free(snap, nrows) when done.
+ * NOTE: when falling back to t->rows, cells are shallow-copied (no strdup).
+ * The snap array itself is heap-allocated but cells alias t->rows strings.
+ * flat_snap_free is safe because row_free only frees text when as_text != NULL,
+ * but we zero out text pointers in the fallback path to avoid double-free. */
+static struct row *flat_snap(const struct table *t, size_t *nrows_out)
+{
+    size_t n = t->flat.nrows;
+    if (n > 0) {
+        *nrows_out = n;
+        struct row *snap = malloc(n * sizeof(struct row));
+        for (size_t ri = 0; ri < n; ri++) {
+            da_init(&snap[ri].cells);
+            for (uint16_t c = 0; c < t->flat.ncols; c++) {
+                struct cell cv = flat_cell_at_pub(&t->flat, c, ri);
+                struct cell owned = cv;
+                if (column_type_is_text(cv.type) && cv.value.as_text)
+                    owned.value.as_text = strdup(cv.value.as_text);
+                da_push(&snap[ri].cells, owned);
+            }
+        }
+        return snap;
+    }
+    *nrows_out = 0;
+    return NULL;
+}
+
+static void flat_snap_free(struct row *snap, size_t n)
+{
+    for (size_t i = 0; i < n; i++) row_free(&snap[i]);
+    free(snap);
+}
 
 static void emit_merged_row(struct row *r1, size_t ncols1,
                             struct row *r2, size_t ncols2,
@@ -371,31 +407,37 @@ static int do_single_join(struct table *t1, const char *alias1,
     size_t ncols1 = t1->columns.count;
     size_t ncols2 = t2->columns.count;
 
+    /* Snapshot both tables from flat storage */
+    size_t n1 = 0, n2 = 0;
+    struct row *s1 = flat_snap(t1, &n1);
+    struct row *s2 = flat_snap(t2, &n2);
+
     /* CROSS JOIN (type 4): cartesian product, no join columns */
     if (join_type == 4) {
         size_t max_join_rows = 10000000;
         size_t emitted = 0;
-        for (size_t i = 0; i < t1->rows.count; i++) {
-            for (size_t j = 0; j < t2->rows.count; j++) {
+        for (size_t i = 0; i < n1; i++) {
+            for (size_t j = 0; j < n2; j++) {
                 if (emitted >= max_join_rows) {
                     arena_set_error(arena, "54000", "join result exceeds maximum row count (10000000)");
                     build_merged_columns_ex(t1, alias1, t2, alias2, out_meta);
+                    flat_snap_free(s1, n1); flat_snap_free(s2, n2);
                     return -1;
                 }
-                emit_merged_row(&t1->rows.items[i], ncols1,
-                                &t2->rows.items[j], ncols2, out_rows, rb);
+                emit_merged_row(&s1[i], ncols1, &s2[j], ncols2, out_rows, rb);
                 emitted++;
             }
         }
         build_merged_columns_ex(t1, alias1, t2, alias2, out_meta);
+        flat_snap_free(s1, n1); flat_snap_free(s2, n2);
         return 0;
     }
 
     /* build merged column metadata first (needed for condition evaluation) */
     build_merged_columns_ex(t1, alias1, t2, alias2, out_meta);
 
-    int *t1_matched = bump_calloc(&arena->scratch, t1->rows.count, sizeof(int));
-    int *t2_matched = bump_calloc(&arena->scratch, t2->rows.count, sizeof(int));
+    int *t1_matched = bump_calloc(&arena->scratch, n1 ? n1 : 1, sizeof(int));
+    int *t2_matched = bump_calloc(&arena->scratch, n2 ? n2 : 1, sizeof(int));
 
     /* Try to extract simple equi-join column indices for hash join.
      * Works for both the join_on_cond path (single COND_COMPARE EQ with
@@ -438,48 +480,44 @@ static int do_single_join(struct table *t1, const char *alias1,
             use_hash_join = 1;
         else {
             arena_set_error(arena, "42703", "join error: could not resolve ON columns");
+            flat_snap_free(s1, n1); flat_snap_free(s2, n2);
             return -1;
         }
     }
     /* else: join_on_cond is a compound condition — use nested-loop eval_condition path */
 
-    /* If join_on_cond is set but not a simple single-equality (so use_hash_join=0),
-     * fall through to the join_on_cond nested-loop path below. */
-
     if (use_hash_join) {
-        /* Hash join: build on t2 (typically smaller), probe with t1 */
-        size_t build_n = t2->rows.count;
+        /* Hash join: build on s2 (typically smaller), probe with s1 */
         uint32_t nbuckets = 1;
-        while (nbuckets < build_n * 2) nbuckets <<= 1;
+        while (nbuckets < n2 * 2) nbuckets <<= 1;
 
         uint32_t *ht_buckets = bump_calloc(&arena->scratch, nbuckets, sizeof(uint32_t));
-        uint32_t *ht_nexts = bump_calloc(&arena->scratch, build_n ? build_n : 1, sizeof(uint32_t));
-        uint32_t *ht_hashes = bump_calloc(&arena->scratch, build_n ? build_n : 1, sizeof(uint32_t));
+        uint32_t *ht_nexts   = bump_calloc(&arena->scratch, n2 ? n2 : 1, sizeof(uint32_t));
+        uint32_t *ht_hashes  = bump_calloc(&arena->scratch, n2 ? n2 : 1, sizeof(uint32_t));
         memset(ht_buckets, 0xFF, nbuckets * sizeof(uint32_t)); /* IDX_NONE */
 
-        /* build phase: hash t2 join column */
-        for (size_t j = 0; j < build_n; j++) {
-            uint32_t h = cell_hash(&t2->rows.items[j].cells.items[hj_t2_col]);
+        /* build phase: hash s2 join column */
+        for (size_t j = 0; j < n2; j++) {
+            uint32_t h = cell_hash(&s2[j].cells.items[hj_t2_col]);
             uint32_t bucket = h & (nbuckets - 1);
             ht_hashes[j] = h;
             ht_nexts[j] = ht_buckets[bucket];
             ht_buckets[bucket] = (uint32_t)j;
         }
 
-        /* probe phase: for each t1 row, look up in hash table */
-        for (size_t i = 0; i < t1->rows.count; i++) {
-            struct cell *probe = &t1->rows.items[i].cells.items[hj_t1_col];
+        /* probe phase: for each s1 row, look up in hash table */
+        for (size_t i = 0; i < n1; i++) {
+            struct cell *probe = &s1[i].cells.items[hj_t1_col];
             uint32_t h = cell_hash(probe);
             uint32_t bucket = h & (nbuckets - 1);
             uint32_t entry = ht_buckets[bucket];
 
             while (entry != 0xFFFFFFFF) {
                 if (ht_hashes[entry] == h &&
-                    cell_equal(probe, &t2->rows.items[entry].cells.items[hj_t2_col])) {
+                    cell_equal(probe, &s2[entry].cells.items[hj_t2_col])) {
                     t1_matched[i] = 1;
                     t2_matched[entry] = 1;
-                    emit_merged_row(&t1->rows.items[i], ncols1,
-                                    &t2->rows.items[entry], ncols2, out_rows, rb);
+                    emit_merged_row(&s1[i], ncols1, &s2[entry], ncols2, out_rows, rb);
                 }
                 entry = ht_nexts[entry];
             }
@@ -487,22 +525,20 @@ static int do_single_join(struct table *t1, const char *alias1,
 
     } else if (join_on_cond != IDX_NONE && arena) {
         /* complex ON condition: nested-loop fallback with eval_condition */
-        for (size_t i = 0; i < t1->rows.count; i++) {
-            struct row *r1 = &t1->rows.items[i];
-            for (size_t j = 0; j < t2->rows.count; j++) {
-                struct row *r2 = &t2->rows.items[j];
+        for (size_t i = 0; i < n1; i++) {
+            for (size_t j = 0; j < n2; j++) {
                 struct row tmp = {0};
                 da_init(&tmp.cells);
                 for (size_t c = 0; c < ncols1; c++)
-                    da_push(&tmp.cells, r1->cells.items[c]);
+                    da_push(&tmp.cells, s1[i].cells.items[c]);
                 for (size_t c = 0; c < ncols2; c++)
-                    da_push(&tmp.cells, r2->cells.items[c]);
+                    da_push(&tmp.cells, s2[j].cells.items[c]);
                 int match = eval_condition(join_on_cond, arena, &tmp, out_meta, NULL);
                 da_free(&tmp.cells);
                 if (!match) continue;
                 t1_matched[i] = 1;
                 t2_matched[j] = 1;
-                emit_merged_row(r1, ncols1, r2, ncols2, out_rows, rb);
+                emit_merged_row(&s1[i], ncols1, &s2[j], ncols2, out_rows, rb);
             }
         }
     } else {
@@ -517,38 +553,40 @@ static int do_single_join(struct table *t1, const char *alias1,
 
         if (t1_join_col < 0 || t2_join_col < 0) {
             arena_set_error(arena, "42703", "join error: could not resolve ON columns");
+            flat_snap_free(s1, n1); flat_snap_free(s2, n2);
             return -1;
         }
 
-        for (size_t i = 0; i < t1->rows.count; i++) {
-            struct row *r1 = &t1->rows.items[i];
-            for (size_t j = 0; j < t2->rows.count; j++) {
-                struct row *r2 = &t2->rows.items[j];
-                if (!join_cmp_match(&r1->cells.items[t1_join_col], &r2->cells.items[t2_join_col], join_op))
+        for (size_t i = 0; i < n1; i++) {
+            for (size_t j = 0; j < n2; j++) {
+                if (!join_cmp_match(&s1[i].cells.items[t1_join_col],
+                                    &s2[j].cells.items[t2_join_col], join_op))
                     continue;
                 t1_matched[i] = 1;
                 t2_matched[j] = 1;
-                emit_merged_row(r1, ncols1, r2, ncols2, out_rows, rb);
+                emit_merged_row(&s1[i], ncols1, &s2[j], ncols2, out_rows, rb);
             }
         }
     }
 
     /* LEFT or FULL: unmatched left rows */
     if (join_type == 1 || join_type == 3) {
-        for (size_t i = 0; i < t1->rows.count; i++) {
+        for (size_t i = 0; i < n1; i++) {
             if (t1_matched[i]) continue;
-            emit_null_right(&t1->rows.items[i], ncols1, t2, out_rows, rb);
+            emit_null_right(&s1[i], ncols1, t2, out_rows, rb);
         }
     }
 
     /* RIGHT or FULL: unmatched right rows */
     if (join_type == 2 || join_type == 3) {
-        for (size_t j = 0; j < t2->rows.count; j++) {
+        for (size_t j = 0; j < n2; j++) {
             if (t2_matched[j]) continue;
-            emit_null_left(t1, &t2->rows.items[j], ncols2, out_rows, rb);
+            emit_null_left(t1, &s2[j], ncols2, out_rows, rb);
         }
     }
 
+    flat_snap_free(s1, n1);
+    flat_snap_free(s2, n2);
     return 0;
 }
 
@@ -723,7 +761,11 @@ static void exec_lateral_join(struct database *db, struct table *t1, const char 
     if (ji->join_alias.len > 0)
         snprintf(lat_alias_buf, sizeof(lat_alias_buf), "%.*s", (int)ji->join_alias.len, ji->join_alias.data);
 
-    for (size_t ri = 0; ri < t1->rows.count; ri++) {
+    /* Snapshot t1 from flat so we can iterate rows */
+    size_t lat_n1 = 0;
+    struct row *lat_s1 = flat_snap(t1, &lat_n1);
+
+    for (size_t ri = 0; ri < lat_n1; ri++) {
         /* Build a rewritten SQL where outer_table.col references are
          * replaced with literal values from the current outer row */
         const char *outer_prefix = a1 ? a1 : t1->name;
@@ -749,8 +791,8 @@ static void exec_lateral_join(struct database *db, struct table *t1, const char 
                         break;
                     }
                 }
-                if (ci >= 0 && ci < (int)t1->rows.items[ri].cells.count) {
-                    struct cell *cv = &t1->rows.items[ri].cells.items[ci];
+                if (ci >= 0 && ci < (int)lat_s1[ri].cells.count) {
+                    struct cell *cv = &lat_s1[ri].cells.items[ci];
                     if (cv->is_null) {
                         wp += (size_t)snprintf(rewritten + wp, rewritten_cap - wp, "NULL");
                     } else if (cv->type == COLUMN_TYPE_INT) {
@@ -901,9 +943,9 @@ static void exec_lateral_join(struct database *db, struct table *t1, const char 
         for (size_t li = 0; li < lat_rows.count; li++) {
             struct row dst = {0};
             da_init(&dst.cells);
-            for (size_t c = 0; c < t1->rows.items[ri].cells.count; c++) {
+            for (size_t c = 0; c < lat_s1[ri].cells.count; c++) {
                 struct cell cp;
-                cell_copy(&cp, &t1->rows.items[ri].cells.items[c]);
+                cell_copy(&cp, &lat_s1[ri].cells.items[c]);
                 da_push(&dst.cells, cp);
             }
             for (size_t c = 0; c < lat_rows.data[li].cells.count; c++) {
@@ -917,6 +959,7 @@ static void exec_lateral_join(struct database *db, struct table *t1, const char 
             row_free(&lat_rows.data[li]);
         free(lat_rows.data);
     }
+    flat_snap_free(lat_s1, lat_n1);
 }
 
 /* Non-lateral first join: materialize subquery if needed, then do_single_join.
@@ -1044,15 +1087,17 @@ static int exec_join_chain(struct database *db, struct query_select *s,
             return -1;
         }
 
-        /* use merged_t as the left table descriptor */
-        merged_t->rows.items = merged->data;
-        merged_t->rows.count = merged->count;
-        merged_t->rows.capacity = merged->count;
+        /* populate merged_t->flat so flat_snap can read it in do_single_join */
+        flat_table_free(&merged_t->flat);
+        if (merged->count > 0 && merged_t->columns.count > 0) {
+            table_flat_init_schema(merged_t);
+            for (size_t _mr = 0; _mr < merged->count; _mr++)
+                table_flat_append_row(merged_t, &merged->data[_mr]);
+        }
 
         struct rows next_merged = {0};
         struct table next_meta = {0};
         da_init(&next_meta.columns);
-        da_init(&next_meta.rows);
         da_init(&next_meta.indexes);
         char jn_alias_buf[128] = {0};
         if (ji->join_alias.len > 0)
@@ -1068,7 +1113,8 @@ static int exec_join_chain(struct database *db, struct query_select *s,
             return -1;
         }
 
-        /* free old merged rows (do_single_join copied cells) */
+        /* free old merged rows (do_single_join copied cells) and flat snap */
+        flat_table_free(&merged_t->flat);
         for (size_t i = 0; i < merged->count; i++)
             row_free(&merged->data[i]);
         free(merged->data);
@@ -1087,9 +1133,13 @@ static int exec_join_aggregate(struct database *db, struct query_select *s, stru
                                struct table *merged_t, struct rows *merged,
                                struct rows *result, struct bump_alloc *rb)
 {
-    merged_t->rows.items = merged->data;
-    merged_t->rows.count = merged->count;
-    merged_t->rows.capacity = merged->count;
+    /* populate merged_t->flat so query_group_by/query_aggregate can scan it */
+    flat_table_free(&merged_t->flat);
+    if (merged->count > 0 && merged_t->columns.count > 0) {
+        table_flat_init_schema(merged_t);
+        for (size_t _mr = 0; _mr < merged->count; _mr++)
+            table_flat_append_row(merged_t, &merged->data[_mr]);
+    }
     int rc;
     if (s->has_group_by && (s->group_by_rollup || s->group_by_cube)) {
         /* ROLLUP/CUBE: run query_group_by for each grouping set */
@@ -1249,11 +1299,6 @@ static void exec_join_project(struct query_select *s, struct query_arena *a,
     int select_all = sv_eq_cstr(s->columns, "*");
     /* Use parsed_columns with eval_expr when available (handles COALESCE, function expressions) */
     int use_parsed = (!select_all && s->parsed_columns_count > 0);
-    if (use_parsed) {
-        merged_t->rows.items = merged->data;
-        merged_t->rows.count = merged->count;
-        merged_t->rows.capacity = merged->count;
-    }
     for (size_t i = start; i < end; i++) {
         struct row dst = {0};
         da_init(&dst.cells);
@@ -1358,7 +1403,6 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
 
     struct table merged_t = {0};
     da_init(&merged_t.columns);
-    da_init(&merged_t.rows);
     da_init(&merged_t.indexes);
     struct rows merged = {0};
 
@@ -1391,8 +1435,6 @@ static int exec_join(struct database *db, struct query *q, struct rows *result, 
     if (s->where.has_where && s->where.where_cond != IDX_NONE) {
         size_t write = 0;
         for (size_t i = 0; i < merged.count; i++) {
-            merged_t.rows.items = merged.data;
-            merged_t.rows.count = merged.count;
             if (eval_condition(s->where.where_cond, a, &merged.data[i], &merged_t, db)) {
                 if (write != i)
                     merged.data[write] = merged.data[i];
@@ -1619,7 +1661,6 @@ static void snapshot_restore(struct database *db, struct db_snapshot *snap)
             *t = snap->saved_tables[i];
             memset(&snap->saved_tables[i], 0, sizeof(struct table));
             snap->saved_valid[i] = 0;
-            table_flat_rebuild_from_rows(t);
         }
     }
     /* Remove tables created during the transaction (not in original snapshot) */
@@ -1647,7 +1688,6 @@ static void snapshot_restore(struct database *db, struct db_snapshot *snap)
             db->total_generation++;
             memset(&snap->saved_tables[i], 0, sizeof(struct table));
             snap->saved_valid[i] = 0;
-            table_flat_rebuild_from_rows(&db->tables.items[db->tables.count - 1]);
         }
     }
     /* Restore types */
@@ -1762,7 +1802,6 @@ struct table *materialize_subquery(struct database *db, const char *sql,
     struct table ct = {0};
     ct.name = strdup(table_name);
     da_init(&ct.columns);
-    da_init(&ct.rows);
     da_init(&ct.indexes);
     /* infer column names — for DML with RETURNING, fall through to fallback */
     if (sq.query_type != QUERY_TYPE_SELECT && sq_rows.count > 0) {
@@ -1882,17 +1921,17 @@ struct table *materialize_subquery(struct database *db, const char *sql,
         }
         columns_done: (void)0;
     }
-    /* move rows — transfer ownership, no cell_copy/strdup needed */
+    /* move rows — transfer ownership, write to flat only */
     for (size_t i = 0; i < sq_rows.count; i++) {
-        da_push(&ct.rows, sq_rows.data[i]);
         /* Normalize cell type tags to match schema (legacy executor may store
          * group-key cells with wrong type tag, e.g. INT column as FLOAT) */
-        struct row *r = &ct.rows.items[ct.rows.count - 1];
+        struct row *r = &sq_rows.data[i];
         for (size_t c = 0; c < ct.columns.count && c < r->cells.count; c++) {
             if (!r->cells.items[c].is_null)
                 r->cells.items[c].type = ct.columns.items[c].type;
         }
-        table_flat_append_row(&ct, &ct.rows.items[ct.rows.count - 1]);
+        table_flat_append_row(&ct, r);
+        row_free(r);
     }
     free(sq_rows.data);
     query_free(&sq);
@@ -2032,13 +2071,17 @@ static void materialize_ctes(struct database *db, struct query_select *s,
                  * the "working table" containing only the newest rows so the
                  * recursive query doesn't re-process old rows. */
                 struct rows accum = {0};
-                for (size_t ri = 0; ri < ct->rows.count; ri++) {
+                for (size_t ri = 0; ri < ct->flat.nrows; ri++) {
                     struct row r = {0};
                     da_init(&r.cells);
-                    for (size_t c = 0; c < ct->rows.items[ri].cells.count; c++) {
-                        struct cell cp;
-                        cell_copy(&cp, &ct->rows.items[ri].cells.items[c]);
-                        da_push(&r.cells, cp);
+                    for (size_t c = 0; c < (size_t)ct->flat.ncols; c++) {
+                        struct cell cp = flat_cell_at_pub(&ct->flat, (uint16_t)c, ri);
+                        struct cell owned;
+                        if (column_type_is_text(cp.type) && cp.value.as_text)
+                            { owned = cp; owned.value.as_text = strdup(cp.value.as_text); }
+                        else
+                            owned = cp;
+                        da_push(&r.cells, owned);
                     }
                     rows_push(&accum, r);
                 }
@@ -2053,9 +2096,6 @@ static void materialize_ctes(struct database *db, struct query_select *s,
                     }
                     if (rec_rows.count == 0) { free(rec_rows.data); break; }
 
-                    for (size_t ri = 0; ri < ct->rows.count; ri++)
-                        row_free(&ct->rows.items[ri]);
-                    ct->rows.count = 0;
                     flat_table_free(&ct->flat);
                     ct->generation++;
                     db->total_generation++;
@@ -2069,15 +2109,7 @@ static void materialize_ctes(struct database *db, struct query_select *s,
                             da_push(&ar.cells, cp);
                         }
                         rows_push(&accum, ar);
-                        struct row wr = {0};
-                        da_init(&wr.cells);
-                        for (size_t c = 0; c < rec_rows.data[ri].cells.count; c++) {
-                            struct cell cp;
-                            cell_copy(&cp, &rec_rows.data[ri].cells.items[c]);
-                            da_push(&wr.cells, cp);
-                        }
-                        da_push(&ct->rows, wr);
-                        table_flat_append_row(ct, &wr);
+                        table_flat_append_row(ct, &rec_rows.data[ri]);
                     }
                     for (size_t ri = 0; ri < rec_rows.count; ri++)
                         row_free(&rec_rows.data[ri]);
@@ -2086,13 +2118,10 @@ static void materialize_ctes(struct database *db, struct query_select *s,
 
                 ct = db_find_table(db, cd_name);
                 if (ct) {
-                    for (size_t ri = 0; ri < ct->rows.count; ri++)
-                        row_free(&ct->rows.items[ri]);
-                    ct->rows.count = 0;
-                    flat_table_free(&ct->flat);
+                        flat_table_free(&ct->flat);
                     for (size_t ri = 0; ri < accum.count; ri++) {
-                        da_push(&ct->rows, accum.data[ri]);
                         table_flat_append_row(ct, &accum.data[ri]);
+                        row_free(&accum.data[ri]);
                     }
                     free(accum.data);
                 } else {
@@ -2434,8 +2463,8 @@ static int db_exec_insert(struct database *db, struct query *q, struct rows *res
                     }
                 }
             }
-            da_push(&t->rows, r);
             table_flat_append_row(t, &r);
+            row_free(&r);
             t->generation++;
             db->total_generation++;
         }
@@ -2468,8 +2497,9 @@ static int db_exec_insert(struct database *db, struct query *q, struct rows *res
                     struct cell *new_cell = &ir_items[ri].cells.items[conflict_col];
                     int conflict = 0;
                     size_t conflict_row = 0;
-                    for (size_t ei = 0; ei < t->rows.count; ei++) {
-                        if (cell_equal(new_cell, &t->rows.items[ei].cells.items[conflict_col])) {
+                    for (size_t ei = 0; ei < t->flat.nrows; ei++) {
+                        struct cell _ec = flat_cell_at_pub(&t->flat, (uint16_t)conflict_col, ei);
+                        if (cell_equal(new_cell, &_ec)) {
                             conflict = 1;
                             conflict_row = ei;
                             break;
@@ -2479,7 +2509,6 @@ static int db_exec_insert(struct database *db, struct query *q, struct rows *res
                         /* Build merged table descriptor: [existing cols] + [excluded.col1, ...] */
                         struct table merged_t = {0};
                         da_init(&merged_t.columns);
-                        da_init(&merged_t.rows);
                         da_init(&merged_t.indexes);
                         size_t ncols = t->columns.count;
                         for (size_t mc = 0; mc < ncols; mc++)
@@ -2497,8 +2526,10 @@ static int db_exec_insert(struct database *db, struct query *q, struct rows *res
                         /* Build merged row: [existing cells] + [new row cells] */
                         struct row merged_row = {0};
                         da_init(&merged_row.cells);
-                        for (size_t mc = 0; mc < t->rows.items[conflict_row].cells.count; mc++)
-                            da_push(&merged_row.cells, t->rows.items[conflict_row].cells.items[mc]);
+                        for (size_t mc = 0; mc < t->columns.count; mc++) {
+                            struct cell _mc = flat_cell_at_pub(&t->flat, (uint16_t)mc, conflict_row);
+                            da_push(&merged_row.cells, _mc);
+                        }
                         for (size_t mc = 0; mc < ir_items[ri].cells.count; mc++)
                             da_push(&merged_row.cells, ir_items[ri].cells.items[mc]);
 
@@ -2551,25 +2582,37 @@ static int db_exec_insert(struct database *db, struct query *q, struct rows *res
                                 }
                             } else
                                 cell_copy(&val, &scp->value);
-                            struct cell *dst = &t->rows.items[conflict_row].cells.items[ci];
-                            if (column_type_is_text(dst->type) && dst->value.as_text)
-                                free(dst->value.as_text);
-                            *dst = val;
-                            /* keep merged_row in sync for subsequent SET clauses */
-                            merged_row.cells.items[ci] = val;
+                            /* patch flat store directly */
+                            struct cell _pval = val;
+                            struct row _upd_row = {0};
+                            da_init(&_upd_row.cells);
+                            for (size_t _uc = 0; _uc < t->columns.count; _uc++) {
+                                struct cell _uc2 = flat_cell_at_pub(&t->flat, (uint16_t)_uc, conflict_row);
+                                da_push(&_upd_row.cells, _uc2);
+                            }
+                            _upd_row.cells.items[ci] = _pval;
+                            merged_row.cells.items[ci] = _pval;
+                            table_flat_update_row(t, conflict_row, &_upd_row);
+                            da_free(&_upd_row.cells);
                         }
                         da_free(&merged_t.columns);
                         da_free(&merged_row.cells);
-                        table_flat_update_row(t, conflict_row, &t->rows.items[conflict_row]);
                         t->generation++;
                         db->total_generation++;
                         /* emit RETURNING row for the updated row */
                         if (ins->has_returning && result) {
+                            struct row _ret_row = {0};
+                            da_init(&_ret_row.cells);
+                            for (size_t _rc = 0; _rc < t->columns.count; _rc++) {
+                                struct cell _rc2 = flat_cell_at_pub(&t->flat, (uint16_t)_rc, conflict_row);
+                                da_push(&_ret_row.cells, _rc2);
+                            }
                             int ret_all = (ins->returning_columns.len == 1 &&
                                            ins->returning_columns.data[0] == '*');
-                            emit_returning_row(t, &t->rows.items[conflict_row],
+                            emit_returning_row(t, &_ret_row,
                                                ins->returning_columns, ret_all,
                                                result, rb);
+                            da_free(&_ret_row.cells);
                         }
                         /* remove this insert row — it was handled as update.
                          * Cell text is bump-allocated, so only free the DA
@@ -2630,8 +2673,9 @@ static int db_exec_insert(struct database *db, struct query *q, struct rows *res
                 for (uint32_t ri = 0; ri < ir_count; ) {
                     struct cell *new_cell = &ir_items[ri].cells.items[insert_cell_idx];
                     int conflict = 0;
-                    for (size_t ei = 0; ei < t->rows.count; ei++) {
-                        if (cell_equal(new_cell, &t->rows.items[ei].cells.items[conflict_col])) {
+                    for (size_t ei = 0; ei < t->flat.nrows; ei++) {
+                        struct cell _dnc = flat_cell_at_pub(&t->flat, (uint16_t)conflict_col, ei);
+                        if (cell_equal(new_cell, &_dnc)) {
                             conflict = 1;
                             break;
                         }
@@ -2733,7 +2777,6 @@ static int db_exec_select(struct database *db, struct query *q, struct rows *res
         struct table gt = {0};
         gt.name = strdup(gs_tbl_name);
         da_init(&gt.columns);
-        da_init(&gt.rows);
         da_init(&gt.indexes);
 
         if (is_ts) {
@@ -2760,8 +2803,8 @@ static int db_exec_select(struct database *db, struct query *q, struct rows *res
                     c.type = COLUMN_TYPE_DATE;
                     c.value.as_date = cur;
                     da_push(&r.cells, c);
-                    da_push(&gt.rows, r);
-                    table_flat_append_row(&gt, &gt.rows.items[gt.rows.count - 1]);
+                    table_flat_append_row(&gt, &r);
+                    da_free(&r.cells);
                     cur = date_add_interval(cur, ts_step_iv);
                 }
             } else {
@@ -2777,8 +2820,8 @@ static int db_exec_select(struct database *db, struct query *q, struct rows *res
                     c.type = c_start.type;
                     c.value.as_timestamp = cur;
                     da_push(&r.cells, c);
-                    da_push(&gt.rows, r);
-                    table_flat_append_row(&gt, &gt.rows.items[gt.rows.count - 1]);
+                    table_flat_append_row(&gt, &r);
+                    da_free(&r.cells);
                     cur = timestamp_add_interval(cur, ts_step_iv);
                 }
             }
@@ -2817,8 +2860,8 @@ static int db_exec_select(struct database *db, struct query *q, struct rows *res
                     c.value.as_int = (int)v;
                 }
                 da_push(&r.cells, c);
-                da_push(&gt.rows, r);
-                table_flat_append_row(&gt, &gt.rows.items[gt.rows.count - 1]);
+                table_flat_append_row(&gt, &r);
+                da_free(&r.cells);
             }
         }
         da_push(&db->tables, gt);
@@ -3123,18 +3166,9 @@ static int db_exec_create(struct database *db, struct query_create_table *crt,
                 free(col.name);
             }
         }
-        /* copy rows */
-        for (size_t ri = 0; ri < sel_rows.count; ri++) {
-            struct row nr = {0};
-            da_init(&nr.cells);
-            for (size_t ci = 0; ci < sel_rows.data[ri].cells.count; ci++) {
-                struct cell cp;
-                cell_copy(&cp, &sel_rows.data[ri].cells.items[ci]);
-                da_push(&nr.cells, cp);
-            }
-            da_push(&t.rows, nr);
-            table_flat_append_row(&t, &t.rows.items[t.rows.count - 1]);
-        }
+        /* copy rows into flat only */
+        for (size_t ri = 0; ri < sel_rows.count; ri++)
+            table_flat_append_row(&t, &sel_rows.data[ri]);
         da_push(&db->tables, t);
         db->total_generation++;
         /* store row count in result for command tag */
@@ -3609,11 +3643,8 @@ static int db_exec_truncate(struct database *db, struct query_delete *del,
         /* COW trigger for TRUNCATE */
         if (txn && txn->in_transaction && txn->snapshot)
             snapshot_cow_table(txn->snapshot, db, t->name);
-        /* free all rows */
-        for (size_t i = 0; i < t->rows.count; i++)
-            row_free(&t->rows.items[i]);
-        t->rows.count = 0;
         flat_table_free(&t->flat);
+        t->flat.nrows = 0;
         t->generation++;
         db->total_generation++;
         /* reset SERIAL counters */
@@ -3639,9 +3670,6 @@ static int db_exec_truncate(struct database *db, struct query_delete *del,
                 if (!has_fk) continue;
                 if (txn && txn->in_transaction && txn->snapshot)
                     snapshot_cow_table(txn->snapshot, db, ref->name);
-                for (size_t ri = 0; ri < ref->rows.count; ri++)
-                    row_free(&ref->rows.items[ri]);
-                ref->rows.count = 0;
                 flat_table_free(&ref->flat);
                 ref->generation++;
                 db->total_generation++;
@@ -3725,12 +3753,10 @@ static int db_exec_create_index(struct database *db, struct query_create_index *
         idx.root = NULL;
         idx.hnsw = hnsw;
         /* backfill existing rows */
-        for (size_t i = 0; i < t->rows.count; i++) {
-            if ((size_t)ci0 < t->rows.items[i].cells.count &&
-                !t->rows.items[i].cells.items[ci0].is_null &&
-                t->rows.items[i].cells.items[ci0].value.as_vector) {
-                hnsw_insert(hnsw, t->rows.items[i].cells.items[ci0].value.as_vector, i);
-            }
+        for (size_t i = 0; i < t->flat.nrows; i++) {
+            struct cell _hc = flat_cell_at_pub(&t->flat, (uint16_t)ci0, i);
+            if (!_hc.is_null && _hc.value.as_vector)
+                hnsw_insert(hnsw, _hc.value.as_vector, i);
         }
         da_push(&t->indexes, idx);
         return 0;
@@ -3742,15 +3768,13 @@ static int db_exec_create_index(struct database *db, struct query_create_index *
         char idx_name_buf[256];
         snprintf(idx_name_buf, sizeof(idx_name_buf), "%.*s",
                  (int)ci->index_name.len, ci->index_name.data);
-        for (size_t i = 0; i < t->rows.count; i++) {
-            if ((size_t)col_indices[0] >= t->rows.items[i].cells.count) continue;
-            struct cell *vi = &t->rows.items[i].cells.items[col_indices[0]];
-            if (vi->is_null || (column_type_is_text(vi->type) && !vi->value.as_text))
+        for (size_t i = 0; i < t->flat.nrows; i++) {
+            struct cell vi = flat_cell_at_pub(&t->flat, (uint16_t)col_indices[0], i);
+            if (vi.is_null || (column_type_is_text(vi.type) && !vi.value.as_text))
                 continue;
-            for (size_t j = i + 1; j < t->rows.count; j++) {
-                if ((size_t)col_indices[0] >= t->rows.items[j].cells.count) continue;
-                struct cell *vj = &t->rows.items[j].cells.items[col_indices[0]];
-                if (cell_compare(vi, vj) == 0) {
+            for (size_t j = i + 1; j < t->flat.nrows; j++) {
+                struct cell vj = flat_cell_at_pub(&t->flat, (uint16_t)col_indices[0], j);
+                if (cell_compare(&vi, &vj) == 0) {
                     index_free(&idx);
                     arena_set_error(arena, "23505",
                         "could not create unique index \"%s\"", idx_name_buf);
@@ -3760,16 +3784,11 @@ static int db_exec_create_index(struct database *db, struct query_create_index *
         }
     }
     /* backfill existing rows */
-    for (size_t i = 0; i < t->rows.count; i++) {
+    for (size_t i = 0; i < t->flat.nrows; i++) {
         struct cell composite[MAX_INDEX_COLS];
-        int ok = 1;
-        for (int c = 0; c < ncols; c++) {
-            if ((size_t)col_indices[c] < t->rows.items[i].cells.count)
-                composite[c] = t->rows.items[i].cells.items[col_indices[c]];
-            else
-                ok = 0;
-        }
-        if (ok) index_insert(&idx, composite, i);
+        for (int c = 0; c < ncols; c++)
+            composite[c] = flat_cell_at_pub(&t->flat, (uint16_t)col_indices[c], i);
+        index_insert(&idx, composite, i);
     }
     idx.is_unique = ci->is_unique;
     da_push(&t->indexes, idx);
@@ -3842,7 +3861,6 @@ static int db_exec_delete(struct database *db, struct query *q,
         /* build merged column metadata: t1 cols (qualified) + t2 cols (qualified) */
         struct table merged = {0};
         da_init(&merged.columns);
-        da_init(&merged.rows);
         da_init(&merged.indexes);
         char t1name[128], t2name[128];
         snprintf(t1name, sizeof(t1name), "%.*s", (int)del->table.len, del->table.data);
@@ -3866,16 +3884,20 @@ static int db_exec_delete(struct database *db, struct query *q,
         /* find which target rows match any USING row */
         size_t dt_ncols = dt->columns.count;
         size_t ut_ncols = ut->columns.count;
-        int *to_delete = calloc(dt->rows.count, sizeof(int));
-        for (size_t i = 0; i < dt->rows.count; i++) {
-            for (size_t j = 0; j < ut->rows.count; j++) {
+        int *to_delete = calloc(dt->flat.nrows, sizeof(int));
+        for (size_t i = 0; i < dt->flat.nrows; i++) {
+            for (size_t j = 0; j < ut->flat.nrows; j++) {
                 /* build merged row */
                 struct row mr = {0};
                 da_init(&mr.cells);
-                for (size_t c = 0; c < dt_ncols; c++)
-                    da_push(&mr.cells, dt->rows.items[i].cells.items[c]);
-                for (size_t c = 0; c < ut_ncols; c++)
-                    da_push(&mr.cells, ut->rows.items[j].cells.items[c]);
+                for (size_t c = 0; c < dt_ncols; c++) {
+                    struct cell _dc = flat_cell_at_pub(&dt->flat, (uint16_t)c, i);
+                    da_push(&mr.cells, _dc);
+                }
+                for (size_t c = 0; c < ut_ncols; c++) {
+                    struct cell _uc = flat_cell_at_pub(&ut->flat, (uint16_t)c, j);
+                    da_push(&mr.cells, _uc);
+                }
                 int match = eval_condition(del->where.where_cond, arena, &mr, &merged, NULL);
                 da_free(&mr.cells);
                 if (match) { to_delete[i] = 1; break; }
@@ -3883,13 +3905,9 @@ static int db_exec_delete(struct database *db, struct query *q,
         }
         /* delete matched rows (iterate backwards to avoid index shifting issues) */
         size_t deleted = 0;
-        for (size_t i = dt->rows.count; i > 0; i--) {
+        for (size_t i = dt->flat.nrows; i > 0; i--) {
             size_t idx = i - 1;
             if (to_delete[idx]) {
-                row_free(&dt->rows.items[idx]);
-                for (size_t k = idx; k + 1 < dt->rows.count; k++)
-                    dt->rows.items[k] = dt->rows.items[k + 1];
-                dt->rows.count--;
                 table_flat_delete_row(dt, idx);
                 deleted++;
                 dt->generation++;
@@ -3949,7 +3967,6 @@ static int db_exec_update(struct database *db, struct query *q,
         /* build merged table descriptor: target columns + FROM columns */
         struct table merged_meta = {0};
         da_init(&merged_meta.columns);
-        da_init(&merged_meta.rows);
         da_init(&merged_meta.indexes);
         for (size_t c = 0; c < t->columns.count; c++) {
             struct column col = {0};
@@ -3970,13 +3987,14 @@ static int db_exec_update(struct database *db, struct query *q,
         }
 
         size_t updated = 0;
-        for (size_t i = 0; i < t->rows.count; i++) {
+        for (size_t i = 0; i < t->flat.nrows; i++) {
             int matched = 0;
             size_t matched_j = 0;
-            for (size_t j = 0; j < ft->rows.count; j++) {
+            for (size_t j = 0; j < ft->flat.nrows; j++) {
                 if (t_join_col >= 0 && ft_join_col >= 0) {
-                    if (cell_equal(&t->rows.items[i].cells.items[t_join_col],
-                                    &ft->rows.items[j].cells.items[ft_join_col])) {
+                    struct cell _tc = flat_cell_at_pub(&t->flat, (uint16_t)t_join_col, i);
+                    struct cell _fc = flat_cell_at_pub(&ft->flat, (uint16_t)ft_join_col, j);
+                    if (cell_equal(&_tc, &_fc)) {
                         matched = 1;
                         matched_j = j;
                         break;
@@ -3989,10 +4007,14 @@ static int db_exec_update(struct database *db, struct query *q,
             /* build merged row: target row cells + FROM row cells */
             struct row merged_row = {0};
             da_init(&merged_row.cells);
-            for (size_t c = 0; c < t->rows.items[i].cells.count; c++)
-                da_push(&merged_row.cells, t->rows.items[i].cells.items[c]);
-            for (size_t c = 0; c < ft->rows.items[matched_j].cells.count; c++)
-                da_push(&merged_row.cells, ft->rows.items[matched_j].cells.items[c]);
+            for (size_t c = 0; c < t->columns.count; c++) {
+                struct cell _tc2 = flat_cell_at_pub(&t->flat, (uint16_t)c, i);
+                da_push(&merged_row.cells, _tc2);
+            }
+            for (size_t c = 0; c < ft->columns.count; c++) {
+                struct cell _fc2 = flat_cell_at_pub(&ft->flat, (uint16_t)c, matched_j);
+                da_push(&merged_row.cells, _fc2);
+            }
 
             /* evaluate all SET expressions against merged row */
             uint32_t nsc = u->set_clauses_count;
@@ -4013,14 +4035,19 @@ static int db_exec_update(struct database *db, struct query *q,
                     cell_copy(&new_vals[sc], &scp->value);
                 }
             }
-            for (size_t sc = 0; sc < nsc; sc++) {
-                if (col_idxs[sc] < 0) continue;
-                struct cell *dst = &t->rows.items[i].cells.items[col_idxs[sc]];
-                if (column_type_is_text(dst->type) && dst->value.as_text)
-                    free(dst->value.as_text);
-                *dst = new_vals[sc];
+            /* apply new values via a fresh flat-sourced row */
+            struct row _upd_row2 = {0};
+            da_init(&_upd_row2.cells);
+            for (size_t c = 0; c < t->columns.count; c++) {
+                struct cell _cc = flat_cell_at_pub(&t->flat, (uint16_t)c, i);
+                da_push(&_upd_row2.cells, _cc);
             }
-            table_flat_update_row(t, i, &t->rows.items[i]);
+            for (size_t sc = 0; sc < nsc; sc++) {
+                if (col_idxs[sc] >= 0)
+                    _upd_row2.cells.items[col_idxs[sc]] = new_vals[sc];
+            }
+            table_flat_update_row(t, i, &_upd_row2);
+            da_free(&_upd_row2.cells);
             da_free(&merged_row.cells);
         }
         if (updated > 0) {
@@ -4031,7 +4058,6 @@ static int db_exec_update(struct database *db, struct query *q,
         for (size_t c = 0; c < merged_meta.columns.count; c++)
             free(merged_meta.columns.items[c].name);
         da_free(&merged_meta.columns);
-        da_free(&merged_meta.rows);
         da_free(&merged_meta.indexes);
         if (result) {
             struct row r = {0};
@@ -4072,21 +4098,50 @@ static int db_exec_alter(struct database *db, struct query_alter *a,
                 free(a->alter_new_col.default_value);
                 a->alter_new_col.default_value = NULL;
             }
-            /* pad existing rows with default value (or NULL) for the new column */
-            size_t new_idx = t->columns.count - 1;
-            struct column *new_col = &t->columns.items[new_idx];
-            for (size_t i = 0; i < t->rows.count; i++) {
-                struct cell pad_cell = {0};
-                if (new_col->has_default && new_col->default_value) {
-                    cell_copy(&pad_cell, new_col->default_value);
-                } else {
-                    pad_cell.type = new_col->type;
-                    pad_cell.is_null = 1;
+            /* schema changed — rebuild flat with new column appended.
+             * Snapshot existing flat rows into heap-owned struct rows first,
+             * then reinitialize flat with the new schema and re-append. */
+            size_t old_ncols = t->columns.count - 1; /* before add_column above */
+            size_t saved_nrows = t->flat.nrows;
+            size_t new_col_idx = t->columns.count - 1;
+            struct column *new_col = &t->columns.items[new_col_idx];
+            /* build pad cell once */
+            struct cell pad_cell = {0};
+            if (new_col->has_default && new_col->default_value)
+                cell_copy(&pad_cell, new_col->default_value);
+            else { pad_cell.type = new_col->type; pad_cell.is_null = 1; }
+            /* snapshot old flat data into a temporary row array */
+            struct row *snap = NULL;
+            if (saved_nrows > 0) {
+                snap = malloc(saved_nrows * sizeof(struct row));
+                for (size_t ri = 0; ri < saved_nrows; ri++) {
+                    da_init(&snap[ri].cells);
+                    for (size_t c = 0; c < old_ncols; c++) {
+                        struct cell cv = flat_cell_at_pub(&t->flat, (uint16_t)c, ri);
+                        struct cell owned = cv;
+                        if (column_type_is_text(cv.type) && cv.value.as_text)
+                            owned.value.as_text = strdup(cv.value.as_text);
+                        da_push(&snap[ri].cells, owned);
+                    }
+                    /* append pad cell for the new column */
+                    struct cell pc = pad_cell;
+                    if (column_type_is_text(pc.type) && pc.value.as_text)
+                        pc.value.as_text = strdup(pc.value.as_text);
+                    da_push(&snap[ri].cells, pc);
                 }
-                da_push(&t->rows.items[i].cells, pad_cell);
             }
-            /* schema changed — rebuild flat storage from updated row-store */
-            table_flat_rebuild_from_rows(t);
+            /* reinitialize flat with new schema */
+            flat_table_free(&t->flat);
+            table_flat_init_schema(t);
+            /* re-append snapshotted rows */
+            for (size_t ri = 0; ri < saved_nrows; ri++) {
+                table_flat_append_row(t, &snap[ri]);
+                row_free(&snap[ri]);
+            }
+            free(snap);
+            /* free one-time pad cell copy */
+            if (column_type_is_text(pad_cell.type) && pad_cell.value.as_text)
+                free((char *)pad_cell.value.as_text);
             t->generation++;
             db->total_generation++;
             return 0;
@@ -4109,18 +4164,29 @@ static int db_exec_alter(struct database *db, struct query_alter *a,
             for (size_t j = (size_t)col_idx; j + 1 < t->columns.count; j++)
                 t->columns.items[j] = t->columns.items[j + 1];
             t->columns.count--;
-            /* remove cell from each row */
-            for (size_t i = 0; i < t->rows.count; i++) {
-                struct row *r = &t->rows.items[i];
-                if ((size_t)col_idx < r->cells.count) {
-                    cell_free_text(&r->cells.items[col_idx]);
-                    for (size_t j = (size_t)col_idx; j + 1 < r->cells.count; j++)
-                        r->cells.items[j] = r->cells.items[j + 1];
-                    r->cells.count--;
+            /* rebuild flat without the dropped column: iterate rows, skip col_idx */
+            {
+                size_t old_nrows = t->flat.nrows;
+                uint16_t old_ncols = t->flat.ncols;
+                struct flat_table old_flat = t->flat;
+                memset(&t->flat, 0, sizeof(t->flat));
+                table_flat_init_schema(t);
+                for (size_t ri = 0; ri < old_nrows; ri++) {
+                    struct row _r = {0};
+                    da_init(&_r.cells);
+                    for (uint16_t c = 0; c < old_ncols; c++) {
+                        if (c == (uint16_t)col_idx) continue;
+                        struct cell cv = flat_cell_at_pub(&old_flat, c, ri);
+                        struct cell owned = cv;
+                        if (column_type_is_text(cv.type) && cv.value.as_text)
+                            owned.value.as_text = strdup(cv.value.as_text);
+                        da_push(&_r.cells, owned);
+                    }
+                    table_flat_append_row(t, &_r);
+                    row_free(&_r);
                 }
+                flat_table_free(&old_flat);
             }
-            /* schema changed — rebuild flat storage from updated row-store */
-            table_flat_rebuild_from_rows(t);
             t->generation++;
             db->total_generation++;
             return 0;
@@ -4154,61 +4220,74 @@ static int db_exec_alter(struct database *db, struct query_alter *a,
             t->columns.items[col_idx].type = new_type;
             /* convert existing cell values to the new type */
             if (old_type != new_type) {
-                for (size_t ri = 0; ri < t->rows.count; ri++) {
-                    struct cell *c = &t->rows.items[ri].cells.items[col_idx];
-                    if (c->is_null) { c->type = new_type; continue; }
-                    if (new_type == COLUMN_TYPE_BOOLEAN) {
-                        int bval = 0;
-                        if (old_type == COLUMN_TYPE_INT) bval = (c->value.as_int != 0);
-                        else if (old_type == COLUMN_TYPE_SMALLINT) bval = (c->value.as_smallint != 0);
-                        else if (old_type == COLUMN_TYPE_BIGINT) bval = (c->value.as_bigint != 0);
-                        else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) bval = (c->value.as_float != 0.0);
-                        else if (column_type_is_text(old_type) && c->value.as_text) bval = (c->value.as_text[0] == 't' || c->value.as_text[0] == 'T' || c->value.as_text[0] == '1');
-                        c->type = COLUMN_TYPE_BOOLEAN;
-                        c->value.as_bool = bval;
-                    } else if (new_type == COLUMN_TYPE_INT) {
-                        int ival = 0;
-                        if (old_type == COLUMN_TYPE_BOOLEAN) ival = c->value.as_bool;
-                        else if (old_type == COLUMN_TYPE_SMALLINT) ival = c->value.as_smallint;
-                        else if (old_type == COLUMN_TYPE_BIGINT) ival = (int)c->value.as_bigint;
-                        else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) ival = (int)c->value.as_float;
-                        else if (column_type_is_text(old_type) && c->value.as_text) ival = atoi(c->value.as_text);
-                        c->type = COLUMN_TYPE_INT;
-                        c->value.as_int = ival;
-                    } else if (new_type == COLUMN_TYPE_BIGINT) {
-                        long long bval = 0;
-                        if (old_type == COLUMN_TYPE_INT) bval = c->value.as_int;
-                        else if (old_type == COLUMN_TYPE_BOOLEAN) bval = c->value.as_bool;
-                        else if (old_type == COLUMN_TYPE_SMALLINT) bval = c->value.as_smallint;
-                        else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) bval = (long long)c->value.as_float;
-                        else if (column_type_is_text(old_type) && c->value.as_text) bval = atoll(c->value.as_text);
-                        c->type = COLUMN_TYPE_BIGINT;
-                        c->value.as_bigint = bval;
-                    } else if (new_type == COLUMN_TYPE_FLOAT || new_type == COLUMN_TYPE_NUMERIC) {
-                        double dval = 0.0;
-                        if (old_type == COLUMN_TYPE_INT) dval = c->value.as_int;
-                        else if (old_type == COLUMN_TYPE_BOOLEAN) dval = c->value.as_bool;
-                        else if (old_type == COLUMN_TYPE_SMALLINT) dval = c->value.as_smallint;
-                        else if (old_type == COLUMN_TYPE_BIGINT) dval = (double)c->value.as_bigint;
-                        else if (column_type_is_text(old_type) && c->value.as_text) dval = atof(c->value.as_text);
-                        c->type = new_type;
-                        c->value.as_float = dval;
-                    } else if (column_type_is_text(new_type)) {
-                        char buf[64];
-                        if (old_type == COLUMN_TYPE_INT) snprintf(buf, sizeof(buf), "%d", c->value.as_int);
-                        else if (old_type == COLUMN_TYPE_BOOLEAN) snprintf(buf, sizeof(buf), "%s", c->value.as_bool ? "true" : "false");
-                        else if (old_type == COLUMN_TYPE_SMALLINT) snprintf(buf, sizeof(buf), "%d", c->value.as_smallint);
-                        else if (old_type == COLUMN_TYPE_BIGINT) snprintf(buf, sizeof(buf), "%lld", c->value.as_bigint);
-                        else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) snprintf(buf, sizeof(buf), "%g", c->value.as_float);
-                        else buf[0] = '\0';
-                        c->type = new_type;
-                        c->value.as_text = strdup(buf);
-                    } else {
-                        c->type = new_type;
+                /* rebuild flat with converted values for the changed column */
+                size_t old_nrows = t->flat.nrows;
+                uint16_t ncols = t->flat.ncols;
+                struct flat_table old_flat = t->flat;
+                memset(&t->flat, 0, sizeof(t->flat));
+                table_flat_init_schema(t);
+                for (size_t ri = 0; ri < old_nrows; ri++) {
+                    struct row _r = {0};
+                    da_init(&_r.cells);
+                    for (uint16_t ci2 = 0; ci2 < ncols; ci2++) {
+                        struct cell cv = flat_cell_at_pub(&old_flat, ci2, ri);
+                        struct cell owned = cv;
+                        if (column_type_is_text(cv.type) && cv.value.as_text)
+                            owned.value.as_text = strdup(cv.value.as_text);
+                        if (ci2 == (uint16_t)col_idx && !cv.is_null) {
+                            /* convert cell to new_type */
+                            struct cell nc = {0}; nc.type = new_type;
+                            if (new_type == COLUMN_TYPE_BOOLEAN) {
+                                int bval = 0;
+                                if (old_type == COLUMN_TYPE_INT) bval = (cv.value.as_int != 0);
+                                else if (old_type == COLUMN_TYPE_SMALLINT) bval = (cv.value.as_smallint != 0);
+                                else if (old_type == COLUMN_TYPE_BIGINT) bval = (cv.value.as_bigint != 0);
+                                else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) bval = (cv.value.as_float != 0.0);
+                                else if (column_type_is_text(old_type) && cv.value.as_text) bval = (cv.value.as_text[0] == 't' || cv.value.as_text[0] == 'T' || cv.value.as_text[0] == '1');
+                                nc.value.as_bool = bval;
+                            } else if (new_type == COLUMN_TYPE_INT) {
+                                int ival = 0;
+                                if (old_type == COLUMN_TYPE_BOOLEAN) ival = cv.value.as_bool;
+                                else if (old_type == COLUMN_TYPE_SMALLINT) ival = cv.value.as_smallint;
+                                else if (old_type == COLUMN_TYPE_BIGINT) ival = (int)cv.value.as_bigint;
+                                else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) ival = (int)cv.value.as_float;
+                                else if (column_type_is_text(old_type) && cv.value.as_text) ival = atoi(cv.value.as_text);
+                                nc.value.as_int = ival;
+                            } else if (new_type == COLUMN_TYPE_BIGINT) {
+                                long long bval2 = 0;
+                                if (old_type == COLUMN_TYPE_INT) bval2 = cv.value.as_int;
+                                else if (old_type == COLUMN_TYPE_BOOLEAN) bval2 = cv.value.as_bool;
+                                else if (old_type == COLUMN_TYPE_SMALLINT) bval2 = cv.value.as_smallint;
+                                else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) bval2 = (long long)cv.value.as_float;
+                                else if (column_type_is_text(old_type) && cv.value.as_text) bval2 = atoll(cv.value.as_text);
+                                nc.value.as_bigint = bval2;
+                            } else if (new_type == COLUMN_TYPE_FLOAT || new_type == COLUMN_TYPE_NUMERIC) {
+                                double dval = 0.0;
+                                if (old_type == COLUMN_TYPE_INT) dval = cv.value.as_int;
+                                else if (old_type == COLUMN_TYPE_BOOLEAN) dval = cv.value.as_bool;
+                                else if (old_type == COLUMN_TYPE_SMALLINT) dval = cv.value.as_smallint;
+                                else if (old_type == COLUMN_TYPE_BIGINT) dval = (double)cv.value.as_bigint;
+                                else if (column_type_is_text(old_type) && cv.value.as_text) dval = atof(cv.value.as_text);
+                                nc.value.as_float = dval;
+                            } else if (column_type_is_text(new_type)) {
+                                char buf[64];
+                                if (old_type == COLUMN_TYPE_INT) snprintf(buf, sizeof(buf), "%d", cv.value.as_int);
+                                else if (old_type == COLUMN_TYPE_BOOLEAN) snprintf(buf, sizeof(buf), "%s", cv.value.as_bool ? "true" : "false");
+                                else if (old_type == COLUMN_TYPE_SMALLINT) snprintf(buf, sizeof(buf), "%d", cv.value.as_smallint);
+                                else if (old_type == COLUMN_TYPE_BIGINT) snprintf(buf, sizeof(buf), "%lld", cv.value.as_bigint);
+                                else if (old_type == COLUMN_TYPE_FLOAT || old_type == COLUMN_TYPE_NUMERIC) snprintf(buf, sizeof(buf), "%g", cv.value.as_float);
+                                else buf[0] = '\0';
+                                nc.value.as_text = strdup(buf);
+                            }
+                            if (column_type_is_text(old_type)) cell_free_text(&owned);
+                            owned = nc;
+                        }
+                        da_push(&_r.cells, owned);
                     }
+                    table_flat_append_row(t, &_r);
+                    row_free(&_r);
                 }
-                /* rebuild flat storage with new types/values */
-                table_flat_rebuild_from_rows(t);
+                flat_table_free(&old_flat);
                 t->generation++;
                 db->total_generation++;
             }
