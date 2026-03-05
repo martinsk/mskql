@@ -17,17 +17,20 @@ PARSE_SCRIPT="$SCRIPT_DIR/parse_perf.py"
 BENCH_NAME="large_sort"
 RUN_ALL=0
 TIME_LIMIT="30s"
+RUN_SIMD=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --bench)  BENCH_NAME="$2"; shift 2 ;;
         --all)    RUN_ALL=1; shift ;;
         --time)   TIME_LIMIT="$2"; shift 2 ;;
+        --simd)   RUN_SIMD=1; shift ;;
         -h|--help)
-            echo "Usage: $0 [--bench NAME] [--all] [--time LIMIT]"
+            echo "Usage: $0 [--bench NAME] [--all] [--time LIMIT] [--simd]"
             echo "  --bench NAME   Profile specific benchmark (default: large_sort)"
             echo "  --all          Profile all benchmarks sequentially"
             echo "  --time LIMIT   xctrace time limit (default: 30s)"
+            echo "  --simd         Also run SIMD/ILP static analysis (simd_report.sh)"
             exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -119,3 +122,10 @@ echo ""
 echo "═══════════════════════════════════════════════════════════"
 echo "  Results saved to: $OUTDIR"
 echo "═══════════════════════════════════════════════════════════"
+
+# ── Optional SIMD/ILP static analysis ────────────────────────────
+if [[ $RUN_SIMD -eq 1 ]]; then
+    echo ""
+    echo "Running SIMD/ILP static analysis..."
+    bash "$SCRIPT_DIR/simd_report.sh"
+fi
