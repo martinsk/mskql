@@ -1777,7 +1777,127 @@ struct table *materialize_subquery(struct database *db, const char *sql,
     parse_ok: (void)0;
     struct rows sq_rows = {0};
 
-    /* Try plan executor fast path for simple SELECTs */
+    /* Try plan executor fast path: block → flat_table directly (no rows) */
+    int used_flat = 0;
+    if (sq.query_type == QUERY_TYPE_SELECT) {
+        struct query_select *ss = &sq.select;
+        struct table *src = NULL;
+        if (ss->table.len > 0)
+            src = db_find_table_sv(db, ss->table);
+        if (src) {
+            struct plan_result pr = plan_build_select(src, ss, &sq.arena, db);
+            if (pr.status == PLAN_OK) {
+                struct table ct = {0};
+                ct.name = strdup(table_name);
+                da_init(&ct.columns);
+                da_init(&ct.indexes);
+
+                struct plan_exec_ctx ctx;
+                plan_exec_init(&ctx, &sq.arena, db, pr.node);
+                plan_exec_to_flat(&ctx, pr.node, &ct.flat);
+
+                /* Infer column names from query AST + types from flat_table */
+                uint16_t ncols_ft = ct.flat.ncols;
+                if (ncols_ft > 0) {
+                    /* generate_series: single column with alias */
+                    if (ss->has_generate_series && ncols_ft == 1) {
+                        struct column col = {0};
+                        if (ss->gs_col_alias.len > 0)
+                            col.name = sv_to_cstr(ss->gs_col_alias);
+                        else
+                            col.name = strdup("generate_series");
+                        col.type = ct.flat.col_types[0];
+                        da_push(&ct.columns, col);
+                        goto flat_columns_done;
+                    }
+                    struct table *src_t = db_find_table_sv(db, ss->table);
+                    if (src_t && sv_eq_cstr(ss->columns, "*")) {
+                        for (uint16_t c = 0; c < src_t->columns.count && c < ncols_ft; c++) {
+                            struct column col = {0};
+                            col.name = strdup(src_t->columns.items[c].name);
+                            col.type = ct.flat.col_types[c];
+                            if (ct.flat.col_types[c] == COLUMN_TYPE_VECTOR)
+                                col.vector_dim = ct.flat.col_vec_dims[c];
+                            da_push(&ct.columns, col);
+                        }
+                    } else if (src_t || ss->columns.len > 0) {
+                        sv cols = ss->columns;
+                        size_t ci = 0;
+                        while (cols.len > 0 && ci < ncols_ft) {
+                            while (cols.len > 0 && (cols.data[0] == ' ' || cols.data[0] == '\t'))
+                                { cols.data++; cols.len--; }
+                            size_t end = 0;
+                            while (end < cols.len && cols.data[end] != ',') end++;
+                            sv col_sv = sv_from(cols.data, end);
+                            while (col_sv.len > 0 && (col_sv.data[col_sv.len-1] == ' ' || col_sv.data[col_sv.len-1] == '\t'))
+                                col_sv.len--;
+                            sv col_name = col_sv;
+                            for (size_t k = 0; k + 2 < col_sv.len; k++) {
+                                if ((col_sv.data[k] == ' ' || col_sv.data[k] == '\t') &&
+                                    (col_sv.data[k+1] == 'A' || col_sv.data[k+1] == 'a') &&
+                                    (col_sv.data[k+2] == 'S' || col_sv.data[k+2] == 's') &&
+                                    (k + 3 >= col_sv.len || col_sv.data[k+3] == ' ' || col_sv.data[k+3] == '\t')) {
+                                    size_t alias_start = k + 3;
+                                    while (alias_start < col_sv.len && (col_sv.data[alias_start] == ' ' || col_sv.data[alias_start] == '\t'))
+                                        alias_start++;
+                                    col_name = sv_from(col_sv.data + alias_start, col_sv.len - alias_start);
+                                    break;
+                                }
+                            }
+                            for (size_t k = 0; k < col_name.len; k++) {
+                                if (col_name.data[k] == '.') {
+                                    col_name = sv_from(col_name.data + k + 1, col_name.len - k - 1);
+                                    break;
+                                }
+                            }
+                            struct column col = {0};
+                            col.name = sv_to_cstr(col_name);
+                            if (src_t) {
+                                int sci = table_find_column_sv(src_t, col_name);
+                                col.type = (sci >= 0) ? src_t->columns.items[sci].type
+                                                      : ct.flat.col_types[ci];
+                            } else {
+                                col.type = ct.flat.col_types[ci];
+                            }
+                            da_push(&ct.columns, col);
+                            ci++;
+                            if (end < cols.len) { cols.data += end + 1; cols.len -= end + 1; }
+                            else break;
+                        }
+                        for (uint32_t ai = 0; ai < ss->aggregates_count && ci < ncols_ft; ai++, ci++) {
+                            struct agg_expr *ae = &sq.arena.aggregates.items[ss->aggregates_start + ai];
+                            struct column col = {0};
+                            if (ae->alias.len > 0)
+                                col.name = sv_to_cstr(ae->alias);
+                            else
+                                col.name = sv_to_cstr(ae->column);
+                            col.type = ct.flat.col_types[ci];
+                            da_push(&ct.columns, col);
+                        }
+                    }
+                    /* fallback: generic column names */
+                    if (ct.columns.count == 0) {
+                        for (uint16_t c = 0; c < ncols_ft; c++) {
+                            struct column col = {0};
+                            char buf[32];
+                            snprintf(buf, sizeof(buf), "column%u", (unsigned)(c + 1));
+                            col.name = strdup(buf);
+                            col.type = ct.flat.col_types[c];
+                            da_push(&ct.columns, col);
+                        }
+                    }
+                    flat_columns_done: (void)0;
+                }
+
+                query_free(&sq);
+                free(gs_rewritten);
+                da_push(&db->tables, ct);
+                return &db->tables.items[db->tables.count - 1];
+            }
+        }
+    }
+
+    /* Slow path: legacy row executor */
     int used_plan = 0;
     if (sq.query_type == QUERY_TYPE_SELECT) {
         struct query_select *ss = &sq.select;
@@ -4518,6 +4638,23 @@ int db_exec_sql_discard(struct database *db, const char *sql)
 
     if (q.query_type == QUERY_TYPE_SELECT) {
         struct query_select *s = &q.select;
+
+        /* Pre-materialize CTEs so plan_build_select can find them as tables */
+        struct table *cte_temps[32] = {0};
+        size_t n_cte_temps = 0;
+        materialize_ctes(db, s, &q.arena, cte_temps, &n_cte_temps);
+
+        /* Clear CTE info so neither plan_build_select nor fallback db_exec
+         * re-materializes them (they already exist as real temp tables). */
+        uint32_t saved_ctes_count = s->ctes_count;
+        uint32_t saved_cte_name = s->cte_name;
+        uint32_t saved_cte_sql = s->cte_sql;
+        if (n_cte_temps > 0) {
+            s->ctes_count = 0;
+            s->cte_name = IDX_NONE;
+            s->cte_sql = IDX_NONE;
+        }
+
         struct table *t = s->table.len > 0 ? db_find_table_sv(db, s->table) : NULL;
         if (t) {
             struct plan_result pr = plan_build_select(t, s, &q.arena, db);
@@ -4525,10 +4662,19 @@ int db_exec_sql_discard(struct database *db, const char *sql)
                 struct plan_exec_ctx ctx;
                 plan_exec_init(&ctx, &q.arena, db, pr.node);
                 int rc = plan_exec_discard(&ctx, pr.node);
+                for (size_t ci = n_cte_temps; ci > 0; ci--)
+                    remove_temp_table(db, cte_temps[ci - 1]);
                 query_free(&q);
                 return rc;
             }
         }
+
+        /* Restore CTE info and clean up temps before falling back */
+        s->ctes_count = saved_ctes_count;
+        s->cte_name = saved_cte_name;
+        s->cte_sql = saved_cte_sql;
+        for (size_t ci = n_cte_temps; ci > 0; ci--)
+            remove_temp_table(db, cte_temps[ci - 1]);
     }
 
     /* fallback: full execution + discard */

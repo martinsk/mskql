@@ -80,6 +80,41 @@ enum vec_op_kind {
     VEC_FUNC_CONCAT_LIT,   /* col || literal → TEXT */
     VEC_FUNC_SUBSTRING,    /* SUBSTRING(col, start[, len]) → TEXT */
     VEC_FUNC_REPLACE,      /* REPLACE(col, lit, lit) → TEXT */
+    VEC_FUNC_CAST_I16_TO_I32, /* SMALLINT → INT widening */
+    VEC_FUNC_CAST_I32_TO_I64, /* INT → BIGINT widening */
+    VEC_FUNC_CAST_I64_TO_I32, /* BIGINT → INT narrowing (truncate) */
+    VEC_LITERAL,              /* broadcast constant into output column */
+    VEC_FUNC_NEG_I16,         /* -col → SMALLINT */
+    VEC_FUNC_NEG_I32,         /* -col → INT */
+    VEC_FUNC_NEG_I64,         /* -col → BIGINT */
+    VEC_FUNC_NEG_F64,         /* -col → FLOAT/NUMERIC */
+    VEC_FUNC_NOT,             /* NOT col → BOOLEAN */
+    VEC_FUNC_IS_NULL,         /* col IS NULL → BOOLEAN */
+    VEC_FUNC_IS_NOT_NULL,     /* col IS NOT NULL → BOOLEAN */
+    VEC_LIT_OP_COL,           /* lit OP col (non-commutative: lit-col, lit/col) */
+    VEC_FUNC_NULLIF_LIT,      /* NULLIF(col, lit) → same type (NULL if col==lit) */
+    VEC_FUNC_GREATEST_I32,    /* GREATEST(col, lit) → INT */
+    VEC_FUNC_GREATEST_I64,    /* GREATEST(col, lit) → BIGINT */
+    VEC_FUNC_GREATEST_F64,    /* GREATEST(col, lit) → FLOAT/NUMERIC */
+    VEC_FUNC_LEAST_I32,       /* LEAST(col, lit) → INT */
+    VEC_FUNC_LEAST_I64,       /* LEAST(col, lit) → BIGINT */
+    VEC_FUNC_LEAST_F64,       /* LEAST(col, lit) → FLOAT/NUMERIC */
+    VEC_FUNC_COALESCE_COL,    /* COALESCE(col, col) → same type */
+    VEC_FUNC_LEFT,            /* LEFT(col, lit) → TEXT */
+    VEC_FUNC_RIGHT,           /* RIGHT(col, lit) → TEXT */
+    VEC_FUNC_LPAD,            /* LPAD(col, lit[, lit]) → TEXT */
+    VEC_FUNC_RPAD,            /* RPAD(col, lit[, lit]) → TEXT */
+    VEC_COL_OP_COL_MIXED,     /* col OP col with type promotion (e.g. INT+BIGINT→BIGINT) */
+    VEC_FUNC_CONCAT_COL,      /* col || col → TEXT */
+    VEC_FUNC_BETWEEN_LIT,     /* col BETWEEN lit AND lit → BOOLEAN */
+    VEC_FUNC_IN_LIST,         /* col IN (lit, lit, ...) → BOOLEAN */
+    VEC_FUNC_LIKE_LIT,        /* col LIKE 'pattern' → BOOLEAN */
+    VEC_FUNC_IS_DISTINCT,     /* col IS [NOT] DISTINCT FROM col/lit → BOOLEAN */
+    VEC_FUNC_EXTRACT,         /* EXTRACT(field FROM date/timestamp col) → FLOAT */
+    VEC_FUNC_DATE_TRUNC,      /* DATE_TRUNC(field, date/timestamp col) → TIMESTAMP */
+    VEC_FUNC_CAST_TO_TEXT,    /* CAST(numeric/date col AS TEXT) → TEXT */
+    VEC_FUNC_CAST_TEXT_TO_NUM,/* CAST(text col AS INT/BIGINT/FLOAT) → numeric */
+    VEC_FUNC_CASE_WHEN,       /* CASE WHEN ... END (per-row condition eval, literal results) */
 };
 
 struct vec_project_op {
@@ -96,6 +131,8 @@ struct vec_project_op {
     int64_t     right_lit_i64; /* second literal (e.g. SUBSTRING length, -1 = no limit) */
     const char *lit_text2;     /* second literal string for VEC_FUNC_REPLACE */
     uint32_t    lit_text2_len; /* strlen of lit_text2 */
+    uint32_t    case_expr_idx; /* for VEC_FUNC_CASE_WHEN: original expr index */
+    struct table *case_table;  /* for VEC_FUNC_CASE_WHEN: table for eval_expr_col */
 };
 
 /* Plan node: arena-allocated in query_arena.plan_nodes DA.
@@ -554,6 +591,14 @@ int plan_exec_to_rows(struct plan_exec_ctx *ctx, uint32_t root_node,
 /* Execute a full plan tree, discarding all output blocks.
  * Measures pure execution cost without block_to_rows / malloc overhead. */
 int plan_exec_discard(struct plan_exec_ctx *ctx, uint32_t root_node);
+
+/* Execute a full plan tree, writing results directly into a flat_table.
+ * Skips the intermediate struct rows conversion — block columns are copied
+ * straight into the flat_table's columnar arrays.  The flat_table must be
+ * zeroed on entry; this function initializes and grows it as needed.
+ * Returns 0 on success, -1 on error. */
+int plan_exec_to_flat(struct plan_exec_ctx *ctx, uint32_t root_node,
+                      struct flat_table *ft);
 
 /* Free heap-allocated state (e.g. flat_table group keys) after plan execution. */
 void plan_exec_cleanup(struct plan_exec_ctx *ctx);

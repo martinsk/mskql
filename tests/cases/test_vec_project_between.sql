@@ -1,0 +1,18 @@
+-- Test vectorized BETWEEN
+CREATE TABLE t_between (a INT, b BIGINT, c FLOAT);
+INSERT INTO t_between VALUES (5, 50, 2.5);
+INSERT INTO t_between VALUES (10, 100, 5.0);
+INSERT INTO t_between VALUES (15, 150, 7.5);
+INSERT INTO t_between VALUES (20, 200, 10.0);
+
+-- INT BETWEEN lit AND lit
+SELECT a, a BETWEEN 8 AND 16 FROM t_between ORDER BY a;
+
+-- BIGINT BETWEEN
+SELECT b, b BETWEEN 80 AND 160 FROM t_between ORDER BY b;
+
+-- FLOAT BETWEEN
+SELECT c, c BETWEEN 3.0 AND 8.0 FROM t_between ORDER BY c;
+
+-- NOT BETWEEN
+SELECT a, a NOT BETWEEN 8 AND 16 FROM t_between ORDER BY a;

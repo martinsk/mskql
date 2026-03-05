@@ -4,6 +4,7 @@
 #include "arena_helpers.h"
 #include "logical.h"
 #include "vector.h"
+#include "datetime.h"
 #ifndef MSKQL_WASM
 #include "parquet.h"
 #include "pq_reader.h"
@@ -14,6 +15,30 @@
 #include <strings.h>
 #include <math.h>
 #include <ctype.h>
+
+/* Fast ASCII case-conversion lookup tables (avoid per-char dylib toupper/tolower calls) */
+static const char upper_lut[256] = {
+    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+    32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
+    64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
+    96,'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',123,124,125,126,127,
+    128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
+    160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+    192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+    224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+};
+static const char lower_lut[256] = {
+    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+    32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
+    64,'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z',91,92,93,94,95,
+    96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,
+    128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
+    160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+    192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+    224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+};
+#define FAST_UPPER(c) upper_lut[(unsigned char)(c)]
+#define FAST_LOWER(c) lower_lut[(unsigned char)(c)]
 
 #define MAX_SORT_KEYS 32
 
@@ -2077,12 +2102,20 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (lit == 0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
                     for (uint16_t i = 0; i < count; i++) dst[i] = src[i] / lit;
                     break;
-                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_MOD:
+                    if (lit == 0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                    for (uint16_t i = 0; i < count; i++) dst[i] = src[i] % lit;
+                    break;
+                case OP_EXP: for (uint16_t i = 0; i < count; i++) dst[i] = (int32_t)pow((double)src[i], (double)lit); break;
+                case OP_BITAND: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] & lit; break;
+                case OP_BITOR:  for (uint16_t i = 0; i < count; i++) dst[i] = src[i] | lit; break;
+                case OP_LSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] << lit; break;
+                case OP_RSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] >> lit; break;
+                case OP_CONCAT: case OP_NEG:
                 case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
                 case OP_AND: case OP_OR: case OP_NOT:
                 case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
                 case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
-                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
                     break;
                 }
                 memcpy(ocb->nulls, lcb->nulls, count);
@@ -2100,12 +2133,20 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (lit == 0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
                     for (uint16_t i = 0; i < count; i++) dst[i] = src[i] / lit;
                     break;
-                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_MOD:
+                    if (lit == 0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                    for (uint16_t i = 0; i < count; i++) dst[i] = src[i] % lit;
+                    break;
+                case OP_EXP: for (uint16_t i = 0; i < count; i++) dst[i] = (int64_t)pow((double)src[i], (double)lit); break;
+                case OP_BITAND: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] & lit; break;
+                case OP_BITOR:  for (uint16_t i = 0; i < count; i++) dst[i] = src[i] | lit; break;
+                case OP_LSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] << lit; break;
+                case OP_RSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] >> lit; break;
+                case OP_CONCAT: case OP_NEG:
                 case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
                 case OP_AND: case OP_OR: case OP_NOT:
                 case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
                 case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
-                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
                     break;
                 }
                 memcpy(ocb->nulls, lcb->nulls, count);
@@ -2124,7 +2165,12 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     if (lit == 0.0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
                     for (uint16_t i = 0; i < count; i++) dst[i] = src[i] / lit;
                     break;
-                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_MOD:
+                    if (lit == 0.0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                    for (uint16_t i = 0; i < count; i++) dst[i] = fmod(src[i], lit);
+                    break;
+                case OP_EXP: for (uint16_t i = 0; i < count; i++) dst[i] = pow(src[i], lit); break;
+                case OP_CONCAT: case OP_NEG:
                 case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
                 case OP_AND: case OP_OR: case OP_NOT:
                 case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
@@ -2135,7 +2181,38 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 memcpy(ocb->nulls, lcb->nulls, count);
                 break;
             }
-            case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_BOOLEAN:
+            case COLUMN_TYPE_SMALLINT: {
+                const int16_t *src = lcb->data.i16;
+                int16_t lit = (int16_t)vop->lit_i64;
+                int16_t *dst = ocb->data.i16;
+                switch (vop->op) {
+                case OP_ADD: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] + lit; break;
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] - lit; break;
+                case OP_MUL: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] * lit; break;
+                case OP_DIV:
+                    if (lit == 0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                    for (uint16_t i = 0; i < count; i++) dst[i] = src[i] / lit;
+                    break;
+                case OP_MOD:
+                    if (lit == 0) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                    for (uint16_t i = 0; i < count; i++) dst[i] = src[i] % lit;
+                    break;
+                case OP_EXP: for (uint16_t i = 0; i < count; i++) dst[i] = (int16_t)pow((double)src[i], (double)lit); break;
+                case OP_BITAND: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] & lit; break;
+                case OP_BITOR:  for (uint16_t i = 0; i < count; i++) dst[i] = src[i] | lit; break;
+                case OP_LSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] << lit; break;
+                case OP_RSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = src[i] >> lit; break;
+                case OP_CONCAT: case OP_NEG:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                    break;
+                }
+                memcpy(ocb->nulls, lcb->nulls, count);
+                break;
+            }
+            case COLUMN_TYPE_BOOLEAN:
             case COLUMN_TYPE_TEXT: case COLUMN_TYPE_DATE:
             case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
             case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
@@ -2160,12 +2237,22 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         dst[i] = rs[i] ? ls[i] / rs[i] : 0;
                     }
                     break;
-                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_MOD:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (rs[i] == 0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = rs[i] ? ls[i] % rs[i] : 0;
+                    }
+                    break;
+                case OP_EXP: for (uint16_t i = 0; i < count; i++) dst[i] = (int32_t)pow((double)ls[i], (double)rs[i]); break;
+                case OP_BITAND: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] & rs[i]; break;
+                case OP_BITOR:  for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] | rs[i]; break;
+                case OP_LSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] << rs[i]; break;
+                case OP_RSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] >> rs[i]; break;
+                case OP_CONCAT: case OP_NEG:
                 case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
                 case OP_AND: case OP_OR: case OP_NOT:
                 case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
                 case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
-                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
                     break;
                 }
                 for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
@@ -2185,12 +2272,22 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         dst[i] = rs[i] ? ls[i] / rs[i] : 0;
                     }
                     break;
-                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_MOD:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (rs[i] == 0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = rs[i] ? ls[i] % rs[i] : 0;
+                    }
+                    break;
+                case OP_EXP: for (uint16_t i = 0; i < count; i++) dst[i] = (int64_t)pow((double)ls[i], (double)rs[i]); break;
+                case OP_BITAND: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] & rs[i]; break;
+                case OP_BITOR:  for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] | rs[i]; break;
+                case OP_LSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] << rs[i]; break;
+                case OP_RSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] >> rs[i]; break;
+                case OP_CONCAT: case OP_NEG:
                 case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
                 case OP_AND: case OP_OR: case OP_NOT:
                 case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
                 case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
-                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
                     break;
                 }
                 for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
@@ -2211,7 +2308,14 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                         dst[i] = rs[i] ? ls[i] / rs[i] : 0.0;
                     }
                     break;
-                case OP_MOD: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_MOD:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (rs[i] == 0.0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = rs[i] != 0.0 ? fmod(ls[i], rs[i]) : 0.0;
+                    }
+                    break;
+                case OP_EXP: for (uint16_t i = 0; i < count; i++) dst[i] = pow(ls[i], rs[i]); break;
+                case OP_CONCAT: case OP_NEG:
                 case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
                 case OP_AND: case OP_OR: case OP_NOT:
                 case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
@@ -2222,13 +2326,160 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
                 break;
             }
-            case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_BOOLEAN:
+            case COLUMN_TYPE_SMALLINT: {
+                const int16_t *ls = lcb->data.i16;
+                const int16_t *rs = rcb->data.i16;
+                int16_t *dst = ocb->data.i16;
+                switch (vop->op) {
+                case OP_ADD: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] + rs[i]; break;
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] - rs[i]; break;
+                case OP_MUL: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] * rs[i]; break;
+                case OP_DIV:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (rs[i] == 0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = rs[i] ? ls[i] / rs[i] : 0;
+                    }
+                    break;
+                case OP_MOD:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (rs[i] == 0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = rs[i] ? ls[i] % rs[i] : 0;
+                    }
+                    break;
+                case OP_EXP: for (uint16_t i = 0; i < count; i++) dst[i] = (int16_t)pow((double)ls[i], (double)rs[i]); break;
+                case OP_BITAND: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] & rs[i]; break;
+                case OP_BITOR:  for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] | rs[i]; break;
+                case OP_LSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] << rs[i]; break;
+                case OP_RSHIFT: for (uint16_t i = 0; i < count; i++) dst[i] = ls[i] >> rs[i]; break;
+                case OP_CONCAT: case OP_NEG:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                    break;
+                }
+                for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
+                break;
+            }
+            case COLUMN_TYPE_BOOLEAN:
             case COLUMN_TYPE_TEXT: case COLUMN_TYPE_DATE:
             case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
             case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
             case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
             case COLUMN_TYPE_VECTOR:
                 break;
+            }
+        } else if (vop->kind == VEC_COL_OP_COL_MIXED) {
+            /* Mixed-type col OP col: promote both sides to output type, compute */
+            struct col_block *rcb = &input.cols[vop->right_col];
+            /* Unpack source column types from lit_i64 */
+            enum column_type lct = (enum column_type)(vop->lit_i64 >> 16);
+            enum column_type rct = (enum column_type)(vop->lit_i64 & 0xFFFF);
+            /* Read left/right as double */
+            double lv[BLOCK_CAPACITY], rv[BLOCK_CAPACITY];
+            for (uint16_t i = 0; i < count; i++) {
+                switch (column_type_storage(lct)) {
+                case STORE_I16: lv[i] = (double)lcb->data.i16[i]; break;
+                case STORE_I32: lv[i] = (double)lcb->data.i32[i]; break;
+                case STORE_I64: lv[i] = (double)lcb->data.i64[i]; break;
+                case STORE_F64: lv[i] = lcb->data.f64[i]; break;
+                case STORE_STR: case STORE_IV: case STORE_UUID: case STORE_VEC: lv[i] = 0; break;
+                }
+                switch (column_type_storage(rct)) {
+                case STORE_I16: rv[i] = (double)rcb->data.i16[i]; break;
+                case STORE_I32: rv[i] = (double)rcb->data.i32[i]; break;
+                case STORE_I64: rv[i] = (double)rcb->data.i64[i]; break;
+                case STORE_F64: rv[i] = rcb->data.f64[i]; break;
+                case STORE_STR: case STORE_IV: case STORE_UUID: case STORE_VEC: rv[i] = 0; break;
+                }
+            }
+            /* Compute into output type */
+            if (vop->out_type == COLUMN_TYPE_FLOAT || vop->out_type == COLUMN_TYPE_NUMERIC) {
+                double *dst = ocb->data.f64;
+                switch (vop->op) {
+                case OP_ADD: for (uint16_t i = 0; i < count; i++) dst[i] = lv[i] + rv[i]; break;
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = lv[i] - rv[i]; break;
+                case OP_MUL: for (uint16_t i = 0; i < count; i++) dst[i] = lv[i] * rv[i]; break;
+                case OP_DIV:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (rv[i] == 0.0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = rv[i] != 0.0 ? lv[i] / rv[i] : 0.0;
+                    }
+                    break;
+                case OP_MOD:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (rv[i] == 0.0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = rv[i] != 0.0 ? fmod(lv[i], rv[i]) : 0.0;
+                    }
+                    break;
+                case OP_EXP: for (uint16_t i = 0; i < count; i++) dst[i] = pow(lv[i], rv[i]); break;
+                default: break;
+                }
+            } else if (vop->out_type == COLUMN_TYPE_BIGINT) {
+                int64_t *dst = ocb->data.i64;
+                for (uint16_t i = 0; i < count; i++) {
+                    int64_t a = (int64_t)lv[i], b = (int64_t)rv[i];
+                    switch (vop->op) {
+                    case OP_ADD: dst[i] = a + b; break;
+                    case OP_SUB: dst[i] = a - b; break;
+                    case OP_MUL: dst[i] = a * b; break;
+                    case OP_DIV:
+                        if (b == 0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = b ? a / b : 0; break;
+                    case OP_MOD:
+                        if (b == 0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = b ? a % b : 0; break;
+                    case OP_EXP: dst[i] = (int64_t)pow(lv[i], rv[i]); break;
+                    case OP_BITAND: dst[i] = a & b; break;
+                    case OP_BITOR:  dst[i] = a | b; break;
+                    case OP_LSHIFT: dst[i] = a << b; break;
+                    case OP_RSHIFT: dst[i] = a >> b; break;
+                    default: break;
+                    }
+                }
+            } else if (vop->out_type == COLUMN_TYPE_INT) {
+                int32_t *dst = ocb->data.i32;
+                for (uint16_t i = 0; i < count; i++) {
+                    int32_t a = (int32_t)lv[i], b = (int32_t)rv[i];
+                    switch (vop->op) {
+                    case OP_ADD: dst[i] = a + b; break;
+                    case OP_SUB: dst[i] = a - b; break;
+                    case OP_MUL: dst[i] = a * b; break;
+                    case OP_DIV:
+                        if (b == 0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = b ? a / b : 0; break;
+                    case OP_MOD:
+                        if (b == 0 && !rcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = b ? a % b : 0; break;
+                    case OP_EXP: dst[i] = (int32_t)pow(lv[i], rv[i]); break;
+                    case OP_BITAND: dst[i] = a & b; break;
+                    case OP_BITOR:  dst[i] = a | b; break;
+                    case OP_LSHIFT: dst[i] = a << b; break;
+                    case OP_RSHIFT: dst[i] = a >> b; break;
+                    default: break;
+                    }
+                }
+            }
+            for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
+        } else if (vop->kind == VEC_FUNC_CONCAT_COL) {
+            struct col_block *rcb = &input.cols[vop->right_col];
+            if (!ocb->str_lens)
+                ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                         BLOCK_CAPACITY, sizeof(uint32_t));
+            for (uint16_t i = 0; i < count; i++) {
+                ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
+                if (ocb->nulls[i]) { ocb->data.str[i] = NULL; continue; }
+                const char *ls = lcb->data.str[i] ? lcb->data.str[i] : "";
+                const char *rs = rcb->data.str[i] ? rcb->data.str[i] : "";
+                size_t ll = lcb->str_lens ? lcb->str_lens[i] : strlen(ls);
+                size_t rl = rcb->str_lens ? rcb->str_lens[i] : strlen(rs);
+                size_t total = ll + rl;
+                char *dst = (char *)bump_alloc(&ctx->arena->scratch, total + 1);
+                memcpy(dst, ls, ll);
+                memcpy(dst + ll, rs, rl);
+                dst[total] = '\0';
+                ocb->data.str[i] = dst;
+                ocb->str_lens[i] = (uint32_t)total;
             }
         } else if (vop->kind == VEC_FUNC_UPPER || vop->kind == VEC_FUNC_LOWER) {
             int is_upper = (vop->kind == VEC_FUNC_UPPER);
@@ -2245,8 +2496,8 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 size_t slen = lcb->str_lens ? lcb->str_lens[i] : strlen(src);
                 char *dst = (char *)bump_alloc(&ctx->arena->scratch, slen + 1);
                 for (size_t j = 0; j < slen; j++)
-                    dst[j] = is_upper ? (char)toupper((unsigned char)src[j])
-                                      : (char)tolower((unsigned char)src[j]);
+                    dst[j] = is_upper ? FAST_UPPER(src[j])
+                                      : FAST_LOWER(src[j]);
                 dst[slen] = '\0';
                 ocb->data.str[i] = dst;
                 ocb->str_lens[i] = (uint32_t)slen;
@@ -2336,6 +2587,493 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             const double *src = lcb->data.f64;
             int64_t *dst = ocb->data.i64;
             for (uint16_t i = 0; i < count; i++) dst[i] = (int64_t)src[i];
+        } else if (vop->kind == VEC_FUNC_CAST_I16_TO_I32) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const int16_t *src = lcb->data.i16;
+            int32_t *dst = ocb->data.i32;
+            for (uint16_t i = 0; i < count; i++) dst[i] = (int32_t)src[i];
+        } else if (vop->kind == VEC_FUNC_CAST_I32_TO_I64) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            enum column_type src_type = lcb->type;
+            int64_t *dst = ocb->data.i64;
+            if (src_type == COLUMN_TYPE_SMALLINT) {
+                const int16_t *src = lcb->data.i16;
+                for (uint16_t i = 0; i < count; i++) dst[i] = (int64_t)src[i];
+            } else {
+                const int32_t *src = lcb->data.i32;
+                for (uint16_t i = 0; i < count; i++) dst[i] = (int64_t)src[i];
+            }
+        } else if (vop->kind == VEC_FUNC_CAST_I64_TO_I32) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const int64_t *src = lcb->data.i64;
+            int32_t *dst = ocb->data.i32;
+            for (uint16_t i = 0; i < count; i++) dst[i] = (int32_t)src[i];
+        } else if (vop->kind == VEC_LITERAL) {
+            enum storage_class sc = column_type_storage(vop->out_type);
+            if (vop->op == 1) { /* NULL literal */
+                memset(ocb->nulls, 1, count);
+            } else {
+                memset(ocb->nulls, 0, count);
+                switch (sc) {
+                case STORE_I16: {
+                    int16_t v = (int16_t)vop->lit_i64;
+                    for (uint16_t i = 0; i < count; i++) ocb->data.i16[i] = v;
+                    break;
+                }
+                case STORE_I32: {
+                    int32_t v = (int32_t)vop->lit_i64;
+                    for (uint16_t i = 0; i < count; i++) ocb->data.i32[i] = v;
+                    break;
+                }
+                case STORE_I64: {
+                    int64_t v = vop->lit_i64;
+                    for (uint16_t i = 0; i < count; i++) ocb->data.i64[i] = v;
+                    break;
+                }
+                case STORE_F64: {
+                    double v = vop->lit_f64;
+                    for (uint16_t i = 0; i < count; i++) ocb->data.f64[i] = v;
+                    break;
+                }
+                case STORE_STR: {
+                    const char *v = vop->lit_text;
+                    if (!ocb->str_lens)
+                        ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                                 BLOCK_CAPACITY, sizeof(uint32_t));
+                    for (uint16_t i = 0; i < count; i++) {
+                        ocb->data.str[i] = (char *)v;
+                        ocb->str_lens[i] = vop->lit_text_len;
+                    }
+                    break;
+                }
+                case STORE_IV: case STORE_UUID: case STORE_VEC:
+                    break;
+                }
+            }
+        } else if (vop->kind == VEC_FUNC_NEG_I16) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const int16_t *src = lcb->data.i16;
+            int16_t *dst = ocb->data.i16;
+            for (uint16_t i = 0; i < count; i++) dst[i] = -src[i];
+        } else if (vop->kind == VEC_FUNC_NEG_I32) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const int32_t *src = lcb->data.i32;
+            int32_t *dst = ocb->data.i32;
+            for (uint16_t i = 0; i < count; i++) dst[i] = -src[i];
+        } else if (vop->kind == VEC_FUNC_NEG_I64) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const int64_t *src = lcb->data.i64;
+            int64_t *dst = ocb->data.i64;
+            for (uint16_t i = 0; i < count; i++) dst[i] = -src[i];
+        } else if (vop->kind == VEC_FUNC_NEG_F64) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const double *src = lcb->data.f64;
+            double *dst = ocb->data.f64;
+            for (uint16_t i = 0; i < count; i++) dst[i] = -src[i];
+        } else if (vop->kind == VEC_FUNC_NOT) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const int32_t *src = lcb->data.i32;
+            int32_t *dst = ocb->data.i32;
+            for (uint16_t i = 0; i < count; i++) dst[i] = !src[i];
+        } else if (vop->kind == VEC_FUNC_IS_NULL) {
+            memset(ocb->nulls, 0, count);
+            int32_t *dst = ocb->data.i32;
+            for (uint16_t i = 0; i < count; i++) dst[i] = lcb->nulls[i] ? 1 : 0;
+        } else if (vop->kind == VEC_FUNC_IS_NOT_NULL) {
+            memset(ocb->nulls, 0, count);
+            int32_t *dst = ocb->data.i32;
+            for (uint16_t i = 0; i < count; i++) dst[i] = lcb->nulls[i] ? 0 : 1;
+        } else if (vop->kind == VEC_FUNC_BETWEEN_LIT) {
+            memset(ocb->nulls, 0, count);
+            int32_t *dst = ocb->data.i32;
+            int negate = vop->op;
+            enum storage_class sc = (enum storage_class)vop->func_precision;
+            switch (sc) {
+            case STORE_I32: {
+                const int32_t *src = lcb->data.i32;
+                int32_t lo = (int32_t)vop->lit_i64, hi = (int32_t)vop->right_lit_i64;
+                for (uint16_t i = 0; i < count; i++) {
+                    int r = (src[i] >= lo && src[i] <= hi);
+                    dst[i] = negate ? !r : r;
+                    if (lcb->nulls[i]) ocb->nulls[i] = 1;
+                }
+                break;
+            }
+            case STORE_I64: {
+                const int64_t *src = lcb->data.i64;
+                int64_t lo = vop->lit_i64, hi = vop->right_lit_i64;
+                for (uint16_t i = 0; i < count; i++) {
+                    int r = (src[i] >= lo && src[i] <= hi);
+                    dst[i] = negate ? !r : r;
+                    if (lcb->nulls[i]) ocb->nulls[i] = 1;
+                }
+                break;
+            }
+            case STORE_F64: {
+                const double *src = lcb->data.f64;
+                double lo = vop->lit_f64, hi;
+                memcpy(&hi, &vop->right_lit_i64, sizeof(double));
+                for (uint16_t i = 0; i < count; i++) {
+                    int r = (src[i] >= lo && src[i] <= hi);
+                    dst[i] = negate ? !r : r;
+                    if (lcb->nulls[i]) ocb->nulls[i] = 1;
+                }
+                break;
+            }
+            case STORE_I16: {
+                const int16_t *src = lcb->data.i16;
+                int16_t lo = (int16_t)vop->lit_i64, hi = (int16_t)vop->right_lit_i64;
+                for (uint16_t i = 0; i < count; i++) {
+                    int r = (src[i] >= lo && src[i] <= hi);
+                    dst[i] = negate ? !r : r;
+                    if (lcb->nulls[i]) ocb->nulls[i] = 1;
+                }
+                break;
+            }
+            case STORE_STR: case STORE_IV: case STORE_UUID: case STORE_VEC:
+                break;
+            }
+        } else if (vop->kind == VEC_FUNC_IN_LIST) {
+            memset(ocb->nulls, 0, count);
+            int32_t *dst = ocb->data.i32;
+            int negate = vop->op;
+            uint32_t vc = vop->lit_text_len;
+            enum storage_class sc = (enum storage_class)vop->func_precision;
+            switch (sc) {
+            case STORE_I32: {
+                const int32_t *src = lcb->data.i32;
+                const int64_t *vals = (const int64_t *)vop->lit_text;
+                for (uint16_t i = 0; i < count; i++) {
+                    if (lcb->nulls[i]) { ocb->nulls[i] = 1; dst[i] = 0; continue; }
+                    int found = 0;
+                    for (uint32_t v = 0; v < vc; v++) { if (src[i] == (int32_t)vals[v]) { found = 1; break; } }
+                    dst[i] = negate ? !found : found;
+                }
+                break;
+            }
+            case STORE_I64: {
+                const int64_t *src = lcb->data.i64;
+                const int64_t *vals = (const int64_t *)vop->lit_text;
+                for (uint16_t i = 0; i < count; i++) {
+                    if (lcb->nulls[i]) { ocb->nulls[i] = 1; dst[i] = 0; continue; }
+                    int found = 0;
+                    for (uint32_t v = 0; v < vc; v++) { if (src[i] == vals[v]) { found = 1; break; } }
+                    dst[i] = negate ? !found : found;
+                }
+                break;
+            }
+            case STORE_F64: {
+                const double *src = lcb->data.f64;
+                const double *vals = (const double *)vop->lit_text;
+                for (uint16_t i = 0; i < count; i++) {
+                    if (lcb->nulls[i]) { ocb->nulls[i] = 1; dst[i] = 0; continue; }
+                    int found = 0;
+                    for (uint32_t v = 0; v < vc; v++) { if (src[i] == vals[v]) { found = 1; break; } }
+                    dst[i] = negate ? !found : found;
+                }
+                break;
+            }
+            case STORE_I16: {
+                const int16_t *src = lcb->data.i16;
+                const int64_t *vals = (const int64_t *)vop->lit_text;
+                for (uint16_t i = 0; i < count; i++) {
+                    if (lcb->nulls[i]) { ocb->nulls[i] = 1; dst[i] = 0; continue; }
+                    int found = 0;
+                    for (uint32_t v = 0; v < vc; v++) { if (src[i] == (int16_t)vals[v]) { found = 1; break; } }
+                    dst[i] = negate ? !found : found;
+                }
+                break;
+            }
+            case STORE_STR: case STORE_IV: case STORE_UUID: case STORE_VEC:
+                break;
+            }
+        } else if (vop->kind == VEC_FUNC_LIKE_LIT) {
+            memset(ocb->nulls, 0, count);
+            int32_t *dst = ocb->data.i32;
+            int negate = vop->op;
+            int icase = vop->func_precision;
+            const char *pat = vop->lit_text;
+            for (uint16_t i = 0; i < count; i++) {
+                if (lcb->nulls[i]) { ocb->nulls[i] = 1; dst[i] = 0; continue; }
+                const char *s = lcb->data.str[i] ? lcb->data.str[i] : "";
+                int m = like_match_esc(pat, s, icase, '\\');
+                dst[i] = negate ? !m : m;
+            }
+        } else if (vop->kind == VEC_FUNC_EXTRACT) {
+            memset(ocb->nulls, 0, count);
+            double *dst = ocb->data.f64;
+            const char *field = vop->lit_text;
+            enum column_type src_ct = (enum column_type)vop->func_precision;
+            if (src_ct == COLUMN_TYPE_DATE) {
+                const int32_t *src = lcb->data.i32;
+                for (uint16_t i = 0; i < count; i++) {
+                    if (lcb->nulls[i]) { ocb->nulls[i] = 1; dst[i] = 0; continue; }
+                    dst[i] = date_extract(src[i], field);
+                }
+            } else {
+                const int64_t *src = lcb->data.i64;
+                for (uint16_t i = 0; i < count; i++) {
+                    if (lcb->nulls[i]) { ocb->nulls[i] = 1; dst[i] = 0; continue; }
+                    dst[i] = timestamp_extract(src[i], field);
+                }
+            }
+        } else if (vop->kind == VEC_FUNC_DATE_TRUNC) {
+            const char *field = vop->lit_text;
+            enum column_type src_ct = (enum column_type)vop->func_precision;
+            if (src_ct == COLUMN_TYPE_DATE) {
+                const int32_t *src = lcb->data.i32;
+                int64_t *dst = ocb->data.i64;
+                for (uint16_t i = 0; i < count; i++) {
+                    ocb->nulls[i] = lcb->nulls[i];
+                    if (lcb->nulls[i]) { dst[i] = 0; continue; }
+                    dst[i] = (int64_t)date_trunc_days(src[i], field) * USEC_PER_DAY;
+                }
+            } else {
+                const int64_t *src = lcb->data.i64;
+                int64_t *dst = ocb->data.i64;
+                for (uint16_t i = 0; i < count; i++) {
+                    ocb->nulls[i] = lcb->nulls[i];
+                    if (lcb->nulls[i]) { dst[i] = 0; continue; }
+                    dst[i] = timestamp_trunc_usec(src[i], field);
+                }
+            }
+        } else if (vop->kind == VEC_FUNC_CAST_TO_TEXT) {
+            enum column_type src_ct = (enum column_type)vop->func_precision;
+            if (!ocb->str_lens)
+                ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                        BLOCK_CAPACITY, sizeof(uint32_t));
+            for (uint16_t i = 0; i < count; i++) {
+                ocb->nulls[i] = lcb->nulls[i];
+                if (lcb->nulls[i]) { ocb->data.str[i] = NULL; continue; }
+                char buf[64];
+                int len = 0;
+                switch (src_ct) {
+                case COLUMN_TYPE_SMALLINT: len = snprintf(buf, sizeof(buf), "%d", (int)lcb->data.i16[i]); break;
+                case COLUMN_TYPE_INT: case COLUMN_TYPE_BOOLEAN:
+                    if (src_ct == COLUMN_TYPE_BOOLEAN)
+                        len = snprintf(buf, sizeof(buf), "%s", lcb->data.i32[i] ? "true" : "false");
+                    else
+                        len = snprintf(buf, sizeof(buf), "%d", lcb->data.i32[i]);
+                    break;
+                case COLUMN_TYPE_BIGINT: len = snprintf(buf, sizeof(buf), "%lld", (long long)lcb->data.i64[i]); break;
+                case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: {
+                    double v = lcb->data.f64[i];
+                    if (v == (double)(long long)v && v >= -1e15 && v <= 1e15)
+                        len = snprintf(buf, sizeof(buf), "%lld", (long long)v);
+                    else
+                        len = snprintf(buf, sizeof(buf), "%g", v);
+                    break;
+                }
+                case COLUMN_TYPE_TEXT:
+                    /* text→text is passthrough, just copy pointer */
+                    ocb->data.str[i] = lcb->data.str[i];
+                    ocb->str_lens[i] = lcb->str_lens ? lcb->str_lens[i] : (lcb->data.str[i] ? (uint32_t)strlen(lcb->data.str[i]) : 0);
+                    continue;
+                case COLUMN_TYPE_DATE: case COLUMN_TYPE_ENUM:
+                    len = snprintf(buf, sizeof(buf), "%d", lcb->data.i32[i]); break;
+                case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
+                case COLUMN_TYPE_TIMESTAMPTZ:
+                    len = snprintf(buf, sizeof(buf), "%lld", (long long)lcb->data.i64[i]); break;
+                case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID:
+                case COLUMN_TYPE_VECTOR:
+                    buf[0] = '\0'; len = 0; break;
+                }
+                if (len > 0) {
+                    char *dst = (char *)bump_alloc(&ctx->arena->scratch, (size_t)len + 1);
+                    memcpy(dst, buf, (size_t)len + 1);
+                    ocb->data.str[i] = dst;
+                    ocb->str_lens[i] = (uint32_t)len;
+                } else {
+                    ocb->data.str[i] = "";
+                    ocb->str_lens[i] = 0;
+                }
+            }
+        } else if (vop->kind == VEC_FUNC_CAST_TEXT_TO_NUM) {
+            for (uint16_t i = 0; i < count; i++) {
+                ocb->nulls[i] = lcb->nulls[i];
+                if (lcb->nulls[i]) continue;
+                const char *s = lcb->data.str[i] ? lcb->data.str[i] : "0";
+                switch (vop->out_type) {
+                case COLUMN_TYPE_INT: ocb->data.i32[i] = (int32_t)strtol(s, NULL, 10); break;
+                case COLUMN_TYPE_BIGINT: ocb->data.i64[i] = strtoll(s, NULL, 10); break;
+                case COLUMN_TYPE_FLOAT: case COLUMN_TYPE_NUMERIC: ocb->data.f64[i] = strtod(s, NULL); break;
+                case COLUMN_TYPE_SMALLINT: case COLUMN_TYPE_TEXT: case COLUMN_TYPE_ENUM:
+                case COLUMN_TYPE_BOOLEAN: case COLUMN_TYPE_DATE: case COLUMN_TYPE_TIME:
+                case COLUMN_TYPE_TIMESTAMP: case COLUMN_TYPE_TIMESTAMPTZ:
+                case COLUMN_TYPE_INTERVAL: case COLUMN_TYPE_UUID: case COLUMN_TYPE_VECTOR:
+                    break;
+                }
+            }
+        } else if (vop->kind == VEC_FUNC_CASE_WHEN) {
+            /* Per-row eval_expr_col for CASE WHEN expressions */
+            if (vop->out_type == COLUMN_TYPE_TEXT) {
+                if (!ocb->str_lens)
+                    ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                            BLOCK_CAPACITY, sizeof(uint32_t));
+            }
+            for (uint16_t i = 0; i < count; i++) {
+                struct col_row_ref ref;
+                ref.cols = input.cols;
+                ref.ncols = input.ncols;
+                ref.ri = i;
+                struct cell result = eval_expr_col(vop->case_expr_idx, ctx->arena,
+                                                   vop->case_table, &ref, ctx->db,
+                                                   &ctx->arena->scratch);
+                if (result.is_null) {
+                    ocb->nulls[i] = 1;
+                    continue;
+                }
+                ocb->nulls[i] = 0;
+                switch (column_type_storage(vop->out_type)) {
+                case STORE_I16: ocb->data.i16[i] = result.value.as_smallint; break;
+                case STORE_I32:
+                    if (vop->out_type == COLUMN_TYPE_BOOLEAN)
+                        ocb->data.i32[i] = result.value.as_int ? 1 : 0;
+                    else
+                        ocb->data.i32[i] = result.value.as_int;
+                    break;
+                case STORE_I64: ocb->data.i64[i] = result.value.as_bigint; break;
+                case STORE_F64: ocb->data.f64[i] = result.value.as_float; break;
+                case STORE_STR: {
+                    const char *s = result.value.as_text ? result.value.as_text : "";
+                    uint32_t slen = (uint32_t)strlen(s);
+                    char *dst = (char *)bump_alloc(&ctx->arena->scratch, slen + 1);
+                    memcpy(dst, s, slen + 1);
+                    ocb->data.str[i] = dst;
+                    if (ocb->str_lens) ocb->str_lens[i] = slen;
+                    break;
+                }
+                case STORE_IV: case STORE_UUID: case STORE_VEC:
+                    ocb->nulls[i] = 1; break;
+                }
+            }
+        } else if (vop->kind == VEC_LIT_OP_COL) {
+            switch (vop->out_type) {
+            case COLUMN_TYPE_INT: {
+                const int32_t *src = lcb->data.i32;
+                int32_t lit = (int32_t)vop->lit_i64;
+                int32_t *dst = ocb->data.i32;
+                switch (vop->op) {
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = lit - src[i]; break;
+                case OP_DIV:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (src[i] == 0 && !lcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = src[i] ? lit / src[i] : 0;
+                    }
+                    break;
+                case OP_MOD:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (src[i] == 0 && !lcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = src[i] ? lit % src[i] : 0;
+                    }
+                    break;
+                case OP_ADD: case OP_MUL: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+                    break;
+                }
+                memcpy(ocb->nulls, lcb->nulls, count);
+                break;
+            }
+            case COLUMN_TYPE_BIGINT: {
+                const int64_t *src = lcb->data.i64;
+                int64_t lit = vop->lit_i64;
+                int64_t *dst = ocb->data.i64;
+                switch (vop->op) {
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = lit - src[i]; break;
+                case OP_DIV:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (src[i] == 0 && !lcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = src[i] ? lit / src[i] : 0;
+                    }
+                    break;
+                case OP_MOD:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (src[i] == 0 && !lcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = src[i] ? lit % src[i] : 0;
+                    }
+                    break;
+                case OP_ADD: case OP_MUL: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+                    break;
+                }
+                memcpy(ocb->nulls, lcb->nulls, count);
+                break;
+            }
+            case COLUMN_TYPE_FLOAT:
+            case COLUMN_TYPE_NUMERIC: {
+                const double *src = lcb->data.f64;
+                double lit = vop->lit_f64;
+                double *dst = ocb->data.f64;
+                switch (vop->op) {
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = lit - src[i]; break;
+                case OP_DIV:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (src[i] == 0.0 && !lcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = src[i] != 0.0 ? lit / src[i] : 0.0;
+                    }
+                    break;
+                case OP_MOD:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (src[i] == 0.0 && !lcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = src[i] != 0.0 ? fmod(lit, src[i]) : 0.0;
+                    }
+                    break;
+                case OP_ADD: case OP_MUL: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+                    break;
+                }
+                memcpy(ocb->nulls, lcb->nulls, count);
+                break;
+            }
+            case COLUMN_TYPE_SMALLINT: {
+                const int16_t *src = lcb->data.i16;
+                int16_t lit = (int16_t)vop->lit_i64;
+                int16_t *dst = ocb->data.i16;
+                switch (vop->op) {
+                case OP_SUB: for (uint16_t i = 0; i < count; i++) dst[i] = lit - src[i]; break;
+                case OP_DIV:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (src[i] == 0 && !lcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = src[i] ? lit / src[i] : 0;
+                    }
+                    break;
+                case OP_MOD:
+                    for (uint16_t i = 0; i < count; i++) {
+                        if (src[i] == 0 && !lcb->nulls[i]) { arena_set_error(ctx->arena, "22012", "division by zero"); return -1; }
+                        dst[i] = src[i] ? lit % src[i] : 0;
+                    }
+                    break;
+                case OP_ADD: case OP_MUL: case OP_CONCAT: case OP_NEG: case OP_EXP:
+                case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+                case OP_AND: case OP_OR: case OP_NOT:
+                case OP_LIKE: case OP_REGEX_MATCH: case OP_REGEX_NOT_MATCH:
+                case OP_REGEX_ICASE_MATCH: case OP_REGEX_ICASE_NOT_MATCH:
+                case OP_BITAND: case OP_BITOR: case OP_LSHIFT: case OP_RSHIFT:
+                    break;
+                }
+                memcpy(ocb->nulls, lcb->nulls, count);
+                break;
+            }
+            case COLUMN_TYPE_BOOLEAN:
+            case COLUMN_TYPE_TEXT: case COLUMN_TYPE_DATE:
+            case COLUMN_TYPE_TIME: case COLUMN_TYPE_TIMESTAMP:
+            case COLUMN_TYPE_TIMESTAMPTZ: case COLUMN_TYPE_INTERVAL:
+            case COLUMN_TYPE_ENUM: case COLUMN_TYPE_UUID:
+            case COLUMN_TYPE_VECTOR:
+                break;
+            }
         } else if (vop->kind == VEC_FUNC_COALESCE_LIT) {
             enum storage_class sc = column_type_storage(vop->out_type);
             switch (sc) {
@@ -2382,6 +3120,233 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             case STORE_STR: case STORE_IV: case STORE_UUID: case STORE_VEC:
                 /* TEXT/INTERVAL/UUID/VEC coalesce not yet vectorized — shouldn't reach here */
                 break;
+            }
+        } else if (vop->kind == VEC_FUNC_COALESCE_COL) {
+            struct col_block *rcb = &input.cols[vop->right_col];
+            enum storage_class sc = column_type_storage(vop->out_type);
+            switch (sc) {
+            case STORE_I32: {
+                const int32_t *ls = lcb->data.i32;
+                const int32_t *rs = rcb->data.i32;
+                int32_t *dst = ocb->data.i32;
+                for (uint16_t i = 0; i < count; i++) {
+                    if (!lcb->nulls[i])       { dst[i] = ls[i]; ocb->nulls[i] = 0; }
+                    else if (!rcb->nulls[i])   { dst[i] = rs[i]; ocb->nulls[i] = 0; }
+                    else                       { dst[i] = 0;     ocb->nulls[i] = 1; }
+                }
+                break;
+            }
+            case STORE_I64: {
+                const int64_t *ls = lcb->data.i64;
+                const int64_t *rs = rcb->data.i64;
+                int64_t *dst = ocb->data.i64;
+                for (uint16_t i = 0; i < count; i++) {
+                    if (!lcb->nulls[i])       { dst[i] = ls[i]; ocb->nulls[i] = 0; }
+                    else if (!rcb->nulls[i])   { dst[i] = rs[i]; ocb->nulls[i] = 0; }
+                    else                       { dst[i] = 0;     ocb->nulls[i] = 1; }
+                }
+                break;
+            }
+            case STORE_F64: {
+                const double *ls = lcb->data.f64;
+                const double *rs = rcb->data.f64;
+                double *dst = ocb->data.f64;
+                for (uint16_t i = 0; i < count; i++) {
+                    if (!lcb->nulls[i])       { dst[i] = ls[i]; ocb->nulls[i] = 0; }
+                    else if (!rcb->nulls[i])   { dst[i] = rs[i]; ocb->nulls[i] = 0; }
+                    else                       { dst[i] = 0.0;   ocb->nulls[i] = 1; }
+                }
+                break;
+            }
+            case STORE_I16: {
+                const int16_t *ls = lcb->data.i16;
+                const int16_t *rs = rcb->data.i16;
+                int16_t *dst = ocb->data.i16;
+                for (uint16_t i = 0; i < count; i++) {
+                    if (!lcb->nulls[i])       { dst[i] = ls[i]; ocb->nulls[i] = 0; }
+                    else if (!rcb->nulls[i])   { dst[i] = rs[i]; ocb->nulls[i] = 0; }
+                    else                       { dst[i] = 0;     ocb->nulls[i] = 1; }
+                }
+                break;
+            }
+            case STORE_STR: {
+                if (!ocb->str_lens)
+                    ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                             BLOCK_CAPACITY, sizeof(uint32_t));
+                for (uint16_t i = 0; i < count; i++) {
+                    if (!lcb->nulls[i]) {
+                        ocb->data.str[i] = lcb->data.str[i];
+                        ocb->str_lens[i] = lcb->str_lens ? lcb->str_lens[i] : (lcb->data.str[i] ? (uint32_t)strlen(lcb->data.str[i]) : 0);
+                        ocb->nulls[i] = 0;
+                    } else if (!rcb->nulls[i]) {
+                        ocb->data.str[i] = rcb->data.str[i];
+                        ocb->str_lens[i] = rcb->str_lens ? rcb->str_lens[i] : (rcb->data.str[i] ? (uint32_t)strlen(rcb->data.str[i]) : 0);
+                        ocb->nulls[i] = 0;
+                    } else {
+                        ocb->data.str[i] = NULL;
+                        ocb->nulls[i] = 1;
+                    }
+                }
+                break;
+            }
+            case STORE_IV: case STORE_UUID: case STORE_VEC:
+                break;
+            }
+        } else if (vop->kind == VEC_FUNC_NULLIF_LIT) {
+            enum storage_class sc = column_type_storage(vop->out_type);
+            switch (sc) {
+            case STORE_I32: {
+                const int32_t *src = lcb->data.i32;
+                int32_t lit = (int32_t)vop->lit_i64;
+                int32_t *dst = ocb->data.i32;
+                for (uint16_t i = 0; i < count; i++) {
+                    dst[i] = src[i];
+                    ocb->nulls[i] = lcb->nulls[i] || (src[i] == lit) ? 1 : 0;
+                }
+                break;
+            }
+            case STORE_I64: {
+                const int64_t *src = lcb->data.i64;
+                int64_t lit = vop->lit_i64;
+                int64_t *dst = ocb->data.i64;
+                for (uint16_t i = 0; i < count; i++) {
+                    dst[i] = src[i];
+                    ocb->nulls[i] = lcb->nulls[i] || (src[i] == lit) ? 1 : 0;
+                }
+                break;
+            }
+            case STORE_F64: {
+                const double *src = lcb->data.f64;
+                double lit = vop->lit_f64;
+                double *dst = ocb->data.f64;
+                for (uint16_t i = 0; i < count; i++) {
+                    dst[i] = src[i];
+                    ocb->nulls[i] = lcb->nulls[i] || (src[i] == lit) ? 1 : 0;
+                }
+                break;
+            }
+            case STORE_I16: {
+                const int16_t *src = lcb->data.i16;
+                int16_t lit = (int16_t)vop->lit_i64;
+                int16_t *dst = ocb->data.i16;
+                for (uint16_t i = 0; i < count; i++) {
+                    dst[i] = src[i];
+                    ocb->nulls[i] = lcb->nulls[i] || (src[i] == lit) ? 1 : 0;
+                }
+                break;
+            }
+            case STORE_STR: case STORE_IV: case STORE_UUID: case STORE_VEC:
+                break;
+            }
+        } else if (vop->kind == VEC_FUNC_GREATEST_I32 || vop->kind == VEC_FUNC_LEAST_I32) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const int32_t *src = lcb->data.i32;
+            int32_t lit = (int32_t)vop->lit_i64;
+            int32_t *dst = ocb->data.i32;
+            if (vop->kind == VEC_FUNC_GREATEST_I32)
+                for (uint16_t i = 0; i < count; i++) dst[i] = src[i] > lit ? src[i] : lit;
+            else
+                for (uint16_t i = 0; i < count; i++) dst[i] = src[i] < lit ? src[i] : lit;
+        } else if (vop->kind == VEC_FUNC_GREATEST_I64 || vop->kind == VEC_FUNC_LEAST_I64) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const int64_t *src = lcb->data.i64;
+            int64_t lit = vop->lit_i64;
+            int64_t *dst = ocb->data.i64;
+            if (vop->kind == VEC_FUNC_GREATEST_I64)
+                for (uint16_t i = 0; i < count; i++) dst[i] = src[i] > lit ? src[i] : lit;
+            else
+                for (uint16_t i = 0; i < count; i++) dst[i] = src[i] < lit ? src[i] : lit;
+        } else if (vop->kind == VEC_FUNC_GREATEST_F64 || vop->kind == VEC_FUNC_LEAST_F64) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            const double *src = lcb->data.f64;
+            double lit = vop->lit_f64;
+            double *dst = ocb->data.f64;
+            if (vop->kind == VEC_FUNC_GREATEST_F64)
+                for (uint16_t i = 0; i < count; i++) dst[i] = src[i] > lit ? src[i] : lit;
+            else
+                for (uint16_t i = 0; i < count; i++) dst[i] = src[i] < lit ? src[i] : lit;
+        } else if (vop->kind == VEC_FUNC_LEFT) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            int64_t n = vop->lit_i64;
+            if (!ocb->str_lens)
+                ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                         BLOCK_CAPACITY, sizeof(uint32_t));
+            for (uint16_t i = 0; i < count; i++) {
+                if (lcb->nulls[i] || !lcb->data.str[i]) {
+                    ocb->data.str[i] = NULL; continue;
+                }
+                const char *src = lcb->data.str[i];
+                size_t slen = lcb->str_lens ? lcb->str_lens[i] : strlen(src);
+                size_t take = (n >= 0 && (size_t)n < slen) ? (size_t)n : slen;
+                char *dst = (char *)bump_alloc(&ctx->arena->scratch, take + 1);
+                memcpy(dst, src, take);
+                dst[take] = '\0';
+                ocb->data.str[i] = dst;
+                ocb->str_lens[i] = (uint32_t)take;
+            }
+        } else if (vop->kind == VEC_FUNC_RIGHT) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            int64_t n = vop->lit_i64;
+            if (!ocb->str_lens)
+                ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                         BLOCK_CAPACITY, sizeof(uint32_t));
+            for (uint16_t i = 0; i < count; i++) {
+                if (lcb->nulls[i] || !lcb->data.str[i]) {
+                    ocb->data.str[i] = NULL; continue;
+                }
+                const char *src = lcb->data.str[i];
+                size_t slen = lcb->str_lens ? lcb->str_lens[i] : strlen(src);
+                size_t take = (n >= 0 && (size_t)n < slen) ? (size_t)n : slen;
+                size_t off = slen - take;
+                char *dst = (char *)bump_alloc(&ctx->arena->scratch, take + 1);
+                memcpy(dst, src + off, take);
+                dst[take] = '\0';
+                ocb->data.str[i] = dst;
+                ocb->str_lens[i] = (uint32_t)take;
+            }
+        } else if (vop->kind == VEC_FUNC_LPAD || vop->kind == VEC_FUNC_RPAD) {
+            memcpy(ocb->nulls, lcb->nulls, count);
+            int64_t target_len = vop->lit_i64;
+            const char *pad = vop->lit_text;
+            uint32_t pad_len = vop->lit_text_len;
+            int is_lpad = (vop->kind == VEC_FUNC_LPAD);
+            if (!ocb->str_lens)
+                ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
+                                                         BLOCK_CAPACITY, sizeof(uint32_t));
+            for (uint16_t i = 0; i < count; i++) {
+                if (lcb->nulls[i] || !lcb->data.str[i]) {
+                    ocb->data.str[i] = NULL; continue;
+                }
+                const char *src = lcb->data.str[i];
+                size_t slen = lcb->str_lens ? lcb->str_lens[i] : strlen(src);
+                if (target_len <= 0) {
+                    char *dst = (char *)bump_alloc(&ctx->arena->scratch, 1);
+                    dst[0] = '\0';
+                    ocb->data.str[i] = dst;
+                    ocb->str_lens[i] = 0;
+                } else if ((size_t)target_len <= slen) {
+                    /* Truncate */
+                    char *dst = (char *)bump_alloc(&ctx->arena->scratch, (size_t)target_len + 1);
+                    memcpy(dst, src, (size_t)target_len);
+                    dst[target_len] = '\0';
+                    ocb->data.str[i] = dst;
+                    ocb->str_lens[i] = (uint32_t)target_len;
+                } else {
+                    size_t pad_needed = (size_t)target_len - slen;
+                    char *dst = (char *)bump_alloc(&ctx->arena->scratch, (size_t)target_len + 1);
+                    if (is_lpad) {
+                        for (size_t j = 0; j < pad_needed; j++)
+                            dst[j] = pad[j % pad_len];
+                        memcpy(dst + pad_needed, src, slen);
+                    } else {
+                        memcpy(dst, src, slen);
+                        for (size_t j = 0; j < pad_needed; j++)
+                            dst[slen + j] = pad[j % pad_len];
+                    }
+                    dst[target_len] = '\0';
+                    ocb->data.str[i] = dst;
+                    ocb->str_lens[i] = (uint32_t)target_len;
+                }
             }
         } else if (vop->kind == VEC_FUNC_SQRT) {
             memcpy(ocb->nulls, lcb->nulls, count);
@@ -6418,6 +7383,60 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
 /* ---- Window function executor ---- */
 
+/* Try radix sort for window sort keys (partition_col, order_col).
+ * Returns 1 if radix sort was used, 0 if caller should fall back to pdqsort. */
+static int window_try_radix(uint32_t *indices, uint32_t total,
+                            void *part_data, uint8_t *part_nulls, enum column_type part_type, int has_part,
+                            void *ord_data, uint8_t *ord_nulls, enum column_type ord_type, int has_ord,
+                            int ord_desc, struct bump_alloc *scratch)
+{
+    /* Single-key fast paths */
+    if (has_part && !has_ord) {
+        int b = sort_key_bits(part_type);
+        if (b == 32) {
+            radix_sort_u32(indices, total, (const int32_t *)part_data, part_nulls, 0, 0, scratch);
+            return 1;
+        } else if (b == 64 && (part_type == COLUMN_TYPE_FLOAT || part_type == COLUMN_TYPE_NUMERIC)) {
+            radix_sort_f64(indices, total, (const double *)part_data, part_nulls, 0, 0, scratch);
+            return 1;
+        } else if (b == 64) {
+            radix_sort_u64(indices, total, (const int64_t *)part_data, part_nulls, 0, 0, scratch);
+            return 1;
+        }
+        return 0;
+    }
+    if (!has_part && has_ord) {
+        int b = sort_key_bits(ord_type);
+        if (b == 32) {
+            radix_sort_u32(indices, total, (const int32_t *)ord_data, ord_nulls, ord_desc, 0, scratch);
+            return 1;
+        } else if (b == 64 && (ord_type == COLUMN_TYPE_FLOAT || ord_type == COLUMN_TYPE_NUMERIC)) {
+            radix_sort_f64(indices, total, (const double *)ord_data, ord_nulls, ord_desc, 0, scratch);
+            return 1;
+        } else if (b == 64) {
+            radix_sort_u64(indices, total, (const int64_t *)ord_data, ord_nulls, ord_desc, 0, scratch);
+            return 1;
+        }
+        return 0;
+    }
+    /* Two-key composite path */
+    if (has_part && has_ord) {
+        void *flat_keys[2] = { part_data, ord_data };
+        uint8_t *flat_nulls[2] = { part_nulls, ord_nulls };
+        enum column_type key_types[2] = { part_type, ord_type };
+        int sort_descs[2] = { 0, ord_desc };
+        uint64_t *composite = (uint64_t *)bump_alloc(scratch, total * sizeof(uint64_t));
+        uint8_t *any_null = (uint8_t *)bump_alloc(scratch, total);
+        memset(any_null, 0, total);
+        if (build_composite_keys(composite, any_null, total, 2,
+                                  flat_keys, flat_nulls, key_types, sort_descs) == 0) {
+            radix_sort_composite(indices, total, composite, scratch);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* qsort comparator for window: sort by (partition_col, order_col) in flat arrays */
 static struct {
     void    *part_data;
@@ -6848,8 +7867,17 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             _wsort_ctx.ord_type = st->flat_types[soc];
             _wsort_ctx.ord_desc = pn->window.sort_ord_desc;
         }
-        if (_wsort_ctx.has_part || _wsort_ctx.has_ord)
-            pdqsort(st->sorted, total, sizeof(uint32_t), window_sort_cmp);
+        if (_wsort_ctx.has_part || _wsort_ctx.has_ord) {
+            if (!window_try_radix(st->sorted, total,
+                                  spc >= 0 ? st->flat_data[spc] : NULL,
+                                  spc >= 0 ? st->flat_nulls[spc] : NULL,
+                                  spc >= 0 ? st->flat_types[spc] : 0, spc >= 0,
+                                  soc >= 0 ? st->flat_data[soc] : NULL,
+                                  soc >= 0 ? st->flat_nulls[soc] : NULL,
+                                  soc >= 0 ? st->flat_types[soc] : 0, soc >= 0,
+                                  pn->window.sort_ord_desc, &ctx->arena->scratch))
+                pdqsort(st->sorted, total, sizeof(uint32_t), window_sort_cmp);
+        }
 
         /* Build partition boundaries */
         st->part_starts = (uint32_t *)bump_alloc(&ctx->arena->scratch, (total + 1) * sizeof(uint32_t));
@@ -6902,7 +7930,13 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     _wsort_ctx.ord_type = st->flat_types[oc];
                     _wsort_ctx.ord_desc = pn->window.sort_ord_desc;
                 }
-                pdqsort(st->sorted, total, sizeof(uint32_t), window_sort_cmp);
+                if (!window_try_radix(st->sorted, total,
+                                      st->flat_data[wpc], st->flat_nulls[wpc], st->flat_types[wpc], 1,
+                                      oc >= 0 ? st->flat_data[oc] : NULL,
+                                      oc >= 0 ? st->flat_nulls[oc] : NULL,
+                                      oc >= 0 ? st->flat_types[oc] : 0, oc >= 0,
+                                      pn->window.sort_ord_desc, &ctx->arena->scratch))
+                    pdqsort(st->sorted, total, sizeof(uint32_t), window_sort_cmp);
 
                 w_part_starts = (uint32_t *)bump_alloc(&ctx->arena->scratch, (total + 1) * sizeof(uint32_t));
                 w_nparts = 0;
@@ -7344,7 +8378,15 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 _wsort_ctx.ord_type = st->flat_types[soc];
                 _wsort_ctx.ord_desc = pn->window.sort_ord_desc;
             }
-            pdqsort(st->sorted, total, sizeof(uint32_t), window_sort_cmp);
+            if (!window_try_radix(st->sorted, total,
+                                  spc >= 0 ? st->flat_data[spc] : NULL,
+                                  spc >= 0 ? st->flat_nulls[spc] : NULL,
+                                  spc >= 0 ? st->flat_types[spc] : 0, spc >= 0,
+                                  soc >= 0 ? st->flat_data[soc] : NULL,
+                                  soc >= 0 ? st->flat_nulls[soc] : NULL,
+                                  soc >= 0 ? st->flat_types[soc] : 0, soc >= 0,
+                                  pn->window.sort_ord_desc, &ctx->arena->scratch))
+                pdqsort(st->sorted, total, sizeof(uint32_t), window_sort_cmp);
         }
 
         st->input_done = 1;
@@ -9095,6 +10137,125 @@ int plan_exec_discard(struct plan_exec_ctx *ctx, uint32_t root_node)
 
     while (plan_next_block(ctx, root_node, &block) == 0)
         row_block_reset(&block);
+
+    plan_exec_cleanup(ctx);
+    return 0;
+}
+
+/* ---- Direct block → flat_table execution (avoids intermediate rows) ---- */
+
+int plan_exec_to_flat(struct plan_exec_ctx *ctx, uint32_t root_node,
+                      struct flat_table *ft)
+{
+    uint16_t ncols = plan_node_ncols(ctx->arena, root_node);
+    if (ncols == 0) return -1;
+
+    struct row_block block;
+    row_block_alloc(&block, ncols, &ctx->arena->scratch);
+
+    int ft_inited = 0;
+
+    while (plan_next_block(ctx, root_node, &block) == 0) {
+        uint16_t active = block.sel ? block.sel_count : block.count;
+        if (active == 0) { row_block_reset(&block); continue; }
+
+        /* Lazy init: set up flat_table schema from first block's types */
+        if (!ft_inited) {
+            size_t init_cap = active > 64 ? (size_t)active * 4 : 256;
+            flat_table_init(ft, ncols, init_cap);
+            for (uint16_t c = 0; c < ncols; c++) {
+                ft->col_types[c] = block.cols[c].type;
+                if (block.cols[c].type == COLUMN_TYPE_VECTOR)
+                    ft->col_vec_dims[c] = block.cols[c].vec_dim;
+            }
+            flat_table_alloc_cols(ft);
+            ft_inited = 1;
+        }
+
+        /* Grow if needed */
+        size_t need = ft->nrows + active;
+        if (need > ft->cap) {
+            size_t new_cap = ft->cap * 2;
+            if (new_cap < need) new_cap = need;
+            flat_table_grow(ft, new_cap);
+        }
+
+        /* Copy block data directly into flat_table columns */
+        size_t base = ft->nrows;
+        for (uint16_t c = 0; c < ncols; c++) {
+            const struct col_block *cb = &block.cols[c];
+            enum storage_class sc = column_type_storage(cb->type);
+
+            if (block.sel) {
+                /* Selection vector path: scatter copy */
+                for (uint16_t r = 0; r < active; r++) {
+                    uint16_t ri = (uint16_t)block.sel[r];
+                    size_t dst_row = base + r;
+                    ft->col_nulls[c][dst_row] = cb->nulls[ri];
+                    if (cb->nulls[ri]) continue;
+                    switch (sc) {
+                    case STORE_I16: ((int16_t *)ft->col_data[c])[dst_row] = cb->data.i16[ri]; break;
+                    case STORE_I32: ((int32_t *)ft->col_data[c])[dst_row] = cb->data.i32[ri]; break;
+                    case STORE_I64: ((int64_t *)ft->col_data[c])[dst_row] = cb->data.i64[ri]; break;
+                    case STORE_F64: ((double *)ft->col_data[c])[dst_row] = cb->data.f64[ri]; break;
+                    case STORE_STR: {
+                        const char *s = cb->data.str[ri];
+                        ((const char **)ft->col_data[c])[dst_row] = s ? strdup(s) : NULL;
+                        break;
+                    }
+                    case STORE_IV:  ((struct interval *)ft->col_data[c])[dst_row] = cb->data.iv[ri]; break;
+                    case STORE_UUID: ((struct uuid_val *)ft->col_data[c])[dst_row] = cb->data.uuid[ri]; break;
+                    case STORE_VEC: {
+                        uint16_t dim = cb->vec_dim;
+                        memcpy(&((float *)ft->col_data[c])[dst_row * dim],
+                               &cb->data.vec[ri * dim], dim * sizeof(float));
+                        break;
+                    }
+                    }
+                }
+            } else {
+                /* Dense path: bulk memcpy for fixed-size types */
+                for (uint16_t r = 0; r < active; r++)
+                    ft->col_nulls[c][base + r] = cb->nulls[r];
+
+                switch (sc) {
+                case STORE_I16:
+                    memcpy(&((int16_t *)ft->col_data[c])[base], cb->data.i16, active * sizeof(int16_t));
+                    break;
+                case STORE_I32:
+                    memcpy(&((int32_t *)ft->col_data[c])[base], cb->data.i32, active * sizeof(int32_t));
+                    break;
+                case STORE_I64:
+                    memcpy(&((int64_t *)ft->col_data[c])[base], cb->data.i64, active * sizeof(int64_t));
+                    break;
+                case STORE_F64:
+                    memcpy(&((double *)ft->col_data[c])[base], cb->data.f64, active * sizeof(double));
+                    break;
+                case STORE_STR:
+                    for (uint16_t r = 0; r < active; r++) {
+                        if (cb->nulls[r]) continue;
+                        const char *s = cb->data.str[r];
+                        ((const char **)ft->col_data[c])[base + r] = s ? strdup(s) : NULL;
+                    }
+                    break;
+                case STORE_IV:
+                    memcpy(&((struct interval *)ft->col_data[c])[base], cb->data.iv, active * sizeof(struct interval));
+                    break;
+                case STORE_UUID:
+                    memcpy(&((struct uuid_val *)ft->col_data[c])[base], cb->data.uuid, active * sizeof(struct uuid_val));
+                    break;
+                case STORE_VEC: {
+                    uint16_t dim = cb->vec_dim;
+                    memcpy(&((float *)ft->col_data[c])[base * dim],
+                           cb->data.vec, (size_t)active * dim * sizeof(float));
+                    break;
+                }
+                }
+            }
+        }
+        ft->nrows += active;
+        row_block_reset(&block);
+    }
 
     plan_exec_cleanup(ctx);
     return 0;
@@ -13626,7 +14787,8 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
             } else if (e->type == EXPR_BINARY_OP) {
                 enum expr_op op = e->binary.op;
                 if (op != OP_ADD && op != OP_SUB && op != OP_MUL && op != OP_DIV &&
-                    op != OP_CONCAT) {
+                    op != OP_MOD && op != OP_CONCAT && op != OP_EXP &&
+                    op != OP_BITAND && op != OP_BITOR && op != OP_LSHIFT && op != OP_RSHIFT) {
                     vec_ok = 0; break;
                 }
                 struct expr *le = &EXPR(arena, e->binary.left);
@@ -13638,16 +14800,51 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                     if (lci < 0 || rci < 0) { vec_ok = 0; break; }
                     enum column_type lt = t->columns.items[lci].type;
                     enum column_type rt = t->columns.items[rci].type;
-                    if (lt != rt) { vec_ok = 0; break; }
-                    if (lt != COLUMN_TYPE_INT && lt != COLUMN_TYPE_BIGINT &&
-                        lt != COLUMN_TYPE_FLOAT && lt != COLUMN_TYPE_NUMERIC) {
-                        vec_ok = 0; break;
+                    /* text || text */
+                    if (op == OP_CONCAT && lt == COLUMN_TYPE_TEXT && rt == COLUMN_TYPE_TEXT) {
+                        vops[i].kind = VEC_FUNC_CONCAT_COL;
+                        vops[i].left_col = (uint16_t)lci;
+                        vops[i].right_col = (uint16_t)rci;
+                        vops[i].out_type = COLUMN_TYPE_TEXT;
+                    } else if (lt == rt) {
+                        /* Same-type col OP col */
+                        if (lt != COLUMN_TYPE_INT && lt != COLUMN_TYPE_BIGINT &&
+                            lt != COLUMN_TYPE_FLOAT && lt != COLUMN_TYPE_NUMERIC &&
+                            lt != COLUMN_TYPE_SMALLINT) {
+                            vec_ok = 0; break;
+                        }
+                        vops[i].kind = VEC_COL_OP_COL;
+                        vops[i].left_col = (uint16_t)lci;
+                        vops[i].right_col = (uint16_t)rci;
+                        vops[i].op = op;
+                        vops[i].out_type = lt;
+                    } else {
+                        /* Mixed-type col OP col: promote to wider type */
+                        int l_is_num = (lt == COLUMN_TYPE_INT || lt == COLUMN_TYPE_BIGINT ||
+                                        lt == COLUMN_TYPE_FLOAT || lt == COLUMN_TYPE_NUMERIC ||
+                                        lt == COLUMN_TYPE_SMALLINT);
+                        int r_is_num = (rt == COLUMN_TYPE_INT || rt == COLUMN_TYPE_BIGINT ||
+                                        rt == COLUMN_TYPE_FLOAT || rt == COLUMN_TYPE_NUMERIC ||
+                                        rt == COLUMN_TYPE_SMALLINT);
+                        if (!l_is_num || !r_is_num) { vec_ok = 0; break; }
+                        /* Determine promoted output type */
+                        enum column_type out;
+                        if (lt == COLUMN_TYPE_FLOAT || lt == COLUMN_TYPE_NUMERIC ||
+                            rt == COLUMN_TYPE_FLOAT || rt == COLUMN_TYPE_NUMERIC)
+                            out = COLUMN_TYPE_FLOAT;
+                        else if (lt == COLUMN_TYPE_BIGINT || rt == COLUMN_TYPE_BIGINT)
+                            out = COLUMN_TYPE_BIGINT;
+                        else if (lt == COLUMN_TYPE_INT || rt == COLUMN_TYPE_INT)
+                            out = COLUMN_TYPE_INT;
+                        else
+                            out = COLUMN_TYPE_SMALLINT;
+                        vops[i].kind = VEC_COL_OP_COL_MIXED;
+                        vops[i].left_col = (uint16_t)lci;
+                        vops[i].right_col = (uint16_t)rci;
+                        vops[i].op = op;
+                        vops[i].out_type = out;
+                        vops[i].lit_i64 = ((int64_t)lt << 16) | (int64_t)rt; /* pack src types */
                     }
-                    vops[i].kind = VEC_COL_OP_COL;
-                    vops[i].left_col = (uint16_t)lci;
-                    vops[i].right_col = (uint16_t)rci;
-                    vops[i].op = op;
-                    vops[i].out_type = lt;
                 } else if (le->type == EXPR_COLUMN_REF && re->type == EXPR_LITERAL) {
                     int lci = table_find_column_sv(t, le->column_ref.column);
                     if (lci < 0) { vec_ok = 0; break; }
@@ -13662,7 +14859,8 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                         vops[i].lit_text_len = (uint32_t)strlen(re->literal.value.as_text);
                     } else {
                         if (lt != COLUMN_TYPE_INT && lt != COLUMN_TYPE_BIGINT &&
-                            lt != COLUMN_TYPE_FLOAT && lt != COLUMN_TYPE_NUMERIC) {
+                            lt != COLUMN_TYPE_FLOAT && lt != COLUMN_TYPE_NUMERIC &&
+                            lt != COLUMN_TYPE_SMALLINT) {
                             vec_ok = 0; break;
                         }
                         /* Extract literal value, coercing to column type */
@@ -13692,12 +14890,35 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                     if (rci < 0) { vec_ok = 0; break; }
                     enum column_type rt = t->columns.items[rci].type;
                     if (rt != COLUMN_TYPE_INT && rt != COLUMN_TYPE_BIGINT &&
-                        rt != COLUMN_TYPE_FLOAT && rt != COLUMN_TYPE_NUMERIC) {
+                        rt != COLUMN_TYPE_FLOAT && rt != COLUMN_TYPE_NUMERIC &&
+                        rt != COLUMN_TYPE_SMALLINT) {
                         vec_ok = 0; break;
                     }
-                    /* Rewrite lit OP col as col OP lit for commutative ops,
-                     * bail for non-commutative (SUB, DIV) */
-                    if (op == OP_SUB || op == OP_DIV) { vec_ok = 0; break; }
+                    /* Rewrite lit OP col as col OP lit for commutative ops.
+                     * For non-commutative (SUB, DIV, MOD) use VEC_LIT_OP_COL. */
+                    if (op == OP_SUB || op == OP_DIV || op == OP_MOD) {
+                        enum column_type lit_t2 = le->literal.type;
+                        double lit_f2 = 0.0;
+                        int64_t lit_i2 = 0;
+                        if (lit_t2 == COLUMN_TYPE_FLOAT || lit_t2 == COLUMN_TYPE_NUMERIC)
+                            lit_f2 = le->literal.value.as_float;
+                        else if (lit_t2 == COLUMN_TYPE_BIGINT)
+                            { lit_i2 = le->literal.value.as_bigint; lit_f2 = (double)lit_i2; }
+                        else if (lit_t2 == COLUMN_TYPE_INT)
+                            { lit_i2 = (int64_t)le->literal.value.as_int; lit_f2 = (double)lit_i2; }
+                        else if (lit_t2 == COLUMN_TYPE_SMALLINT)
+                            { lit_i2 = (int64_t)le->literal.value.as_smallint; lit_f2 = (double)lit_i2; }
+                        else { vec_ok = 0; break; }
+                        vops[i].kind = VEC_LIT_OP_COL;
+                        vops[i].left_col = (uint16_t)rci;
+                        vops[i].op = op;
+                        vops[i].out_type = rt;
+                        if (rt == COLUMN_TYPE_FLOAT || rt == COLUMN_TYPE_NUMERIC)
+                            vops[i].lit_f64 = lit_f2;
+                        else
+                            vops[i].lit_i64 = lit_i2;
+                        continue;
+                    }
                     /* Extract literal value, coercing to column type */
                     enum column_type lit_t2 = le->literal.type;
                     double lit_f2 = 0.0;
@@ -13958,12 +15179,52 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                     uint32_t arg1_idx = arena->arg_indices.items[e->func_call.args_start + 1];
                     struct expr *a0 = &EXPR(arena, arg0_idx);
                     struct expr *a1 = &EXPR(arena, arg1_idx);
+                    if (a0->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                    int ci = table_find_column_sv(t, a0->column_ref.column);
+                    if (ci < 0) { vec_ok = 0; break; }
+                    enum column_type ct = t->columns.items[ci].type;
+                    if (a1->type == EXPR_COLUMN_REF) {
+                        /* COALESCE(col, col) */
+                        int ci2 = table_find_column_sv(t, a1->column_ref.column);
+                        if (ci2 < 0) { vec_ok = 0; break; }
+                        enum column_type ct2 = t->columns.items[ci2].type;
+                        if (ct != ct2) { vec_ok = 0; break; }
+                        vops[i].kind = VEC_FUNC_COALESCE_COL;
+                        vops[i].left_col = (uint16_t)ci;
+                        vops[i].right_col = (uint16_t)ci2;
+                        vops[i].out_type = ct;
+                    } else if (a1->type == EXPR_LITERAL) {
+                        /* COALESCE(col, literal) */
+                        enum storage_class sclass = column_type_storage(ct);
+                        if (sclass == STORE_STR || sclass == STORE_IV || sclass == STORE_UUID) { vec_ok = 0; break; }
+                        int64_t lit_i = 0; double lit_f = 0.0;
+                        enum column_type lit_t = a1->literal.type;
+                        if (lit_t == COLUMN_TYPE_FLOAT || lit_t == COLUMN_TYPE_NUMERIC)
+                            lit_f = a1->literal.value.as_float;
+                        else if (lit_t == COLUMN_TYPE_BIGINT)
+                            { lit_i = a1->literal.value.as_bigint; lit_f = (double)lit_i; }
+                        else if (lit_t == COLUMN_TYPE_INT)
+                            { lit_i = (int64_t)a1->literal.value.as_int; lit_f = (double)lit_i; }
+                        else if (lit_t == COLUMN_TYPE_SMALLINT)
+                            { lit_i = (int64_t)a1->literal.value.as_smallint; lit_f = (double)lit_i; }
+                        else { vec_ok = 0; break; }
+                        vops[i].kind = VEC_FUNC_COALESCE_LIT;
+                        vops[i].left_col = (uint16_t)ci;
+                        vops[i].out_type = ct;
+                        if (sclass == STORE_F64) vops[i].lit_f64 = lit_f;
+                        else vops[i].lit_i64 = lit_i;
+                    } else { vec_ok = 0; break; }
+                } else if (fn == FUNC_NULLIF && nargs == 2) {
+                    uint32_t arg0_idx = arena->arg_indices.items[e->func_call.args_start];
+                    uint32_t arg1_idx = arena->arg_indices.items[e->func_call.args_start + 1];
+                    struct expr *a0 = &EXPR(arena, arg0_idx);
+                    struct expr *a1 = &EXPR(arena, arg1_idx);
                     if (a0->type != EXPR_COLUMN_REF || a1->type != EXPR_LITERAL) { vec_ok = 0; break; }
                     int ci = table_find_column_sv(t, a0->column_ref.column);
                     if (ci < 0) { vec_ok = 0; break; }
                     enum column_type ct = t->columns.items[ci].type;
                     enum storage_class sclass = column_type_storage(ct);
-                    if (sclass == STORE_STR || sclass == STORE_IV || sclass == STORE_UUID) { vec_ok = 0; break; }
+                    if (sclass != STORE_I32 && sclass != STORE_I64 && sclass != STORE_F64 && sclass != STORE_I16) { vec_ok = 0; break; }
                     int64_t lit_i = 0; double lit_f = 0.0;
                     enum column_type lit_t = a1->literal.type;
                     if (lit_t == COLUMN_TYPE_FLOAT || lit_t == COLUMN_TYPE_NUMERIC)
@@ -13975,11 +15236,129 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                     else if (lit_t == COLUMN_TYPE_SMALLINT)
                         { lit_i = (int64_t)a1->literal.value.as_smallint; lit_f = (double)lit_i; }
                     else { vec_ok = 0; break; }
-                    vops[i].kind = VEC_FUNC_COALESCE_LIT;
+                    vops[i].kind = VEC_FUNC_NULLIF_LIT;
                     vops[i].left_col = (uint16_t)ci;
                     vops[i].out_type = ct;
                     if (sclass == STORE_F64) vops[i].lit_f64 = lit_f;
                     else vops[i].lit_i64 = lit_i;
+                } else if ((fn == FUNC_GREATEST || fn == FUNC_LEAST) && nargs == 2) {
+                    uint32_t arg0_idx = arena->arg_indices.items[e->func_call.args_start];
+                    uint32_t arg1_idx = arena->arg_indices.items[e->func_call.args_start + 1];
+                    struct expr *a0 = &EXPR(arena, arg0_idx);
+                    struct expr *a1 = &EXPR(arena, arg1_idx);
+                    if (a0->type != EXPR_COLUMN_REF || a1->type != EXPR_LITERAL) { vec_ok = 0; break; }
+                    int ci = table_find_column_sv(t, a0->column_ref.column);
+                    if (ci < 0) { vec_ok = 0; break; }
+                    enum column_type ct = t->columns.items[ci].type;
+                    int64_t lit_i = 0; double lit_f = 0.0;
+                    enum column_type lit_t = a1->literal.type;
+                    if (lit_t == COLUMN_TYPE_FLOAT || lit_t == COLUMN_TYPE_NUMERIC)
+                        lit_f = a1->literal.value.as_float;
+                    else if (lit_t == COLUMN_TYPE_BIGINT)
+                        { lit_i = a1->literal.value.as_bigint; lit_f = (double)lit_i; }
+                    else if (lit_t == COLUMN_TYPE_INT)
+                        { lit_i = (int64_t)a1->literal.value.as_int; lit_f = (double)lit_i; }
+                    else if (lit_t == COLUMN_TYPE_SMALLINT)
+                        { lit_i = (int64_t)a1->literal.value.as_smallint; lit_f = (double)lit_i; }
+                    else { vec_ok = 0; break; }
+                    int is_greatest = (fn == FUNC_GREATEST);
+                    if (ct == COLUMN_TYPE_INT) {
+                        vops[i].kind = is_greatest ? VEC_FUNC_GREATEST_I32 : VEC_FUNC_LEAST_I32;
+                        vops[i].out_type = COLUMN_TYPE_INT;
+                        vops[i].lit_i64 = lit_i;
+                    } else if (ct == COLUMN_TYPE_BIGINT) {
+                        vops[i].kind = is_greatest ? VEC_FUNC_GREATEST_I64 : VEC_FUNC_LEAST_I64;
+                        vops[i].out_type = COLUMN_TYPE_BIGINT;
+                        vops[i].lit_i64 = lit_i;
+                    } else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC) {
+                        vops[i].kind = is_greatest ? VEC_FUNC_GREATEST_F64 : VEC_FUNC_LEAST_F64;
+                        vops[i].out_type = ct;
+                        vops[i].lit_f64 = lit_f;
+                    } else { vec_ok = 0; break; }
+                    vops[i].left_col = (uint16_t)ci;
+                } else if ((fn == FUNC_LEFT || fn == FUNC_RIGHT) && nargs == 2) {
+                    uint32_t a0_idx = arena->arg_indices.items[e->func_call.args_start];
+                    uint32_t a1_idx = arena->arg_indices.items[e->func_call.args_start + 1];
+                    struct expr *a0 = &EXPR(arena, a0_idx);
+                    struct expr *a1 = &EXPR(arena, a1_idx);
+                    if (a0->type != EXPR_COLUMN_REF || a1->type != EXPR_LITERAL) { vec_ok = 0; break; }
+                    int ci = table_find_column_sv(t, a0->column_ref.column);
+                    if (ci < 0) { vec_ok = 0; break; }
+                    if (t->columns.items[ci].type != COLUMN_TYPE_TEXT) { vec_ok = 0; break; }
+                    int64_t n = 0;
+                    if (a1->literal.type == COLUMN_TYPE_INT) n = a1->literal.value.as_int;
+                    else if (a1->literal.type == COLUMN_TYPE_BIGINT) n = a1->literal.value.as_bigint;
+                    else { vec_ok = 0; break; }
+                    vops[i].kind = (fn == FUNC_LEFT) ? VEC_FUNC_LEFT : VEC_FUNC_RIGHT;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = COLUMN_TYPE_TEXT;
+                    vops[i].lit_i64 = n;
+                } else if ((fn == FUNC_LPAD || fn == FUNC_RPAD) && (nargs == 2 || nargs == 3)) {
+                    uint32_t a0_idx = arena->arg_indices.items[e->func_call.args_start];
+                    uint32_t a1_idx = arena->arg_indices.items[e->func_call.args_start + 1];
+                    struct expr *a0 = &EXPR(arena, a0_idx);
+                    struct expr *a1 = &EXPR(arena, a1_idx);
+                    if (a0->type != EXPR_COLUMN_REF || a1->type != EXPR_LITERAL) { vec_ok = 0; break; }
+                    int ci = table_find_column_sv(t, a0->column_ref.column);
+                    if (ci < 0) { vec_ok = 0; break; }
+                    if (t->columns.items[ci].type != COLUMN_TYPE_TEXT) { vec_ok = 0; break; }
+                    int64_t pad_len = 0;
+                    if (a1->literal.type == COLUMN_TYPE_INT) pad_len = a1->literal.value.as_int;
+                    else if (a1->literal.type == COLUMN_TYPE_BIGINT) pad_len = a1->literal.value.as_bigint;
+                    else { vec_ok = 0; break; }
+                    const char *pad_str = " "; uint32_t pad_str_len = 1;
+                    if (nargs == 3) {
+                        uint32_t a2_idx = arena->arg_indices.items[e->func_call.args_start + 2];
+                        struct expr *a2 = &EXPR(arena, a2_idx);
+                        if (a2->type != EXPR_LITERAL || a2->literal.type != COLUMN_TYPE_TEXT) { vec_ok = 0; break; }
+                        pad_str = a2->literal.value.as_text ? a2->literal.value.as_text : " ";
+                        pad_str_len = (uint32_t)strlen(pad_str);
+                        if (pad_str_len == 0) { vec_ok = 0; break; }
+                    }
+                    vops[i].kind = (fn == FUNC_LPAD) ? VEC_FUNC_LPAD : VEC_FUNC_RPAD;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = COLUMN_TYPE_TEXT;
+                    vops[i].lit_i64 = pad_len;
+                    vops[i].lit_text = pad_str;
+                    vops[i].lit_text_len = pad_str_len;
+                } else if ((fn == FUNC_EXTRACT || fn == FUNC_DATE_PART) && nargs == 2) {
+                    uint32_t a0_idx = arena->arg_indices.items[e->func_call.args_start];
+                    uint32_t a1_idx = arena->arg_indices.items[e->func_call.args_start + 1];
+                    struct expr *a0 = &EXPR(arena, a0_idx); /* field name (text literal) */
+                    struct expr *a1 = &EXPR(arena, a1_idx); /* source column */
+                    if (a0->type != EXPR_LITERAL || !column_type_is_text(a0->literal.type) ||
+                        !a0->literal.value.as_text) { vec_ok = 0; break; }
+                    if (a1->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                    int ci = table_find_column_sv(t, a1->column_ref.column);
+                    if (ci < 0) { vec_ok = 0; break; }
+                    enum column_type ct = t->columns.items[ci].type;
+                    if (ct != COLUMN_TYPE_DATE && ct != COLUMN_TYPE_TIMESTAMP &&
+                        ct != COLUMN_TYPE_TIMESTAMPTZ) { vec_ok = 0; break; }
+                    vops[i].kind = VEC_FUNC_EXTRACT;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = COLUMN_TYPE_FLOAT;
+                    vops[i].lit_text = a0->literal.value.as_text;
+                    vops[i].lit_text_len = (uint32_t)strlen(a0->literal.value.as_text);
+                    vops[i].func_precision = (int)ct; /* store source type */
+                } else if (fn == FUNC_DATE_TRUNC && nargs == 2) {
+                    uint32_t a0_idx = arena->arg_indices.items[e->func_call.args_start];
+                    uint32_t a1_idx = arena->arg_indices.items[e->func_call.args_start + 1];
+                    struct expr *a0 = &EXPR(arena, a0_idx); /* field name (text literal) */
+                    struct expr *a1 = &EXPR(arena, a1_idx); /* source column */
+                    if (a0->type != EXPR_LITERAL || !column_type_is_text(a0->literal.type) ||
+                        !a0->literal.value.as_text) { vec_ok = 0; break; }
+                    if (a1->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                    int ci = table_find_column_sv(t, a1->column_ref.column);
+                    if (ci < 0) { vec_ok = 0; break; }
+                    enum column_type ct = t->columns.items[ci].type;
+                    if (ct != COLUMN_TYPE_DATE && ct != COLUMN_TYPE_TIMESTAMP &&
+                        ct != COLUMN_TYPE_TIMESTAMPTZ) { vec_ok = 0; break; }
+                    vops[i].kind = VEC_FUNC_DATE_TRUNC;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = (ct == COLUMN_TYPE_DATE) ? COLUMN_TYPE_TIMESTAMP : ct;
+                    vops[i].lit_text = a0->literal.value.as_text;
+                    vops[i].lit_text_len = (uint32_t)strlen(a0->literal.value.as_text);
+                    vops[i].func_precision = (int)ct; /* store source type */
                 } else {
                     vec_ok = 0; break;
                 }
@@ -14007,6 +15386,35 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                     vops[i].kind = VEC_FUNC_CAST_F64_TO_I64;
                     vops[i].left_col = (uint16_t)ci;
                     vops[i].out_type = COLUMN_TYPE_BIGINT;
+                } else if (dst_ct == COLUMN_TYPE_INT && src_ct == COLUMN_TYPE_SMALLINT) {
+                    vops[i].kind = VEC_FUNC_CAST_I16_TO_I32;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = COLUMN_TYPE_INT;
+                } else if (dst_ct == COLUMN_TYPE_BIGINT &&
+                           (src_ct == COLUMN_TYPE_INT || src_ct == COLUMN_TYPE_SMALLINT)) {
+                    vops[i].kind = VEC_FUNC_CAST_I32_TO_I64;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = COLUMN_TYPE_BIGINT;
+                } else if (dst_ct == COLUMN_TYPE_INT && src_ct == COLUMN_TYPE_BIGINT) {
+                    vops[i].kind = VEC_FUNC_CAST_I64_TO_I32;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = COLUMN_TYPE_INT;
+                } else if (dst_ct == COLUMN_TYPE_TEXT) {
+                    /* CAST(numeric/date/bool col AS TEXT) */
+                    enum storage_class ssc = column_type_storage(src_ct);
+                    if (ssc == STORE_I16 || ssc == STORE_I32 || ssc == STORE_I64 ||
+                        ssc == STORE_F64 || ssc == STORE_STR) {
+                        vops[i].kind = VEC_FUNC_CAST_TO_TEXT;
+                        vops[i].left_col = (uint16_t)ci;
+                        vops[i].out_type = COLUMN_TYPE_TEXT;
+                        vops[i].func_precision = (int)src_ct; /* store source type */
+                    } else { vec_ok = 0; break; }
+                } else if (src_ct == COLUMN_TYPE_TEXT &&
+                           (dst_ct == COLUMN_TYPE_INT || dst_ct == COLUMN_TYPE_BIGINT ||
+                            dst_ct == COLUMN_TYPE_FLOAT || dst_ct == COLUMN_TYPE_NUMERIC)) {
+                    vops[i].kind = VEC_FUNC_CAST_TEXT_TO_NUM;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = dst_ct;
                 } else if (src_ct == dst_ct || (column_type_storage(src_ct) == column_type_storage(dst_ct))) {
                     /* Identity cast or same-storage cast — passthrough */
                     vops[i].kind = VEC_PASSTHROUGH;
@@ -14015,6 +15423,194 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                 } else {
                     vec_ok = 0; break;
                 }
+            } else if (e->type == EXPR_LITERAL) {
+                struct cell *lit = &e->literal;
+                if (lit->is_null) {
+                    vops[i].kind = VEC_LITERAL;
+                    vops[i].out_type = COLUMN_TYPE_INT;
+                    vops[i].op = 1; /* flag: NULL literal */
+                    vops[i].lit_i64 = 0; /* value irrelevant, all nulls */
+                } else {
+                    enum column_type lt = lit->type;
+                    switch (column_type_storage(lt)) {
+                    case STORE_I16:
+                        vops[i].lit_i64 = (int64_t)lit->value.as_smallint;
+                        break;
+                    case STORE_I32:
+                        vops[i].lit_i64 = (int64_t)lit->value.as_int;
+                        break;
+                    case STORE_I64:
+                        vops[i].lit_i64 = lit->value.as_bigint;
+                        break;
+                    case STORE_F64:
+                        vops[i].lit_f64 = lit->value.as_float;
+                        break;
+                    case STORE_STR:
+                        vops[i].lit_text = lit->value.as_text ? lit->value.as_text : "";
+                        vops[i].lit_text_len = (uint32_t)(lit->value.as_text ? strlen(lit->value.as_text) : 0);
+                        break;
+                    case STORE_IV: case STORE_UUID: case STORE_VEC:
+                        vec_ok = 0; break;
+                    }
+                    if (!vec_ok) break;
+                    vops[i].kind = VEC_LITERAL;
+                    vops[i].out_type = lt;
+                }
+            } else if (e->type == EXPR_UNARY_OP) {
+                struct expr *operand = &EXPR(arena, e->unary.operand);
+                if (operand->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                int ci = table_find_column_sv(t, operand->column_ref.column);
+                if (ci < 0) { vec_ok = 0; break; }
+                enum column_type ct = t->columns.items[ci].type;
+                if (e->unary.op == OP_NEG) {
+                    if (ct == COLUMN_TYPE_SMALLINT)     vops[i].kind = VEC_FUNC_NEG_I16;
+                    else if (ct == COLUMN_TYPE_INT)      vops[i].kind = VEC_FUNC_NEG_I32;
+                    else if (ct == COLUMN_TYPE_BIGINT)   vops[i].kind = VEC_FUNC_NEG_I64;
+                    else if (ct == COLUMN_TYPE_FLOAT || ct == COLUMN_TYPE_NUMERIC)
+                                                         vops[i].kind = VEC_FUNC_NEG_F64;
+                    else { vec_ok = 0; break; }
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = ct;
+                } else if (e->unary.op == OP_NOT) {
+                    if (ct != COLUMN_TYPE_BOOLEAN) { vec_ok = 0; break; }
+                    vops[i].kind = VEC_FUNC_NOT;
+                    vops[i].left_col = (uint16_t)ci;
+                    vops[i].out_type = COLUMN_TYPE_BOOLEAN;
+                } else {
+                    vec_ok = 0; break;
+                }
+            } else if (e->type == EXPR_IS_NULL) {
+                struct expr *operand = &EXPR(arena, e->is_null.operand_is);
+                if (operand->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                int ci = table_find_column_sv(t, operand->column_ref.column);
+                if (ci < 0) { vec_ok = 0; break; }
+                vops[i].kind = e->is_null.negate ? VEC_FUNC_IS_NOT_NULL : VEC_FUNC_IS_NULL;
+                vops[i].left_col = (uint16_t)ci;
+                vops[i].out_type = COLUMN_TYPE_BOOLEAN;
+            } else if (e->type == EXPR_BETWEEN) {
+                if (e->between.symmetric) { vec_ok = 0; break; }
+                struct expr *operand = &EXPR(arena, e->between.operand);
+                struct expr *lo = &EXPR(arena, e->between.low);
+                struct expr *hi = &EXPR(arena, e->between.high);
+                if (operand->type != EXPR_COLUMN_REF ||
+                    lo->type != EXPR_LITERAL || hi->type != EXPR_LITERAL) { vec_ok = 0; break; }
+                int ci = table_find_column_sv(t, operand->column_ref.column);
+                if (ci < 0) { vec_ok = 0; break; }
+                enum column_type ct = t->columns.items[ci].type;
+                enum storage_class sc = column_type_storage(ct);
+                if (sc != STORE_I32 && sc != STORE_I64 && sc != STORE_F64 && sc != STORE_I16) { vec_ok = 0; break; }
+                int64_t lo_i = 0, hi_i = 0; double lo_f = 0, hi_f = 0;
+                if (sc == STORE_F64) {
+                    lo_f = (lo->literal.type == COLUMN_TYPE_FLOAT || lo->literal.type == COLUMN_TYPE_NUMERIC)
+                           ? lo->literal.value.as_float : (double)lo->literal.value.as_int;
+                    hi_f = (hi->literal.type == COLUMN_TYPE_FLOAT || hi->literal.type == COLUMN_TYPE_NUMERIC)
+                           ? hi->literal.value.as_float : (double)hi->literal.value.as_int;
+                } else {
+                    if (lo->literal.type == COLUMN_TYPE_BIGINT) lo_i = lo->literal.value.as_bigint;
+                    else if (lo->literal.type == COLUMN_TYPE_INT) lo_i = lo->literal.value.as_int;
+                    else if (lo->literal.type == COLUMN_TYPE_SMALLINT) lo_i = lo->literal.value.as_smallint;
+                    else { vec_ok = 0; break; }
+                    if (hi->literal.type == COLUMN_TYPE_BIGINT) hi_i = hi->literal.value.as_bigint;
+                    else if (hi->literal.type == COLUMN_TYPE_INT) hi_i = hi->literal.value.as_int;
+                    else if (hi->literal.type == COLUMN_TYPE_SMALLINT) hi_i = hi->literal.value.as_smallint;
+                    else { vec_ok = 0; break; }
+                }
+                vops[i].kind = VEC_FUNC_BETWEEN_LIT;
+                vops[i].left_col = (uint16_t)ci;
+                vops[i].out_type = COLUMN_TYPE_BOOLEAN;
+                vops[i].op = e->between.negate ? 1 : 0;
+                if (sc == STORE_F64) {
+                    vops[i].lit_f64 = lo_f;
+                    vops[i].right_lit_i64 = 0; /* use lit_text for hi_f */
+                    /* Pack hi_f into right_lit_i64 via memcpy */
+                    memcpy(&vops[i].right_lit_i64, &hi_f, sizeof(double));
+                } else {
+                    vops[i].lit_i64 = lo_i;
+                    vops[i].right_lit_i64 = hi_i;
+                }
+                vops[i].func_precision = (int)sc; /* store storage class for executor */
+            } else if (e->type == EXPR_IN_LIST) {
+                struct expr *operand = &EXPR(arena, e->in_list.operand);
+                if (operand->type != EXPR_COLUMN_REF) { vec_ok = 0; break; }
+                int ci = table_find_column_sv(t, operand->column_ref.column);
+                if (ci < 0) { vec_ok = 0; break; }
+                enum column_type ct = t->columns.items[ci].type;
+                enum storage_class sc = column_type_storage(ct);
+                if (sc != STORE_I32 && sc != STORE_I64 && sc != STORE_F64 && sc != STORE_I16) { vec_ok = 0; break; }
+                /* Verify all values are literals and count <= 32 */
+                uint32_t vc = e->in_list.values_count;
+                if (vc == 0 || vc > 32) { vec_ok = 0; break; }
+                int all_lit = 1;
+                for (uint32_t v = 0; v < vc; v++) {
+                    uint32_t vi = arena->arg_indices.items[e->in_list.values_start + v];
+                    if (EXPR(arena, vi).type != EXPR_LITERAL) { all_lit = 0; break; }
+                }
+                if (!all_lit) { vec_ok = 0; break; }
+                /* Allocate literal array in scratch and pack values */
+                if (sc == STORE_F64) {
+                    double *vals = (double *)bump_alloc(&arena->scratch, vc * sizeof(double));
+                    for (uint32_t v = 0; v < vc; v++) {
+                        struct expr *ve = &EXPR(arena, arena->arg_indices.items[e->in_list.values_start + v]);
+                        if (ve->literal.type == COLUMN_TYPE_FLOAT || ve->literal.type == COLUMN_TYPE_NUMERIC)
+                            vals[v] = ve->literal.value.as_float;
+                        else vals[v] = (double)ve->literal.value.as_int;
+                    }
+                    vops[i].lit_text = (const char *)vals; /* reuse pointer field */
+                } else {
+                    int64_t *vals = (int64_t *)bump_alloc(&arena->scratch, vc * sizeof(int64_t));
+                    for (uint32_t v = 0; v < vc; v++) {
+                        struct expr *ve = &EXPR(arena, arena->arg_indices.items[e->in_list.values_start + v]);
+                        if (ve->literal.type == COLUMN_TYPE_BIGINT) vals[v] = ve->literal.value.as_bigint;
+                        else if (ve->literal.type == COLUMN_TYPE_INT) vals[v] = ve->literal.value.as_int;
+                        else if (ve->literal.type == COLUMN_TYPE_SMALLINT) vals[v] = ve->literal.value.as_smallint;
+                        else vals[v] = 0;
+                    }
+                    vops[i].lit_text = (const char *)vals;
+                }
+                vops[i].kind = VEC_FUNC_IN_LIST;
+                vops[i].left_col = (uint16_t)ci;
+                vops[i].out_type = COLUMN_TYPE_BOOLEAN;
+                vops[i].op = e->in_list.negate ? 1 : 0;
+                vops[i].lit_text_len = vc;
+                vops[i].func_precision = (int)sc;
+            } else if (e->type == EXPR_LIKE) {
+                if (e->like.similar_to) { vec_ok = 0; break; }
+                struct expr *operand = &EXPR(arena, e->like.operand);
+                struct expr *pattern = &EXPR(arena, e->like.pattern);
+                if (operand->type != EXPR_COLUMN_REF || pattern->type != EXPR_LITERAL) { vec_ok = 0; break; }
+                if (pattern->literal.type != COLUMN_TYPE_TEXT || !pattern->literal.value.as_text) { vec_ok = 0; break; }
+                int ci = table_find_column_sv(t, operand->column_ref.column);
+                if (ci < 0) { vec_ok = 0; break; }
+                if (t->columns.items[ci].type != COLUMN_TYPE_TEXT) { vec_ok = 0; break; }
+                vops[i].kind = VEC_FUNC_LIKE_LIT;
+                vops[i].left_col = (uint16_t)ci;
+                vops[i].out_type = COLUMN_TYPE_BOOLEAN;
+                vops[i].op = e->like.negate ? 1 : 0;
+                vops[i].func_precision = e->like.case_insensitive ? 1 : 0;
+                vops[i].lit_text = pattern->literal.value.as_text;
+                vops[i].lit_text_len = (uint32_t)strlen(pattern->literal.value.as_text);
+            } else if (e->type == EXPR_CASE_WHEN) {
+                /* Accept CASE WHEN — evaluate per-row via eval_expr_col.
+                 * This prevents the entire projection from falling back to
+                 * EXPR_PROJECT when one column is a CASE expression. */
+                /* Determine output type from first THEN branch or ELSE */
+                enum column_type case_out = COLUMN_TYPE_TEXT; /* default */
+                if (e->case_when.branches_count > 0) {
+                    struct case_when_branch *b0 = &ABRANCH(arena, e->case_when.branches_start);
+                    struct expr *then0 = &EXPR(arena, b0->then_expr_idx);
+                    if (then0->type == EXPR_LITERAL) case_out = then0->literal.type;
+                    else if (then0->type == EXPR_COLUMN_REF) {
+                        int tci = table_find_column_sv(t, then0->column_ref.column);
+                        if (tci >= 0) case_out = t->columns.items[tci].type;
+                    }
+                } else if (e->case_when.else_expr != IDX_NONE) {
+                    struct expr *else_e = &EXPR(arena, e->case_when.else_expr);
+                    if (else_e->type == EXPR_LITERAL) case_out = else_e->literal.type;
+                }
+                vops[i].kind = VEC_FUNC_CASE_WHEN;
+                vops[i].case_expr_idx = expr_proj_indices[i];
+                vops[i].case_table = t;
+                vops[i].out_type = case_out;
             } else {
                 vec_ok = 0; break;
             }

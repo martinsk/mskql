@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 enum token_type {
     TOK_KEYWORD,
@@ -66,67 +67,38 @@ static void skip_whitespace(struct lexer *l)
         l->pos++;
 }
 
+static const char *kw_len2[] = {"AS","BY","DO","IN","IS","ON","OR","TO"};
+static const char *kw_len3[] = {"ABS","ADD","ALL","AND","ANY","ASC","AVG","CSV","END","INT","KEY","LAG","MAX","MIN","MOD","NOT","SET","SUM"};
+static const char *kw_len4[] = {"BOOL","BOTH","CASE","CAST","CEIL","CHAR","COPY","CUBE","DATE","DESC","DISK","DROP","ELSE","ENUM","FROM","FULL","INT2","INT4","INT8","INTO","JOIN","LAST","LEAD","LEFT","LIKE","LPAD","NEXT","NULL","ONLY","OVER","RANK","REAL","ROWS","RPAD","SETS","SHOW","SIGN","SOME","SQRT","TEXT","THEN","TIME","TRIM","TRUE","TYPE","UUID","VIEW","WHEN","WITH"};
+static const char *kw_len5[] = {"ALTER","ARRAY","BEGIN","CHECK","COUNT","CROSS","FALSE","FETCH","FIRST","FLOAT","FLOOR","GROUP","ILIKE","INDEX","INNER","LEAST","LIMIT","LOWER","NTILE","NULLS","ORDER","OUTER","POWER","RANGE","RESET","RIGHT","ROUND","START","STDIN","TABLE","TRUNC","UNION","UPPER","USING","WHERE"};
+static const char *kw_len6[] = {"ALWAYS","BIGINT","COLUMN","COMMIT","CONCAT","CREATE","DELETE","DOUBLE","ESCAPE","EXCEPT","EXISTS","FILTER","FLOAT8","GROUPS","HAVING","HEADER","INSERT","LENGTH","NULLIF","OFFSET","RANDOM","RENAME","REPEAT","ROLLUP","SELECT","SERIAL","SETVAL","STDDEV","STDOUT","STRPOS","UNIQUE","UPDATE","VALUES","VECTOR","WINDOW"};
+static const char *kw_len7[] = {"ANALYZE","BETWEEN","BOOLEAN","BOOL_OR","CASCADE","CEILING","COLLATE","CURRENT","CURRVAL","DECIMAL","DEFAULT","DISCARD","EXCLUDE","EXPLAIN","EXTRACT","FOREIGN","INITCAP","INTEGER","LATERAL","LEADING","NATURAL","NEXTVAL","NOTHING","NUMERIC","OPTIONS","PRIMARY","RELEASE","REPLACE","REVERSE","SERIAL2","SIMILAR","TO_DATE","UNKNOWN","VARCHAR"};
+static const char *kw_len8[] = {"BOOL_AND","COALESCE","CONFLICT","DISTINCT","FILENAME","GREATEST","GROUPING","IDENTITY","INTERVAL","MAXVALUE","MINVALUE","OPERATOR","POSITION","ROLLBACK","SEQUENCE","SMALLINT","TRAILING","TRUNCATE","VARIANCE"};
+static const char *kw_len9[] = {"ARRAY_AGG","BIGSERIAL","CHARACTER","CONCAT_WS","CUME_DIST","DIRECTORY","FOLLOWING","GENERATED","INCREMENT","INTERSECT","LOCALTIME","NTH_VALUE","PARTITION","PRECEDING","RECURSIVE","RETURNING","SAVEPOINT","SUBSTRING","SYMMETRIC","TIMESTAMP","TRANSLATE","UNBOUNDED"};
+static const char *kw_len10[] = {"DEALLOCATE","DENSE_RANK","LAST_VALUE","REFERENCES","ROW_NUMBER","SPLIT_PART","STRING_AGG"};
+static const char *kw_len11[] = {"FIRST_VALUE","QUOTE_IDENT","SMALLSERIAL","TIMESTAMPTZ","TRANSACTION"};
+static const char *kw_len12[] = {"CURRENT_DATE","CURRENT_TIME","PERCENT_RANK","TO_TIMESTAMP"};
+static const char *kw_len14[] = {"REGEXP_REPLACE"};
+static const char *kw_len17[] = {"CURRENT_TIMESTAMP"};
+
+#define KW_BUCKET(n) { kw_len##n, sizeof(kw_len##n)/sizeof(kw_len##n[0]) }
+static const struct { const char **words; uint16_t count; } kw_buckets[18] = {
+    [2]  = KW_BUCKET(2),  [3]  = KW_BUCKET(3),  [4]  = KW_BUCKET(4),
+    [5]  = KW_BUCKET(5),  [6]  = KW_BUCKET(6),  [7]  = KW_BUCKET(7),
+    [8]  = KW_BUCKET(8),  [9]  = KW_BUCKET(9),  [10] = KW_BUCKET(10),
+    [11] = KW_BUCKET(11), [12] = KW_BUCKET(12), [14] = KW_BUCKET(14),
+    [17] = KW_BUCKET(17),
+};
+#undef KW_BUCKET
+
 static int is_keyword(sv word)
 {
-    const char *keywords[] = {
-        "SELECT", "INSERT", "INTO", "VALUES", "FROM",
-        "DELETE", "WHERE", "CREATE", "TABLE", "DROP",
-        "JOIN", "ON", "RETURNING", "INDEX",
-        "TYPE", "AS", "ENUM",
-        "SUM", "COUNT", "AVG", "MIN", "MAX", "STRING_AGG", "ARRAY_AGG",
-        "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE",
-        "PERCENT_RANK", "CUME_DIST",
-        "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE",
-        "OVER", "PARTITION", "BY", "ORDER",
-        "UPDATE", "SET", "AND", "OR", "NOT", "NULL", "IS",
-        "LIMIT", "OFFSET", "ASC", "DESC", "GROUP", "HAVING",
-        "SMALLINT", "INT2", "SMALLSERIAL", "SERIAL2",
-        "INT", "INTEGER", "INT4", "SERIAL", "FLOAT", "FLOAT8", "DOUBLE", "REAL", "TEXT",
-        "VARCHAR", "CHAR", "CHARACTER", "BOOLEAN", "BOOL",
-        "BIGINT", "INT8", "BIGSERIAL", "NUMERIC", "DECIMAL",
-        "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "UUID", "VECTOR",
-        "DISTINCT", "IN", "BETWEEN", "LIKE", "ILIKE",
-        "LEFT", "RIGHT", "FULL", "OUTER", "COALESCE", "CASE",
-        "WHEN", "THEN", "ELSE", "END", "TRUE", "FALSE",
-        "PRIMARY", "KEY", "DEFAULT", "CHECK", "UNIQUE",
-        "ALTER", "ADD", "RENAME", "COLUMN", "TO",
-        "BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION",
-        "INNER", "CROSS", "NATURAL", "USING", "LATERAL",
-        "UNION", "INTERSECT", "EXCEPT", "ALL",
-        "WITH", "RECURSIVE", "EXISTS",
-        "CONFLICT", "DO", "NOTHING",
-        "NULLIF", "GREATEST", "LEAST",
-        "UPPER", "LOWER", "LENGTH", "SUBSTRING", "TRIM",
-        "ANY", "SOME", "ARRAY",
-        "ROWS", "RANGE", "GROUPS", "UNBOUNDED", "PRECEDING", "FOLLOWING", "CURRENT",
-        "EXCLUDE",
-        "LEADING", "TRAILING", "BOTH",
-        "GENERATED", "ALWAYS", "IDENTITY",
-        "ROLLUP", "CUBE", "GROUPING", "SETS",
-        "SEQUENCE", "VIEW", "REPLACE", "START", "INCREMENT",
-        "MINVALUE", "MAXVALUE", "REFERENCES", "CASCADE",
-        "NEXTVAL", "CURRVAL",
-        "CAST", "FETCH", "FIRST", "NEXT", "ONLY",
-        "EXTRACT", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "LOCALTIME",
-        "TRUNCATE",
-        "EXPLAIN", "ANALYZE", "COPY", "STDIN", "STDOUT", "CSV", "HEADER",
-        "SAVEPOINT", "RELEASE", "UNIQUE", "SYMMETRIC", "UNKNOWN",
-        "ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "POWER", "SQRT", "MOD", "SIGN", "RANDOM",
-        "LPAD", "RPAD", "CONCAT", "CONCAT_WS", "POSITION", "SPLIT_PART",
-        "LEFT", "RIGHT", "REPEAT", "REVERSE", "INITCAP",
-        "SHOW", "RESET", "DISCARD", "DEALLOCATE",
-        "OPERATOR", "COLLATE",
-        "NULLS", "FIRST", "LAST", "FILTER",
-        "FOREIGN", "OPTIONS", "FILENAME", "DISK", "DIRECTORY",
-        "SIMILAR", "ESCAPE",
-        "WINDOW",
-        "BOOL_AND", "BOOL_OR", "STDDEV", "VARIANCE",
-        "QUOTE_IDENT", "STRPOS", "REGEXP_REPLACE", "SETVAL",
-        "TRUNC", "TO_DATE", "TO_TIMESTAMP", "TRANSLATE",
-        NULL
-    };
-    for (int i = 0; keywords[i]; i++) {
-        if (sv_eq_ignorecase_cstr(word, keywords[i]))
+    if (word.len < 2 || word.len > 17) return 0;
+    uint16_t n = kw_buckets[word.len].count;
+    if (n == 0) return 0;
+    const char **bucket = kw_buckets[word.len].words;
+    for (uint16_t i = 0; i < n; i++) {
+        if (strncasecmp(word.data, bucket[i], word.len) == 0)
             return 1;
     }
     return 0;
