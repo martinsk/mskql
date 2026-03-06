@@ -15,6 +15,7 @@ static inline uint32_t arena_alloc_expr(struct query_arena *a)
 {
     struct expr e;
     memset(&e, 0, sizeof(e));
+    e.column_ref.resolved_idx = -2;
     da_push(&a->exprs, e);
     return (uint32_t)(a->exprs.count - 1);
 }
@@ -29,6 +30,8 @@ static inline uint32_t arena_alloc_cond(struct query_arena *a)
     c.lhs_expr = IDX_NONE;
     c.subquery_sql = IDX_NONE;
     c.scalar_subquery_sql = IDX_NONE;
+    c.resolved_col_idx = -2;
+    c.resolved_rhs_col_idx = -2;
     da_push(&a->conditions, c);
     return (uint32_t)(a->conditions.count - 1);
 }

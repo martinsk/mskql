@@ -6,7 +6,7 @@
 
 /* ---- Logical IR node types ----
  *
- * A canonical 9-node intermediate representation sitting between the parser
+ * A canonical 7-node intermediate representation sitting between the parser
  * (query_select AST) and the physical plan builder (plan.c).
  *
  * The parser emits a rich query_select with ~40 flags.  logical_build()
@@ -31,17 +31,26 @@ enum logical_op {
     L_AGGREGATE,   /* child + group keys + agg exprs; HAVING becomes outer L_FILTER */
     L_SORT,        /* child + sort keys */
     L_LIMIT,       /* child + count + offset */
-    L_SUBQUERY,    /* inline subquery / CTE: child_root is root of inner logical tree */
-    L_DISTINCT_ON,    /* keep first row per key after sort: desugared from DISTINCT ON */
-    L_WINDOW,         /* window functions (SELECT ... OVER (...)) */
-    L_SET_OP,         /* UNION / INTERSECT / EXCEPT */
-    L_GENERATE_SERIES, /* generate_series(start, stop[, step]) virtual table */
 };
 
 /* L_SCAN payload */
 struct logical_scan {
     sv   table;           /* table name */
     sv   alias;           /* table alias, may be empty */
+    /* virtual table: generate_series(start, stop[, step]) */
+    int      is_generate_series;     /* 1 = virtual generate_series scan */
+    uint32_t gs_start_expr;          /* index into arena->exprs */
+    uint32_t gs_stop_expr;           /* index into arena->exprs */
+    uint32_t gs_step_expr;           /* index into arena->exprs, or IDX_NONE */
+    /* set operation: UNION / INTERSECT / EXCEPT */
+    int      is_set_op;              /* 1 = virtual set-op scan */
+    enum set_op_kind set_op_kind;
+    int      set_all;
+    uint32_t set_rhs_sql_idx;        /* index into arena->strings for RHS SQL */
+    /* inline subquery / CTE */
+    int      is_subquery;              /* 1 = FROM subquery or non-recursive CTE */
+    uint32_t subquery_sql_idx;         /* index into arena->strings for inner SQL */
+    sv       subquery_alias;           /* table alias (CTE name or subquery alias) */
 };
 
 /* L_FILTER payload */
@@ -63,6 +72,7 @@ struct logical_project {
     int      has_distinct_on;
     uint32_t distinct_on_start;      /* index into arena->svs */
     uint32_t distinct_on_count;
+    int      has_window;             /* 1 if window functions present (routes to build_window) */
 };
 
 /* L_JOIN payload */
@@ -79,6 +89,9 @@ struct logical_aggregate {
     uint32_t group_by_exprs_start; /* index into arena->arg_indices */
     int      group_by_rollup;
     int      group_by_cube;
+    int      first_row_only;        /* 1 = DISTINCT ON: keep first row per key group */
+    uint32_t distinct_on_key_start; /* index into arena->svs (only when first_row_only) */
+    uint32_t distinct_on_key_count;
     /* agg expressions are carried in L_PROJECT above this node */
 };
 
@@ -96,47 +109,6 @@ struct logical_limit {
     int64_t offset_count;
 };
 
-/* L_SUBQUERY payload — represents an inline subquery or non-recursive CTE.
- * sql_idx is an index into arena->strings pointing to the inner SQL text.
- * The physical builder (build_subquery in plan.c) calls query_parse on it
- * and builds a sub-plan, just like build_set_op does for UNION/INTERSECT.
- * The outer query treats the output of this node as if it were an L_SCAN. */
-struct logical_subquery {
-    uint32_t sql_idx;  /* index into arena->strings for inner SQL text */
-    sv       alias;    /* table alias (CTE name or FROM subquery alias) */
-};
-
-/* L_WINDOW payload — window function query.
- * All relevant fields are carried in the outer query_select; this node is
- * a marker that logical_to_physical routes to build_window. */
-struct logical_window {
-    int dummy; /* no extra payload needed — build_window reads query_select directly */
-};
-
-/* L_SET_OP payload — UNION / INTERSECT / EXCEPT.
- * rhs_sql_idx is an index into arena->strings for the RHS SQL text. */
-struct logical_set_op {
-    enum set_op_kind set_op;
-    int      set_all;     /* 1 for UNION ALL / INTERSECT ALL / EXCEPT ALL */
-    uint32_t rhs_sql_idx; /* index into arena->strings for RHS SQL */
-};
-
-/* L_GENERATE_SERIES payload — generate_series(start, stop[, step]).
- * Expression indices point into the outer query_select arena. */
-struct logical_gen_series {
-    uint32_t start_expr; /* index into arena->exprs */
-    uint32_t stop_expr;  /* index into arena->exprs */
-    uint32_t step_expr;  /* index into arena->exprs, or IDX_NONE */
-};
-
-/* L_DISTINCT_ON payload — keep first row per (key_start..key_start+key_count).
- * Desugared from DISTINCT ON (col1, col2): logical_build emits L_SORT on the
- * DISTINCT ON keys first, then L_DISTINCT_ON to strip duplicates. */
-struct logical_distinct_on {
-    uint32_t key_start;  /* index into arena->svs */
-    uint32_t key_count;  /* number of key columns */
-};
-
 /* A logical plan node.  Arena-allocated in arena->bump.
  * Children referenced by index into the logical_nodes array (also bump). */
 struct logical_node {
@@ -151,11 +123,6 @@ struct logical_node {
         struct logical_aggregate   aggregate;
         struct logical_sort        sort;
         struct logical_limit       limit;
-        struct logical_subquery    subquery;
-        struct logical_distinct_on distinct_on;
-        struct logical_window      window;
-        struct logical_set_op      set_op;
-        struct logical_gen_series  gen_series;
     };
 };
 
@@ -171,9 +138,12 @@ struct logical_node {
  *   NATURAL JOIN       → L_JOIN with explicit ON condition (via join_info)
  *   JOIN ... USING(c)  → L_JOIN with explicit ON condition (via join_info)
  *   ORDER BY + LIMIT   → L_LIMIT wrapping L_SORT (TOP_N candidate for matcher)
- *   Non-recursive CTE  → L_SUBQUERY (inline; no temp table materialization)
- *   FROM subquery      → L_SUBQUERY (inline; no temp table materialization)
- *   DISTINCT ON (cols) → L_SORT(cols) + L_DISTINCT_ON(cols)
+ *   Window functions   → L_PROJECT with has_window=1 (routes to build_window)
+ *   Non-recursive CTE  → L_SCAN with is_subquery=1
+ *   FROM subquery      → L_SCAN with is_subquery=1
+ *   UNION/INTERSECT/EXCEPT → L_SCAN with is_set_op=1
+ *   generate_series()  → L_SCAN with is_generate_series=1
+ *   DISTINCT ON (cols) → L_SORT(cols) + L_AGGREGATE(first_row_only=1)
  *
  * logical_build always succeeds (no validation) — inner parse errors for
  * subquery SQL must be detected before calling logical_build.

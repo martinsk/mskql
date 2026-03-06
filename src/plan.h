@@ -38,7 +38,7 @@ enum plan_op {
 
 enum plan_status {
     PLAN_OK,       /* plan built successfully */
-    PLAN_NOTIMPL,  /* feature not yet implemented — fall back to legacy */
+    PLAN_NOTIMPL,  /* deprecated — kept for build_subquery legacy fallback */
     PLAN_ERROR     /* real error (bad column, type mismatch, etc.) */
 };
 
@@ -48,7 +48,7 @@ struct plan_result {
 };
 
 #define PLAN_RES_OK(n)   ((struct plan_result){ .node = (n), .status = PLAN_OK })
-#define PLAN_RES_NOTIMPL ((struct plan_result){ .node = IDX_NONE, .status = PLAN_NOTIMPL })
+#define PLAN_RES_NOTIMPL ((struct plan_result){ .node = IDX_NONE, .status = PLAN_NOTIMPL }) /* deprecated */
 #define PLAN_RES_ERR     ((struct plan_result){ .node = IDX_NONE, .status = PLAN_ERROR })
 
 /* Vectorized projection operation — one per output column */
@@ -570,8 +570,8 @@ uint32_t plan_alloc_node(struct query_arena *arena, enum plan_op op);
 
 /* Try to build a block-oriented plan for a SELECT query.
  * Returns a plan_result: PLAN_OK with a valid node index on success,
- * PLAN_NOTIMPL for unimplemented features (fall back to legacy),
- * or PLAN_ERROR for real errors (bad column, type mismatch, etc.). */
+ * or PLAN_ERROR for real errors (bad column, type mismatch, unsupported
+ * feature, etc.).  PLAN_NOTIMPL is no longer returned. */
 struct plan_result plan_build_select(struct table *t, struct query_select *s,
                                      struct query_arena *arena, struct database *db);
 

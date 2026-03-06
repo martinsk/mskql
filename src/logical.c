@@ -48,47 +48,58 @@ uint32_t logical_build(struct query_select *s, struct query_arena *arena,
 
     uint32_t current;
 
-    /* ---- generate_series fast path: emit L_GENERATE_SERIES leaf ---- */
+    /* ---- generate_series fast path: emit L_SCAN(is_generate_series=1) leaf ---- */
     if (s->has_generate_series && s->gs_start_expr != IDX_NONE &&
         s->gs_stop_expr != IDX_NONE) {
-        uint32_t gs_idx = logical_alloc_node(arena, L_GENERATE_SERIES);
+        uint32_t gs_idx = logical_alloc_node(arena, L_SCAN);
         struct logical_node *gs = logical_node_get(arena, gs_idx);
-        gs->gen_series.start_expr = s->gs_start_expr;
-        gs->gen_series.stop_expr  = s->gs_stop_expr;
-        gs->gen_series.step_expr  = s->gs_step_expr;
-        current = gs_idx;
-        /* generate_series does not support WHERE/JOIN/GROUP BY/etc in this path */
-        return current;
+        gs->scan.is_generate_series = 1;
+        gs->scan.gs_start_expr = s->gs_start_expr;
+        gs->scan.gs_stop_expr  = s->gs_stop_expr;
+        gs->scan.gs_step_expr  = s->gs_step_expr;
+        return gs_idx;
     }
 
-    /* ---- Window function path: emit L_WINDOW leaf ---- */
+    /* ---- Window function path: emit L_PROJECT with has_window=1 ---- */
     if (s->select_exprs_count > 0) {
-        uint32_t win_idx = logical_alloc_node(arena, L_WINDOW);
-        /* no payload needed — build_window reads query_select directly */
-        (void)logical_node_get(arena, win_idx);
-        current = win_idx;
-        return current;
+        uint32_t proj_idx = logical_alloc_node(arena, L_PROJECT);
+        struct logical_node *pr = logical_node_get(arena, proj_idx);
+        pr->project.columns               = s->columns;
+        pr->project.parsed_columns_start  = s->parsed_columns_start;
+        pr->project.parsed_columns_count  = s->parsed_columns_count;
+        pr->project.select_exprs_start    = s->select_exprs_start;
+        pr->project.select_exprs_count    = s->select_exprs_count;
+        pr->project.aggregates_start      = s->aggregates_start;
+        pr->project.aggregates_count      = s->aggregates_count;
+        pr->project.agg_before_cols       = s->agg_before_cols;
+        pr->project.has_expr_aggs         = s->has_expr_aggs;
+        pr->project.has_distinct_on       = s->has_distinct_on;
+        pr->project.distinct_on_start     = s->distinct_on_start;
+        pr->project.distinct_on_count     = s->distinct_on_count;
+        pr->project.has_window            = 1;
+        return proj_idx;
     }
 
-    /* ---- Set operation path: emit L_SET_OP leaf ---- */
+    /* ---- Set operation path: emit L_SCAN(is_set_op=1) leaf ---- */
     if (s->has_set_op && s->set_rhs_sql != IDX_NONE) {
-        uint32_t sop_idx = logical_alloc_node(arena, L_SET_OP);
+        uint32_t sop_idx = logical_alloc_node(arena, L_SCAN);
         struct logical_node *sop = logical_node_get(arena, sop_idx);
-        sop->set_op.set_op      = s->set_op;
-        sop->set_op.set_all     = s->set_all;
-        sop->set_op.rhs_sql_idx = s->set_rhs_sql;
-        current = sop_idx;
-        return current;
+        sop->scan.is_set_op       = 1;
+        sop->scan.set_op_kind     = s->set_op;
+        sop->scan.set_all         = s->set_all;
+        sop->scan.set_rhs_sql_idx = s->set_rhs_sql;
+        return sop_idx;
     }
 
-    /* ---- Base: L_SUBQUERY (FROM subquery) or L_SCAN ---- */
+    /* ---- Base: L_SCAN (possibly with is_subquery=1) ---- */
 
     if (s->from_subquery_sql != IDX_NONE) {
-        /* FROM (SELECT ...) AS alias: desugar to L_SUBQUERY */
-        uint32_t sq_idx = logical_alloc_node(arena, L_SUBQUERY);
+        /* FROM (SELECT ...) AS alias: desugar to L_SCAN(is_subquery=1) */
+        uint32_t sq_idx = logical_alloc_node(arena, L_SCAN);
         struct logical_node *sq = logical_node_get(arena, sq_idx);
-        sq->subquery.sql_idx = s->from_subquery_sql;
-        sq->subquery.alias   = s->from_subquery_alias;
+        sq->scan.is_subquery       = 1;
+        sq->scan.subquery_sql_idx  = s->from_subquery_sql;
+        sq->scan.subquery_alias    = s->from_subquery_alias;
         current = sq_idx;
     } else {
         /* Plain table scan.
@@ -178,26 +189,26 @@ uint32_t logical_build(struct query_select *s, struct query_arena *arena,
         current = proj_idx;
     }
 
-    /* ---- L_DISTINCT_ON: desugar from DISTINCT ON (cols) ---- */
+    /* ---- DISTINCT ON: desugar to L_SORT + L_AGGREGATE(first_row_only=1) ---- */
     if (s->has_distinct_on && s->distinct_on_count > 0) {
         /* First: sort by the DISTINCT ON key columns so duplicates are adjacent */
         uint32_t sort_idx = logical_alloc_node(arena, L_SORT);
         struct logical_node *so = logical_node_get(arena, sort_idx);
         so->child               = current;
-        /* Re-use the distinct_on svs as the sort key (same columns).
-         * Store their sv start index in sort.order_by_start as a negative
-         * sentinel that the physical builder recognises as "sv-based sort". */
         so->sort.order_by_start = s->distinct_on_start;
         so->sort.order_by_count = s->distinct_on_count;
         current = sort_idx;
 
-        /* Then: emit only the first row per key group */
-        uint32_t don_idx = logical_alloc_node(arena, L_DISTINCT_ON);
-        struct logical_node *don = logical_node_get(arena, don_idx);
-        don->child                   = current;
-        don->distinct_on.key_start   = s->distinct_on_start;
-        don->distinct_on.key_count   = s->distinct_on_count;
-        current = don_idx;
+        /* Then: keep first row per key group via L_AGGREGATE(first_row_only) */
+        uint32_t agg_idx = logical_alloc_node(arena, L_AGGREGATE);
+        struct logical_node *ag = logical_node_get(arena, agg_idx);
+        ag->child                            = current;
+        ag->aggregate.group_by_start         = IDX_NONE;
+        ag->aggregate.group_by_count         = 0;
+        ag->aggregate.first_row_only         = 1;
+        ag->aggregate.distinct_on_key_start  = s->distinct_on_start;
+        ag->aggregate.distinct_on_key_count  = s->distinct_on_count;
+        current = agg_idx;
     }
 
     /* ---- L_SORT ---- */
@@ -317,9 +328,8 @@ static uint32_t normalize_node(uint32_t idx, struct query_arena *arena,
     struct logical_node *n = logical_node_get(arena, idx);
     if (!n) return idx;
 
-    /* Leaf-like nodes: no children to recurse into. */
-    if (n->op == L_SUBQUERY || n->op == L_WINDOW ||
-        n->op == L_SET_OP   || n->op == L_GENERATE_SERIES) return idx;
+    /* L_SCAN leaves (virtual scans) have no children to recurse into;
+     * the normal recursion via n->child == IDX_NONE handles this. */
 
     /* Recurse into children first (bottom-up) */
     uint32_t new_child = normalize_node(n->child, arena, db);
@@ -485,7 +495,18 @@ static int logical_explain_node(struct query_arena *arena, uint32_t idx,
 
     switch (n->op) {
     case L_SCAN:
-        if (n->scan.alias.len > 0)
+        if (n->scan.is_subquery)
+            r = snprintf(buf+written, buflen-written, "Subquery [alias: " SV_FMT "]\n",
+                         (int)n->scan.subquery_alias.len, n->scan.subquery_alias.data);
+        else if (n->scan.is_set_op) {
+            const char *opname = "Union";
+            if (n->scan.set_op_kind == 1) opname = "Intersect";
+            else if (n->scan.set_op_kind == 2) opname = "Except";
+            r = snprintf(buf+written, buflen-written, "SetOp %s%s\n",
+                         opname, n->scan.set_all ? " ALL" : "");
+        } else if (n->scan.is_generate_series)
+            r = snprintf(buf+written, buflen-written, "GenerateSeries\n");
+        else if (n->scan.alias.len > 0)
             r = snprintf(buf+written, buflen-written, "Scan on " SV_FMT " [alias: " SV_FMT "]\n",
                          (int)n->scan.table.len, n->scan.table.data,
                          (int)n->scan.alias.len, n->scan.alias.data);
@@ -506,7 +527,9 @@ static int logical_explain_node(struct query_arena *arena, uint32_t idx,
     }
 
     case L_PROJECT: {
-        if (n->project.columns.len > 0 &&
+        if (n->project.has_window)
+            r = snprintf(buf+written, buflen-written, "Project [window]\n");
+        else if (n->project.columns.len > 0 &&
             !(n->project.columns.len == 1 && n->project.columns.data[0] == '*'))
             r = snprintf(buf+written, buflen-written, "Project [" SV_FMT "]\n",
                          (int)n->project.columns.len, n->project.columns.data);
@@ -553,7 +576,18 @@ static int logical_explain_node(struct query_arena *arena, uint32_t idx,
     }
 
     case L_AGGREGATE: {
-        if (n->aggregate.group_by_count > 0) {
+        if (n->aggregate.first_row_only) {
+            int w = snprintf(buf+written, buflen-written, "DistinctOn [");
+            if (w > 0) written += w;
+            for (uint32_t k = 0; k < n->aggregate.distinct_on_key_count && written < buflen-4; k++) {
+                sv col = arena->svs.items[n->aggregate.distinct_on_key_start + k];
+                if (k > 0) { r = snprintf(buf+written, buflen-written, ", "); if (r>0) written+=r; }
+                r = snprintf(buf+written, buflen-written, SV_FMT, (int)col.len, col.data);
+                if (r > 0) written += r;
+            }
+            r = snprintf(buf+written, buflen-written, "]\n");
+            if (r > 0) written += r;
+        } else if (n->aggregate.group_by_count > 0) {
             int w = snprintf(buf+written, buflen-written, "Aggregate GROUP BY [");
             if (w > 0) written += w;
             for (uint32_t k = 0; k < n->aggregate.group_by_count && written < buflen-4; k++) {
@@ -605,47 +639,6 @@ static int logical_explain_node(struct query_arena *arena, uint32_t idx,
         break;
     }
 
-    case L_SUBQUERY:
-        r = snprintf(buf+written, buflen-written, "Subquery [alias: " SV_FMT "]\n",
-                     (int)n->subquery.alias.len, n->subquery.alias.data);
-        if (r > 0) written += r;
-        break;
-
-    case L_WINDOW:
-        r = snprintf(buf+written, buflen-written, "Window\n");
-        if (r > 0) written += r;
-        break;
-
-    case L_SET_OP: {
-        const char *opname = "Union";
-        if (n->set_op.set_op == 1) opname = "Intersect";
-        else if (n->set_op.set_op == 2) opname = "Except";
-        r = snprintf(buf+written, buflen-written, "SetOp %s%s\n",
-                     opname, n->set_op.set_all ? " ALL" : "");
-        if (r > 0) written += r;
-        break;
-    }
-
-    case L_GENERATE_SERIES:
-        r = snprintf(buf+written, buflen-written, "GenerateSeries\n");
-        if (r > 0) written += r;
-        break;
-
-    case L_DISTINCT_ON: {
-        int w = snprintf(buf+written, buflen-written, "DistinctOn [");
-        if (w > 0) written += w;
-        for (uint32_t k = 0; k < n->distinct_on.key_count && written < buflen-4; k++) {
-            sv col = arena->svs.items[n->distinct_on.key_start + k];
-            if (k > 0) { r = snprintf(buf+written, buflen-written, ", "); if (r>0) written+=r; }
-            r = snprintf(buf+written, buflen-written, SV_FMT, (int)col.len, col.data);
-            if (r > 0) written += r;
-        }
-        r = snprintf(buf+written, buflen-written, "]\n");
-        if (r > 0) written += r;
-        r = logical_explain_node(arena, n->child, buf+written, buflen-written, depth+1);
-        if (r > 0) written += r;
-        break;
-    }
     }
     return written;
 }

@@ -451,8 +451,12 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
             struct cell *c;
             int has_lhs_expr = 0;
             if (cond->column.len > 0) {
-                /* Try column lookup first (needed for HAVING with aggregate virtual columns) */
-                int col_idx = table_find_column_sv(t, cond->column);
+                /* Cached column lookup: resolve once, reuse on subsequent rows */
+                int col_idx = cond->resolved_col_idx;
+                if (col_idx == -2) {
+                    col_idx = table_find_column_sv(t, cond->column);
+                    cond->resolved_col_idx = col_idx;
+                }
                 if (col_idx >= 0) {
                     c = &row->cells.items[col_idx];
                 } else if (cond->lhs_expr != IDX_NONE) {
@@ -472,7 +476,11 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
                 lhs_tmp = eval_expr(cond->lhs_expr, arena, t, row, db, NULL);
                 c = &lhs_tmp;
             } else {
-                int col_idx = table_find_column_sv(t, cond->column);
+                int col_idx = cond->resolved_col_idx;
+                if (col_idx == -2) {
+                    col_idx = table_find_column_sv(t, cond->column);
+                    cond->resolved_col_idx = col_idx;
+                }
                 if (col_idx < 0) return 0;
                 c = &row->cells.items[col_idx];
             }
@@ -544,7 +552,11 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
                 struct cell *rhs_val = &cond->value;
                 struct cell rhs_col_cell;
                 if (cond->rhs_column.len > 0) {
-                    int rhs_col = table_find_column_sv(t, cond->rhs_column);
+                    int rhs_col = cond->resolved_rhs_col_idx;
+                    if (rhs_col == -2) {
+                        rhs_col = table_find_column_sv(t, cond->rhs_column);
+                        cond->resolved_rhs_col_idx = rhs_col;
+                    }
                     if (rhs_col < 0) goto cond_cleanup;
                     rhs_col_cell = row->cells.items[rhs_col];
                     rhs_val = &rhs_col_cell;
@@ -678,7 +690,11 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
             }
             /* column-to-column comparison (JOIN ON conditions) */
             if (cond->rhs_column.len > 0) {
-                int rhs_col = table_find_column_sv(t, cond->rhs_column);
+                int rhs_col = cond->resolved_rhs_col_idx;
+                if (rhs_col == -2) {
+                    rhs_col = table_find_column_sv(t, cond->rhs_column);
+                    cond->resolved_rhs_col_idx = rhs_col;
+                }
                 if (rhs_col < 0) goto cond_cleanup;
                 struct cell *rhs = &row->cells.items[rhs_col];
                 if (c->is_null || (column_type_is_text(c->type) && !c->value.as_text))
@@ -726,9 +742,11 @@ static int eval_condition3(uint32_t cond_idx, struct query_arena *arena,
             /* Coerce TEXT RHS to ENUM ordinal when LHS is ENUM */
             if (c->type == COLUMN_TYPE_ENUM && cond->value.type == COLUMN_TYPE_TEXT
                 && !cond->value.is_null && cond->value.value.as_text && t) {
-                int col_idx = -1;
-                if (cond->column.len > 0)
+                int col_idx = cond->resolved_col_idx;
+                if (col_idx == -2 && cond->column.len > 0) {
                     col_idx = table_find_column_sv(t, cond->column);
+                    cond->resolved_col_idx = col_idx;
+                }
                 if (col_idx >= 0 && t->columns.items[col_idx].enum_type_name && db) {
                     struct enum_type *et = db_find_type(db, t->columns.items[col_idx].enum_type_name);
                     if (et) {
@@ -3660,22 +3678,25 @@ struct cell eval_expr(uint32_t expr_idx, struct query_arena *arena,
 
     case EXPR_COLUMN_REF: {
         if (!t || !row) return cell_make_null();
-        sv col = e->column_ref.column;
-        int idx = -1;
-        if (e->column_ref.table.len > 0) {
-            /* try table.column qualified lookup first (avoids ambiguity in merged join tables) */
-            char qname[256];
-            snprintf(qname, sizeof(qname), SV_FMT "." SV_FMT,
-                     SV_ARG(e->column_ref.table), SV_ARG(col));
-            sv qsv = sv_from(qname, strlen(qname));
-            idx = table_find_column_sv(t, qsv);
+        int idx = e->column_ref.resolved_idx;
+        if (idx == -2) {
+            sv col = e->column_ref.column;
+            idx = -1;
+            if (e->column_ref.table.len > 0) {
+                char qname[256];
+                snprintf(qname, sizeof(qname), SV_FMT "." SV_FMT,
+                         SV_ARG(e->column_ref.table), SV_ARG(col));
+                sv qsv = sv_from(qname, strlen(qname));
+                idx = table_find_column_sv(t, qsv);
+            }
+            if (idx < 0)
+                idx = table_find_column_sv(t, col);
+            e->column_ref.resolved_idx = idx;
         }
-        if (idx < 0)
-            idx = table_find_column_sv(t, col);
         if (idx < 0) {
             arena_set_error(arena, "42703",
                 "column \"%.*s\" does not exist",
-                (int)col.len, col.data);
+                (int)e->column_ref.column.len, e->column_ref.column.data);
             return cell_make_null();
         }
         return cell_deep_copy_rb(&row->cells.items[idx], rb);
@@ -6942,7 +6963,7 @@ int query_select_exec(struct table *t, struct query_select *s, struct query_aren
 
     /* try block-oriented plan executor — handles aggregates, GROUP BY,
      * single-table scans, joins, set ops via columnar path with scan cache.
-     * Falls through to legacy dispatchers on PLAN_NOTIMPL. */
+     * Falls through to legacy dispatchers on PLAN_ERROR. */
     if (!s->has_set_op) {
         struct plan_result pr = plan_build_select(t, s, arena, db);
         if (pr.status == PLAN_OK) {
@@ -6950,9 +6971,9 @@ int query_select_exec(struct table *t, struct query_select *s, struct query_aren
             plan_exec_init(&ctx, arena, db, pr.node);
             return plan_exec_to_rows(&ctx, pr.node, result, rb);
         }
-        if (s->has_group_by && s->aggregates_count > 0)
-            fprintf(stderr, "DEBUG: plan_build_select NOTIMPL for GROUP BY+AGG (grp=%u agg=%u parsed=%u having=%d)\n",
-                    s->group_by_count, s->aggregates_count, s->parsed_columns_count, s->has_having);
+        /* Clear any error set by plan_build_select so the legacy path
+         * can proceed without a stale error message leaking through. */
+        arena_clear_error(arena);
     }
 
     /* dispatch to GROUP BY path */

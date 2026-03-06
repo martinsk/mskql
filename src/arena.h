@@ -228,6 +228,13 @@ static inline void arena_set_error(struct query_arena *a,
     va_end(ap);
 }
 
+/* Clear any previously set error so a retry path can proceed cleanly. */
+static inline void arena_clear_error(struct query_arena *a)
+{
+    a->errmsg[0] = '\0';
+    a->sqlstate[0] = '\0';
+}
+
 static inline void query_arena_init(struct query_arena *a)
 {
     da_init(&a->exprs);

@@ -200,6 +200,10 @@ struct condition {
     int is_all;
     uint32_t array_values_start;  /* index into arena.cells */
     uint32_t array_values_count;
+    /* cached column indices — avoids repeated table_find_column_sv per row.
+     * -2 = not yet resolved, -1 = column not found, >=0 = valid index. */
+    int resolved_col_idx;
+    int resolved_rhs_col_idx;
 };
 
 int eval_condition(uint32_t cond_idx, struct query_arena *arena,
@@ -375,6 +379,7 @@ struct expr {
         struct {
             sv table;       /* empty if unqualified */
             sv column;
+            int resolved_idx; /* cached column index: -2=unresolved, -1=not found, >=0=valid */
         } column_ref;
 
         /* EXPR_BINARY_OP */

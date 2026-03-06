@@ -3663,7 +3663,7 @@ static int db_exec_explain(struct database *db, struct query_explain *ex,
         struct table *t = NULL;
         if (es->table.len > 0)
             t = db_find_table_sv(db, es->table);
-        struct plan_result epr = { .node = IDX_NONE, .status = PLAN_NOTIMPL };
+        struct plan_result epr = { .node = IDX_NONE, .status = PLAN_ERROR };
         if (t)
             epr = plan_build_select(t, es, &inner_q.arena, db);
 

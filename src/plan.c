@@ -11484,15 +11484,6 @@ static int extract_join_keys(struct join_info *ji, struct query_arena *arena,
 static struct plan_result build_join(struct table *t, struct query_select *s,
                                      struct query_arena *arena, struct database *db)
 {
-    /* Bail out for unsupported features */
-    if (s->select_exprs_count > 0) return PLAN_RES_NOTIMPL; /* window functions */
-    if (s->has_set_op)          return PLAN_RES_NOTIMPL;
-    if (s->ctes_count > 0)     return PLAN_RES_NOTIMPL;
-    if (s->cte_sql != IDX_NONE) return PLAN_RES_NOTIMPL;
-    if (s->from_subquery_sql != IDX_NONE) return PLAN_RES_NOTIMPL;
-    if (s->has_recursive_cte)   return PLAN_RES_NOTIMPL;
-    if (s->has_distinct_on)     return PLAN_RES_NOTIMPL;
-    if (s->insert_rows_count > 0) return PLAN_RES_NOTIMPL;
     /* NOTE: has_expr_aggs is NOT bailed here for expression-*inside*-aggregate
      * patterns like SUM(col * col) — those are handled by try_vectorize_agg_exprs
      * + agg_col_idxs=-2.  However, expression-*wrapping*-aggregate patterns like
@@ -11513,18 +11504,28 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
             /* Top-level is a column ref or literal — no aggregate, fine */
             if (!expr_has_agg(arena, sc->expr_idx)) continue;
             /* Top-level wraps an aggregate (e.g. COALESCE(SUM(...),0)) — bail */
-            return PLAN_RES_NOTIMPL;
+            arena_set_error(arena, "0A000", "expression-wrapping aggregates not supported in joins");
+            return PLAN_RES_ERR;
         }
     }
     /* HAVING without GROUP BY is handled in build_simple_agg */
-    if (s->group_by_rollup || s->group_by_cube) return PLAN_RES_NOTIMPL;
+    if (s->group_by_rollup || s->group_by_cube) {
+        arena_set_error(arena, "0A000", "ROLLUP/CUBE not supported");
+        return PLAN_RES_ERR;
+    }
     /* Bail if GROUP BY query has extra complex columns (subqueries, COALESCE, etc.) */
     if (s->has_group_by && s->aggregates_count > 0 &&
-        s->parsed_columns_count > s->group_by_count + s->aggregates_count) return PLAN_RES_NOTIMPL;
+        s->parsed_columns_count > s->group_by_count + s->aggregates_count) {
+        arena_set_error(arena, "0A000", "expression columns in GROUP BY joins not supported");
+        return PLAN_RES_ERR;
+    }
 
     struct table *t1 = t;
     if (!t1) return PLAN_RES_ERR;
-    if (table_has_mixed_types(t1)) return PLAN_RES_NOTIMPL;
+    if (table_has_mixed_types(t1)) {
+        arena_set_error(arena, "0A000", "table has mixed column types");
+        return PLAN_RES_ERR;
+    }
 
     /* Collect all tables, aliases, and validate all joins are INNER equi-joins */
     int max_tables = (int)s->joins_count + 1;
@@ -11552,15 +11553,24 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     for (uint32_t j = 0; j < s->joins_count; j++) {
         struct join_info *ji = &arena->joins.items[s->joins_start + j];
         if (ji->join_type == JOIN_CROSS) has_cross = 1;
-        if (ji->is_lateral)     return PLAN_RES_NOTIMPL;
+        if (ji->is_lateral) {
+            arena_set_error(arena, "0A000", "LATERAL joins not supported");
+            return PLAN_RES_ERR;
+        }
         if (ji->join_type != JOIN_INNER && ji->join_type != JOIN_CROSS) has_non_inner = 1;
 
         struct table *tn = db_find_table_sv(db, ji->join_table);
         if (!tn) {
             return PLAN_RES_ERR;
         }
-        if (tn->kind == TABLE_VIEW) return PLAN_RES_NOTIMPL;
-        if (table_has_mixed_types(tn)) return PLAN_RES_NOTIMPL;
+        if (tn->kind == TABLE_VIEW) {
+            arena_set_error(arena, "0A000", "views not supported in joins");
+            return PLAN_RES_ERR;
+        }
+        if (table_has_mixed_types(tn)) {
+            arena_set_error(arena, "0A000", "table has mixed column types");
+            return PLAN_RES_ERR;
+        }
 
         /* Resolve NATURAL JOIN: find matching column names between left and right */
         if (ji->is_natural) {
@@ -11580,7 +11590,10 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
                     }
                 }
             }
-            if (nmatches != 1) return PLAN_RES_NOTIMPL; /* 0 or multi-column */
+            if (nmatches != 1) {
+                arena_set_error(arena, "0A000", "NATURAL JOIN requires exactly one matching column");
+                return PLAN_RES_ERR;
+            }
             ji->join_left_col = match_col;
             ji->join_right_col = match_col;
             ji->join_op = CMP_EQ;
@@ -11594,7 +11607,10 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
             for (size_t k = 0; k < ji->using_col.len; k++) {
                 if (ji->using_col.data[k] == ',') { has_comma = 1; break; }
             }
-            if (has_comma) return PLAN_RES_NOTIMPL; /* multi-column USING */
+            if (has_comma) {
+                arena_set_error(arena, "0A000", "multi-column USING not supported");
+                return PLAN_RES_ERR;
+            }
             ji->join_left_col = ji->using_col;
             ji->join_right_col = ji->using_col;
             ji->join_op = CMP_EQ;
@@ -11610,8 +11626,14 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
         cum_cols += (uint16_t)tn->columns.count;
     }
     /* Multi-table non-INNER joins need the legacy executor */
-    if (ntables > 2 && has_non_inner) return PLAN_RES_NOTIMPL;
-    if (ntables > 2 && has_cross) return PLAN_RES_NOTIMPL; /* multi-table cross join */
+    if (ntables > 2 && has_non_inner) {
+        arena_set_error(arena, "0A000", "multi-table non-INNER joins not supported");
+        return PLAN_RES_ERR;
+    }
+    if (ntables > 2 && has_cross) {
+        arena_set_error(arena, "0A000", "multi-table cross joins not supported");
+        return PLAN_RES_ERR;
+    }
 
     /* Extract join keys for each join */
     int *outer_keys = (int *)bump_alloc(&arena->scratch, s->joins_count * sizeof(int));
@@ -11674,11 +11696,15 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
         agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
         for (uint32_t a = 0; a < s->aggregates_count; a++) {
             struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
-            if (ae->func == AGG_NONE)
-                return PLAN_RES_NOTIMPL;
+            if (ae->func == AGG_NONE) {
+                arena_set_error(arena, "42803", "invalid aggregate function");
+                return PLAN_RES_ERR;
+            }
             if (ae->has_distinct && ae->func != AGG_COUNT &&
-                ae->func != AGG_STRING_AGG && ae->func != AGG_ARRAY_AGG)
-                return PLAN_RES_NOTIMPL;
+                ae->func != AGG_STRING_AGG && ae->func != AGG_ARRAY_AGG) {
+                arena_set_error(arena, "0A000", "DISTINCT not supported for this aggregate");
+                return PLAN_RES_ERR;
+            }
             if (ae->expr_idx != IDX_NONE) {
                 agg_col_idxs[a] = -2; /* expression-based aggregate */
             } else if (sv_eq_cstr(ae->column, "*")) {
@@ -11711,7 +11737,10 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
                     }
                 }
             }
-            if (grp_col_idxs[g] < 0) return PLAN_RES_NOTIMPL;
+            if (grp_col_idxs[g] < 0) {
+                arena_set_error(arena, "42703", "GROUP BY column not found");
+                return PLAN_RES_ERR;
+            }
         }
     }
 
@@ -11779,11 +11808,15 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
                     if (e->type == EXPR_SUBQUERY) { expr_ok = 0; break; }
                     expr_proj_indices_join[i] = sc->expr_idx;
                 }
-                if (!expr_ok) return PLAN_RES_NOTIMPL;
+                if (!expr_ok) {
+                    arena_set_error(arena, "0A000", "unsupported expression in SELECT list");
+                    return PLAN_RES_ERR;
+                }
                 need_expr_project_join = 1;
             }
         } else {
-            return PLAN_RES_NOTIMPL;
+            arena_set_error(arena, "0A000", "unsupported column list in join query");
+            return PLAN_RES_ERR;
         }
 
         /* Pre-validate ORDER BY columns in merged column space */
@@ -11816,8 +11849,10 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
     if (s->where.has_where && s->where.where_cond != IDX_NONE) {
         if (validate_compound_filter_r(&join_cr, arena, s->where.where_cond))
             join_filter_ok = 1;
-        else
-            return PLAN_RES_NOTIMPL;
+        else {
+            arena_set_error(arena, "0A000", "unsupported WHERE clause in join");
+            return PLAN_RES_ERR;
+        }
     }
 
     /* --- Predicate pushdown: classify WHERE predicates by table --- */
@@ -12217,7 +12252,10 @@ static struct plan_result build_join(struct table *t, struct query_select *s,
             }
             current = try_append_having_filter(current, s, arena);
             hcond->lhs_expr = saved_lhs;
-            if (current == IDX_NONE) return PLAN_RES_NOTIMPL;
+            if (current == IDX_NONE) {
+                arena_set_error(arena, "0A000", "unsupported HAVING clause in join");
+                return PLAN_RES_ERR;
+            }
         }
 
         /* Append SORT if ORDER BY present */
@@ -12341,7 +12379,8 @@ static struct plan_result build_set_op(struct table *t, struct query_select *s,
         rs->from_subquery_sql != IDX_NONE || rs->has_generate_series ||
         rs->select_exprs_count > 0) {
         query_free(&rhs_q);
-        return PLAN_RES_NOTIMPL;
+        arena_set_error(arena, "0A000", "complex RHS query in set operation not supported");
+        return PLAN_RES_ERR;
     }
 
     struct table *t2 = db_find_table_sv(db, rs->table);
@@ -12360,16 +12399,17 @@ static struct plan_result build_set_op(struct table *t, struct query_select *s,
         lhs_col_map = (int *)bump_alloc(&arena->scratch, lhs_ncols * sizeof(int));
         for (uint32_t i = 0; i < s->parsed_columns_count; i++) {
             struct select_column *sc = &arena->select_cols.items[s->parsed_columns_start + i];
-            if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return PLAN_RES_NOTIMPL; }
+            if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); arena_set_error(arena, "0A000", "unsupported expression in set operation LHS"); return PLAN_RES_ERR; }
             struct expr *e = &EXPR(arena, sc->expr_idx);
-            if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return PLAN_RES_NOTIMPL; }
+            if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); arena_set_error(arena, "0A000", "unsupported expression in set operation LHS"); return PLAN_RES_ERR; }
             int ci = table_find_column_sv(t, e->column_ref.column);
             if (ci < 0) { query_free(&rhs_q); return PLAN_RES_ERR; }
             lhs_col_map[i] = ci;
         }
     } else {
         query_free(&rhs_q);
-        return PLAN_RES_NOTIMPL;
+        arena_set_error(arena, "0A000", "unsupported column list in set operation LHS");
+        return PLAN_RES_ERR;
     }
 
     /* Resolve RHS columns */
@@ -12385,9 +12425,9 @@ static struct plan_result build_set_op(struct table *t, struct query_select *s,
         rhs_col_map = (int *)bump_alloc(&arena->scratch, rhs_ncols * sizeof(int));
         for (uint32_t i = 0; i < rs->parsed_columns_count; i++) {
             struct select_column *sc = &rhs_q.arena.select_cols.items[rs->parsed_columns_start + i];
-            if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); return PLAN_RES_NOTIMPL; }
+            if (sc->expr_idx == IDX_NONE) { query_free(&rhs_q); arena_set_error(arena, "0A000", "unsupported expression in set operation RHS"); return PLAN_RES_ERR; }
             struct expr *e = &EXPR(&rhs_q.arena, sc->expr_idx);
-            if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); return PLAN_RES_NOTIMPL; }
+            if (e->type != EXPR_COLUMN_REF) { query_free(&rhs_q); arena_set_error(arena, "0A000", "unsupported expression in set operation RHS"); return PLAN_RES_ERR; }
             int ci = table_find_column_sv(t2, e->column_ref.column);
             if (ci < 0) { query_free(&rhs_q); return PLAN_RES_ERR; }
             rhs_col_map[i] = ci;
@@ -12395,12 +12435,13 @@ static struct plan_result build_set_op(struct table *t, struct query_select *s,
     } else {
         /* Try legacy text-based column resolution */
         if (rs->columns.len > 0 && !sv_eq_cstr(rs->columns, "*")) {
-            /* Parse comma-separated column list from raw text */
             query_free(&rhs_q);
-            return PLAN_RES_NOTIMPL;
+            arena_set_error(arena, "0A000", "unsupported column list in set operation RHS");
+            return PLAN_RES_ERR;
         }
         query_free(&rhs_q);
-        return PLAN_RES_NOTIMPL;
+        arena_set_error(arena, "0A000", "unsupported column list in set operation RHS");
+        return PLAN_RES_ERR;
     }
 
     /* Column counts must match */
@@ -12416,7 +12457,8 @@ static struct plan_result build_set_op(struct table *t, struct query_select *s,
     /* Check for mixed cell types in both tables */
     if (table_has_mixed_types(t) || table_has_mixed_types(t2)) {
         query_free(&rhs_q);
-        return PLAN_RES_NOTIMPL;
+        arena_set_error(arena, "0A000", "table has mixed column types");
+        return PLAN_RES_ERR;
     }
 
     /* Build LHS plan: SEQ_SCAN (→ PROJECT if not SELECT *) */
@@ -12555,7 +12597,10 @@ static struct plan_result build_window(struct table *t, struct query_select *s,
     uint16_t n_pass = 0, n_win = 0;
     for (size_t e = 0; e < nexprs; e++) {
         struct select_expr *se = &arena->select_exprs.items[s->select_exprs_start + e];
-        if (se->kind == SEL_EXPR_WIN) return PLAN_RES_NOTIMPL; /* expression with embedded window */
+        if (se->kind == SEL_EXPR_WIN) {
+            arena_set_error(arena, "0A000", "expression with embedded window function not supported");
+            return PLAN_RES_ERR;
+        }
         if (se->kind == SEL_COLUMN) n_pass++;
         else {
             n_win++;
@@ -12644,8 +12689,10 @@ static struct plan_result build_window(struct table *t, struct query_select *s,
     }
 
     /* Bail out if table has mixed cell types */
-    if (table_has_mixed_types(t))
-        return PLAN_RES_NOTIMPL;
+    if (table_has_mixed_types(t)) {
+        arena_set_error(arena, "0A000", "table has mixed column types");
+        return PLAN_RES_ERR;
+    }
 
     /* Build scan → (filter →) window (→ sort) plan */
     uint32_t current = build_seq_scan(t, arena);
@@ -12990,21 +13037,22 @@ static struct plan_result build_expr_agg(struct table *t, struct query_select *s
                                          struct query_arena *arena)
 {
     if (!t) return PLAN_RES_ERR;
-    if (table_has_mixed_types(t)) return PLAN_RES_NOTIMPL;
-    /* Only handle single-table, no joins, no subqueries, no window functions */
-    if (s->has_join) return PLAN_RES_NOTIMPL;
-    if (s->select_exprs_count > 0) return PLAN_RES_NOTIMPL;
-    if (s->has_set_op) return PLAN_RES_NOTIMPL;
-    if (s->ctes_count > 0) return PLAN_RES_NOTIMPL;
-    if (s->cte_sql != IDX_NONE) return PLAN_RES_NOTIMPL;
-    if (s->from_subquery_sql != IDX_NONE) return PLAN_RES_NOTIMPL;
-    if (s->has_recursive_cte) return PLAN_RES_NOTIMPL;
-    if (s->group_by_rollup || s->group_by_cube) return PLAN_RES_NOTIMPL;
+    if (table_has_mixed_types(t)) {
+        arena_set_error(arena, "0A000", "table has mixed column types");
+        return PLAN_RES_ERR;
+    }
+    if (s->group_by_rollup || s->group_by_cube) {
+        arena_set_error(arena, "0A000", "ROLLUP/CUBE not supported");
+        return PLAN_RES_ERR;
+    }
 
     /* Collect parsed_columns that have expr_idx with embedded aggregates.
      * Also collect standalone aggregates and group-by columns. */
     uint32_t out_ncols = s->parsed_columns_count;
-    if (out_ncols == 0) return PLAN_RES_NOTIMPL;
+    if (out_ncols == 0) {
+        arena_set_error(arena, "42601", "no output columns");
+        return PLAN_RES_ERR;
+    }
 
     /* Extract embedded aggregates from expression trees.
      * This modifies the expression trees in-place (rewrites FUNC_AGG_* to EXPR_COLUMN_REF). */
@@ -13029,8 +13077,10 @@ static struct plan_result build_expr_agg(struct table *t, struct query_select *s
             uint32_t cloned = clone_expr_replace_aggs(arena, sc->expr_idx, t,
                                                        standalone_agg_count + extracted_agg_count,
                                                        &extracted_agg_count);
-            if (cloned == IDX_NONE)
-                return PLAN_RES_NOTIMPL;
+            if (cloned == IDX_NONE) {
+                arena_set_error(arena, "0A000", "unsupported expression in aggregate query");
+                return PLAN_RES_ERR;
+            }
             out_expr_indices[i] = cloned;
         } else if (standalone_idx < standalone_agg_count) {
             /* Standalone aggregate — create a column ref to its synthetic name */
@@ -13045,7 +13095,10 @@ static struct plan_result build_expr_agg(struct table *t, struct query_select *s
 
     /* Merge: total aggregates = standalone + extracted */
     uint32_t total_agg_count = standalone_agg_count + extracted_agg_count;
-    if (total_agg_count == 0) return PLAN_RES_NOTIMPL;
+    if (total_agg_count == 0) {
+        arena_set_error(arena, "42803", "no aggregates found in expression-aggregate query");
+        return PLAN_RES_ERR;
+    }
 
     /* Build a unified aggregates range: standalone aggs are at s->aggregates_start,
      * extracted aggs are at extracted_agg_start. We need them contiguous.
@@ -13059,15 +13112,18 @@ static struct plan_result build_expr_agg(struct table *t, struct query_select *s
         unified_agg_start = s->aggregates_start;
     } else {
         /* Need to copy into contiguous range — bail for now */
-        return PLAN_RES_NOTIMPL;
+        arena_set_error(arena, "0A000", "non-contiguous aggregate ranges not supported");
+        return PLAN_RES_ERR;
     }
 
     /* Validate aggregate columns */
     int *agg_col_idxs = (int *)bump_alloc(&arena->scratch, total_agg_count * sizeof(int));
     for (uint32_t a = 0; a < total_agg_count; a++) {
         struct agg_expr *ae = &arena->aggregates.items[unified_agg_start + a];
-        if (ae->func == AGG_NONE)
-            return PLAN_RES_NOTIMPL;
+        if (ae->func == AGG_NONE) {
+            arena_set_error(arena, "42803", "invalid aggregate function");
+            return PLAN_RES_ERR;
+        }
         if (ae->expr_idx != IDX_NONE) {
             agg_col_idxs[a] = -2;
         } else if (ae->column.len > 0 && sv_eq_cstr(ae->column, "*")) {
@@ -13089,7 +13145,10 @@ static struct plan_result build_expr_agg(struct table *t, struct query_select *s
         uint32_t filtered = try_append_compound_filter(current, t, arena, arena, s->where.where_cond);
         if (filtered == current) {
             filtered = try_append_simple_filter(current, t, arena, arena, s->where.where_cond);
-            if (filtered == current) return PLAN_RES_NOTIMPL;
+            if (filtered == current) {
+                arena_set_error(arena, "0A000", "unsupported WHERE clause in expression-aggregate query");
+                return PLAN_RES_ERR;
+            }
         }
         current = filtered;
     }
@@ -13293,8 +13352,8 @@ static struct plan_result build_expr_agg(struct table *t, struct query_select *s
 
     /* Add HAVING filter if present */
     if (s->has_having && s->having_cond != IDX_NONE) {
-        /* HAVING with expr_aggs is complex — bail to legacy */
-        return PLAN_RES_NOTIMPL;
+        arena_set_error(arena, "0A000", "HAVING not supported in expression-aggregate query");
+        return PLAN_RES_ERR;
     }
 
     /* Add SORT node if ORDER BY is present */
@@ -13358,8 +13417,10 @@ static struct plan_result build_expr_agg(struct table *t, struct query_select *s
 
         if (sort_ok && sort_nord > 0)
             current = append_sort_node(current, arena, sort_cols_buf, sort_descs_buf, sort_nf_buf, sort_nord);
-        else
-            return PLAN_RES_NOTIMPL;
+        else {
+            arena_set_error(arena, "0A000", "unsupported ORDER BY in expression-aggregate query");
+            return PLAN_RES_ERR;
+        }
     }
 
     current = build_limit(current, s, arena);
@@ -13374,14 +13435,19 @@ static struct plan_result build_simple_agg(struct table *t, struct query_select 
                                            struct query_arena *arena)
 {
     if (!t) return PLAN_RES_ERR;
-    if (table_has_mixed_types(t)) return PLAN_RES_NOTIMPL;
+    if (table_has_mixed_types(t)) {
+        arena_set_error(arena, "0A000", "table has mixed column types");
+        return PLAN_RES_ERR;
+    }
 
     /* Validate aggregates */
     int *agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
     for (uint32_t a = 0; a < s->aggregates_count; a++) {
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
-        if (ae->func == AGG_NONE)
-            return PLAN_RES_NOTIMPL;
+        if (ae->func == AGG_NONE) {
+            arena_set_error(arena, "42803", "invalid aggregate function");
+            return PLAN_RES_ERR;
+        }
         if (ae->expr_idx != IDX_NONE) {
             agg_col_idxs[a] = -2;
         } else if (sv_eq_cstr(ae->column, "*")) {
@@ -13400,7 +13466,10 @@ static struct plan_result build_simple_agg(struct table *t, struct query_select 
         uint32_t filtered = try_append_compound_filter(current, t, arena, arena, s->where.where_cond);
         if (filtered == current) {
             filtered = try_append_simple_filter(current, t, arena, arena, s->where.where_cond);
-            if (filtered == current) return PLAN_RES_NOTIMPL; /* WHERE too complex */
+            if (filtered == current) {
+                arena_set_error(arena, "0A000", "unsupported WHERE clause in simple aggregate query");
+                return PLAN_RES_ERR;
+            }
         }
         current = filtered;
     }
@@ -13443,7 +13512,10 @@ static struct plan_result build_simple_agg(struct table *t, struct query_select 
     /* HAVING filter (without GROUP BY) */
     if (s->has_having && s->having_cond != IDX_NONE) {
         current = try_append_having_filter(current, s, arena);
-        if (current == IDX_NONE) return PLAN_RES_NOTIMPL;
+        if (current == IDX_NONE) {
+            arena_set_error(arena, "0A000", "unsupported HAVING clause in simple aggregate query");
+            return PLAN_RES_ERR;
+        }
     }
 
     return PLAN_RES_OK(current);
@@ -13713,10 +13785,17 @@ static enum plan_status validate_agg_columns(struct table *t, struct query_selec
                                               struct query_arena *arena,
                                               int *agg_col_idxs, int **out_grp_col_idxs)
 {
+    /* CTE / subquery tables may lack column metadata — bail early */
+    if (t->columns.count == 0) {
+        arena_set_error(arena, "0A000", "table has no column metadata (CTE/subquery)");
+        return PLAN_ERROR;
+    }
     for (uint32_t a = 0; a < s->aggregates_count; a++) {
         struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
-        if (ae->func == AGG_NONE)
-            return PLAN_NOTIMPL;
+        if (ae->func == AGG_NONE) {
+            arena_set_error(arena, "42803", "invalid aggregate function");
+            return PLAN_ERROR;
+        }
         /* STRING_AGG ORDER BY is handled via deferred sorting */
         if (ae->expr_idx != IDX_NONE) {
             agg_col_idxs[a] = -2; /* expression-based aggregate */
@@ -13724,7 +13803,11 @@ static enum plan_status validate_agg_columns(struct table *t, struct query_selec
             agg_col_idxs[a] = -1; /* COUNT(*) */
         } else {
             int ci = table_find_column_sv(t, ae->column);
-            if (ci < 0) return PLAN_ERROR;
+            if (ci < 0) {
+                arena_set_error(arena, "42703", "column '%.*s' not found in table",
+                                (int)ae->column.len, ae->column.data);
+                return PLAN_ERROR;
+            }
             agg_col_idxs[a] = ci;
         }
     }
@@ -13788,10 +13871,15 @@ static enum plan_status validate_agg_columns(struct table *t, struct query_selec
             /* check for expression-based GROUP BY key */
             if (grp[g] < 0 && s->group_by_exprs_start + g < (uint32_t)arena->arg_indices.count) {
                 uint32_t expr_idx = arena->arg_indices.items[s->group_by_exprs_start + g];
-                if (expr_idx != IDX_NONE)
-                    return PLAN_NOTIMPL; /* expression GROUP BY — fall to legacy */
+                if (expr_idx != IDX_NONE) {
+                    arena_set_error(arena, "0A000", "expression-based GROUP BY not supported");
+                    return PLAN_ERROR;
+                }
             }
-            if (grp[g] < 0) return PLAN_NOTIMPL;
+            if (grp[g] < 0) {
+                arena_set_error(arena, "42703", "GROUP BY column not found");
+                return PLAN_ERROR;
+            }
         }
         *out_grp_col_idxs = grp;
     }
@@ -13806,7 +13894,10 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
 {
     /* Bail if parsed_columns has extra complex columns (subqueries, COALESCE, etc.) */
     if (s->parsed_columns_count > s->group_by_count + s->aggregates_count &&
-        s->aggregates_count > 0) return PLAN_RES_NOTIMPL;
+        s->aggregates_count > 0) {
+        arena_set_error(arena, "0A000", "complex columns in aggregate query not supported");
+        return PLAN_RES_ERR;
+    }
     int *agg_col_idxs = (int *)bump_alloc(&arena->scratch, s->aggregates_count * sizeof(int));
     int *grp_col_idxs = NULL;
     enum plan_status vs = validate_agg_columns(t, s, arena, agg_col_idxs, &grp_col_idxs);
@@ -13939,7 +14030,10 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
         uint32_t filtered = try_append_compound_filter(scan_idx, t, arena, arena, s->where.where_cond);
         if (filtered == scan_idx) {
             filtered = try_append_simple_filter(scan_idx, t, arena, arena, s->where.where_cond);
-            if (filtered == scan_idx) return PLAN_RES_NOTIMPL;
+            if (filtered == scan_idx) {
+                arena_set_error(arena, "0A000", "unsupported WHERE clause in aggregate query");
+                return PLAN_RES_ERR;
+            }
         }
         /* If we projected and used a simple filter, remap its col_idx */
         if (can_project && needed_count > 0 && needed_count < table_ncols &&
@@ -14051,7 +14145,10 @@ static struct plan_result build_aggregate(struct table *t, struct query_select *
         }
         current = try_append_having_filter(current, s, arena);
         hcond->lhs_expr = saved_lhs;
-        if (current == IDX_NONE) return PLAN_RES_NOTIMPL;
+        if (current == IDX_NONE) {
+            arena_set_error(arena, "0A000", "unsupported HAVING clause in aggregate query");
+            return PLAN_RES_ERR;
+        }
     }
 
     /* Add SORT node if ORDER BY is present */
@@ -14201,13 +14298,19 @@ static struct plan_result build_semi_join(struct table *t, struct query_select *
     if (isq->has_join || isq->has_group_by || isq->aggregates_count > 0 ||
         isq->has_set_op || isq->ctes_count > 0 || isq->has_distinct ||
         isq->from_subquery_sql != IDX_NONE || isq->has_generate_series) {
-        query_free(out_sq); return PLAN_RES_NOTIMPL;
+        query_free(out_sq);
+        arena_set_error(arena, "0A000", "complex inner query in semi-join not supported");
+        return PLAN_RES_ERR;
     }
 
     /* Find inner table */
     struct table *semi_inner_t = db_find_table_sv(db, isq->table);
     if (!semi_inner_t) { query_free(out_sq); return PLAN_RES_ERR; }
-    if (semi_inner_t->kind == TABLE_VIEW) { query_free(out_sq); return PLAN_RES_NOTIMPL; }
+    if (semi_inner_t->kind == TABLE_VIEW) {
+        query_free(out_sq);
+        arena_set_error(arena, "0A000", "views in semi-join not supported");
+        return PLAN_RES_ERR;
+    }
 
     /* Resolve inner SELECT column — must be a single column ref */
     int semi_inner_key = -1;
@@ -14253,19 +14356,27 @@ static struct plan_result build_semi_join(struct table *t, struct query_select *
                         semi_inner_filter_val.value.as_text =
                             bump_strdup(&arena->scratch, semi_inner_filter_val.value.as_text);
                 } else {
-                    query_free(out_sq); return PLAN_RES_NOTIMPL;
+                    query_free(out_sq);
+                    arena_set_error(arena, "0A000", "unsupported column type in semi-join inner WHERE");
+                    return PLAN_RES_ERR;
                 }
             } else {
-                query_free(out_sq); return PLAN_RES_NOTIMPL;
+                query_free(out_sq);
+                arena_set_error(arena, "0A000", "unsupported filter in semi-join inner WHERE");
+                return PLAN_RES_ERR;
             }
         } else {
-            query_free(out_sq); return PLAN_RES_NOTIMPL; /* complex inner WHERE */
+            query_free(out_sq);
+            arena_set_error(arena, "0A000", "complex inner WHERE in semi-join not supported");
+            return PLAN_RES_ERR;
         }
     }
 
     /* Check for mixed cell types in inner table */
     if (table_has_mixed_types(semi_inner_t)) {
-        query_free(out_sq); return PLAN_RES_NOTIMPL;
+        query_free(out_sq);
+        arena_set_error(arena, "0A000", "table has mixed column types");
+        return PLAN_RES_ERR;
     }
 
     /* --- Build plan nodes --- */
@@ -14322,19 +14433,7 @@ static struct plan_result build_semi_join(struct table *t, struct query_select *
 static struct plan_result build_single_table(struct table *t, struct query_select *s,
                                              struct query_arena *arena, struct database *db)
 {
-    /* Bail out for queries we don't handle yet */
-    if (s->has_join)            return PLAN_RES_NOTIMPL;
-    if (s->select_exprs_count > 0) return PLAN_RES_NOTIMPL; /* window functions — handled above */
-    if (s->has_group_by)        return PLAN_RES_NOTIMPL;
-    if (s->aggregates_count > 0) return PLAN_RES_NOTIMPL;
-    if (s->has_set_op)          return PLAN_RES_NOTIMPL;
-    if (s->ctes_count > 0)     return PLAN_RES_NOTIMPL;
-    if (s->cte_sql != IDX_NONE) return PLAN_RES_NOTIMPL;
-    if (s->from_subquery_sql != IDX_NONE) return PLAN_RES_NOTIMPL;
-    if (s->has_recursive_cte)   return PLAN_RES_NOTIMPL;
-    if (s->has_distinct_on)     return PLAN_RES_NOTIMPL;
     if (!t)                     return PLAN_RES_ERR;
-    if (s->insert_rows_count > 0) return PLAN_RES_NOTIMPL; /* literal SELECT */
 
     int select_all = sv_eq_cstr(s->columns, "*");
     /* Detect table.* pattern (e.g. SELECT t.*) and treat as SELECT * */
@@ -14363,8 +14462,10 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
             if (sc->expr_idx != IDX_NONE) {
                 struct expr *e = &EXPR(arena, sc->expr_idx);
                 if (e->type == EXPR_COLUMN_REF && e->column_ref.column.len == 1 &&
-                    e->column_ref.column.data[0] == '*')
-                    return PLAN_RES_NOTIMPL;
+                    e->column_ref.column.data[0] == '*') {
+                    arena_set_error(arena, "0A000", "wildcard mixed with other columns not supported");
+                    return PLAN_RES_ERR;
+                }
             }
         }
     }
@@ -14398,12 +14499,16 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                 if (e->type == EXPR_SUBQUERY) { expr_ok = 0; break; }
                 expr_proj_indices[i] = sc->expr_idx;
             }
-            if (!expr_ok) return PLAN_RES_NOTIMPL;
+            if (!expr_ok) {
+                arena_set_error(arena, "0A000", "unsupported expression in SELECT list");
+                return PLAN_RES_ERR;
+            }
             need_expr_project = 1;
         }
     } else {
         /* Legacy text-based column list — can't handle */
-        return PLAN_RES_NOTIMPL;
+        arena_set_error(arena, "0A000", "unsupported column list in query");
+        return PLAN_RES_ERR;
     }
 
     /* Pre-validate ORDER BY columns BEFORE allocating plan nodes */
@@ -14640,7 +14745,8 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                 if (validate_compound_filter(t, arena, s->where.where_cond)) {
                     compound_filter_cond = s->where.where_cond;
                 } else {
-                    return PLAN_RES_NOTIMPL;
+                    arena_set_error(arena, "0A000", "unsupported WHERE clause");
+                    return PLAN_RES_ERR;
                 }
             }
         }
@@ -14649,8 +14755,10 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
     /* Build scan source if not already set by semi-join */
     if (!have_source) {
         /* Bail out if outer table has mixed cell types (e.g. after ALTER COLUMN TYPE) */
-        if (table_has_mixed_types(t))
-            return PLAN_RES_NOTIMPL;
+        if (table_has_mixed_types(t)) {
+            arena_set_error(arena, "0A000", "table has mixed column types");
+            return PLAN_RES_ERR;
+        }
 
         /* --- All validation passed, now allocate plan nodes --- */
 
@@ -15655,8 +15763,7 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
  * The inner SQL is parsed here (validate-then-build pattern), the parsed
  * query is bump-allocated so it lives for the duration of the outer query,
  * and the column count is resolved from the inner scan table's schema.
- * On PLAN_NOTIMPL from the inner plan_build_select, falls back to NOTIMPL
- * so the outer query can fall through to the legacy path. */
+ * On PLAN_ERROR from the inner plan_build_select, propagates the error. */
 static struct plan_result build_subquery(struct query_select *s,
                                          struct query_arena *arena,
                                          struct database *db,
@@ -15664,29 +15771,42 @@ static struct plan_result build_subquery(struct query_select *s,
                                          sv alias)
 {
     (void)s; /* outer query clauses are applied by the caller, not here */
-    if (!db) return PLAN_RES_NOTIMPL;
-    if (sql_idx == IDX_NONE) return PLAN_RES_NOTIMPL;
+    if (!db) {
+        arena_set_error(arena, "0A000", "no database context for subquery");
+        return PLAN_RES_ERR;
+    }
+    if (sql_idx == IDX_NONE) {
+        arena_set_error(arena, "42601", "missing subquery SQL");
+        return PLAN_RES_ERR;
+    }
 
     const char *sql = ASTRING(arena, sql_idx);
-    if (!sql || !*sql) return PLAN_RES_NOTIMPL;
+    if (!sql || !*sql) {
+        arena_set_error(arena, "42601", "empty subquery SQL");
+        return PLAN_RES_ERR;
+    }
 
     /* Parse the inner SQL with its own arena (query_parse_into resets the
      * outer arena which would destroy all outer AST state).  The parsed
      * query is used only to build the inner plan; it is freed after build. */
     struct query *iq = (struct query *)bump_alloc(&arena->scratch, sizeof(struct query));
     memset(iq, 0, sizeof(*iq));
-    if (query_parse(sql, iq) != 0)
-        return PLAN_RES_NOTIMPL;
+    if (query_parse(sql, iq) != 0) {
+        arena_set_error(arena, "42601", "failed to parse subquery");
+        return PLAN_RES_ERR;
+    }
     if (iq->query_type != QUERY_TYPE_SELECT) {
         query_free(iq);
-        return PLAN_RES_NOTIMPL;
+        arena_set_error(arena, "0A000", "subquery must be a SELECT");
+        return PLAN_RES_ERR;
     }
 
     /* Validate: only non-recursive inner queries for now */
     struct query_select *iss = &iq->select;
     if (iss->has_recursive_cte) {
         query_free(iq);
-        return PLAN_RES_NOTIMPL;
+        arena_set_error(arena, "0A000", "recursive CTE in subquery not supported");
+        return PLAN_RES_ERR;
     }
 
     /* Build the inner plan using iq's own arena so that all index fields
@@ -15694,10 +15814,8 @@ static struct plan_result build_subquery(struct query_select *s,
      * inner plan nodes live in iq->arena and are executed via a sub-ctx
      * in subquery_next.
      *
-     * If plan_build_select returns NOTIMPL (inner query is unplannable by the
-     * columnar executor), fall back to PLAN_LEGACY_EXEC which materialises the
-     * inner result via the legacy row-at-a-time executor and streams it as
-     * BLOCK_CAPACITY-sized col_blocks. */
+     * If plan_build_select returns an error (inner query is unplannable by the
+     * columnar executor), propagate the error to the caller. */
     struct table *sub_t = NULL;
     if (iss->table.len > 0)
         sub_t = db_find_table_sv(db, iss->table);
@@ -15708,7 +15826,8 @@ static struct plan_result build_subquery(struct query_select *s,
         uint16_t ncols = plan_node_ncols(&iq->arena, inner_pr.node);
         if (ncols == 0) {
             query_free(iq);
-            return PLAN_RES_NOTIMPL;
+            arena_set_error(arena, "0A000", "subquery produces no columns");
+            return PLAN_RES_ERR;
         }
 
         /* Allocate the PLAN_SUBQUERY node in the outer arena */
@@ -15741,7 +15860,116 @@ static struct plan_result build_subquery(struct query_select *s,
     }
 
     query_free(iq);
-    return PLAN_RES_NOTIMPL;
+    arena_set_error(arena, "0A000", "failed to build subquery plan");
+    return PLAN_RES_ERR;
+}
+
+/* ---- Plan builder: aggregate dispatch ----
+ *
+ * Routes L_AGGREGATE to the appropriate physical builder:
+ * expression-wrapping aggs, DISTINCT-only, simple aggregates, or GROUP BY. */
+static struct plan_result build_aggregate_dispatch(struct table *t,
+                                                    struct query_select *s,
+                                                    struct query_arena *arena,
+                                                    struct database *db)
+{
+    /* Expression-wrapping aggregates: COALESCE(SUM(...), 0) etc. */
+    if (s->has_expr_aggs && t) {
+        struct plan_result ea_pr = build_expr_agg(t, s, arena);
+        if (ea_pr.status == PLAN_OK) return ea_pr;
+    }
+
+    /* DISTINCT-only (group_by_count==0, agg_count==0) */
+    if (s->has_distinct && !s->has_group_by && s->aggregates_count == 0)
+        return build_single_table(t, s, arena, db);
+
+    /* Simple aggregate: no GROUP BY, single-table */
+    if (!s->has_group_by && s->aggregates_count > 0 && t &&
+        s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
+        !s->has_distinct && !s->has_distinct_on &&
+        (s->parsed_columns_count == 0 ||
+         s->parsed_columns_count == s->aggregates_count)) {
+        return build_simple_agg(t, s, arena);
+    }
+
+    /* GROUP BY + aggregates, single-table */
+    if (s->has_group_by && s->aggregates_count > 0 && t &&
+        s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
+        !s->has_distinct && !s->has_distinct_on &&
+        !s->group_by_rollup && !s->group_by_cube) {
+        return build_aggregate(t, s, arena);
+    }
+
+    arena_set_error(arena, "0A000", "unsupported aggregate query shape");
+    return PLAN_RES_ERR;
+}
+
+/* ---- Plan builder: set-op guarded path ----
+ *
+ * Thin guard wrapper around build_set_op.  Validates that the query shape
+ * is a plain UNION/INTERSECT/EXCEPT with no unsupported clauses. */
+static struct plan_result build_set_op_guarded(struct table *t,
+                                                struct query_select *s,
+                                                struct query_arena *arena,
+                                                struct database *db)
+{
+    if (!t || !db) return PLAN_RES_ERR;
+    return build_set_op(t, s, arena, db);
+}
+
+/* ---- Plan builder: generate_series path ----
+ *
+ * Builds a PLAN_GENERATE_SERIES node for integer series.
+ * Timestamp/date/interval series return PLAN_RES_ERR with arena_set_error. */
+static struct plan_result build_generate_series(struct query_select *s,
+                                                 struct query_arena *arena,
+                                                 struct database *db)
+{
+    struct cell c_start = eval_expr(s->gs_start_expr, arena, NULL, NULL, db, NULL);
+    struct cell c_stop  = eval_expr(s->gs_stop_expr,  arena, NULL, NULL, db, NULL);
+
+    if (c_start.type == COLUMN_TYPE_DATE || c_start.type == COLUMN_TYPE_TIMESTAMP ||
+        c_start.type == COLUMN_TYPE_TIMESTAMPTZ) {
+        arena_set_error(arena, "0A000", "date/timestamp generate_series not supported");
+        return PLAN_RES_ERR;
+    }
+    if (c_start.type == COLUMN_TYPE_INTERVAL || c_stop.type == COLUMN_TYPE_INTERVAL) {
+        arena_set_error(arena, "0A000", "interval generate_series not supported");
+        return PLAN_RES_ERR;
+    }
+
+    long long gs_start = (c_start.type == COLUMN_TYPE_BIGINT) ? c_start.value.as_bigint
+                       : (c_start.type == COLUMN_TYPE_FLOAT)  ? (long long)c_start.value.as_float
+                       : c_start.value.as_int;
+    long long gs_stop  = (c_stop.type == COLUMN_TYPE_BIGINT) ? c_stop.value.as_bigint
+                       : (c_stop.type == COLUMN_TYPE_FLOAT)  ? (long long)c_stop.value.as_float
+                       : c_stop.value.as_int;
+    long long gs_step  = 1;
+    if (s->gs_step_expr != IDX_NONE) {
+        struct cell c_step = eval_expr(s->gs_step_expr, arena, NULL, NULL, db, NULL);
+        if (c_step.type == COLUMN_TYPE_INTERVAL || column_type_is_text(c_step.type)) {
+            arena_set_error(arena, "0A000", "interval/text step in generate_series not supported");
+            return PLAN_RES_ERR;
+        }
+        gs_step = (c_step.type == COLUMN_TYPE_BIGINT) ? c_step.value.as_bigint
+                : (c_step.type == COLUMN_TYPE_FLOAT)  ? (long long)c_step.value.as_float
+                : c_step.value.as_int;
+    }
+    if (gs_step == 0) gs_step = 1;
+
+    int use_bigint = (c_start.type == COLUMN_TYPE_BIGINT ||
+                      c_stop.type == COLUMN_TYPE_BIGINT ||
+                      gs_start > 2147483647LL || gs_start < -2147483648LL ||
+                      gs_stop  > 2147483647LL || gs_stop  < -2147483648LL);
+
+    uint32_t gs_idx = plan_alloc_node(arena, PLAN_GENERATE_SERIES);
+    PLAN_NODE(arena, gs_idx).gen_series.start      = gs_start;
+    PLAN_NODE(arena, gs_idx).gen_series.stop       = gs_stop;
+    PLAN_NODE(arena, gs_idx).gen_series.step       = gs_step;
+    PLAN_NODE(arena, gs_idx).gen_series.use_bigint = use_bigint;
+    uint32_t gs_phys = gs_idx;
+    gs_phys = build_limit(gs_phys, s, arena);
+    return PLAN_RES_OK(gs_phys);
 }
 
 /* ---- Plan builder: DISTINCT ON path ----
@@ -15756,8 +15984,8 @@ static struct plan_result build_distinct_on(struct table *t,
 {
     /* Delegate to build_single_table which handles the base scan + sort.
      * Then wrap the result in PLAN_DISTINCT_ON. */
-    if (!t) return PLAN_RES_NOTIMPL;
-    if (s->distinct_on_count == 0) return PLAN_RES_NOTIMPL;
+    if (!t) return PLAN_RES_ERR;
+    if (s->distinct_on_count == 0) return PLAN_RES_ERR;
 
     /* Resolve key column indices against the table schema */
     int key_cols[32];
@@ -15771,7 +15999,10 @@ static struct plan_result build_distinct_on(struct table *t,
                 break;
             }
         }
-        if (found < 0) return PLAN_RES_NOTIMPL; /* unknown column */
+        if (found < 0) {
+            arena_set_error(arena, "42703", "DISTINCT ON column not found");
+            return PLAN_RES_ERR;
+        }
         key_cols[nk++] = found;
     }
 
@@ -15802,8 +16033,7 @@ static struct plan_result build_distinct_on(struct table *t,
  * the original query_select fields — the tree op just determines which
  * builder is called, removing the ad-hoc flag cascade that was here before.
  *
- * Returns PLAN_RES_NOTIMPL for query shapes not yet handled (falls back to
- * the legacy row-at-a-time executor via the caller).
+ * Returns PLAN_RES_ERR for query shapes not yet handled.
  */
 static struct plan_result logical_to_physical(struct table *t,
                                               struct query_select *s,
@@ -15811,32 +16041,50 @@ static struct plan_result logical_to_physical(struct table *t,
                                               struct database *db,
                                               uint32_t root)
 {
-    if (root == IDX_NONE) return PLAN_RES_NOTIMPL;
+    if (root == IDX_NONE) return PLAN_RES_ERR;
 
     struct logical_node *rn = logical_node_get(arena, root);
-    if (!rn) return PLAN_RES_NOTIMPL;
+    if (!rn) return PLAN_RES_ERR;
 
     /* ---- Route by dominant logical operator ----
      * Walk down through wrapper nodes (LIMIT, SORT, PROJECT, FILTER,
-     * AGGREGATE, DISTINCT_ON) to find the dominant structural node.
-     * Priority: L_JOIN > L_SUBQUERY > L_AGGREGATE > L_SCAN.
+     * AGGREGATE) to find the dominant structural node.
+     * Priority: L_JOIN > L_AGGREGATE > L_SCAN.
+     * L_PROJECT with has_window=1 is detected as a window function query.
+     * L_SCAN with is_subquery/is_set_op/is_generate_series detected via flags.
      * We track the highest-priority structural node seen while descending. */
     enum logical_op dominant = rn->op;
     uint32_t cur = root;
     struct logical_node *cn = rn;
-    uint32_t subquery_node_idx = IDX_NONE;
+    int has_window = 0;
+    int is_generate_series = 0;
+    int is_set_op = 0;
+    int is_subquery = 0;
+    int has_first_row_only = 0;
+    uint32_t subquery_sql_idx = IDX_NONE;
+    sv subquery_alias = {0};
     while (cn) {
         if (cn->op == L_JOIN) {
             dominant = L_JOIN;
             break; /* L_JOIN is highest priority — stop immediately */
         }
-        if (cn->op == L_SUBQUERY) {
-            dominant = L_SUBQUERY;
-            subquery_node_idx = cur;
-            break; /* L_SUBQUERY is a leaf — stop */
+        if (cn->op == L_PROJECT && cn->project.has_window) {
+            has_window = 1;
         }
-        if (cn->op == L_AGGREGATE && dominant != L_JOIN && dominant != L_SUBQUERY) {
-            dominant = L_AGGREGATE;
+        if (cn->op == L_SCAN && cn->scan.is_subquery) {
+            is_subquery = 1;
+            subquery_sql_idx = cn->scan.subquery_sql_idx;
+            subquery_alias = cn->scan.subquery_alias;
+        }
+        if (cn->op == L_SCAN && cn->scan.is_generate_series) {
+            is_generate_series = 1;
+        }
+        if (cn->op == L_SCAN && cn->scan.is_set_op) {
+            is_set_op = 1;
+        }
+        if (cn->op == L_AGGREGATE) {
+            if (cn->aggregate.first_row_only) has_first_row_only = 1;
+            if (dominant != L_JOIN) dominant = L_AGGREGATE;
         }
         cur = cn->child;
         cn = logical_node_get(arena, cur);
@@ -15847,129 +16095,35 @@ static struct plan_result logical_to_physical(struct table *t,
             /* The L_JOIN node is present — route to build_join which handles
              * both plain joins and join + GROUP BY + HAVING queries. */
             if (db) return build_join(t, s, arena, db);
-            return PLAN_RES_NOTIMPL;
-
-        case L_SUBQUERY: {
-            /* Non-recursive CTE or FROM subquery: build inline. */
-            struct logical_node *sqn = logical_node_get(arena, subquery_node_idx);
-            if (!sqn) return PLAN_RES_NOTIMPL;
-            return build_subquery(s, arena, db, sqn->subquery.sql_idx, sqn->subquery.alias);
-        }
+            return PLAN_RES_ERR;
 
         case L_AGGREGATE:
-            /* L_AGGREGATE without a join: GROUP BY, bare aggregates, DISTINCT.
-             * Recursive CTE: fall back to legacy. */
-            if (s->has_set_op || s->has_recursive_cte)
-                return PLAN_RES_NOTIMPL;
-
-            /* Expression-wrapping aggregates: COALESCE(SUM(...), 0) etc. */
-            if (s->has_expr_aggs && t) {
-                struct plan_result ea_pr = build_expr_agg(t, s, arena);
-                if (ea_pr.status == PLAN_OK) return ea_pr;
-            }
-
-            /* DISTINCT-only (group_by_count==0, agg_count==0) */
-            if (s->has_distinct && !s->has_group_by && s->aggregates_count == 0)
-                return build_single_table(t, s, arena, db);
-
-            /* Simple aggregate: no GROUP BY, single-table */
-            if (!s->has_group_by && s->aggregates_count > 0 && t &&
-                s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
-                !s->has_distinct && !s->has_distinct_on &&
-                (s->parsed_columns_count == 0 ||
-                 s->parsed_columns_count == s->aggregates_count)) {
-                struct plan_result sa_pr = build_simple_agg(t, s, arena);
-                if (sa_pr.status == PLAN_OK) return sa_pr;
-            }
-
-            /* GROUP BY + aggregates, single-table */
-            if (s->has_group_by && s->aggregates_count > 0 && t &&
-                s->select_exprs_count == 0 && s->insert_rows_count == 0 &&
-                !s->has_distinct && !s->has_distinct_on &&
-                !s->group_by_rollup && !s->group_by_cube) {
-                struct plan_result agg_pr = build_aggregate(t, s, arena);
-                if (agg_pr.status == PLAN_OK) return agg_pr;
-            }
-
-            return PLAN_RES_NOTIMPL;
-
-        case L_DISTINCT_ON:
-            /* DISTINCT ON desugared: sort + keep first per key */
-            return build_distinct_on(t, s, arena, db);
-
-        case L_WINDOW:
-            /* Window functions: SELECT ... OVER (...).
-             * build_window has its own guards; delegate unconditionally. */
-            return build_window(t, s, arena);
-
-        case L_SET_OP:
-            /* UNION / INTERSECT / EXCEPT */
-            if (!s->has_join && !s->has_group_by && s->aggregates_count == 0 &&
-                s->ctes_count == 0 && s->cte_sql == IDX_NONE &&
-                s->from_subquery_sql == IDX_NONE && !s->has_recursive_cte &&
-                s->select_exprs_count == 0 && !s->where.has_where &&
-                t && db && s->insert_rows_count == 0)
-                return build_set_op(t, s, arena, db);
-            return PLAN_RES_NOTIMPL;
-
-        case L_GENERATE_SERIES: {
-            /* generate_series(start, stop[, step]) — integer series only here;
-             * timestamp/date/interval series bail to legacy via PLAN_RES_NOTIMPL
-             * inside this block (mirrors the old fast-path guard logic). */
-            if (s->has_join || s->has_group_by || s->aggregates_count > 0 ||
-                s->has_set_op || s->ctes_count > 0 || s->has_distinct ||
-                s->select_exprs_count > 0 || s->where.has_where ||
-                s->has_order_by || s->parsed_columns_count > 0)
-                return PLAN_RES_NOTIMPL;
-            if (!sv_eq_cstr(s->columns, "*"))
-                return PLAN_RES_NOTIMPL;
-
-            struct cell c_start = eval_expr(s->gs_start_expr, arena, NULL, NULL, db, NULL);
-            struct cell c_stop  = eval_expr(s->gs_stop_expr,  arena, NULL, NULL, db, NULL);
-
-            if (c_start.type == COLUMN_TYPE_DATE || c_start.type == COLUMN_TYPE_TIMESTAMP ||
-                c_start.type == COLUMN_TYPE_TIMESTAMPTZ)
-                return PLAN_RES_NOTIMPL;
-            if (c_start.type == COLUMN_TYPE_INTERVAL || c_stop.type == COLUMN_TYPE_INTERVAL)
-                return PLAN_RES_NOTIMPL;
-
-            long long gs_start = (c_start.type == COLUMN_TYPE_BIGINT) ? c_start.value.as_bigint
-                               : (c_start.type == COLUMN_TYPE_FLOAT)  ? (long long)c_start.value.as_float
-                               : c_start.value.as_int;
-            long long gs_stop  = (c_stop.type == COLUMN_TYPE_BIGINT) ? c_stop.value.as_bigint
-                               : (c_stop.type == COLUMN_TYPE_FLOAT)  ? (long long)c_stop.value.as_float
-                               : c_stop.value.as_int;
-            long long gs_step  = 1;
-            if (s->gs_step_expr != IDX_NONE) {
-                struct cell c_step = eval_expr(s->gs_step_expr, arena, NULL, NULL, db, NULL);
-                if (c_step.type == COLUMN_TYPE_INTERVAL || column_type_is_text(c_step.type))
-                    return PLAN_RES_NOTIMPL;
-                gs_step = (c_step.type == COLUMN_TYPE_BIGINT) ? c_step.value.as_bigint
-                        : (c_step.type == COLUMN_TYPE_FLOAT)  ? (long long)c_step.value.as_float
-                        : c_step.value.as_int;
-            }
-            if (gs_step == 0) gs_step = 1;
-
-            int use_bigint = (c_start.type == COLUMN_TYPE_BIGINT ||
-                              c_stop.type == COLUMN_TYPE_BIGINT ||
-                              gs_start > 2147483647LL || gs_start < -2147483648LL ||
-                              gs_stop  > 2147483647LL || gs_stop  < -2147483648LL);
-
-            uint32_t gs_idx = plan_alloc_node(arena, PLAN_GENERATE_SERIES);
-            PLAN_NODE(arena, gs_idx).gen_series.start    = gs_start;
-            PLAN_NODE(arena, gs_idx).gen_series.stop     = gs_stop;
-            PLAN_NODE(arena, gs_idx).gen_series.step     = gs_step;
-            PLAN_NODE(arena, gs_idx).gen_series.use_bigint = use_bigint;
-            uint32_t gs_phys = gs_idx;
-            gs_phys = build_limit(gs_phys, s, arena);
-            return PLAN_RES_OK(gs_phys);
-        }
+            /* DISTINCT ON: L_AGGREGATE with first_row_only=1 */
+            if (has_first_row_only)
+                return build_distinct_on(t, s, arena, db);
+            return build_aggregate_dispatch(t, s, arena, db);
 
         case L_SCAN:
         case L_FILTER:
         case L_SORT:
         case L_LIMIT:
         case L_PROJECT:
+            /* Window functions: L_PROJECT with has_window=1 */
+            if (has_window)
+                return build_window(t, s, arena);
+
+            /* Subquery / CTE: L_SCAN with is_subquery=1 */
+            if (is_subquery)
+                return build_subquery(s, arena, db, subquery_sql_idx, subquery_alias);
+
+            /* UNION / INTERSECT / EXCEPT: L_SCAN with is_set_op=1 */
+            if (is_set_op)
+                return build_set_op_guarded(t, s, arena, db);
+
+            /* generate_series: L_SCAN with is_generate_series=1 */
+            if (is_generate_series)
+                return build_generate_series(s, arena, db);
+
             /* Single-table path: scan ± filter ± project ± sort ± limit */
             return build_single_table(t, s, arena, db);
     }
@@ -15982,36 +16136,26 @@ static struct plan_result logical_to_physical(struct table *t,
 
 /* Try to build a block-oriented plan for a SELECT query.
  * Returns a plan_result: PLAN_OK with a valid node index on success,
- * PLAN_NOTIMPL for unimplemented features (fall back to legacy),
- * or PLAN_ERROR for real errors (bad column, type mismatch, etc.). */
+ * or PLAN_ERROR for real errors (bad column, type mismatch, unsupported
+ * feature, etc.). */
 struct plan_result plan_build_select(struct table *t, struct query_select *s,
                                      struct query_arena *arena, struct database *db)
 {
     /* ---- Logical IR path ----
      * Build the canonical logical tree, apply normalization rewrites,
      * then pattern-match to physical plan nodes.
-     * Falls back to build_single_table on NOTIMPL.
      * Reset logical_nodes count first so that a previous failed attempt
-     * (e.g. from try_plan_send → NOTIMPL → legacy retry) doesn't leave
-     * stale nodes in the DA, and so the backing buffer is reused. */
+     * doesn't leave stale nodes in the DA, and so the backing buffer
+     * is reused. */
     da_reset(&arena->logical_nodes);
     {
         uint32_t lroot = logical_build(s, arena, db);
         if (lroot != IDX_NONE) {
             lroot = logical_normalize(lroot, arena, db);
-            struct plan_result lpr = logical_to_physical(t, s, arena, db, lroot);
-            if (lpr.status == PLAN_OK || lpr.status == PLAN_ERROR)
-                return lpr;
-            /* PLAN_NOTIMPL from a subquery/CTE dominant: propagate so the
-             * caller's legacy path can materialise the subquery/CTE. */
-            if (s->from_subquery_sql != IDX_NONE ||
-                s->ctes_count > 0 || s->cte_sql != IDX_NONE ||
-                s->has_recursive_cte)
-                return PLAN_RES_NOTIMPL;
-            /* Otherwise fall through to build_single_table */
+            return logical_to_physical(t, s, arena, db, lroot);
         }
     }
 
-    /* ---- Single-table path (final fallback) ---- */
+    /* logical_build returned IDX_NONE — try single-table as last resort */
     return build_single_table(t, s, arena, db);
 }
