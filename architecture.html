@@ -19,15 +19,15 @@
 <hr class="title-rule">
 
 <p>
-    Aggregates 20&times; faster than PostgreSQL. Correlated subqueries 691&times; faster.
-    Dashboard-style throughput at 96,000&nbsp;queries per second. These numbers are not
+    Aggregates 20&times; faster than PostgreSQL. Correlated subqueries 826&times; faster.
+    Dashboard-style throughput at 97,000&nbsp;queries per second. These numbers are not
     the result of exotic algorithms&mdash;they come from removing the layers that make
     traditional databases slow: buffer pools, WAL, MVCC, and query planners.
 </p>
 
 <p>
     What remains is a four-stage pipeline&mdash;wire protocol, parser, executor,
-    storage&mdash;in <strong>~52.8K lines of C with zero external dependencies.</strong>
+    storage&mdash;in <strong>~55K lines of C with zero external dependencies.</strong>
     Every query flows from TCP bytes to results through code you can read end-to-end.
 </p>
 
@@ -416,6 +416,8 @@
     <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
     &ensp;&middot;&ensp;
     <a href="index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="notes/index.html">Notes</a>
 </footer>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>

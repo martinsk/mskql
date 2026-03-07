@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; CTE materialization</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>CTE materialization: from legacy fallback to plan executor</h1>
+<span class="subtitle">Pre-materialize non-recursive CTEs as temp tables before plan build.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark is <code>bench_mixed_analytical</code>: a CTE pipeline that joins,
+    aggregates, and sorts across a star-schema dataset. 50,000 order rows, 2,000
+    customers, 200 products. Measured as wall-clock latency through the PostgreSQL
+    wire protocol, 500 iterations.
+</p>
+
+<pre><code class="language-sql">WITH order_summary AS (
+    SELECT o.customer_id,
+           SUM(o.quantity * p.price) AS total
+    FROM orders o
+    JOIN products p ON o.product_id = p.id
+    GROUP BY o.customer_id
+)
+SELECT c.region, COUNT(*), SUM(os.total) AS revenue
+FROM order_summary os
+JOIN customers c ON os.customer_id = c.id
+GROUP BY c.region
+ORDER BY revenue DESC;</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    The plan executor (<code>plan.c</code>) handles SELECT queries through a columnar
+    pipeline: scan &rarr; filter &rarr; hash join &rarr; hash aggregate &rarr; sort &rarr;
+    top-N &rarr; project. This pipeline is significantly faster than the legacy
+    row-by-row executor in <code>query.c</code>. However, queries with CTEs were
+    falling back to the legacy path entirely.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    The logical plan builder (<code>logical_build</code>) emitted
+    <code>L_SCAN(cte_name)</code> when it encountered a CTE reference in the FROM
+    clause. The plan executor then called <code>db_find_table_sv()</code> to resolve
+    the scan source&mdash;but CTE names are not real tables, so the lookup returned
+    NULL. This caused <code>plan_build_select()</code> to return failure, and the
+    entire query fell back to the legacy row-by-row executor.
+</p>
+
+<p>
+    The result: a query that should have run through the fast columnar pipeline
+    (hash join + hash aggregate + sort on column blocks) instead ran through the
+    slow path (per-row expression evaluation, row-based hash table, row-based sort).
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    In <code>plan_build_select()</code> (<code>plan.c</code>), before calling
+    <code>logical_build</code>, the function now iterates over the query&rsquo;s CTE
+    list. For each non-recursive CTE:
+</p>
+
+<ol>
+    <li>Execute the CTE body through <code>db_exec()</code>, which may itself use
+        the plan executor for the CTE&rsquo;s inner query.</li>
+    <li>Materialize the result as a temporary table with the CTE&rsquo;s name.</li>
+    <li>Register the temp table in the database so that
+        <code>db_find_table_sv()</code> resolves it.</li>
+</ol>
+
+<p>
+    After the outer query completes, the temp tables are dropped. This approach
+    means <code>logical_build</code> sees real tables for every CTE reference,
+    and the full columnar pipeline handles the outer query&rsquo;s joins, aggregates,
+    and sorts.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    Same query, same machine:
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th></th><th class="num">mskql</th><th class="num">PostgreSQL</th><th class="num">DuckDB</th></tr></thead>
+    <tbody>
+        <tr><td>mixed_analytical (500 iter)</td><td class="num">7ms</td><td class="num">65ms</td><td class="num">28ms</td></tr>
+        <tr><td>vs PostgreSQL ratio</td><td class="num" colspan="3">0.11&times; (mskql 9&times; faster)</td></tr>
+        <tr><td>vs DuckDB ratio</td><td class="num" colspan="3">0.25&times; (mskql 4&times; faster)</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    The CTE materialization fix moved the entire analytical pipeline into the
+    columnar executor. Combined with the result cache (which caches the wire bytes
+    for repeated identical queries), this workload sustains 97,210 QPS under
+    concurrent throughput testing.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

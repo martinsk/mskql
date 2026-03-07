@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Zero steady-state allocation: the arena model</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Zero steady-state allocation: the arena model</h1>
+<span class="subtitle">Bump-slab arena with pointer rewind replaces malloc/free per query.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark is <code>bench_aggregate</code>: 5,000 rows, 500 iterations of a
+    GROUP BY query. Measured as wall-clock latency through the PostgreSQL wire protocol.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE sales (
+    id INT, region TEXT, product TEXT,
+    quantity INT, amount NUMERIC(10,2)
+);
+-- 5,000 rows inserted
+
+SELECT region, SUM(amount)
+FROM sales
+GROUP BY region;
+-- repeated 500 times</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    The aggregate workload runs 500 iterations of the same query. Each iteration
+    allocates memory for parse trees, executor state, hash table buckets, result
+    rows, and wire buffers. Under concurrent load with 8 threads, the system
+    allocator&rsquo;s lock becomes a serialization point.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    The traditional execution path called <code>malloc()</code> and
+    <code>free()</code> at every level: per-query for the parse tree, per-row for
+    expression evaluation temporaries, per-group for hash table entries, per-result
+    for wire serialization buffers. A single iteration of the aggregate query on
+    5,000 rows could issue hundreds of allocation calls. Multiply by 500 iterations
+    and the allocator overhead becomes measurable.
+</p>
+
+<p>
+    More critically, <code>free()</code> fragments the heap. After thousands of
+    queries, the allocator spends increasing time searching free lists. Under
+    AddressSanitizer (which the test suite runs under), each allocation also
+    incurs quarantine overhead.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    The engine uses a bump-slab arena (<code>arena.h</code>). Each connection owns
+    a <code>query_arena</code> with a scratch region. All per-query allocations&mdash;parse
+    nodes, plan nodes, hash table buckets, sort arrays, intermediate column
+    blocks&mdash;come from <code>bump_alloc(scratch, size)</code>, which advances a
+    pointer and returns the previous position.
+</p>
+
+<p>
+    At query end, <code>query_arena_reset()</code> rewinds the pointer to zero.
+    No <code>free()</code> calls. No fragmentation. No lock contention. The arena
+    grows by allocating new slabs (64&nbsp;KB each) only when needed; slabs are
+    retained across queries so steady-state allocation is zero.
+</p>
+
+<p>
+    Hash tables, sort arrays, and plan nodes all bump-allocate from
+    <code>arena.scratch</code>. The only heap allocations that remain are for
+    table storage (which persists across queries) and the slab chain itself
+    (which grows monotonically and never shrinks).
+</p>
+
+<h2>Result</h2>
+
+<p>
+    Same query, same machine:
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th></th><th class="num">mskql</th><th class="num">PostgreSQL</th><th class="num">Ratio</th></tr></thead>
+    <tbody>
+        <tr><td>aggregate (500 iter, 5K rows)</td><td class="num">15ms</td><td class="num">265ms</td><td class="num">0.06&times;</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    The arena model is not an optimization applied to a slow path&mdash;it is the
+    memory model. Every query, from simple lookups to complex analytical CTEs,
+    allocates from the same bump slab and resets at the same point. The 18&times;
+    advantage over PostgreSQL on this workload reflects the cumulative effect of
+    removing thousands of <code>malloc</code>/<code>free</code> pairs per query.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

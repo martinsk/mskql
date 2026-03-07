@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Vectorized expression aggregates (VEC_PROJECT)</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Vectorized expression aggregates (VEC_PROJECT)</h1>
+<span class="subtitle">Direct column-array arithmetic replaces per-row expression evaluation.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark is <code>bench_expression_agg</code>: 5,000 rows, 500 iterations
+    of an aggregate with an arithmetic expression in the SELECT list. Measured as
+    wall-clock latency through the PostgreSQL wire protocol.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE sales (
+    id INT, region TEXT, product TEXT,
+    quantity INT, amount NUMERIC(10,2),
+    price NUMERIC(10,2)
+);
+-- 5,000 rows inserted
+
+SELECT category, SUM(price * quantity)
+FROM sales
+GROUP BY category;
+-- repeated 500 times</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    The expression <code>price * quantity</code> inside <code>SUM()</code> must
+    be evaluated for every row before aggregation. The legacy executor evaluates
+    this per-row: for each of 5,000 rows, call <code>eval_expr()</code>, which
+    dispatches on expression type, reads two cells, performs the multiplication,
+    and writes the result to a temporary cell. This is 5,000 function calls with
+    type dispatch per iteration, 2,500,000 across 500 iterations.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    The per-row evaluator <code>eval_expr()</code> handles arbitrary expression
+    trees: nested function calls, CASE expressions, type coercions, NULL
+    propagation. For the common case of a simple binary operation on two columns,
+    this generality is overhead. The function call, type switch, cell read, cell
+    write, and NULL check dominate the actual arithmetic.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    The plan builder recognizes simple arithmetic expressions and emits
+    <code>VEC_PROJECT</code> / <code>VEC_FUNC_*</code> nodes in the plan tree
+    (<code>plan.c</code>). These operate directly on <code>col_block</code> arrays:
+</p>
+
+<ul>
+    <li><strong><code>VEC_FUNC_MUL_I32</code></strong>,
+        <strong><code>VEC_FUNC_MUL_F64</code></strong> &mdash; multiply two
+        contiguous column arrays in a tight loop with no per-element dispatch.</li>
+    <li><strong><code>VEC_FUNC_ADD_*</code></strong>,
+        <strong><code>VEC_FUNC_SUB_*</code></strong>,
+        <strong><code>VEC_FUNC_DIV_*</code></strong> &mdash; same pattern for
+        other arithmetic operations.</li>
+    <li><strong><code>VEC_FUNC_CEIL</code></strong>,
+        <strong><code>VEC_FUNC_FLOOR</code></strong>,
+        <strong><code>VEC_FUNC_SQRT</code></strong>,
+        <strong><code>VEC_FUNC_SIGN_*</code></strong>,
+        <strong><code>VEC_FUNC_MOD_*</code></strong>,
+        <strong><code>VEC_FUNC_POWER</code></strong> &mdash; unary and binary
+        math functions vectorized.</li>
+    <li><strong><code>VEC_FUNC_CAST_F64_TO_I32</code></strong>,
+        <strong><code>VEC_FUNC_COALESCE_LIT</code></strong> &mdash; type casts
+        and COALESCE with literal defaults.</li>
+</ul>
+
+<p>
+    The vectorized path reads contiguous <code>int32_t[]</code> or
+    <code>double[]</code> arrays from the column block, applies the operation in
+    a single loop, and writes the result to a new column block. NULL handling is
+    done via a parallel <code>uint8_t[]</code> null bitmap, checked once per
+    block rather than per element.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    Same query, same machine:
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th></th><th class="num">mskql</th><th class="num">PostgreSQL</th><th class="num">DuckDB</th></tr></thead>
+    <tbody>
+        <tr><td>expression_agg (500 iter, 5K rows)</td><td class="num">15ms</td><td class="num">299ms</td><td class="num">220ms</td></tr>
+        <tr><td>vs PostgreSQL ratio</td><td class="num" colspan="3">0.05&times; (mskql 20&times; faster)</td></tr>
+        <tr><td>vs DuckDB ratio</td><td class="num" colspan="3">0.07&times; (mskql 15&times; faster)</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    The VEC_PROJECT path is used automatically by the plan builder when it
+    recognizes eligible expressions. Queries with complex expression trees
+    (nested CASE, multi-level function composition) fall back to the per-row
+    evaluator. The plan builder makes this decision at build time with zero
+    runtime overhead for either path.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

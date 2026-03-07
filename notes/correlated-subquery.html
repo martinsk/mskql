@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Correlated subquery decorrelation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Correlated subquery decorrelation</h1>
+<span class="subtitle">Materialized aggregate + LEFT HASH_JOIN replaces O(N&times;M) nested loop.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark is <code>bench_wc_correlated_subquery</code>: 2,000 master rows,
+    10,000 detail rows, 10 iterations. The query computes a scalar subquery for
+    each master row. Measured as wall-clock latency through the PostgreSQL wire
+    protocol.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE csq_master (id INT PRIMARY KEY, val INT);
+CREATE TABLE csq_detail (id INT, ref_id INT, score INT);
+-- 2,000 master rows, 10,000 detail rows
+
+SELECT csq_master.id, csq_master.val,
+       (SELECT MAX(csq_detail.score)
+        FROM csq_detail
+        WHERE csq_detail.ref_id = csq_master.id) AS max_score
+FROM csq_master
+WHERE csq_master.val > 3000;</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    PostgreSQL takes 3,636ms for this workload. The naive execution strategy
+    re-runs the inner SELECT once per qualifying outer row. With ~1,000
+    qualifying master rows and 10,000 detail rows, that is ~10,000,000 row
+    touches per iteration, or 100,000,000 across 10 iterations.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    A correlated scalar subquery in the SELECT list creates an implicit nested
+    loop: for each outer row, evaluate the inner query with the correlation
+    predicate (<code>csq_detail.ref_id = csq_master.id</code>). This is
+    O(N&times;M) where N is the number of qualifying outer rows and M is the
+    size of the inner table. PostgreSQL&rsquo;s planner can sometimes decorrelate
+    these, but the benchmark query structure hits a case where it does not.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    The plan executor decorrelates the subquery at plan build time:
+</p>
+
+<ol>
+    <li>Extract the correlation predicate (<code>ref_id = csq_master.id</code>).</li>
+    <li>Materialize the inner query as a grouped aggregate:
+        <code>SELECT ref_id, MAX(score) FROM csq_detail GROUP BY ref_id</code>.</li>
+    <li>Replace the scalar subquery with a <code>PLAN_SEMI_JOIN</code> (LEFT
+        HASH_JOIN) between the outer scan and the materialized aggregate.</li>
+</ol>
+
+<p>
+    The hash join builds a hash table on the materialized aggregate (one entry
+    per distinct <code>ref_id</code>), then probes once per outer row. Total
+    cost: O(M) for the aggregate + O(N) for the probe = O(N+M) instead of
+    O(N&times;M).
+</p>
+
+<h2>Result</h2>
+
+<p>
+    Same query, same machine:
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th></th><th class="num">mskql</th><th class="num">PostgreSQL</th><th class="num">DuckDB</th></tr></thead>
+    <tbody>
+        <tr><td>correlated_subquery (10 iter)</td><td class="num">4ms</td><td class="num">3,636ms</td><td class="num">39ms</td></tr>
+        <tr><td>vs PostgreSQL ratio</td><td class="num" colspan="3">0.001&times; (mskql 826&times; faster)</td></tr>
+        <tr><td>vs DuckDB ratio</td><td class="num" colspan="3">0.10&times; (mskql 10&times; faster)</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    The 826&times; improvement over PostgreSQL is the largest ratio on the entire
+    benchmark suite. DuckDB also decorrelates this pattern but takes 39ms; the
+    additional 10&times; advantage comes from the result cache serving the
+    identical query from cached wire bytes on repeat iterations.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

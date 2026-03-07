@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Disk-backed tables</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Disk-backed tables: near-zero overhead persistence</h1>
+<span class="subtitle"><code>CREATE DISK TABLE</code> adds persistence at 0.96&times; the in-memory speed.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark uses the same aggregate workload as the in-memory benchmarks,
+    but the table is created with <code>CREATE DISK TABLE</code>. 5,000 rows,
+    500 iterations. Measured as wall-clock latency through the PostgreSQL wire
+    protocol.
+</p>
+
+<pre><code class="language-sql">CREATE DISK TABLE sales (
+    id INT, region TEXT, product TEXT,
+    quantity INT, amount NUMERIC(10,2)
+) DIRECTORY '/tmp/mskql_bench/sales';
+-- 5,000 rows inserted (auto-persisted to disk)
+
+SELECT region, SUM(amount)
+FROM sales
+GROUP BY region;
+-- repeated 500 times</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    In-memory tables are volatile. Restarting the mskql process loses all data.
+    For use cases that require persistence&mdash;development databases, long-running
+    analytics servers, any deployment where data outlives the process&mdash;the
+    in-memory-only model is insufficient.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    Adding persistence typically introduces I/O overhead on both reads and writes.
+    Disk-based databases use buffer pools, page caches, and write-ahead logs to
+    manage the memory-to-disk boundary. Each of these layers adds latency and
+    complexity.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    The disk I/O layer (<code>diskio.c</code> / <code>diskio.h</code>) implements
+    a simpler model:
+</p>
+
+<ul>
+    <li><strong>Write path:</strong> On INSERT, UPDATE, or DELETE, the modified
+        column data is written to the disk directory. Writes are append-oriented
+        and use the same columnar layout as in-memory storage.</li>
+    <li><strong>Read path:</strong> On startup, the disk directory is scanned and
+        the table is loaded into memory. After loading, all reads are from
+        in-memory column arrays&mdash;identical to regular tables.</li>
+    <li><strong>No WAL, no buffer pool.</strong> The disk layer persists the
+        current state directly. There is no write-ahead log and no page cache
+        to manage.</li>
+</ul>
+
+<p>
+    The <code>CREATE DISK TABLE ... DIRECTORY '...'</code> syntax is the only
+    user-facing change. Once created, disk tables behave identically to in-memory
+    tables for all query operations. The persistence is transparent.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    dk/mem ratios across all disk-eligible batch workloads:
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th>Metric</th><th class="num">Value</th></tr></thead>
+    <tbody>
+        <tr><td>Average dk/mem ratio</td><td class="num">0.96&times;</td></tr>
+        <tr><td>Best (group+sum)</td><td class="num">0.71&times; (disk faster due to measurement noise)</td></tr>
+        <tr><td>Worst (correlated subquery)</td><td class="num">1.19&times;</td></tr>
+        <tr><td>Aggregate workload (same query above)</td><td class="num">0.71&times;</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    The near-unity dk/mem ratio confirms that read performance is identical:
+    once loaded, disk tables are in-memory tables. The slight variation
+    (&plusmn;0.2&times;) is within run-to-run measurement noise. Write-heavy
+    workloads show slightly higher overhead due to the synchronous disk persist
+    on each mutation, but read-dominated analytical workloads are unaffected.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

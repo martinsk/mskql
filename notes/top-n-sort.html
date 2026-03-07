@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Top-N sort: fused SORT + LIMIT</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Top-N sort: fused SORT + LIMIT via binary heap</h1>
+<span class="subtitle">Binary max-heap of size K avoids full sort when LIMIT is present.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark is <code>bench_subquery_complex</code>: 50,000 event rows joined
+    with a subquery filter, sorted, and limited. Measured as wall-clock latency
+    through the PostgreSQL wire protocol, 10 iterations.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE events (
+    id INT, user_id INT, score INT,
+    amount NUMERIC(10,2), label TEXT, ts TIMESTAMP
+);
+CREATE TABLE customers (
+    id INT PRIMARY KEY, name TEXT, tier TEXT, region TEXT
+);
+-- 50,000 events, 2,000 customers
+
+SELECT * FROM events
+WHERE user_id IN (
+    SELECT id FROM customers WHERE tier = 'premium'
+) AND amount > 100
+ORDER BY amount DESC
+LIMIT 500;</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    Without the optimization, the executor sorts all qualifying rows (potentially
+    tens of thousands) to return only 500. A full sort of N rows is O(N&nbsp;log&nbsp;N).
+    When K&nbsp;&laquo;&nbsp;N, most of the sort work is wasted.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    The plan executor originally treated ORDER BY and LIMIT as separate pipeline
+    stages: <code>PLAN_SORT</code> sorted all input rows, then <code>PLAN_LIMIT</code>
+    truncated the output. The sort stage had no knowledge of the downstream LIMIT
+    and performed a full radix or comparison sort on the entire input.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    The plan builder detects ORDER BY + LIMIT patterns and emits a single
+    <code>PLAN_TOP_N</code> node that fuses both operations. The implementation
+    in <code>plan.c</code>:
+</p>
+
+<ol>
+    <li><strong>Build phase:</strong> Maintain a binary max-heap of size K.
+        For each input row, compare against the heap root (the worst row in the
+        current top-K). If the new row is better, replace the root and sift down.
+        Cost: O(N&nbsp;log&nbsp;K).</li>
+    <li><strong>Emit phase:</strong> Extract the K rows from the heap and sort
+        them with pdqsort for final output order. Cost: O(K&nbsp;log&nbsp;K).</li>
+</ol>
+
+<p>
+    For this workload with K=500 and N=~25,000 qualifying rows:
+    O(N&nbsp;log&nbsp;K) = 25,000&nbsp;&times;&nbsp;9 = 225,000 comparisons, versus
+    O(N&nbsp;log&nbsp;N) = 25,000&nbsp;&times;&nbsp;15 = 375,000 for a full sort.
+    The heap also avoids materializing all rows before sorting.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    Same query, same machine:
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th></th><th class="num">mskql</th><th class="num">PostgreSQL</th><th class="num">DuckDB</th></tr></thead>
+    <tbody>
+        <tr><td>subquery_complex (10 iter, LIMIT 500)</td><td class="num">7ms</td><td class="num">82ms</td><td class="num">12ms</td></tr>
+        <tr><td>vs PostgreSQL ratio</td><td class="num" colspan="3">0.09&times; (mskql 12&times; faster)</td></tr>
+        <tr><td>vs DuckDB ratio</td><td class="num" colspan="3">0.58&times; (mskql 1.7&times; faster)</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    The Top-N optimization matters most when K is small relative to N. As
+    K approaches N, the benefit diminishes and the node degrades to a full sort
+    with heap overhead. The plan builder only emits <code>PLAN_TOP_N</code> when
+    LIMIT is present; unlimited ORDER BY uses <code>PLAN_SORT</code> with
+    radix sort.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

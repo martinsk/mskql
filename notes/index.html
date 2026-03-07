@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Notes</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="../index.html">&larr; mskql</a></p>
+
+<h1>Notes</h1>
+<span class="subtitle">Implementation details, measured.</span>
+<hr class="title-rule">
+
+<p>
+    Each note describes one optimization: the query used to measure it, what
+    the code was doing before, what changed, and the before/after numbers.
+    All measurements use the same benchmark harness
+    (<a href="../bench-vs-pg.html">bench-vs-pg</a>) on the same machine.
+</p>
+
+<ol reversed style="list-style:none; padding:0; margin:1.5rem 0;">
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="result-cache.html">Result cache and join cache</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Wire-byte result cache + hash-join build-side cache.
+        mixed_analytical throughput: 97,210 QPS vs PostgreSQL 508 QPS (191&times;).
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="disk-tables.html">Disk-backed tables: near-zero overhead persistence</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        <code>CREATE DISK TABLE</code> adds persistence at 0.96&times; the in-memory speed.
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="vec-project.html">Vectorized expression aggregates (VEC_PROJECT)</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Direct column-array arithmetic replaces per-row expression evaluation.
+        expression_agg: 15ms vs PostgreSQL 299ms (20&times;).
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="top-n-sort.html">Top-N sort: fused SORT + LIMIT via binary heap</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Binary max-heap of size K avoids full sort.
+        subquery_complex with LIMIT 500 on 50K rows.
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="correlated-subquery.html">Correlated subquery decorrelation</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Materialized aggregate + LEFT HASH_JOIN replaces O(N&times;M) nested loop.
+        4ms vs PostgreSQL 3,636ms (826&times;).
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="cte-materialization.html">CTE materialization: from legacy fallback to plan executor</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Pre-materialize non-recursive CTEs as temp tables before plan build.
+        mixed_analytical CTE pipeline fully in the columnar executor.
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="radix-sort.html">Radix sort for integer ORDER BY</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        8-bit radix sort replaces comparison-based sort for integer keys.
+        large_sort: 77ms vs PostgreSQL 209ms.
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="arena-model.html">Zero steady-state allocation: the arena model</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Bump-slab arena with pointer rewind replaces malloc/free per query.
+        aggregate: 15ms vs PostgreSQL 265ms (18&times;).
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="order-by-gap.html">Closing the ORDER BY gap: 4.65&times; slower to 1.18&times;</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Direct columnar&rarr;wire serialization + flat sort comparator.
+        order_by: 1,676ms &rarr; 429ms.
+        </span>
+    </li>
+</ol>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="../bench-vs-pg.html">Benchmarks</a>
+</footer>
+
+</body>
+</html>

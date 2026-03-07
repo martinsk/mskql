@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Closing the ORDER BY gap</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Closing the ORDER BY gap: 4.65&times; slower to 1.18&times;</h1>
+<span class="subtitle">Direct columnar&rarr;wire serialization and flat sort comparator.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark is <code>bench_order_by</code>: 5,000 rows, 200 iterations of
+    <code>SELECT * FROM t ORDER BY val DESC</code> over a table with integer and text
+    columns. Measured as wall-clock latency through the PostgreSQL wire protocol
+    (psycopg2, localhost, same machine for all engines).
+</p>
+
+<pre><code class="language-sql">CREATE TABLE t (id INT, val INT, label TEXT);
+-- 5,000 rows inserted
+
+SELECT * FROM t ORDER BY val DESC;
+-- repeated 200 times, total wall-clock measured</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    Before the fix, mskql took 1,676ms for this workload. PostgreSQL took 356ms.
+    That made mskql 4.65&times; slower on ORDER BY&mdash;the worst ratio on the
+    entire benchmark suite. For an in-memory database, returning sorted results
+    slower than a disk-based engine is a fundamental problem.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    Profiling showed two bottlenecks:
+</p>
+
+<p>
+    <strong>1. One <code>write()</code> syscall per result row.</strong>
+    The wire serializer called <code>send_data_rows()</code> which issued one
+    <code>write()</code> per DataRow message. For 5,000 rows &times; 200 iterations,
+    that is 1,000,000 syscalls. Each syscall costs ~1&micro;s of kernel overhead,
+    adding ~1 second of pure syscall latency to the workload.
+</p>
+
+<p>
+    <strong>2. Per-row block/row index decoding in the sort comparator.</strong>
+    The sort comparator <code>sort_index_cmp()</code> encoded block index and row
+    index into a single integer, then decoded them on every comparison. For 5,000
+    rows, qsort makes ~60,000 comparisons, each doing two decode operations plus
+    pointer chasing through <code>all_cols[block * ncols + col]</code>.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    <strong>Batched wire writes</strong> (<code>pgwire.c</code>:
+    <code>try_plan_send()</code>). For SELECT queries that the plan executor can
+    handle, this function bypasses <code>block_to_rows()</code> and
+    <code>send_data_rows()</code> entirely. It pulls column blocks via
+    <code>plan_next_block()</code> and serializes directly from <code>col_block</code>
+    arrays into pgwire DataRow messages. Messages accumulate in a 64&nbsp;KB buffer
+    and flush with a single <code>write()</code> call.
+</p>
+
+<p>
+    <strong>Flat sort comparator</strong> (<code>plan.c</code>:
+    <code>sort_flat_cmp()</code>). The new comparator uses flat contiguous arrays
+    (<code>flat_keys[]</code>, <code>flat_nulls[]</code>, <code>key_types[]</code>)
+    stored in <code>block_sort_ctx</code>. Sorted indices are simple 0..total-1
+    flat indices with direct array lookups&mdash;no block/row encode/decode, no
+    pointer chasing.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    Same query, same machine, same benchmark harness:
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th></th><th class="num">Before</th><th class="num">After</th><th class="num">Speedup</th></tr></thead>
+    <tbody>
+        <tr><td>order_by (wall-clock, 200 iter)</td><td class="num">1,676ms</td><td class="num">429ms</td><td class="num">3.9&times;</td></tr>
+        <tr><td>vs PostgreSQL ratio</td><td class="num">4.65&times; slower</td><td class="num">1.18&times; slower</td><td class="num">&mdash;</td></tr>
+        <tr><td>Internal C bench (no wire)</td><td class="num">1,752ms</td><td class="num">142ms</td><td class="num">12.3&times;</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    The wire batching alone accounted for the majority of the wall-clock improvement.
+    The flat comparator reduced the internal sort time by 12.3&times;, but that was
+    masked by the syscall overhead in the "before" measurement.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

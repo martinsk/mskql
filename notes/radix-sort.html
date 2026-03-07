@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Radix sort for integer ORDER BY</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Radix sort for integer ORDER BY</h1>
+<span class="subtitle">8-bit radix sort replaces comparison-based sort for integer and float keys.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark is <code>bench_large_sort</code>: 50,000 rows, 10 iterations of a
+    multi-column ORDER BY. Measured as wall-clock latency through the PostgreSQL wire
+    protocol.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE events (
+    id INT, user_id INT, score INT,
+    amount NUMERIC(10,2), label TEXT, ts TIMESTAMP
+);
+-- 50,000 rows inserted
+
+SELECT * FROM events ORDER BY score DESC, id ASC;
+-- repeated 10 times</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    Sorting 50,000 rows by integer columns using a comparison-based sort
+    (qsort) requires approximately N&times;log2(N) &approx; 780,000 comparisons.
+    Each comparison invokes a function pointer, decodes the column type, and
+    performs the actual comparison. For multi-column sorts, this multiplies
+    by the number of sort keys.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    The generic sort path used <code>qsort</code> with a comparator that
+    dispatched on column type for every comparison. For integer columns, the
+    type dispatch and function-pointer overhead dominated the actual comparison
+    cost. The comparator also handled NULLs, multi-column tiebreaking, and
+    ASC/DESC direction on every call.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    Three radix sort variants in <code>plan.c</code>:
+</p>
+
+<ul>
+    <li><strong><code>radix_sort_u32</code></strong> &mdash; 4 passes of 8-bit radix
+        for 32-bit integer keys (INT, SMALLINT).</li>
+    <li><strong><code>radix_sort_u64</code></strong> &mdash; 8 passes for 64-bit
+        integer keys (BIGINT).</li>
+    <li><strong><code>radix_sort_f64</code></strong> &mdash; 8 passes with IEEE 754
+        bit-flip (sign bit inversion + conditional complement) so that the
+        numeric order of doubles matches the bitwise order.</li>
+</ul>
+
+<p>
+    For multi-column ORDER BY, the sort applies radix sort on the least-significant
+    key first and works toward the most-significant key, exploiting radix sort&rsquo;s
+    stability. Each pass is O(N) with a 256-bucket histogram, making the total
+    cost O(N&times;k) where k is the number of bytes in the key.
+</p>
+
+<p>
+    DESC order is handled by inverting the key bits before sorting. NULL handling
+    is done by mapping NULLs to the highest or lowest key value (depending on
+    NULLS FIRST/LAST) before the radix passes.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    Same query, same machine:
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th></th><th class="num">mskql</th><th class="num">PostgreSQL</th><th class="num">DuckDB</th></tr></thead>
+    <tbody>
+        <tr><td>large_sort (10 iter, 50K rows)</td><td class="num">77ms</td><td class="num">209ms</td><td class="num">49ms</td></tr>
+        <tr><td>vs PostgreSQL ratio</td><td class="num" colspan="3">0.37&times; (mskql 2.7&times; faster)</td></tr>
+        <tr><td>vs DuckDB ratio</td><td class="num" colspan="3">1.57&times; (DuckDB faster)</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    Radix sort closes most of the gap with DuckDB on integer sorts. DuckDB still
+    wins because its sort is SIMD-optimized for columnar data. The remaining
+    difference is in the materialization and wire serialization of 50,000 sorted
+    rows, not the sort itself.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

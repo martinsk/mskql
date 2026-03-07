@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Result cache and join cache</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Result cache and join cache</h1>
+<span class="subtitle">Wire-byte result cache + hash-join build-side cache.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark is <code>bench_mixed_analytical</code> under concurrent throughput
+    testing: 8 threads, 5 seconds, each thread repeatedly executing the same
+    CTE&rarr;join&rarr;aggregate&rarr;sort query. Measured as queries per second.
+</p>
+
+<pre><code class="language-sql">WITH order_summary AS (
+    SELECT o.customer_id,
+           SUM(o.quantity * p.price) AS total
+    FROM orders o
+    JOIN products p ON o.product_id = p.id
+    GROUP BY o.customer_id
+)
+SELECT c.region, COUNT(*), SUM(os.total) AS revenue
+FROM order_summary os
+JOIN customers c ON os.customer_id = c.id
+GROUP BY c.region
+ORDER BY revenue DESC;
+-- 8 threads, each running this query continuously for 5 seconds</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    Dashboard-style workloads poll the same analytical query repeatedly. Without
+    caching, each poll re-executes the full pipeline: CTE materialization, hash
+    join build, hash aggregate, sort, wire serialization. Even with the fast
+    columnar executor, this limits throughput to the single-query latency.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    Two sources of redundant work:
+</p>
+
+<p>
+    <strong>1. Identical queries re-execute the full pipeline.</strong>
+    If the underlying tables have not changed, the result is the same. But the
+    executor has no way to know this without re-running the query.
+</p>
+
+<p>
+    <strong>2. Hash join build-side reconstruction.</strong>
+    For queries with joins, the build side (inner table) is scanned, hashed, and
+    inserted into a hash table on every execution. When the inner table has not
+    changed, this is wasted work.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    <strong>Result cache</strong> (<code>pgwire.c</code>: <code>rcache</code>).
+    After executing a SELECT query and serializing the result to wire bytes, the
+    serialized bytes are stored in a hash map keyed by the SQL text. On the next
+    identical query, the cache checks whether any table referenced by the query
+    has been modified (via a generation counter on each table). If no table has
+    changed, the cached wire bytes are sent directly to the client&mdash;bypassing
+    parsing, planning, execution, and serialization entirely.
+</p>
+
+<p>
+    <strong>Join cache</strong> (<code>table.c</code>: <code>join_cache</code>).
+    The hash join build-side hash table is retained across queries. Each table
+    tracks a generation counter that increments on INSERT, UPDATE, or DELETE.
+    The join cache stores the build-side hash table along with the generation
+    counter at build time. On the next query, if the generation counter matches,
+    the cached hash table is reused without rebuilding.
+</p>
+
+<p>
+    Cache invalidation is exact: any mutation to any referenced table invalidates
+    the result cache entry. There are no TTLs, no stale reads, and no
+    configuration knobs.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    Same query, same machine, 8 threads:
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th></th><th class="num">mskql</th><th class="num">PostgreSQL</th><th class="num">Ratio</th></tr></thead>
+    <tbody>
+        <tr><td>mixed_analytical QPS</td><td class="num">97,210</td><td class="num">508</td><td class="num">191&times;</td></tr>
+        <tr><td>p50 latency</td><td class="num">0.082ms</td><td class="num">15.7ms</td><td class="num">&mdash;</td></tr>
+        <tr><td>wide_aggregate QPS</td><td class="num">97,008</td><td class="num">1,055</td><td class="num">92&times;</td></tr>
+        <tr><td>group_sum QPS</td><td class="num">97,210</td><td class="num">14,305</td><td class="num">6.8&times;</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    At 97,210 QPS, each query completes in 82 microseconds. The result cache
+    turns any repeated read-only query into a hash lookup + socket write. The
+    191&times; ratio over PostgreSQL is the highest on the throughput benchmark
+    suite.
+</p>
+
+<p>
+    The cache is most effective for read-heavy analytical dashboards where the
+    same queries run repeatedly against slowly-changing data. For write-heavy
+    workloads, frequent invalidation reduces the hit rate and the throughput
+    advantage narrows (mixed read/write: 0.94&times; PostgreSQL).
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>
