@@ -1122,6 +1122,746 @@ static double bench_vector_filter(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Node benchmarks: shared setup                                      */
+/* ------------------------------------------------------------------ */
+
+static void setup_node_int_table(struct database *db, int nrows)
+{
+    exec(db, "CREATE TABLE t (id INT, grp INT, val INT)");
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "INSERT INTO t SELECT n, n %% 100, (n * 7) %% %d "
+             "FROM generate_series(1, %d) AS g(n)", nrows, nrows);
+    exec(db, sql);
+}
+
+static void setup_node_float_table(struct database *db, int nrows)
+{
+    exec(db, "CREATE TABLE tf (id INT, grp INT, val FLOAT)");
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "INSERT INTO tf SELECT n, n %% 100, ((n * 7) %% %d) * 1.0 "
+             "FROM generate_series(1, %d) AS g(n)", nrows, nrows);
+    exec(db, sql);
+}
+
+static void setup_node_text_table(struct database *db, int nrows)
+{
+    exec(db, "CREATE TABLE tt (id INT, name TEXT, val INT)");
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "INSERT INTO tt SELECT n, 'name_' || n, (n * 7) %% %d "
+             "FROM generate_series(1, %d) AS g(n)", nrows, nrows);
+    exec(db, sql);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: seq_scan (pure memcpy throughput)                   */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_seq_scan(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT * FROM t");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: filter_int (~50% selectivity, vectorized compare)   */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_filter_int(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT * FROM t WHERE val > 50000");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: filter_low_sel (~5% selectivity, compact pass)      */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_filter_low_sel(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT * FROM t WHERE val > 95000");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: filter_compound (AND-chained columnar filter)       */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_filter_compound(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT * FROM t WHERE val > 30000 AND grp < 50");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: project (column pruning 3→2)                       */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_project(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT id, val FROM t");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: vec_project_int (VEC_COL_OP_LIT i32, auto-vec)     */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_vec_project_int(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT val * 2 + 1 FROM t");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: vec_project_float (SIMD float throughput)           */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_vec_project_float(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_float_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT val * 2.5 + 1.0 FROM tf");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: vec_project_col_col (VEC_COL_OP_COL bandwidth)     */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_vec_project_col_col(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT id + val FROM t");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: vec_project_multi (4 vec ops per block)            */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_vec_project_multi(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT val * 2, val + 1, val - 3, val / 2 FROM t");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: vec_project_text (UPPER — string, not SIMD)        */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_vec_project_text(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_text_table(&db, 50000);
+
+    const int N = 100;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT UPPER(name) FROM tt");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: sort_int (single INT key — radix sort path)        */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_sort_int(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 50000);
+
+    const int N = 50;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT * FROM t ORDER BY val");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: sort_float (FLOAT key — radix_sort_f64)            */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_sort_float(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_float_table(&db, 50000);
+
+    const int N = 50;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT * FROM tf ORDER BY val");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: sort_text (TEXT key — pdqsort + strcmp)             */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_sort_text(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_text_table(&db, 50000);
+
+    const int N = 20;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT * FROM tt ORDER BY name");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: sort_multi (multi-key — composite radix or pdq)    */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_sort_multi(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 50000);
+
+    const int N = 50;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT * FROM t ORDER BY grp, val");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: simple_agg (COUNT/SUM/AVG, no GROUP BY)            */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_simple_agg(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 500;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT COUNT(*), SUM(val), AVG(val) FROM t");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: hash_agg_few (100 groups — L1-resident HT)        */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_hash_agg_few(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT grp, SUM(val) FROM t GROUP BY grp");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: hash_agg_many (100K groups — cache-miss-heavy)     */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_hash_agg_many(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 50;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT id, SUM(val) FROM t GROUP BY id");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: hash_agg_multi (multi-agg accumulation)            */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_hash_agg_multi(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT grp, SUM(val), COUNT(*), AVG(val) FROM t GROUP BY grp");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: hash_join (100K × 1K — L1-resident build side)     */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_hash_join(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+    exec(&db, "CREATE TABLE t_inner (id INT, label INT)");
+    exec(&db, "INSERT INTO t_inner SELECT n, n * 3 "
+              "FROM generate_series(1, 1000) AS g(n)");
+
+    const int N = 50;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT t.id, t.val, t_inner.label "
+            "FROM t JOIN t_inner ON t.grp = t_inner.id");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: hash_join_large (100K × 50K — L2/L3 pressure)     */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_hash_join_large(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+    exec(&db, "CREATE TABLE t_big (id INT, payload INT)");
+    exec(&db, "INSERT INTO t_big SELECT n, n * 11 "
+              "FROM generate_series(1, 50000) AS g(n)");
+
+    const int N = 10;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT t.id, t_big.payload "
+            "FROM t JOIN t_big ON t.val = t_big.id");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: semi_join (hash semi-join via IN subquery)         */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_semi_join(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 50000);
+    exec(&db, "CREATE TABLE t_filter (id INT, flag INT)");
+    exec(&db, "INSERT INTO t_filter SELECT n, n % 2 "
+              "FROM generate_series(1, 5000) AS g(n)");
+
+    const int N = 50;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT * FROM t WHERE grp IN "
+            "(SELECT id FROM t_filter WHERE flag = 1)");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: limit (early termination from 100K)                */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_limit(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 2000;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT * FROM t LIMIT 100");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: top_n (heap-based ORDER BY ... LIMIT)              */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_top_n(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 100;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT * FROM t ORDER BY val LIMIT 100");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: window (ROW_NUMBER OVER PARTITION BY)              */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_window(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 50000);
+
+    const int N = 10;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT id, grp, val, "
+            "ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) FROM t");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: distinct (hash dedup, 100K→100)                    */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_distinct(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db, "SELECT DISTINCT grp FROM t");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: set_op (UNION of two 50K tables)                   */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_set_op(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    exec(&db, "CREATE TABLE t_a (id INT, val INT)");
+    exec(&db, "CREATE TABLE t_b (id INT, val INT)");
+    exec(&db, "INSERT INTO t_a SELECT n, n * 3 "
+              "FROM generate_series(1, 50000) AS g(n)");
+    exec(&db, "INSERT INTO t_b SELECT n + 25000, n * 7 "
+              "FROM generate_series(1, 50000) AS g(n)");
+
+    const int N = 10;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT id, val FROM t_a UNION SELECT id, val FROM t_b");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: gen_series (virtual table scan throughput)          */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_gen_series(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+
+    const int N = 200;
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        db_exec_sql_discard(&db,
+            "SELECT * FROM generate_series(1, 100000)");
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node benchmark: index_scan (B-tree point lookups)                  */
+/* ------------------------------------------------------------------ */
+
+static double bench_node_index_scan(void)
+{
+    struct database db;
+    db_init(&db, "bench");
+    setup_node_int_table(&db, 100000);
+    exec(&db, "CREATE INDEX idx_t_id ON t (id)");
+
+    const int N = 1000;
+    char sql[128];
+    g_niter = N;
+    double t0 = now_sec();
+    for (int i = 0; i < N; i++) {
+        double it0 = now_sec();
+        snprintf(sql, sizeof(sql),
+                 "SELECT * FROM t WHERE id = %d", (i * 7919) % 100000 + 1);
+        db_exec_sql_discard(&db, sql);
+        g_iter_ms[i] = (now_sec() - it0) * 1e3;
+    }
+    double elapsed_ms = (now_sec() - t0) * 1e3;
+
+    db_free(&db);
+    return elapsed_ms;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Registry                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -1162,6 +1902,34 @@ static struct bench_entry benchmarks[] = {
     { "vector_scan",          bench_vector_scan },
     { "vector_wide",          bench_vector_wide },
     { "vector_filter",        bench_vector_filter },
+    { "node_seq_scan",        bench_node_seq_scan },
+    { "node_filter_int",      bench_node_filter_int },
+    { "node_filter_low_sel",  bench_node_filter_low_sel },
+    { "node_filter_compound", bench_node_filter_compound },
+    { "node_project",         bench_node_project },
+    { "node_vec_project_int", bench_node_vec_project_int },
+    { "node_vec_project_float", bench_node_vec_project_float },
+    { "node_vec_project_col_col", bench_node_vec_project_col_col },
+    { "node_vec_project_multi", bench_node_vec_project_multi },
+    { "node_vec_project_text", bench_node_vec_project_text },
+    { "node_sort_int",        bench_node_sort_int },
+    { "node_sort_float",      bench_node_sort_float },
+    { "node_sort_text",       bench_node_sort_text },
+    { "node_sort_multi",      bench_node_sort_multi },
+    { "node_simple_agg",      bench_node_simple_agg },
+    { "node_hash_agg_few",    bench_node_hash_agg_few },
+    { "node_hash_agg_many",   bench_node_hash_agg_many },
+    { "node_hash_agg_multi",  bench_node_hash_agg_multi },
+    { "node_hash_join",       bench_node_hash_join },
+    { "node_hash_join_large", bench_node_hash_join_large },
+    { "node_semi_join",       bench_node_semi_join },
+    { "node_limit",           bench_node_limit },
+    { "node_top_n",           bench_node_top_n },
+    { "node_window",          bench_node_window },
+    { "node_distinct",        bench_node_distinct },
+    { "node_set_op",          bench_node_set_op },
+    { "node_gen_series",      bench_node_gen_series },
+    { "node_index_scan",      bench_node_index_scan },
 };
 
 static int nbench = (int)(sizeof(benchmarks) / sizeof(benchmarks[0]));
@@ -1197,9 +1965,12 @@ int main(int argc, char **argv)
     const char *filter = NULL;
     const char *json_path = NULL;
 
+    const char *prefix = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--json") == 0 && i + 1 < argc) {
             json_path = argv[++i];
+        } else if (strcmp(argv[i], "--prefix") == 0 && i + 1 < argc) {
+            prefix = argv[++i];
         } else {
             filter = argv[i];
         }
@@ -1209,10 +1980,12 @@ int main(int argc, char **argv)
     printf("=========================================="
            "======================================\n");
 
-    struct bench_result results[64];
+    struct bench_result results[128];
     int ran = 0;
     for (int i = 0; i < nbench; i++) {
         if (filter && strcmp(filter, benchmarks[i].name) != 0)
+            continue;
+        if (prefix && strncmp(prefix, benchmarks[i].name, strlen(prefix)) != 0)
             continue;
         printf("  running %-30s ...", benchmarks[i].name);
         fflush(stdout);
