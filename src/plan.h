@@ -220,6 +220,7 @@ struct plan_node {
             struct table *table;       /* for eval_expr on expression aggs */
             int      *agg_order_col; /* bump: ORDER BY column index per aggregate (-1 = none) */
             int      *agg_order_desc; /* bump: 1=DESC per aggregate */
+            int       int_fast_path; /* 1 = all aggs are simple SUM/COUNT/MIN/MAX/AVG on int cols, no DISTINCT/FILTER */
         } simple_agg;
         struct {
             size_t offset;
@@ -254,7 +255,8 @@ struct plan_node {
         } parquet_scan;
         struct {
             uint16_t ncols;           /* number of output columns */
-            struct vec_project_op *ops; /* bump-allocated: [ncols] */
+            uint16_t aux_count;       /* number of auxiliary/temp ops before output ops */
+            struct vec_project_op *ops; /* bump-allocated: [aux_count + ncols] */
         } vec_project;
         struct {
             int     *sort_cols;        /* bump: column indices to sort by */

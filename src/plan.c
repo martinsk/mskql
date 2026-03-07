@@ -16,6 +16,12 @@
 #include <math.h>
 #include <ctype.h>
 
+/* Forward declarations */
+static int try_vec_resolve_expr(struct expr *e, struct table *t,
+                                struct query_arena *arena,
+                                struct vec_project_op *vops, uint16_t *nvops,
+                                uint16_t max_ops, uint16_t child_ncols, int depth);
+
 /* Fast ASCII case-conversion lookup tables (avoid per-char dylib toupper/tolower calls) */
 static const char upper_lut[256] = {
     0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
@@ -2001,6 +2007,8 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 {
     struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
     uint16_t out_ncols = pn->vec_project.ncols;
+    uint16_t aux_count = pn->vec_project.aux_count;
+    uint16_t total_ops = aux_count + out_ncols;
     struct vec_project_op *ops = pn->vec_project.ops;
 
     uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
@@ -2055,18 +2063,29 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         input = compact;
     }
 
+    /* Allocate auxiliary col_blocks for intermediate results (nested expressions) */
+    struct col_block *aux_cols = NULL;
+    if (aux_count > 0) {
+        aux_cols = (struct col_block *)bump_alloc(&ctx->arena->scratch,
+                                                   aux_count * sizeof(struct col_block));
+        memset(aux_cols, 0, aux_count * sizeof(struct col_block));
+    }
+
     out->count = count;
     out->sel = NULL;
     out->sel_count = 0;
 
-    for (uint16_t c = 0; c < out_ncols; c++) {
+    for (uint16_t c = 0; c < total_ops; c++) {
         struct vec_project_op *vop = &ops[c];
-        struct col_block *ocb = &out->cols[c];
+        /* Aux ops write to aux_cols; final ops write to out->cols */
+        struct col_block *ocb = (c < aux_count) ? &aux_cols[c] : &out->cols[c - aux_count];
         ocb->type = vop->out_type;
         ocb->count = count;
 
         if (vop->kind == VEC_PASSTHROUGH) {
-            struct col_block *icb = &input.cols[vop->left_col];
+            struct col_block *icb = (vop->left_col < child_ncols)
+                ? &input.cols[vop->left_col]
+                : &aux_cols[vop->left_col - child_ncols];
             memcpy(ocb->nulls, icb->nulls, count * sizeof(uint8_t));
             switch (column_type_storage(vop->out_type)) {
             case STORE_I32: memcpy(ocb->data.i32, icb->data.i32, count * sizeof(int32_t)); break;
@@ -2086,7 +2105,9 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             continue;
         }
 
-        struct col_block *lcb = &input.cols[vop->left_col];
+        struct col_block *lcb = (vop->left_col < child_ncols)
+            ? &input.cols[vop->left_col]
+            : &aux_cols[vop->left_col - child_ncols];
 
         if (vop->kind == VEC_COL_OP_LIT) {
             switch (vop->out_type) {
@@ -2221,7 +2242,9 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 break;
             }
         } else if (vop->kind == VEC_COL_OP_COL) {
-            struct col_block *rcb = &input.cols[vop->right_col];
+            struct col_block *rcb = (vop->right_col < child_ncols)
+                ? &input.cols[vop->right_col]
+                : &aux_cols[vop->right_col - child_ncols];
             switch (vop->out_type) {
             case COLUMN_TYPE_INT: {
                 const int32_t *ls = lcb->data.i32;
@@ -2371,7 +2394,9 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             }
         } else if (vop->kind == VEC_COL_OP_COL_MIXED) {
             /* Mixed-type col OP col: promote both sides to output type, compute */
-            struct col_block *rcb = &input.cols[vop->right_col];
+            struct col_block *rcb = (vop->right_col < child_ncols)
+                ? &input.cols[vop->right_col]
+                : &aux_cols[vop->right_col - child_ncols];
             /* Unpack source column types from lit_i64 */
             enum column_type lct = (enum column_type)(vop->lit_i64 >> 16);
             enum column_type rct = (enum column_type)(vop->lit_i64 & 0xFFFF);
@@ -2462,7 +2487,9 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             }
             for (uint16_t i = 0; i < count; i++) ocb->nulls[i] = lcb->nulls[i] | rcb->nulls[i];
         } else if (vop->kind == VEC_FUNC_CONCAT_COL) {
-            struct col_block *rcb = &input.cols[vop->right_col];
+            struct col_block *rcb = (vop->right_col < child_ncols)
+                ? &input.cols[vop->right_col]
+                : &aux_cols[vop->right_col - child_ncols];
             if (!ocb->str_lens)
                 ocb->str_lens = (uint32_t *)bump_calloc(&ctx->arena->scratch,
                                                          BLOCK_CAPACITY, sizeof(uint32_t));
@@ -3122,7 +3149,9 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 break;
             }
         } else if (vop->kind == VEC_FUNC_COALESCE_COL) {
-            struct col_block *rcb = &input.cols[vop->right_col];
+            struct col_block *rcb = (vop->right_col < child_ncols)
+                ? &input.cols[vop->right_col]
+                : &aux_cols[vop->right_col - child_ncols];
             enum storage_class sc = column_type_storage(vop->out_type);
             switch (sc) {
             case STORE_I32: {
@@ -5549,6 +5578,189 @@ static int simple_agg_emit(struct plan_exec_ctx *ctx, struct plan_node *pn,
     return 0;
 }
 
+/* Vectorized block-level accumulation for simple_agg int_fast_path.
+ * Processes entire block in tight per-aggregate loops, avoiding per-row dispatch.
+ * Handles selection vectors when present. */
+static void simple_agg_vec_consume(struct simple_agg_state *st,
+                                    struct plan_node *pn,
+                                    struct row_block *input)
+{
+    uint16_t count = input->count;
+    uint16_t active = row_block_active_count(input);
+    int has_sel = (input->sel_count > 0);
+    uint32_t agg_n = pn->simple_agg.agg_count;
+
+    st->total_rows += active;
+
+    for (uint32_t a = 0; a < agg_n; a++) {
+        int ac = pn->simple_agg.agg_col_indices[a];
+
+        if (ac == -1) {
+            /* COUNT(*): just add active row count (no per-row work needed) */
+            continue;
+        }
+
+        struct col_block *acb = &input->cols[ac];
+        const uint8_t *nulls = acb->nulls;
+        enum storage_class sc = column_type_storage(acb->type);
+
+        if (sc == STORE_I32) {
+            const int32_t *vals = acb->data.i32;
+            int64_t local_sum = 0;
+            int32_t local_min = st->minmax_init[a] ? (int32_t)st->mins[a] : 0;
+            int32_t local_max = st->minmax_init[a] ? (int32_t)st->maxs[a] : 0;
+            int have_minmax = st->minmax_init[a];
+            size_t local_nn = 0;
+
+            if (has_sel) {
+                for (uint16_t r = 0; r < active; r++) {
+                    uint16_t ri = input->sel[r];
+                    if (nulls[ri]) continue;
+                    int32_t v = vals[ri];
+                    local_sum += v;
+                    if (!have_minmax || v < local_min) local_min = v;
+                    if (!have_minmax || v > local_max) local_max = v;
+                    have_minmax = 1;
+                    local_nn++;
+                }
+            } else {
+                for (uint16_t ri = 0; ri < count; ri++) {
+                    if (nulls[ri]) continue;
+                    int32_t v = vals[ri];
+                    local_sum += v;
+                    if (!have_minmax || v < local_min) local_min = v;
+                    if (!have_minmax || v > local_max) local_max = v;
+                    have_minmax = 1;
+                    local_nn++;
+                }
+            }
+            st->i64_sums[a] += local_sum;
+            st->nonnull[a] += local_nn;
+            if (have_minmax) {
+                st->mins[a] = (double)local_min;
+                st->maxs[a] = (double)local_max;
+                st->minmax_init[a] = 1;
+            }
+        } else if (sc == STORE_I64) {
+            const int64_t *vals = acb->data.i64;
+            int64_t local_sum = 0;
+            int64_t local_min, local_max;
+            int have_minmax = st->minmax_init[a];
+            if (have_minmax) {
+                memcpy(&local_min, &st->mins[a], sizeof(int64_t));
+                memcpy(&local_max, &st->maxs[a], sizeof(int64_t));
+            } else {
+                local_min = local_max = 0;
+            }
+            size_t local_nn = 0;
+
+            if (has_sel) {
+                for (uint16_t r = 0; r < active; r++) {
+                    uint16_t ri = input->sel[r];
+                    if (nulls[ri]) continue;
+                    int64_t v = vals[ri];
+                    local_sum += v;
+                    if (!have_minmax || v < local_min) local_min = v;
+                    if (!have_minmax || v > local_max) local_max = v;
+                    have_minmax = 1;
+                    local_nn++;
+                }
+            } else {
+                for (uint16_t ri = 0; ri < count; ri++) {
+                    if (nulls[ri]) continue;
+                    int64_t v = vals[ri];
+                    local_sum += v;
+                    if (!have_minmax || v < local_min) local_min = v;
+                    if (!have_minmax || v > local_max) local_max = v;
+                    have_minmax = 1;
+                    local_nn++;
+                }
+            }
+            st->i64_sums[a] += local_sum;
+            st->nonnull[a] += local_nn;
+            if (have_minmax) {
+                memcpy(&st->mins[a], &local_min, sizeof(double));
+                memcpy(&st->maxs[a], &local_max, sizeof(double));
+                st->minmax_init[a] = 1;
+            }
+        } else if (sc == STORE_I16) {
+            const int16_t *vals = acb->data.i16;
+            int64_t local_sum = 0;
+            int16_t local_min = st->minmax_init[a] ? (int16_t)(int)st->mins[a] : 0;
+            int16_t local_max = st->minmax_init[a] ? (int16_t)(int)st->maxs[a] : 0;
+            int have_minmax = st->minmax_init[a];
+            size_t local_nn = 0;
+
+            if (has_sel) {
+                for (uint16_t r = 0; r < active; r++) {
+                    uint16_t ri = input->sel[r];
+                    if (nulls[ri]) continue;
+                    int16_t v = vals[ri];
+                    local_sum += v;
+                    if (!have_minmax || v < local_min) local_min = v;
+                    if (!have_minmax || v > local_max) local_max = v;
+                    have_minmax = 1;
+                    local_nn++;
+                }
+            } else {
+                for (uint16_t ri = 0; ri < count; ri++) {
+                    if (nulls[ri]) continue;
+                    int16_t v = vals[ri];
+                    local_sum += v;
+                    if (!have_minmax || v < local_min) local_min = v;
+                    if (!have_minmax || v > local_max) local_max = v;
+                    have_minmax = 1;
+                    local_nn++;
+                }
+            }
+            st->i64_sums[a] += local_sum;
+            st->nonnull[a] += local_nn;
+            if (have_minmax) {
+                st->mins[a] = (double)local_min;
+                st->maxs[a] = (double)local_max;
+                st->minmax_init[a] = 1;
+            }
+        } else if (sc == STORE_F64) {
+            const double *vals = acb->data.f64;
+            double local_sum = 0.0;
+            double local_min = st->minmax_init[a] ? st->mins[a] : 0.0;
+            double local_max = st->minmax_init[a] ? st->maxs[a] : 0.0;
+            int have_minmax = st->minmax_init[a];
+            size_t local_nn = 0;
+
+            if (has_sel) {
+                for (uint16_t r = 0; r < active; r++) {
+                    uint16_t ri = input->sel[r];
+                    if (nulls[ri]) continue;
+                    double v = vals[ri];
+                    local_sum += v;
+                    if (!have_minmax || v < local_min) local_min = v;
+                    if (!have_minmax || v > local_max) local_max = v;
+                    have_minmax = 1;
+                    local_nn++;
+                }
+            } else {
+                for (uint16_t ri = 0; ri < count; ri++) {
+                    if (nulls[ri]) continue;
+                    double v = vals[ri];
+                    local_sum += v;
+                    if (!have_minmax || v < local_min) local_min = v;
+                    if (!have_minmax || v > local_max) local_max = v;
+                    have_minmax = 1;
+                    local_nn++;
+                }
+            }
+            st->sums[a] += local_sum;
+            st->nonnull[a] += local_nn;
+            if (have_minmax) {
+                st->mins[a] = local_min;
+                st->maxs[a] = local_max;
+                st->minmax_init[a] = 1;
+            }
+        }
+    }
+}
+
 static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                            struct row_block *out)
 {
@@ -5594,6 +5806,13 @@ static int simple_agg_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         row_block_alloc(&input, child_ncols, &ctx->arena->scratch);
 
         while (plan_next_block(ctx, pn->left, &input) == 0) {
+            /* Fast path: vectorized block-level accumulation */
+            if (pn->simple_agg.int_fast_path) {
+                simple_agg_vec_consume(st, pn, &input);
+                row_block_reset(&input);
+                continue;
+            }
+
             uint16_t active = row_block_active_count(&input);
 
             /* Pre-compute vectorized binop aggregate results for the entire block */
@@ -13507,6 +13726,26 @@ static struct plan_result build_simple_agg(struct table *t, struct query_select 
         PLAN_NODE(arena, agg_idx).simple_agg.agg_order_col = aoc;
         PLAN_NODE(arena, agg_idx).simple_agg.agg_order_desc = aod;
     }
+    /* ---- INT fast path detection for vectorized block accumulation ---- */
+    {
+        int ifp = 1;
+        for (uint32_t a = 0; a < s->aggregates_count && ifp; a++) {
+            struct agg_expr *ae = &arena->aggregates.items[s->aggregates_start + a];
+            /* Only SUM/COUNT/MIN/MAX/AVG */
+            if (ae->func != AGG_SUM && ae->func != AGG_COUNT && ae->func != AGG_AVG &&
+                ae->func != AGG_MIN && ae->func != AGG_MAX)
+                ifp = 0;
+            if (ae->has_distinct || ae->filter_cond != IDX_NONE) ifp = 0;
+            int ac = agg_col_idxs[a];
+            if (ac == -2 || ac == -3) ifp = 0; /* expression or vec binop agg */
+            if (ac >= 0 && ifp) {
+                enum storage_class sc = column_type_storage(t->columns.items[ac].type);
+                if (sc != STORE_I32 && sc != STORE_I64 && sc != STORE_I16 && sc != STORE_F64)
+                    ifp = 0;
+            }
+        }
+        PLAN_NODE(arena, agg_idx).simple_agg.int_fast_path = ifp;
+    }
     current = agg_idx;
 
     /* HAVING filter (without GROUP BY) */
@@ -14879,9 +15118,17 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
      * Try vectorized path first for simple col OP col / col OP lit expressions. */
     if (need_expr_project) {
         int vec_ok = 1;
+        /* Output ops: one per projection column */
         struct vec_project_op *vops = (struct vec_project_op *)bump_alloc(
             &arena->scratch, proj_ncols * sizeof(struct vec_project_op));
         memset(vops, 0, proj_ncols * sizeof(struct vec_project_op));
+        /* Aux ops buffer for nested expression intermediates (max 4 aux per output col) */
+        uint16_t aux_max = (uint16_t)(proj_ncols * 4);
+        struct vec_project_op *aux_ops = (struct vec_project_op *)bump_alloc(
+            &arena->scratch, aux_max * sizeof(struct vec_project_op));
+        memset(aux_ops, 0, aux_max * sizeof(struct vec_project_op));
+        uint16_t aux_used = 0;
+        uint16_t ep_child_ncols = plan_node_ncols(arena, current);
 
         for (uint16_t i = 0; i < proj_ncols && vec_ok; i++) {
             struct expr *e = &EXPR(arena, expr_proj_indices[i]);
@@ -15049,7 +15296,14 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
                     else
                         vops[i].lit_i64 = lit_i2;
                 } else {
-                    vec_ok = 0; break;
+                    /* Nested expression (e.g. (col*2)+1): try recursive resolver */
+                    int ref = try_vec_resolve_expr(e, t, arena, aux_ops, &aux_used,
+                                                    aux_max, ep_child_ncols, 0);
+                    if (ref < 0) { vec_ok = 0; break; }
+                    /* ref points to an aux slot; emit PASSTHROUGH to it */
+                    vops[i].kind = VEC_PASSTHROUGH;
+                    vops[i].left_col = (uint16_t)ref;
+                    vops[i].out_type = aux_ops[ref - ep_child_ncols].out_type;
                 }
             } else if (e->type == EXPR_FUNC_CALL) {
                 enum expr_func fn = e->func_call.func;
@@ -15728,7 +15982,19 @@ static struct plan_result build_single_table(struct table *t, struct query_selec
             uint32_t vp_idx = plan_alloc_node(arena, PLAN_VEC_PROJECT);
             PLAN_NODE(arena, vp_idx).left = current;
             PLAN_NODE(arena, vp_idx).vec_project.ncols = proj_ncols;
-            PLAN_NODE(arena, vp_idx).vec_project.ops = vops;
+            if (aux_used > 0) {
+                /* Combine: [aux_ops[0..aux_used-1] | vops[0..proj_ncols-1]] */
+                uint16_t total = aux_used + proj_ncols;
+                struct vec_project_op *combined = (struct vec_project_op *)bump_alloc(
+                    &arena->scratch, total * sizeof(struct vec_project_op));
+                memcpy(combined, aux_ops, aux_used * sizeof(struct vec_project_op));
+                memcpy(combined + aux_used, vops, proj_ncols * sizeof(struct vec_project_op));
+                PLAN_NODE(arena, vp_idx).vec_project.ops = combined;
+                PLAN_NODE(arena, vp_idx).vec_project.aux_count = aux_used;
+            } else {
+                PLAN_NODE(arena, vp_idx).vec_project.ops = vops;
+                PLAN_NODE(arena, vp_idx).vec_project.aux_count = 0;
+            }
             current = vp_idx;
         } else {
             uint32_t eproj_idx = plan_alloc_node(arena, PLAN_EXPR_PROJECT);
@@ -16130,6 +16396,171 @@ static struct plan_result logical_to_physical(struct table *t,
 
     /* Exhaustive switch above covers all enum values — unreachable */
     __builtin_unreachable();
+}
+
+/* Recursively resolve an expression into VEC_PROJECT ops.
+ * Returns a "column index" that the caller can use as left_col/right_col:
+ *   - For a column ref: returns the table column index (< child_ncols).
+ *   - For a nested expression: emits one or more aux ops into vops[*nvops],
+ *     returns child_ncols + (aux slot index) so the caller can reference it.
+ *   - Returns -1 on failure (expression too complex for vectorization).
+ * depth limits recursion to prevent stack overflow (max ~8 levels). */
+static int try_vec_resolve_expr(struct expr *e, struct table *t,
+                                struct query_arena *arena,
+                                struct vec_project_op *vops, uint16_t *nvops,
+                                uint16_t max_ops, uint16_t child_ncols, int depth)
+{
+    if (depth > 8) return -1;
+
+    if (e->type == EXPR_COLUMN_REF) {
+        int ci = table_find_column_sv(t, e->column_ref.column);
+        return ci; /* -1 if not found */
+    }
+
+    if (e->type == EXPR_LITERAL) {
+        /* Sentinel: caller must extract literal value and store in parent op.
+         * We return -2 to indicate "this is a literal, not a column". */
+        return -2;
+    }
+
+    if (e->type == EXPR_BINARY_OP) {
+        enum expr_op op = e->binary.op;
+        if (op != OP_ADD && op != OP_SUB && op != OP_MUL && op != OP_DIV &&
+            op != OP_MOD && op != OP_EXP &&
+            op != OP_BITAND && op != OP_BITOR && op != OP_LSHIFT && op != OP_RSHIFT)
+            return -1;
+
+        struct expr *le = &EXPR(arena, e->binary.left);
+        struct expr *re = &EXPR(arena, e->binary.right);
+
+        int left_ref = try_vec_resolve_expr(le, t, arena, vops, nvops, max_ops, child_ncols, depth + 1);
+        if (left_ref == -1) return -1;
+
+        int right_ref = try_vec_resolve_expr(re, t, arena, vops, nvops, max_ops, child_ncols, depth + 1);
+        if (right_ref == -1) return -1;
+
+        /* Both are literals — can't vectorize (constant folding not done here) */
+        if (left_ref == -2 && right_ref == -2) return -1;
+
+        /* Determine types */
+        enum column_type lt, rt;
+        if (left_ref == -2) {
+            /* literal OP col/aux: get type from right side */
+            if (right_ref >= 0 && (uint16_t)right_ref < child_ncols)
+                rt = t->columns.items[right_ref].type;
+            else if (right_ref >= (int)child_ncols)
+                rt = vops[right_ref - child_ncols].out_type;
+            else return -1;
+            lt = rt; /* coerce literal to match column type */
+        } else if (right_ref == -2) {
+            /* col/aux OP literal: get type from left side */
+            if (left_ref >= 0 && (uint16_t)left_ref < child_ncols)
+                lt = t->columns.items[left_ref].type;
+            else if (left_ref >= (int)child_ncols)
+                lt = vops[left_ref - child_ncols].out_type;
+            else return -1;
+            rt = lt;
+        } else {
+            /* col/aux OP col/aux */
+            if (left_ref >= 0 && (uint16_t)left_ref < child_ncols)
+                lt = t->columns.items[left_ref].type;
+            else
+                lt = vops[left_ref - child_ncols].out_type;
+            if (right_ref >= 0 && (uint16_t)right_ref < child_ncols)
+                rt = t->columns.items[right_ref].type;
+            else
+                rt = vops[right_ref - child_ncols].out_type;
+        }
+
+        /* Only numeric types */
+        if (lt != COLUMN_TYPE_INT && lt != COLUMN_TYPE_BIGINT &&
+            lt != COLUMN_TYPE_FLOAT && lt != COLUMN_TYPE_NUMERIC &&
+            lt != COLUMN_TYPE_SMALLINT)
+            return -1;
+
+        if (*nvops >= max_ops) return -1;
+        uint16_t slot = (*nvops)++;
+        struct vec_project_op *vop = &vops[slot];
+        memset(vop, 0, sizeof(*vop));
+        vop->op = op;
+
+        if (right_ref == -2) {
+            /* col/aux OP literal */
+            enum column_type lit_t = re->literal.type;
+            double lit_f = 0.0;
+            int64_t lit_i = 0;
+            if (lit_t == COLUMN_TYPE_FLOAT || lit_t == COLUMN_TYPE_NUMERIC)
+                lit_f = re->literal.value.as_float;
+            else if (lit_t == COLUMN_TYPE_BIGINT)
+                { lit_i = re->literal.value.as_bigint; lit_f = (double)lit_i; }
+            else if (lit_t == COLUMN_TYPE_INT)
+                { lit_i = (int64_t)re->literal.value.as_int; lit_f = (double)lit_i; }
+            else if (lit_t == COLUMN_TYPE_SMALLINT)
+                { lit_i = (int64_t)re->literal.value.as_smallint; lit_f = (double)lit_i; }
+            else { (*nvops)--; return -1; }
+            vop->kind = VEC_COL_OP_LIT;
+            vop->left_col = (uint16_t)left_ref;
+            vop->out_type = lt;
+            if (lt == COLUMN_TYPE_FLOAT || lt == COLUMN_TYPE_NUMERIC)
+                vop->lit_f64 = lit_f;
+            else
+                vop->lit_i64 = lit_i;
+        } else if (left_ref == -2) {
+            /* literal OP col/aux */
+            enum column_type lit_t = le->literal.type;
+            double lit_f = 0.0;
+            int64_t lit_i = 0;
+            if (lit_t == COLUMN_TYPE_FLOAT || lit_t == COLUMN_TYPE_NUMERIC)
+                lit_f = le->literal.value.as_float;
+            else if (lit_t == COLUMN_TYPE_BIGINT)
+                { lit_i = le->literal.value.as_bigint; lit_f = (double)lit_i; }
+            else if (lit_t == COLUMN_TYPE_INT)
+                { lit_i = (int64_t)le->literal.value.as_int; lit_f = (double)lit_i; }
+            else if (lit_t == COLUMN_TYPE_SMALLINT)
+                { lit_i = (int64_t)le->literal.value.as_smallint; lit_f = (double)lit_i; }
+            else { (*nvops)--; return -1; }
+            if (op == OP_SUB || op == OP_DIV || op == OP_MOD) {
+                vop->kind = VEC_LIT_OP_COL;
+            } else {
+                /* Commutative: rewrite as col OP lit */
+                vop->kind = VEC_COL_OP_LIT;
+            }
+            vop->left_col = (uint16_t)right_ref;
+            vop->out_type = rt;
+            if (rt == COLUMN_TYPE_FLOAT || rt == COLUMN_TYPE_NUMERIC)
+                vop->lit_f64 = lit_f;
+            else
+                vop->lit_i64 = lit_i;
+        } else {
+            /* col/aux OP col/aux */
+            if (lt == rt) {
+                vop->kind = VEC_COL_OP_COL;
+                vop->left_col = (uint16_t)left_ref;
+                vop->right_col = (uint16_t)right_ref;
+                vop->out_type = lt;
+            } else {
+                /* Mixed-type: promote */
+                enum column_type out;
+                if (lt == COLUMN_TYPE_FLOAT || lt == COLUMN_TYPE_NUMERIC ||
+                    rt == COLUMN_TYPE_FLOAT || rt == COLUMN_TYPE_NUMERIC)
+                    out = COLUMN_TYPE_FLOAT;
+                else if (lt == COLUMN_TYPE_BIGINT || rt == COLUMN_TYPE_BIGINT)
+                    out = COLUMN_TYPE_BIGINT;
+                else if (lt == COLUMN_TYPE_INT || rt == COLUMN_TYPE_INT)
+                    out = COLUMN_TYPE_INT;
+                else
+                    out = COLUMN_TYPE_SMALLINT;
+                vop->kind = VEC_COL_OP_COL_MIXED;
+                vop->left_col = (uint16_t)left_ref;
+                vop->right_col = (uint16_t)right_ref;
+                vop->out_type = out;
+                vop->lit_i64 = ((int64_t)lt << 16) | (int64_t)rt;
+            }
+        }
+        return (int)child_ncols + (int)slot;
+    }
+
+    return -1; /* unsupported expression type */
 }
 
 /* ---- Plan builder ---- */
