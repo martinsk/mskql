@@ -341,6 +341,41 @@ static inline void cb_copy_value(struct col_block *dst, uint32_t dst_i,
            cb_elem_size(src));
 }
 
+/* Batch gather: compact selected rows from src into contiguous dst.
+ * sel[0..n-1] are the source row indices to gather.
+ * Uses one type switch per column (not per element) for tight loops. */
+static void cb_gather(struct col_block *dst, const struct col_block *src,
+                      const uint32_t *sel, uint16_t n)
+{
+    for (uint16_t i = 0; i < n; i++)
+        dst->nulls[i] = src->nulls[sel[i]];
+
+    switch (column_type_storage(src->type)) {
+    case STORE_I16: { const int16_t *s = src->data.i16; int16_t *d = dst->data.i16;
+        for (uint16_t i = 0; i < n; i++) d[i] = s[sel[i]]; break; }
+    case STORE_I32: { const int32_t *s = src->data.i32; int32_t *d = dst->data.i32;
+        for (uint16_t i = 0; i < n; i++) d[i] = s[sel[i]]; break; }
+    case STORE_I64: { const int64_t *s = src->data.i64; int64_t *d = dst->data.i64;
+        for (uint16_t i = 0; i < n; i++) d[i] = s[sel[i]]; break; }
+    case STORE_F64: { const double *s = src->data.f64; double *d = dst->data.f64;
+        for (uint16_t i = 0; i < n; i++) d[i] = s[sel[i]]; break; }
+    case STORE_STR: { char *const *s = src->data.str; char **d = dst->data.str;
+        for (uint16_t i = 0; i < n; i++) d[i] = s[sel[i]]; break; }
+    case STORE_IV: { const struct interval *s = src->data.iv; struct interval *d = dst->data.iv;
+        for (uint16_t i = 0; i < n; i++) d[i] = s[sel[i]]; break; }
+    case STORE_UUID: { const struct uuid_val *s = src->data.uuid; struct uuid_val *d = dst->data.uuid;
+        for (uint16_t i = 0; i < n; i++) d[i] = s[sel[i]]; break; }
+    case STORE_VEC:
+        if (src->data.vec && src->vec_dim > 0) {
+            uint16_t dim = src->vec_dim;
+            for (uint16_t i = 0; i < n; i++)
+                memcpy(&dst->data.vec[i * dim], &src->data.vec[sel[i] * dim],
+                       dim * sizeof(float));
+        }
+        break;
+    }
+}
+
 /* Helper: get output column count for a plan node. */
 uint16_t plan_node_ncols(struct query_arena *arena, uint32_t node_idx)
 {
@@ -474,7 +509,14 @@ void row_block_alloc(struct row_block *rb, uint16_t ncols,
 {
     rb->ncols = ncols;
     rb->count = 0;
-    rb->cols = (struct col_block *)bump_calloc(scratch, ncols, sizeof(struct col_block));
+    rb->cols = (struct col_block *)bump_alloc(scratch, ncols * sizeof(struct col_block));
+    /* Zero only the header+nulls+str_lens region (1040 bytes) per col_block,
+     * not the 16KB data union which gets overwritten by scan/copy anyway.
+     * This saves ~94% of the zeroing cost vs bump_calloc. */
+    for (uint16_t i = 0; i < ncols; i++) {
+        memset(&rb->cols[i], 0, offsetof(struct col_block, data));
+        rb->cols[i].data.vec = NULL; /* ensure VECTOR pointer starts NULL */
+    }
     rb->sel = NULL;
     rb->sel_count = 0;
 }
@@ -2096,30 +2138,8 @@ static int vec_project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             struct col_block *dst = &compact.cols[col];
             dst->type = src->type;
             dst->count = count;
-            for (uint16_t i = 0; i < count; i++) {
-                uint16_t ri = input.sel[i];
-                dst->nulls[i] = src->nulls[ri];
-            }
-            switch (column_type_storage(src->type)) {
-            case STORE_I32: for (uint16_t i = 0; i < count; i++) dst->data.i32[i] = src->data.i32[input.sel[i]]; break;
-            case STORE_I64: for (uint16_t i = 0; i < count; i++) dst->data.i64[i] = src->data.i64[input.sel[i]]; break;
-            case STORE_F64: for (uint16_t i = 0; i < count; i++) dst->data.f64[i] = src->data.f64[input.sel[i]]; break;
-            case STORE_I16: for (uint16_t i = 0; i < count; i++) dst->data.i16[i] = src->data.i16[input.sel[i]]; break;
-            case STORE_STR: for (uint16_t i = 0; i < count; i++) dst->data.str[i] = src->data.str[input.sel[i]]; break;
-            case STORE_IV:  for (uint16_t i = 0; i < count; i++) dst->data.iv[i]  = src->data.iv[input.sel[i]]; break;
-            case STORE_UUID: for (uint16_t i = 0; i < count; i++) memcpy(dst->data.uuid + i * 16, src->data.uuid + input.sel[i] * 16, 16); break;
-            case STORE_VEC:
-                if (src->data.vec && src->vec_dim > 0) {
-                    uint16_t dim = src->vec_dim;
-                    dst->vec_dim = dim;
-                    dst->data.vec = src->data.vec;
-                    float *tmp = (float *)bump_alloc(&ctx->arena->scratch, count * dim * sizeof(float));
-                    for (uint16_t i = 0; i < count; i++)
-                        memcpy(&tmp[i * dim], &src->data.vec[input.sel[i] * dim], dim * sizeof(float));
-                    dst->data.vec = tmp;
-                }
-                break;
-            }
+            cb_ensure_vec(dst, src, &ctx->arena->scratch);
+            cb_gather(dst, src, input.sel, count);
         }
         input = compact;
     }
@@ -6961,10 +6981,7 @@ static int sort_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     compact.cols[c].type = blk->cols[c].type;
                     compact.cols[c].count = active;
                     cb_ensure_vec(&compact.cols[c], &blk->cols[c], &ctx->arena->scratch);
-                    for (uint16_t i = 0; i < active; i++) {
-                        uint16_t ri = (uint16_t)blk->sel[i];
-                        cb_copy_value(&compact.cols[c], i, &blk->cols[c], ri);
-                    }
+                    cb_gather(&compact.cols[c], &blk->cols[c], blk->sel, active);
                 }
                 *blk = compact;
             }
@@ -7584,10 +7601,7 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     compact.cols[c].type = input.cols[c].type;
                     compact.cols[c].count = count;
                     cb_ensure_vec(&compact.cols[c], &input.cols[c], &ctx->arena->scratch);
-                    for (uint16_t i = 0; i < count; i++) {
-                        uint16_t ri = (uint16_t)input.sel[i];
-                        cb_copy_value(&compact.cols[c], i, &input.cols[c], ri);
-                    }
+                    cb_gather(&compact.cols[c], &input.cols[c], input.sel, count);
                 }
                 input = compact;
             }
@@ -7721,7 +7735,7 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
             }
 
-            row_block_alloc(&input, child_ncols, &ctx->arena->scratch);
+            row_block_reset(&input);
         }
 
         if (!types_set || st->heap_size == 0) {
@@ -8208,8 +8222,7 @@ static int window_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     compact.cols[c].type = blk->cols[c].type;
                     compact.cols[c].count = active;
                     cb_ensure_vec(&compact.cols[c], &blk->cols[c], &ctx->arena->scratch);
-                    for (uint16_t i = 0; i < active; i++)
-                        cb_copy_value(&compact.cols[c], i, &blk->cols[c], (uint16_t)blk->sel[i]);
+                    cb_gather(&compact.cols[c], &blk->cols[c], blk->sel, active);
                 }
                 *blk = compact;
             }
