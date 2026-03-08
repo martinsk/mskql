@@ -1910,10 +1910,6 @@ static int project_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 {
     struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
 
-    /* Pull from child into a temporary block */
-    struct row_block child_block;
-    row_block_alloc(&child_block, out->ncols, &ctx->arena->scratch);
-
     /* We need the child's full column set first */
     uint16_t child_ncols = plan_node_ncols(ctx->arena, pn->left);
     if (child_ncols == 0) child_ncols = out->ncols;
@@ -7557,6 +7553,20 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         uint32_t init_cap = st->heap_cap * 2;
         if (init_cap < 256) init_cap = 256;
 
+        /* Detect single-key numeric fast path for threshold-based pruning.
+         * When the heap is full, we can compare the input row's sort key
+         * directly from the col_block against the heap root's key WITHOUT
+         * copying all columns first.  This skips ~99.9% of copies. */
+        int single_key_fast = 0;
+        int sk_col = -1;        /* sort key column index */
+        int sk_desc = 0;
+        enum column_type sk_type = COLUMN_TYPE_INT;
+        if (pn->top_n.nsort_cols == 1) {
+            sk_col = pn->top_n.sort_cols[0];
+            sk_desc = pn->top_n.sort_descs[0];
+            /* Type will be set from first block */
+        }
+
         /* Collection phase: pull all blocks, maintain heap of best N */
         struct row_block input;
         row_block_alloc(&input, child_ncols, &ctx->arena->scratch);
@@ -7596,6 +7606,18 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                 }
                 st->flat_cap = init_cap;
                 types_set = 1;
+
+                /* Enable single-key fast path for numeric types */
+                if (sk_col >= 0 && sk_col < child_ncols) {
+                    sk_type = st->flat_types[sk_col];
+                    if (sk_type == COLUMN_TYPE_INT || sk_type == COLUMN_TYPE_BOOLEAN ||
+                        sk_type == COLUMN_TYPE_DATE || sk_type == COLUMN_TYPE_ENUM ||
+                        sk_type == COLUMN_TYPE_BIGINT || sk_type == COLUMN_TYPE_TIME ||
+                        sk_type == COLUMN_TYPE_TIMESTAMP || sk_type == COLUMN_TYPE_TIMESTAMPTZ ||
+                        sk_type == COLUMN_TYPE_FLOAT || sk_type == COLUMN_TYPE_NUMERIC ||
+                        sk_type == COLUMN_TYPE_SMALLINT)
+                        single_key_fast = 1;
+                }
             }
 
             /* Append rows to flat arrays and maintain heap */
@@ -7617,9 +7639,64 @@ static int top_n_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                     st->heap[st->heap_size] = fi;
                     st->heap_size++;
                     top_n_sift_up(st, pn, st->heap_size - 1);
+                } else if (single_key_fast) {
+                    /* Fast path: compare sort key directly from col_block
+                     * against heap root threshold — skip copy if row can't win. */
+                    uint32_t root_fi = st->heap[0];
+                    uint8_t new_null = input.cols[sk_col].nulls[r];
+                    uint8_t root_null = st->flat_nulls[sk_col][root_fi];
+                    int skip = 0;
+                    if (!new_null && !root_null) {
+                        if (sk_type == COLUMN_TYPE_INT || sk_type == COLUMN_TYPE_BOOLEAN ||
+                            sk_type == COLUMN_TYPE_DATE || sk_type == COLUMN_TYPE_ENUM) {
+                            int32_t nv = input.cols[sk_col].data.i32[r];
+                            int32_t rv = ((const int32_t *)st->flat_data[sk_col])[root_fi];
+                            skip = sk_desc ? (nv <= rv) : (nv >= rv);
+                        } else if (sk_type == COLUMN_TYPE_BIGINT || sk_type == COLUMN_TYPE_TIME ||
+                                   sk_type == COLUMN_TYPE_TIMESTAMP || sk_type == COLUMN_TYPE_TIMESTAMPTZ) {
+                            int64_t nv = input.cols[sk_col].data.i64[r];
+                            int64_t rv = ((const int64_t *)st->flat_data[sk_col])[root_fi];
+                            skip = sk_desc ? (nv <= rv) : (nv >= rv);
+                        } else if (sk_type == COLUMN_TYPE_FLOAT || sk_type == COLUMN_TYPE_NUMERIC) {
+                            double nv = input.cols[sk_col].data.f64[r];
+                            double rv = ((const double *)st->flat_data[sk_col])[root_fi];
+                            skip = sk_desc ? (nv <= rv) : (nv >= rv);
+                        } else if (sk_type == COLUMN_TYPE_SMALLINT) {
+                            int16_t nv = input.cols[sk_col].data.i16[r];
+                            int16_t rv = ((const int16_t *)st->flat_data[sk_col])[root_fi];
+                            skip = sk_desc ? (nv <= rv) : (nv >= rv);
+                        }
+                    } else if (new_null && !root_null) {
+                        /* NULL row vs non-NULL root — check NULLS FIRST/LAST */
+                        int nf = pn->top_n.sort_nulls_first ? pn->top_n.sort_nulls_first[0] : -1;
+                        int nulls_go_first = (nf == 1) || (nf == -1 && sk_desc);
+                        /* NULL "sorts before" if nulls_go_first; new row is better only if that's true */
+                        skip = !nulls_go_first; /* skip if NULL goes last (row is worse) */
+                    } else if (!new_null && root_null) {
+                        int nf = pn->top_n.sort_nulls_first ? pn->top_n.sort_nulls_first[0] : -1;
+                        int nulls_go_first = (nf == 1) || (nf == -1 && sk_desc);
+                        skip = nulls_go_first; /* skip if NULL root goes first (root is better) */
+                    } else {
+                        skip = 1; /* both NULL — equal, skip */
+                    }
+                    if (skip) continue;
+
+                    /* Row beats threshold — copy and replace root */
+                    uint32_t fi = st->total_rows;
+                    if (fi >= st->flat_cap)
+                        top_n_grow_flat(st, st->flat_cap * 2, &ctx->arena->scratch);
+                    for (uint16_t c = 0; c < child_ncols; c++) {
+                        size_t elem_sz = st->flat_elem_sizes[c];
+                        memcpy((uint8_t *)st->flat_data[c] + fi * elem_sz,
+                               (uint8_t *)cb_data_ptr(&input.cols[c], 0) + r * elem_sz,
+                               elem_sz);
+                        st->flat_nulls[c][fi] = input.cols[c].nulls[r];
+                    }
+                    st->total_rows++;
+                    st->heap[0] = fi;
+                    top_n_sift_down(st, pn, 0);
                 } else {
-                    /* Heap full — compare new row against root (worst of best N).
-                     * We need to temporarily store the new row to compare. */
+                    /* Generic path: copy row then compare against root */
                     uint32_t fi = st->total_rows;
                     if (fi >= st->flat_cap)
                         top_n_grow_flat(st, st->flat_cap * 2, &ctx->arena->scratch);
@@ -9426,20 +9503,129 @@ static int set_op_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
 
 /* ---- Hash-based DISTINCT ---- */
 
+/* Tagged wrapper: distinguishes i32 fast path from generic set_op_state. */
+#define DISTINCT_TAG_GENERIC 0
+#define DISTINCT_TAG_I32     1
+
+struct distinct_state_wrapper {
+    int tag;  /* DISTINCT_TAG_GENERIC or DISTINCT_TAG_I32 */
+    union {
+        struct set_op_state generic;
+        struct {
+            int32_t  *vals;        /* unique values collected */
+            uint8_t   has_null;    /* 1 if NULL was seen */
+            uint32_t  count;       /* number of unique values (excl. NULL) */
+            uint32_t  cap;         /* capacity of vals array */
+            uint32_t *ht_slots;    /* open-addressing: slot -> vals index, or 0xFFFFFFFF */
+            uint32_t  ht_mask;     /* power-of-2 - 1 */
+            int       phase;       /* 0=collect, 1=emit */
+            uint32_t  emit_cursor;
+        } i32;
+    } u;
+};
+
+static inline int di32_insert(struct distinct_state_wrapper *w, int32_t v,
+                               struct bump_alloc *scratch)
+{
+    uint32_t h = (uint32_t)v * 2654435761u;
+    uint32_t slot = h & w->u.i32.ht_mask;
+    for (;;) {
+        uint32_t idx = w->u.i32.ht_slots[slot];
+        if (idx == 0xFFFFFFFF) break;
+        if (w->u.i32.vals[idx] == v) return 0; /* duplicate */
+        slot = (slot + 1) & w->u.i32.ht_mask;
+    }
+    if (w->u.i32.count >= w->u.i32.cap) {
+        uint32_t new_cap = w->u.i32.cap * 2;
+        int32_t *nv = (int32_t *)bump_alloc(scratch, new_cap * sizeof(int32_t));
+        memcpy(nv, w->u.i32.vals, w->u.i32.count * sizeof(int32_t));
+        w->u.i32.vals = nv;
+        w->u.i32.cap = new_cap;
+    }
+    if (w->u.i32.count * 10 >= w->u.i32.ht_mask * 7) {
+        uint32_t new_size = (w->u.i32.ht_mask + 1) * 2;
+        uint32_t *ns = (uint32_t *)bump_alloc(scratch, new_size * sizeof(uint32_t));
+        memset(ns, 0xFF, new_size * sizeof(uint32_t));
+        uint32_t nm = new_size - 1;
+        for (uint32_t i = 0; i < w->u.i32.count; i++) {
+            uint32_t s = ((uint32_t)w->u.i32.vals[i] * 2654435761u) & nm;
+            while (ns[s] != 0xFFFFFFFF) s = (s + 1) & nm;
+            ns[s] = i;
+        }
+        w->u.i32.ht_slots = ns;
+        w->u.i32.ht_mask = nm;
+        slot = h & nm;
+        while (w->u.i32.ht_slots[slot] != 0xFFFFFFFF) slot = (slot + 1) & nm;
+    }
+    uint32_t idx = w->u.i32.count++;
+    w->u.i32.vals[idx] = v;
+    w->u.i32.ht_slots[slot] = idx;
+    return 1;
+}
+
 static int distinct_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
                          struct row_block *out)
 {
     struct plan_node *pn = &PLAN_NODE(ctx->arena, node_idx);
-    struct set_op_state *st = (struct set_op_state *)ctx->node_states[node_idx];
-    if (!st) {
+    struct distinct_state_wrapper *w =
+        (struct distinct_state_wrapper *)ctx->node_states[node_idx];
+
+    if (!w) {
         uint16_t ncols = plan_node_ncols(ctx->arena, pn->left);
-        st = (struct set_op_state *)bump_calloc(&ctx->arena->scratch, 1, sizeof(*st));
+        w = (struct distinct_state_wrapper *)bump_calloc(
+            &ctx->arena->scratch, 1, sizeof(*w));
+        ctx->node_states[node_idx] = w;
+
+        /* Detect single-column integer fast path */
+        int use_i32 = 0;
+        struct row_block peek;
+        if (ncols == 1) {
+            row_block_alloc(&peek, ncols, &ctx->arena->scratch);
+            int rc = plan_next_block(ctx, pn->left, &peek);
+            if (rc == 0 && (peek.cols[0].type == COLUMN_TYPE_INT ||
+                            peek.cols[0].type == COLUMN_TYPE_BOOLEAN))
+                use_i32 = 1;
+            /* If rc != 0, empty input — will return -1 below */
+            if (rc != 0) {
+                w->tag = DISTINCT_TAG_GENERIC;
+                w->u.generic.ncols = ncols;
+                w->u.generic.phase = 1;
+                w->u.generic.row_count = 0;
+                w->u.generic.emit_cursor = 0;
+                goto generic_emit;
+            }
+        }
+
+        if (use_i32) {
+            w->tag = DISTINCT_TAG_I32;
+            w->u.i32.cap = 4096;
+            w->u.i32.vals = (int32_t *)bump_alloc(&ctx->arena->scratch,
+                                                    w->u.i32.cap * sizeof(int32_t));
+            uint32_t ht_size = 8192;
+            w->u.i32.ht_slots = (uint32_t *)bump_alloc(&ctx->arena->scratch,
+                                                         ht_size * sizeof(uint32_t));
+            memset(w->u.i32.ht_slots, 0xFF, ht_size * sizeof(uint32_t));
+            w->u.i32.ht_mask = ht_size - 1;
+            w->u.i32.phase = 0;
+
+            /* Process peeked block */
+            uint16_t active = row_block_active_count(&peek);
+            for (uint16_t i = 0; i < active; i++) {
+                uint16_t ri = row_block_row_idx(&peek, i);
+                if (peek.cols[0].nulls[ri]) { w->u.i32.has_null = 1; continue; }
+                di32_insert(w, peek.cols[0].data.i32[ri], &ctx->arena->scratch);
+            }
+            goto i32_collect;
+        }
+
+        /* Generic path */
+        w->tag = DISTINCT_TAG_GENERIC;
+        struct set_op_state *st = &w->u.generic;
         st->ncols = ncols;
         st->row_cap = 4096;
         st->row_count = 0;
         st->phase = 0;
         st->emit_cursor = 0;
-
         st->col_data = (void **)bump_alloc(&ctx->arena->scratch, ncols * sizeof(void *));
         st->col_nulls = (uint8_t **)bump_alloc(&ctx->arena->scratch, ncols * sizeof(uint8_t *));
         st->col_types = (enum column_type *)bump_alloc(&ctx->arena->scratch, ncols * sizeof(enum column_type));
@@ -9448,12 +9634,83 @@ static int distinct_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
             st->col_data[c] = bump_calloc(&ctx->arena->scratch, st->row_cap, sizeof(double));
             st->col_nulls[c] = (uint8_t *)bump_calloc(&ctx->arena->scratch, st->row_cap, 1);
         }
-
         block_ht_init(&st->ht, st->row_cap, &ctx->arena->scratch);
-        ctx->node_states[node_idx] = st;
+
+        /* If we peeked a block (ncols==1 but non-int type), process it now */
+        if (ncols == 1) {
+            uint16_t active = row_block_active_count(&peek);
+            for (uint16_t i = 0; i < active; i++) {
+                uint16_t ri = row_block_row_idx(&peek, i);
+                if (st->row_count >= st->row_cap)
+                    set_op_grow(st, &ctx->arena->scratch);
+                if (st->row_count == 0) {
+                    for (uint16_t c2 = 0; c2 < st->ncols; c2++)
+                        st->col_types[c2] = peek.cols[c2].type;
+                }
+                uint32_t di = st->row_count;
+                set_op_copy_from_block(st, &peek, ri, di);
+                st->row_count++;
+                if (!set_op_ht_insert(st, di))
+                    st->row_count--;
+            }
+        }
+        goto generic_collect;
     }
 
-    /* Phase 0: collect all input rows, dedup via hash table */
+    /* Re-entry: dispatch by tag */
+    if (w->tag == DISTINCT_TAG_I32) {
+        if (w->u.i32.phase == 0) goto i32_collect;
+        goto i32_emit;
+    }
+    goto generic_reentry;
+
+    /* ---- i32 fast path: collect remaining blocks ---- */
+i32_collect: {
+        struct row_block input;
+        row_block_alloc(&input, 1, &ctx->arena->scratch);
+        while (plan_next_block(ctx, pn->left, &input) == 0) {
+            uint16_t active = row_block_active_count(&input);
+            for (uint16_t i = 0; i < active; i++) {
+                uint16_t ri = row_block_row_idx(&input, i);
+                if (input.cols[0].nulls[ri]) { w->u.i32.has_null = 1; continue; }
+                di32_insert(w, input.cols[0].data.i32[ri], &ctx->arena->scratch);
+            }
+            row_block_reset(&input);
+        }
+        w->u.i32.phase = 1;
+        w->u.i32.emit_cursor = 0;
+    }
+i32_emit: {
+        uint32_t cursor = w->u.i32.emit_cursor;
+        uint32_t total = w->u.i32.count + (w->u.i32.has_null ? 1 : 0);
+        if (cursor >= total) return -1;
+
+        row_block_reset(out);
+        out->cols[0].type = COLUMN_TYPE_INT;
+        uint16_t n = 0;
+        while (cursor < total && n < BLOCK_CAPACITY) {
+            if (cursor < w->u.i32.count) {
+                out->cols[0].data.i32[n] = w->u.i32.vals[cursor];
+                out->cols[0].nulls[n] = 0;
+            } else {
+                out->cols[0].nulls[n] = 1;
+                out->cols[0].data.i32[n] = 0;
+            }
+            n++;
+            cursor++;
+        }
+        out->count = n;
+        w->u.i32.emit_cursor = cursor;
+        return 0;
+    }
+
+    /* ---- Generic path ---- */
+generic_reentry:;
+    struct set_op_state *st = &w->u.generic;
+    if (st->phase == 1) goto generic_emit;
+
+generic_collect:
+    st = &w->u.generic;
     if (st->phase == 0) {
         struct row_block input;
         row_block_alloc(&input, st->ncols, &ctx->arena->scratch);
@@ -9484,8 +9741,9 @@ static int distinct_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         st->emit_cursor = 0;
     }
 
+generic_emit:
     /* Phase 1: emit unique rows (match_mode=0: no filtering) */
-    return flat_emit_block(st, out, 0);
+    return flat_emit_block(&w->u.generic, out, 0);
 }
 
 /* ---- Parquet Scan ---- */

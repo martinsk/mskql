@@ -4656,7 +4656,7 @@ int db_exec_sql_discard(struct database *db, const char *sql)
         }
 
         struct table *t = s->table.len > 0 ? db_find_table_sv(db, s->table) : NULL;
-        if (t) {
+        if (t || s->has_generate_series) {
             struct plan_result pr = plan_build_select(t, s, &q.arena, db);
             if (pr.status == PLAN_OK) {
                 struct plan_exec_ctx ctx;
