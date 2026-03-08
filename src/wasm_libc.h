@@ -50,6 +50,14 @@ typedef unsigned int       uintptr_t;  /* wasm32: pointers are 32-bit */
 #define LLONG_MAX  INT64_MAX
 #define LLONG_MIN  INT64_MIN
 
+/* ── inttypes format macros ────────────────────────────────────── */
+#define PRId32 "d"
+#define PRIu32 "u"
+#define PRIx32 "x"
+#define PRId64 "lld"
+#define PRIu64 "llu"
+#define PRIx64 "llx"
+
 /* ── stdbool ────────────────────────────────────────────────────── */
 #ifndef __cplusplus
 typedef _Bool bool;

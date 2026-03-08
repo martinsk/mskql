@@ -115,7 +115,7 @@ wasm: wasm-stubs $(WASM_TARGET)
 
 wasm-stubs: | $(BUILDDIR)
 	@mkdir -p $(WASM_INCDIR) $(WASM_INCDIR)/sys
-	@for h in stdio.h stdlib.h string.h strings.h stddef.h stdint.h stdbool.h stdarg.h ctype.h math.h time.h signal.h float.h unistd.h; do \
+	@for h in stdio.h stdlib.h string.h strings.h stddef.h stdint.h stdbool.h stdarg.h ctype.h math.h time.h signal.h float.h unistd.h inttypes.h; do \
 		echo '/* stub */' > $(WASM_INCDIR)/$$h; \
 	done
 	@echo '/* stub */' > $(WASM_INCDIR)/sys/stat.h
