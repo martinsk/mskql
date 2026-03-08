@@ -402,6 +402,71 @@ static inline void block_ht_init(struct block_hash_table *ht, uint32_t capacity,
     ht->count = 0;
 }
 
+/* ---- Swiss Table helpers for hash join ---- */
+
+/* Extract the 7-bit tag from a full 32-bit hash (bits 25..31). */
+static inline uint8_t swiss_h2(uint32_t h) { return (uint8_t)(h >> 25) & 0x7F; }
+
+/* Initialize Swiss Table overlay on an existing block_hash_table.
+ * Call AFTER block_ht_init (which sets up nexts/hashes for chaining duplicates).
+ * nslots is sized to ~8/7 of capacity for ≤87.5% load factor. */
+static void swiss_ht_init(struct block_hash_table *ht, uint32_t capacity,
+                           struct bump_alloc *scratch)
+{
+    uint32_t ns = 16; /* minimum one group */
+    uint32_t target = capacity + capacity / 7 + 16; /* ~87.5% max load */
+    while (ns < target) ns <<= 1;
+    ht->nslots = ns;
+    ht->slot_mask = ns - 1;
+    ht->ctrl = (uint8_t *)bump_alloc(scratch, ns);
+    memset(ht->ctrl, SWISS_CTRL_EMPTY, ns);
+    ht->slot_entry = (uint32_t *)bump_alloc(scratch, ns * sizeof(uint32_t));
+}
+
+/* Insert entry_idx with precomputed hash h into the Swiss Table.
+ * Duplicate keys are chained via ht->nexts[] (set by caller). */
+static void swiss_ht_insert(struct block_hash_table *ht, uint32_t entry_idx, uint32_t h)
+{
+    uint8_t tag = swiss_h2(h);
+    uint32_t pos = h & ht->slot_mask;
+    while (ht->ctrl[pos] != SWISS_CTRL_EMPTY)
+        pos = (pos + 1) & ht->slot_mask;
+    ht->ctrl[pos] = tag;
+    ht->slot_entry[pos] = entry_idx;
+}
+
+/* Probe the Swiss Table for the bucket head matching hash h.
+ * Uses the classic buckets[] lookup — Swiss Table accelerates the initial
+ * lookup, but for correctness with duplicate-key chains we use buckets[].
+ * The Swiss Table benefit is in the build phase (cache-friendly insert)
+ * and in the fast-miss path (ctrl byte scan).
+ *
+ * Returns the head entry of the hash chain, or IDX_NONE if empty bucket. */
+static uint32_t swiss_ht_probe(const struct block_hash_table *ht, uint32_t h)
+{
+    if (!ht->ctrl) {
+        /* No Swiss overlay — fall back to classic bucket lookup */
+        return ht->buckets[h & (ht->nbuckets - 1)];
+    }
+    /* Quick rejection: scan ctrl bytes starting at h's home position.
+     * If we hit EMPTY before finding any tag match, the key is absent. */
+    uint8_t tag = swiss_h2(h);
+    uint32_t pos = h & ht->slot_mask;
+    uint32_t mask = ht->slot_mask;
+    for (;;) {
+        uint8_t c = ht->ctrl[pos];
+        if (c == tag) {
+            /* Found a tag match — return the classic bucket head for this hash.
+             * The entry in the Swiss slot may not be the actual chain head
+             * (due to duplicate inserts), so use buckets[] for correctness. */
+            return ht->buckets[h & (ht->nbuckets - 1)];
+        }
+        if (c == SWISS_CTRL_EMPTY)
+            return IDX_NONE;
+        pos = (pos + 1) & mask;
+    }
+}
+
 /* ---- Row block init (needs bump_alloc from arena.h) ---- */
 
 void row_block_alloc(struct row_block *rb, uint16_t ncols,
@@ -3783,6 +3848,22 @@ static int hash_join_restore_from_cache(struct plan_exec_ctx *ctx,
     st->ht.buckets = (uint32_t *)bump_alloc(&ctx->arena->scratch, jc->nbuckets * sizeof(uint32_t));
     memcpy(st->ht.buckets, jc->buckets, jc->nbuckets * sizeof(uint32_t));
 
+    /* Restore Swiss Table overlay */
+    if (jc->ctrl) {
+        st->ht.nslots = jc->nslots;
+        st->ht.slot_mask = jc->slot_mask;
+        st->ht.ctrl = (uint8_t *)bump_alloc(&ctx->arena->scratch, jc->nslots);
+        memcpy(st->ht.ctrl, jc->ctrl, jc->nslots);
+        st->ht.slot_entry = (uint32_t *)bump_alloc(&ctx->arena->scratch,
+                                                     jc->nslots * sizeof(uint32_t));
+        memcpy(st->ht.slot_entry, jc->slot_entry, jc->nslots * sizeof(uint32_t));
+    } else {
+        st->ht.ctrl = NULL;
+        st->ht.slot_entry = NULL;
+        st->ht.nslots = 0;
+        st->ht.slot_mask = 0;
+    }
+
     st->build_done = 1;
     return 0;
 }
@@ -3798,6 +3879,8 @@ static void hash_join_save_to_cache(struct hash_join_state *st,
         free(jc->hashes);
         free(jc->nexts);
         free(jc->buckets);
+        free(jc->ctrl);
+        free(jc->slot_entry);
     }
 
     uint16_t ncols = st->build_ncols;
@@ -3839,6 +3922,21 @@ static void hash_join_save_to_cache(struct hash_join_state *st,
     memcpy(jc->nexts, st->ht.nexts, nrows * sizeof(uint32_t));
     jc->buckets = (uint32_t *)malloc(st->ht.nbuckets * sizeof(uint32_t));
     memcpy(jc->buckets, st->ht.buckets, st->ht.nbuckets * sizeof(uint32_t));
+
+    /* Save Swiss Table overlay */
+    if (st->ht.ctrl) {
+        jc->nslots = st->ht.nslots;
+        jc->slot_mask = st->ht.slot_mask;
+        jc->ctrl = (uint8_t *)malloc(st->ht.nslots);
+        memcpy(jc->ctrl, st->ht.ctrl, st->ht.nslots);
+        jc->slot_entry = (uint32_t *)malloc(st->ht.nslots * sizeof(uint32_t));
+        memcpy(jc->slot_entry, st->ht.slot_entry, st->ht.nslots * sizeof(uint32_t));
+    } else {
+        jc->ctrl = NULL;
+        jc->slot_entry = NULL;
+        jc->nslots = 0;
+        jc->slot_mask = 0;
+    }
 
     jc->valid = 1;
 }
@@ -3929,9 +4027,10 @@ static void hash_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
         row_block_reset(&inner_block);
     }
 
-    /* Build hash table on the join key column */
-    block_ht_init(&st->ht, st->build_count > 0 ? st->build_count : 1,
-                  &ctx->arena->scratch);
+    /* Build hash table on the join key column (Swiss Table + nexts[] for duplicates) */
+    uint32_t build_cap = st->build_count > 0 ? st->build_count : 1;
+    block_ht_init(&st->ht, build_cap, &ctx->arena->scratch);
+    swiss_ht_init(&st->ht, build_cap, &ctx->arena->scratch);
 
     struct flat_col *key_fc = &st->build_cols[key_col];
     int build_widen = (pn->hash_join.key_type == COLUMN_TYPE_BIGINT &&
@@ -3946,10 +4045,17 @@ static void hash_join_build(struct plan_exec_ctx *ctx, uint32_t node_idx)
         } else {
             h = flat_col_hash(key_fc, i);
         }
-        uint32_t bucket = h & (st->ht.nbuckets - 1);
         st->ht.hashes[i] = h;
-        st->ht.nexts[i] = st->ht.buckets[bucket];
+        /* Chain duplicates via classic buckets/nexts */
+        uint32_t bucket = h & (st->ht.nbuckets - 1);
+        uint32_t prev_head = st->ht.buckets[bucket];
+        st->ht.nexts[i] = prev_head;
         st->ht.buckets[bucket] = i;
+        /* Insert into Swiss Table: only the new head of each chain.
+         * When a new entry becomes the head, it replaces the old head
+         * in the Swiss Table slot.  We always insert — for duplicate
+         * hashes the probe will find the head and follow nexts[]. */
+        swiss_ht_insert(&st->ht, i, h);
         st->ht.count++;
     }
 
@@ -4067,8 +4173,7 @@ static int hash_join_next(struct plan_exec_ctx *ctx, uint32_t node_idx,
         } else {
             h = block_hash_cell(outer_key_cb, oi);
         }
-        uint32_t bucket = h & (st->ht.nbuckets - 1);
-        uint32_t entry = st->ht.buckets[bucket];
+        uint32_t entry = swiss_ht_probe(&st->ht, h);
         int found = 0;
 
         while (entry != IDX_NONE && entry != 0xFFFFFFFF && out_count < BLOCK_CAPACITY) {

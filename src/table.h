@@ -20,6 +20,11 @@ struct join_cache {
     uint32_t        *nexts;      /* [ft.nrows] next pointers */
     uint32_t        *buckets;    /* [nbuckets] bucket heads */
     uint32_t         nbuckets;   /* number of hash buckets */
+    /* Swiss Table overlay for hash join probe */
+    uint8_t         *ctrl;       /* [nslots] metadata bytes */
+    uint32_t        *slot_entry; /* [nslots] entry index per slot */
+    uint32_t         nslots;     /* power of 2 */
+    uint32_t         slot_mask;  /* nslots - 1 */
     int              valid;
 };
 

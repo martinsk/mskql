@@ -595,6 +595,8 @@ void table_free(struct table *t)
         free(t->join_cache.hashes);
         free(t->join_cache.nexts);
         free(t->join_cache.buckets);
+        free(t->join_cache.ctrl);
+        free(t->join_cache.slot_entry);
     }
 
     /* Free kind-specific union fields */

@@ -55,7 +55,18 @@ struct block_hash_table {
     uint32_t *hashes;          /* bump-allocated, cached hash per entry */
     uint32_t  capacity;        /* max entries before resize */
     uint32_t  count;           /* current number of entries */
+    /* Swiss Table overlay — used by hash join only.
+     * ctrl[i]: 0x00–0x7F = occupied (top 7 bits of hash), 0x80 = empty.
+     * slot_entry[i]: entry index stored at slot i.
+     * Other consumers (hash_agg, semi_join, etc.) ignore these fields. */
+    uint8_t  *ctrl;            /* [nslots] metadata bytes, NULL if not Swiss */
+    uint32_t *slot_entry;      /* [nslots] entry index per slot */
+    uint32_t  nslots;          /* power of 2, >= capacity * 8/7 */
+    uint32_t  slot_mask;       /* nslots - 1 */
 };
+
+#define SWISS_CTRL_EMPTY  0x80
+#define SWISS_GROUP_SIZE  16
 
 /* ---- inline helpers ---- */
 
