@@ -206,6 +206,7 @@ struct plan_node {
             struct table *table;     /* source table — needed for eval_expr on expression aggregates */
             enum column_type *agg_col_types; /* bump: original table column type per aggregate (for emit after projection) */
             int       int_fast_path; /* 1 = all group keys and agg cols are integer-family (STORE_I32/I64) */
+            int       skip_minmax;  /* 1 = no MIN/MAX aggregates → skip min/max tracking in int fast path */
             int      *agg_order_col; /* bump: ORDER BY column index per aggregate (-1 = none) */
             int      *agg_order_desc; /* bump: 1=DESC per aggregate */
         } hash_agg;

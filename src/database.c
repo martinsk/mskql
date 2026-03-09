@@ -2990,8 +2990,14 @@ static int db_exec_select(struct database *db, struct query *q, struct rows *res
     }
 
     struct table *gs_temp = NULL;
-    if (s->has_generate_series)
+    if (s->has_generate_series) {
         gs_temp = materialize_generate_series(db, q, s);
+        /* Clear flag: generate_series is now a real temp table, so the plan
+         * executor should treat it as a plain table scan (with expression
+         * projection) rather than taking the generate_series fast path
+         * which only produces the raw series column. */
+        s->has_generate_series = 0;
+    }
 
     /* view expansion: if the table is a view, materialize it */
     struct table *view_temp = NULL;
@@ -3427,6 +3433,7 @@ static int db_exec_drop(struct database *db, struct query_drop_table *dt,
             for (size_t j = i; j + 1 < db->tables.count; j++)
                 db->tables.items[j] = db->tables.items[j + 1];
             db->tables.count--;
+            db->total_generation++;
             found = 1;
             break;
         }
@@ -4626,6 +4633,181 @@ int db_exec_sql(struct database *db, const char *sql, struct rows *result)
     return rc;
 }
 
+/* Try to inline a simple CTE query by building a single plan tree.
+ * Pattern: WITH <name> AS (<inner>) SELECT * FROM <name> [WHERE ...] [ORDER BY ...] [LIMIT ...]
+ * Returns 0 on success, -1 if inlining is not possible. */
+static int try_inline_cte_discard(struct database *db, struct query *q)
+{
+    struct query_select *s = &q->select;
+
+    /* Detect single non-recursive CTE */
+    const char *cte_sql_str = NULL;
+    const char *cte_name_str = NULL;
+    if (s->ctes_count == 1 && !s->has_recursive_cte) {
+        struct cte_def *cd = &q->arena.ctes.items[s->ctes_start];
+        if (cd->is_recursive) return -1;
+        cte_sql_str = ASTRING(&q->arena, cd->sql_idx);
+        cte_name_str = ASTRING(&q->arena, cd->name_idx);
+    } else if (s->ctes_count == 0 && s->cte_name != IDX_NONE &&
+               s->cte_sql != IDX_NONE && !s->has_recursive_cte) {
+        cte_sql_str = ASTRING(&q->arena, s->cte_sql);
+        cte_name_str = ASTRING(&q->arena, s->cte_name);
+    } else {
+        return -1;
+    }
+
+    /* Outer query must be SELECT * FROM <cte_name> */
+    if (!sv_eq_cstr(s->columns, "*")) return -1;
+    if (!sv_eq_cstr(s->table, cte_name_str)) return -1;
+    if (s->has_join || s->has_group_by || s->aggregates_count > 0 ||
+        s->has_set_op || s->has_distinct || s->has_distinct_on ||
+        s->select_exprs_count > 0 || s->from_subquery_sql != IDX_NONE ||
+        s->has_generate_series || s->has_expr_aggs ||
+        s->parsed_columns_count > 0 || s->insert_rows_count > 0)
+        return -1;
+
+    /* Parse inner CTE query */
+    struct query inner_q = {0};
+    if (query_parse(cte_sql_str, &inner_q) != 0) {
+        query_free(&inner_q);
+        return -1;
+    }
+    if (inner_q.query_type != QUERY_TYPE_SELECT) {
+        query_free(&inner_q);
+        return -1;
+    }
+
+    struct query_select *is = &inner_q.select;
+    struct table *src = NULL;
+    if (is->table.len > 0) src = db_find_table_sv(db, is->table);
+    if (!src) { query_free(&inner_q); return -1; }
+
+    /* Build plan for inner CTE query */
+    struct plan_result pr = plan_build_select(src, is, &inner_q.arena, db);
+    if (pr.status != PLAN_OK) { query_free(&inner_q); return -1; }
+    uint32_t current = pr.node;
+
+    /* Append outer WHERE: resolve column names against inner query output */
+    if (s->where.has_where && s->where.where_cond != IDX_NONE) {
+        struct condition *oc = &q->arena.conditions.items[s->where.where_cond];
+        /* Simple comparison: col CMP literal */
+        if (oc->type != COND_COMPARE || oc->column.len == 0) goto bail;
+
+        /* Resolve column name against inner query's output layout */
+        uint16_t ngrp = is->has_group_by ? (uint16_t)is->group_by_count : 0;
+        uint32_t agg_n = is->aggregates_count;
+        uint16_t agg_offset = is->agg_before_cols ? 0 : ngrp;
+        uint16_t grp_offset = is->agg_before_cols ? (uint16_t)agg_n : 0;
+        int col_idx = -1;
+
+        /* Match against GROUP BY column names */
+        for (uint32_t g = 0; g < is->group_by_count; g++) {
+            sv gcol = inner_q.arena.svs.items[is->group_by_start + g];
+            if (sv_eq_ignorecase(oc->column, gcol)) {
+                col_idx = (int)(grp_offset + g);
+                break;
+            }
+        }
+        /* Match against aggregate aliases */
+        if (col_idx < 0) {
+            for (uint32_t a = 0; a < agg_n; a++) {
+                struct agg_expr *ae = &inner_q.arena.aggregates.items[is->aggregates_start + a];
+                if (ae->alias.len > 0 && sv_eq_ignorecase(oc->column, ae->alias)) {
+                    col_idx = (int)(agg_offset + a);
+                    break;
+                }
+            }
+        }
+        /* Match against source table columns (non-agg queries) */
+        if (col_idx < 0 && agg_n == 0 && ngrp == 0) {
+            col_idx = table_find_column_sv(src, oc->column);
+        }
+        if (col_idx < 0) goto bail;
+
+        /* Create filter node in inner arena */
+        uint32_t fi = plan_alloc_node(&inner_q.arena, PLAN_FILTER);
+        /* Copy condition into inner arena */
+        struct condition nc = *oc;
+        da_push(&inner_q.arena.conditions, nc);
+        uint32_t new_cond = (uint32_t)(inner_q.arena.conditions.count - 1);
+
+        PLAN_NODE(&inner_q.arena, fi).left = current;
+        PLAN_NODE(&inner_q.arena, fi).filter.cond_idx = new_cond;
+        PLAN_NODE(&inner_q.arena, fi).filter.col_idx = col_idx;
+        PLAN_NODE(&inner_q.arena, fi).filter.cmp_op = oc->op;
+        PLAN_NODE(&inner_q.arena, fi).filter.cmp_val = oc->value;
+        current = fi;
+    }
+
+    /* Append outer ORDER BY */
+    if (s->has_order_by && s->order_by_count > 0) {
+        uint16_t ngrp = is->has_group_by ? (uint16_t)is->group_by_count : 0;
+        uint32_t agg_n = is->aggregates_count;
+        uint16_t agg_offset = is->agg_before_cols ? 0 : ngrp;
+        uint16_t grp_offset = is->agg_before_cols ? (uint16_t)agg_n : 0;
+
+        uint16_t sort_nord = s->order_by_count < 32 ? (uint16_t)s->order_by_count : 32;
+        int *sc = (int *)bump_alloc(&inner_q.arena.scratch, sort_nord * sizeof(int));
+        int *sd = (int *)bump_alloc(&inner_q.arena.scratch, sort_nord * sizeof(int));
+        int *snf = (int *)bump_alloc(&inner_q.arena.scratch, sort_nord * sizeof(int));
+
+        for (uint16_t k = 0; k < sort_nord; k++) {
+            struct order_by_item *obi = &q->arena.order_items.items[s->order_by_start + k];
+            sc[k] = -1;
+            sd[k] = obi->desc;
+            snf[k] = obi->nulls_first;
+
+            for (uint32_t g = 0; g < is->group_by_count; g++) {
+                sv gcol = inner_q.arena.svs.items[is->group_by_start + g];
+                if (sv_eq_ignorecase(obi->column, gcol)) { sc[k] = (int)(grp_offset + g); break; }
+            }
+            if (sc[k] < 0) {
+                for (uint32_t a = 0; a < agg_n; a++) {
+                    struct agg_expr *ae = &inner_q.arena.aggregates.items[is->aggregates_start + a];
+                    if (ae->alias.len > 0 && sv_eq_ignorecase(obi->column, ae->alias)) {
+                        sc[k] = (int)(agg_offset + a); break;
+                    }
+                }
+            }
+            if (sc[k] < 0 && agg_n == 0 && ngrp == 0)
+                sc[k] = table_find_column_sv(src, obi->column);
+            if (sc[k] < 0) goto bail;
+        }
+
+        uint32_t sort_idx = plan_alloc_node(&inner_q.arena, PLAN_SORT);
+        PLAN_NODE(&inner_q.arena, sort_idx).left = current;
+        PLAN_NODE(&inner_q.arena, sort_idx).sort.sort_cols = sc;
+        PLAN_NODE(&inner_q.arena, sort_idx).sort.sort_descs = sd;
+        PLAN_NODE(&inner_q.arena, sort_idx).sort.sort_nulls_first = snf;
+        PLAN_NODE(&inner_q.arena, sort_idx).sort.nsort_cols = sort_nord;
+        current = sort_idx;
+    }
+
+    /* Append outer LIMIT/OFFSET */
+    if (s->has_limit || s->has_offset) {
+        uint32_t lim_idx = plan_alloc_node(&inner_q.arena, PLAN_LIMIT);
+        PLAN_NODE(&inner_q.arena, lim_idx).left = current;
+        PLAN_NODE(&inner_q.arena, lim_idx).limit.has_limit = s->has_limit;
+        PLAN_NODE(&inner_q.arena, lim_idx).limit.limit = s->has_limit ? (size_t)s->limit_count : 0;
+        PLAN_NODE(&inner_q.arena, lim_idx).limit.has_offset = s->has_offset;
+        PLAN_NODE(&inner_q.arena, lim_idx).limit.offset = s->has_offset ? (size_t)s->offset_count : 0;
+        current = lim_idx;
+    }
+
+    /* Execute unified plan and discard results */
+    {
+        struct plan_exec_ctx ctx;
+        plan_exec_init(&ctx, &inner_q.arena, db, current);
+        int rc = plan_exec_discard(&ctx, current);
+        query_free(&inner_q);
+        return rc;
+    }
+
+bail:
+    query_free(&inner_q);
+    return -1;
+}
+
 /* Execute SQL and discard results — avoids block_to_rows / malloc overhead.
  * Falls back to db_exec_sql + rows_free when plan executor can't handle the query. */
 int db_exec_sql_discard(struct database *db, const char *sql)
@@ -4638,6 +4820,12 @@ int db_exec_sql_discard(struct database *db, const char *sql)
 
     if (q.query_type == QUERY_TYPE_SELECT) {
         struct query_select *s = &q.select;
+
+        /* Try CTE inlining: build unified plan without temp table */
+        if ((s->ctes_count > 0 || s->cte_name != IDX_NONE) && !s->has_recursive_cte) {
+            int rc = try_inline_cte_discard(db, &q);
+            if (rc >= 0) { query_free(&q); return rc; }
+        }
 
         /* Pre-materialize CTEs so plan_build_select can find them as tables */
         struct table *cte_temps[32] = {0};

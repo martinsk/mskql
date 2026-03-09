@@ -81,7 +81,9 @@ static int tb_bin(TB *t, uint8_t **d, int32_t *l) {
 }
 static int tb_fhdr(TB *t, int *ft, int16_t *fid, int16_t prev) {
     uint8_t b; if(tb_byte(t,&b)<0)return -1;
-    *ft=b&0x0f; int16_t d=(b>>4)&0x0f;
+    *ft=b&0x0f;
+    if(!*ft){*fid=0;return 0;} /* stop byte */
+    int16_t d=(b>>4)&0x0f;
     if(d) *fid=prev+d;
     else { int64_t v; if(tb_svar(t,&v)<0)return -1; *fid=(int16_t)v; }
     return 0;
@@ -93,16 +95,16 @@ static int tb_skip_struct(TB *t) {
 }
 static int tb_skip(TB *t, int ft) {
     switch(ft){
-    case 1: case 2: return 0;
-    case 3:{uint8_t b;return tb_byte(t,&b);}
-    case 4: case 5: case 6:{int64_t v;return tb_svar(t,&v);}
-    case 7: if(t->pos+8>t->len)return -1; t->pos+=8; return 0;
-    case 8:{uint8_t*d;int32_t l;return tb_bin(t,&d,&l);}
-    case 12: return tb_skip_struct(t);
-    case 13:{if(t->pos>=t->len)return -1; uint8_t kv=t->buf[t->pos++]; int kt=kv>>4,vt=kv&0xf; uint64_t n; if(tb_uvar(t,&n)<0)return -1; for(uint64_t i=0;i<n;i++){if(tb_skip(t,kt)<0||tb_skip(t,vt)<0)return -1;} return 0;}
-    case 14: case 15:{if(t->pos>=t->len)return -1; uint8_t h=t->buf[t->pos++]; int et; uint64_t n;
+    case 1: case 2: return 0; /* bool true/false */
+    case 3:{uint8_t b;return tb_byte(t,&b);} /* i8 */
+    case 4: case 5: case 6:{int64_t v;return tb_svar(t,&v);} /* i16, i32, i64 */
+    case 7: if(t->pos+8>t->len)return -1; t->pos+=8; return 0; /* double */
+    case 8:{uint8_t*d;int32_t l;return tb_bin(t,&d,&l);} /* binary */
+    case 9: case 10:{if(t->pos>=t->len)return -1; uint8_t h=t->buf[t->pos++]; int et; uint64_t n; /* list, set */
         if((h>>4)==0xf){et=h&0xf;if(tb_uvar(t,&n)<0)return -1;}else{et=h&0xf;n=(h>>4)&0xf;}
         for(uint64_t i=0;i<n;i++) if(tb_skip(t,et)<0)return -1; return 0;}
+    case 11:{if(t->pos>=t->len)return -1; uint8_t kv=t->buf[t->pos++]; int kt=kv>>4,vt=kv&0xf; uint64_t n; if(tb_uvar(t,&n)<0)return -1; for(uint64_t i=0;i<n;i++){if(tb_skip(t,kt)<0||tb_skip(t,vt)<0)return -1;} return 0;} /* map */
+    case 12: return tb_skip_struct(t); /* struct */
     default: return -1;
     }
 }
@@ -256,8 +258,9 @@ static int parse_schema_elem(TB *t, struct pq_col_meta *out, int *is_leaf)
         case 4: { uint8_t *d; int32_t l; if (tb_bin(t,&d,&l)<0) return -1;
                   out->name=(char*)malloc((size_t)l+1); if(!out->name)return -1;
                   memcpy(out->name,d,(size_t)l); out->name[l]='\0'; break; }
-        case 5: { int32_t v; if (tb_i32(t,&v)<0) return -1; out->converted_type=v; break; }
-        case 9: { /* LogicalType union struct */
+        case 5: { int32_t v; if (tb_i32(t,&v)<0) return -1; (void)v; break; } /* num_children */
+        case 6: { int32_t v; if (tb_i32(t,&v)<0) return -1; out->converted_type=v; break; }
+        case 10: { /* LogicalType union struct */
             int16_t lp=0;
             while (t->pos<t->len) {
                 int lft; int16_t lfid; if(tb_fhdr(t,&lft,&lfid,lp)<0)return -1; if(!lft)break; lp=lfid;
@@ -289,11 +292,11 @@ static int parse_col_meta(TB *t, struct pq_chunk_meta *out)
     while(t->pos<t->len){
         int ft;int16_t fid;if(tb_fhdr(t,&ft,&fid,prev)<0)return -1;if(!ft)break;prev=fid;
         switch(fid){
-        case 1:{int32_t v;if(tb_i32(t,&v)<0)return -1;out->compression=v;break;}
-        case 5:{int64_t v;if(tb_i64(t,&v)<0)return -1;(void)v;break;} /* uncompressed */
-        case 6:{int64_t v;if(tb_i64(t,&v)<0)return -1;out->total_compressed_size=v;break;}
-        case 8:{int64_t v;if(tb_i64(t,&v)<0)return -1;out->data_page_offset=v;break;}
-        case 10:{int64_t v;if(tb_i64(t,&v)<0)return -1;out->dict_page_offset=v;break;}
+        case 4:{int32_t v;if(tb_i32(t,&v)<0)return -1;out->compression=v;break;}
+        case 6:{int64_t v;if(tb_i64(t,&v)<0)return -1;(void)v;break;} /* total_uncompressed_size */
+        case 7:{int64_t v;if(tb_i64(t,&v)<0)return -1;out->total_compressed_size=v;break;}
+        case 9:{int64_t v;if(tb_i64(t,&v)<0)return -1;out->data_page_offset=v;break;}
+        case 11:{int64_t v;if(tb_i64(t,&v)<0)return -1;out->dict_page_offset=v;break;}
         default:if(tb_skip(t,ft)<0)return -1;break;
         }
     }
@@ -335,12 +338,13 @@ static int parse_row_group(TB *t, struct pq_row_group_meta *rg, int32_t ncols)
                 if(col_idx<ncols){if(parse_col_chunk(t,&rg->chunks[col_idx++])<0)return -1;}
                 else if(tb_skip_struct(t)<0)return -1;
             } break;}
-        case 2:{int64_t v;if(tb_i64(t,&v)<0)return -1;rg->num_rows=v;break;}
+        case 3:{int64_t v;if(tb_i64(t,&v)<0)return -1;rg->num_rows=v;break;}
         default:if(tb_skip(t,ft)<0)return -1;break;
         }
     }
     return 0;
 }
+
 
 static int read_footer(pq_reader_t *r)
 {

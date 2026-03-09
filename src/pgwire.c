@@ -994,17 +994,29 @@ static inline size_t fast_timestamptz_to_str(int64_t usec, char *buf)
 }
 
 /* Fast int32 → decimal string. Returns length written. buf must be >= 12 bytes.
+ * Writes directly into buf — no intermediate buffer or memcpy.
  * Uses two-digit lookup table to halve the number of divisions. */
 static inline size_t fast_i32_to_str(int32_t v, char *buf)
 {
-    char tmp[12];
-    char *p = tmp + sizeof(tmp);
     int neg = 0;
     uint32_t uv;
-    if (v < 0) { neg = 1; uv = (uint32_t)(-(int64_t)v); } else { uv = (uint32_t)v; }
+    if (v < 0) { neg = 1; uv = (uint32_t)(-(int64_t)v); *buf = '-'; } else { uv = (uint32_t)v; }
+    int nd;
+    if      (uv < 10)         nd = 1;
+    else if (uv < 100)        nd = 2;
+    else if (uv < 1000)       nd = 3;
+    else if (uv < 10000)      nd = 4;
+    else if (uv < 100000)     nd = 5;
+    else if (uv < 1000000)    nd = 6;
+    else if (uv < 10000000)   nd = 7;
+    else if (uv < 100000000)  nd = 8;
+    else if (uv < 1000000000) nd = 9;
+    else                      nd = 10;
+    size_t len = (size_t)nd + (size_t)neg;
+    char *p = buf + len;
+    *p = '\0';
     while (uv >= 100) {
-        uint32_t r = uv % 100;
-        uv /= 100;
+        uint32_t r = uv % 100; uv /= 100;
         p -= 2;
         p[0] = digit_pairs[r * 2];
         p[1] = digit_pairs[r * 2 + 1];
@@ -1016,27 +1028,43 @@ static inline size_t fast_i32_to_str(int32_t v, char *buf)
     } else {
         *--p = '0' + (char)uv;
     }
-    size_t dlen = (size_t)(tmp + sizeof(tmp) - p);
-    size_t len = dlen + (size_t)neg;
-    char *out = buf;
-    if (neg) *out++ = '-';
-    memcpy(out, p, dlen);
-    buf[len] = '\0';
     return len;
 }
 
 /* Fast int64 → decimal string. Returns length written. buf must be >= 21 bytes.
+ * Writes directly into buf — no intermediate buffer or memcpy.
  * Uses two-digit lookup table to halve the number of divisions. */
 static inline size_t fast_i64_to_str(int64_t v, char *buf)
 {
-    char tmp[21];
-    char *p = tmp + sizeof(tmp);
     int neg = 0;
     uint64_t uv;
-    if (v < 0) { neg = 1; uv = (uint64_t)(-(v + 1)) + 1; } else { uv = (uint64_t)v; }
+    if (v < 0) { neg = 1; uv = (uint64_t)(-(v + 1)) + 1; *buf = '-'; } else { uv = (uint64_t)v; }
+    int nd;
+    if      (uv < 10ULL)                  nd = 1;
+    else if (uv < 100ULL)                 nd = 2;
+    else if (uv < 1000ULL)                nd = 3;
+    else if (uv < 10000ULL)               nd = 4;
+    else if (uv < 100000ULL)              nd = 5;
+    else if (uv < 1000000ULL)             nd = 6;
+    else if (uv < 10000000ULL)            nd = 7;
+    else if (uv < 100000000ULL)           nd = 8;
+    else if (uv < 1000000000ULL)          nd = 9;
+    else if (uv < 10000000000ULL)         nd = 10;
+    else if (uv < 100000000000ULL)        nd = 11;
+    else if (uv < 1000000000000ULL)       nd = 12;
+    else if (uv < 10000000000000ULL)      nd = 13;
+    else if (uv < 100000000000000ULL)     nd = 14;
+    else if (uv < 1000000000000000ULL)    nd = 15;
+    else if (uv < 10000000000000000ULL)   nd = 16;
+    else if (uv < 100000000000000000ULL)  nd = 17;
+    else if (uv < 1000000000000000000ULL) nd = 18;
+    else if (uv < 10000000000000000000ULL) nd = 19;
+    else                                   nd = 20;
+    size_t len = (size_t)nd + (size_t)neg;
+    char *p = buf + len;
+    *p = '\0';
     while (uv >= 100) {
-        uint64_t r = uv % 100;
-        uv /= 100;
+        uint64_t r = uv % 100; uv /= 100;
         p -= 2;
         p[0] = digit_pairs[r * 2];
         p[1] = digit_pairs[r * 2 + 1];
@@ -1048,12 +1076,6 @@ static inline size_t fast_i64_to_str(int64_t v, char *buf)
     } else {
         *--p = '0' + (char)uv;
     }
-    size_t dlen = (size_t)(tmp + sizeof(tmp) - p);
-    size_t len = dlen + (size_t)neg;
-    char *out = buf;
-    if (neg) *out++ = '-';
-    memcpy(out, p, dlen);
-    buf[len] = '\0';
     return len;
 }
 
@@ -1153,11 +1175,12 @@ static inline size_t fast_f64_to_str(double v, char *buf)
     return (size_t)snprintf(buf, 32, "%g", neg ? -v : v);
 }
 
-/* Push a col_block cell value directly into a msgbuf as a pgwire text field. */
+/* Push a col_block cell value directly into a msgbuf as a pgwire text field.
+ * Uses cb_* accessors to handle both borrowed and owned col_blocks. */
 static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, uint16_t ri,
                                  struct database *db, struct table *t, uint16_t col_idx)
 {
-    if (cb->nulls[ri]) {
+    if (cb_nulls(cb)[ri]) {
         msgbuf_push_u32(m, (uint32_t)-1);
         return;
     }
@@ -1166,77 +1189,80 @@ static void msgbuf_push_col_cell(struct msgbuf *m, const struct col_block *cb, u
     size_t len;
     switch (cb->type) {
     case COLUMN_TYPE_SMALLINT:
-        len = fast_i32_to_str((int32_t)cb->data.i16[ri], buf);
+        len = fast_i32_to_str((int32_t)cb_i16(cb)[ri], buf);
         txt = buf;
         break;
     case COLUMN_TYPE_INT:
-        len = fast_i32_to_str(cb->data.i32[ri], buf);
+        len = fast_i32_to_str(cb_i32(cb)[ri], buf);
         txt = buf;
         break;
     case COLUMN_TYPE_BOOLEAN:
-        buf[0] = cb->data.i32[ri] ? 't' : 'f';
+        buf[0] = cb_i32(cb)[ri] ? 't' : 'f';
         buf[1] = '\0';
         len = 1;
         txt = buf;
         break;
     case COLUMN_TYPE_BIGINT:
-        len = fast_i64_to_str(cb->data.i64[ri], buf);
+        len = fast_i64_to_str(cb_i64(cb)[ri], buf);
         txt = buf;
         break;
     case COLUMN_TYPE_FLOAT:
     case COLUMN_TYPE_NUMERIC:
-        len = fast_f64_to_str(cb->data.f64[ri], buf);
+        len = fast_f64_to_str(cb_f64(cb)[ri], buf);
         txt = buf;
         break;
     case COLUMN_TYPE_DATE:
-        date_to_str(cb->data.i32[ri], buf, sizeof(buf));
+        date_to_str(cb_i32(cb)[ri], buf, sizeof(buf));
         txt = buf; len = strlen(buf);
         break;
     case COLUMN_TYPE_TIME:
-        time_to_str(cb->data.i64[ri], buf, sizeof(buf));
+        time_to_str(cb_i64(cb)[ri], buf, sizeof(buf));
         txt = buf; len = strlen(buf);
         break;
     case COLUMN_TYPE_TIMESTAMP:
-        timestamp_to_str(cb->data.i64[ri], buf, sizeof(buf));
+        timestamp_to_str(cb_i64(cb)[ri], buf, sizeof(buf));
         txt = buf; len = strlen(buf);
         break;
     case COLUMN_TYPE_TIMESTAMPTZ:
-        timestamptz_to_str(cb->data.i64[ri], buf, sizeof(buf));
+        timestamptz_to_str(cb_i64(cb)[ri], buf, sizeof(buf));
         txt = buf; len = strlen(buf);
         break;
     case COLUMN_TYPE_INTERVAL:
-        interval_to_str(cb->data.iv[ri], buf, sizeof(buf));
+        interval_to_str(cb_iv(cb)[ri], buf, sizeof(buf));
         txt = buf; len = strlen(buf);
         break;
     case COLUMN_TYPE_TEXT:
-        if (!cb->data.str[ri]) {
+        if (!cb_str(cb)[ri]) {
             msgbuf_push_u32(m, (uint32_t)-1);
             return;
         }
-        txt = cb->data.str[ri];
+        txt = cb_str(cb)[ri];
         len = strlen(txt);
         break;
     case COLUMN_TYPE_ENUM: {
         const char *label = NULL;
         if (t && col_idx < t->columns.count && t->columns.items[col_idx].enum_type_name && db) {
             struct enum_type *et = db_find_type(db, t->columns.items[col_idx].enum_type_name);
-            if (et) label = enum_label(et, cb->data.i32[ri]);
+            if (et) label = enum_label(et, cb_i32(cb)[ri]);
         }
-        if (!label) { snprintf(buf, sizeof(buf), "%d", cb->data.i32[ri]); label = buf; }
+        if (!label) { snprintf(buf, sizeof(buf), "%d", cb_i32(cb)[ri]); label = buf; }
         txt = label; len = strlen(txt);
         break;
     }
-    case COLUMN_TYPE_UUID:
-        uuid_format(&cb->data.uuid[ri], buf);
+    case COLUMN_TYPE_UUID: {
+        struct uuid_val uv = cb_uuid(cb)[ri];
+        uuid_format(&uv, buf);
         txt = buf; len = 36;
         break;
+    }
     case COLUMN_TYPE_VECTOR: {
         uint16_t dim = cb->vec_dim;
-        if (dim > 0 && cb->data.vec) {
+        const float *vdata = cb_vec(cb);
+        if (dim > 0 && vdata) {
             size_t bufsz = (size_t)dim * 16 + 3;
             char vbuf_stack[2048];
             char *vbuf = (bufsz <= sizeof(vbuf_stack)) ? vbuf_stack : (char *)malloc(bufsz);
-            len = (size_t)vector_format_fast(&cb->data.vec[ri * dim], dim, vbuf, bufsz);
+            len = (size_t)vector_format_fast(&vdata[ri * dim], dim, vbuf, bufsz);
             msgbuf_push_u32(m, (uint32_t)len);
             msgbuf_push(m, vbuf, len);
             if (vbuf != vbuf_stack) free(vbuf);
@@ -1272,11 +1298,11 @@ static uint16_t serialize_all_int_block(struct msgbuf *wire,
         dst += 2;
         for (uint16_t c = 0; c < ncols; c++) {
             const struct col_block *cb = &block->cols[c];
-            if (cb->nulls[ri]) {
+            if (cb_nulls(cb)[ri]) {
                 put_u32(dst, (uint32_t)-1);
                 dst += 4;
             } else {
-                size_t len = fast_i32_to_str(cb->data.i32[ri], (char *)(dst + 4));
+                size_t len = fast_i32_to_str(cb_i32(cb)[ri], (char *)(dst + 4));
                 put_u32(dst, (uint32_t)len);
                 dst += 4 + len;
             }
@@ -1307,15 +1333,15 @@ static uint16_t serialize_int_bigint_block(struct msgbuf *wire,
         dst += 2;
         for (uint16_t c = 0; c < ncols; c++) {
             const struct col_block *cb = &block->cols[c];
-            if (cb->nulls[ri]) {
+            if (cb_nulls(cb)[ri]) {
                 put_u32(dst, (uint32_t)-1);
                 dst += 4;
             } else if (cb->type == COLUMN_TYPE_BIGINT) {
-                size_t len = fast_i64_to_str(cb->data.i64[ri], (char *)(dst + 4));
+                size_t len = fast_i64_to_str(cb_i64(cb)[ri], (char *)(dst + 4));
                 put_u32(dst, (uint32_t)len);
                 dst += 4 + len;
             } else {
-                size_t len = fast_i32_to_str(cb->data.i32[ri], (char *)(dst + 4));
+                size_t len = fast_i32_to_str(cb_i32(cb)[ri], (char *)(dst + 4));
                 put_u32(dst, (uint32_t)len);
                 dst += 4 + len;
             }
@@ -1368,173 +1394,305 @@ static uint16_t serialize_numeric_block(struct msgbuf *wire,
     if (all_int_bigint)
         return serialize_int_bigint_block(wire, block, ncols, active, ri_buf);
 
-    /* Pre-compute text string lengths for TEXT columns into per-column arrays.
-     * This avoids calling strlen twice (once for estimation, once for serialization).
-     * text_lens[c][r] stores the strlen for column c, row r (0 if null/NULL ptr).
-     * We use a flat stack array: up to 8 text columns × BLOCK_CAPACITY uint16_t = 16KB. */
-    #define MAX_TEXT_COLS_CACHED 8
-    uint16_t text_lens_store[MAX_TEXT_COLS_CACHED][BLOCK_CAPACITY];
-    uint16_t *text_lens[64] = {0};
-    size_t text_total_bytes = 0;
-    size_t fixed_cols = 0;
-    int n_text_cols = 0;
+    /* ---- Two-pass column-at-a-time serialization ----
+     *
+     * Pass 1 (column-major): for each column, serialize all cell values into a
+     * per-column scratch buffer using tight typed loops (type switch only once
+     * per column, not per cell).  Store per-cell byte offsets and lengths.
+     *
+     * Pass 2 (row-major assembly): build DataRow messages by memcpy from the
+     * per-column scratch buffers.  The inner loop has no type dispatch at all. */
+
+    /* Per-column scratch: serialized bytes + per-cell (offset, len, is_null).
+     * col_buf[c]  — serialized bytes for column c
+     * col_off[c][r] — byte offset in col_buf[c] where row r's value starts
+     * col_len[c][r] — serialized byte length for row r (0xFFFF = null) */
+    #define SER_NULL 0xFFFFU
+    #define COL_BUF_STACK_BYTES (64 * 1024)  /* 64KB stack for small results */
+
+    /* Scratch buffers: up to 64 columns.  Each column gets at most
+     * active * max_cell_bytes of scratch.  We allocate from a single
+     * contiguous stack buffer if possible, else malloc. */
+    uint32_t col_off_store[64][BLOCK_CAPACITY];
+    uint16_t col_len_store[64][BLOCK_CAPACITY];
+
+    /* Estimate per-column scratch sizes and total */
+    size_t col_buf_sizes[64];
+    size_t total_scratch = 0;
+    for (uint16_t c = 0; c < ncols; c++) {
+        size_t per_cell;
+        switch (block->cols[c].type) {
+        case COLUMN_TYPE_INT:       per_cell = 12; break;
+        case COLUMN_TYPE_SMALLINT:  per_cell = 8;  break;
+        case COLUMN_TYPE_BIGINT:    per_cell = 21; break;
+        case COLUMN_TYPE_BOOLEAN:   per_cell = 1;  break;
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC:   per_cell = 32; break;
+        case COLUMN_TYPE_DATE:      per_cell = 16; break;
+        case COLUMN_TYPE_TIME:      per_cell = 20; break;
+        case COLUMN_TYPE_TIMESTAMP: per_cell = 32; break;
+        case COLUMN_TYPE_TIMESTAMPTZ: per_cell = 36; break;
+        case COLUMN_TYPE_INTERVAL:  per_cell = 68; break;
+        case COLUMN_TYPE_UUID:      per_cell = 36; break;
+        case COLUMN_TYPE_TEXT:      per_cell = 0;  break; /* TEXT uses pointers, not copies */
+        case COLUMN_TYPE_VECTOR:    per_cell = (size_t)block->cols[c].vec_dim * 16 + 3; break;
+        case COLUMN_TYPE_ENUM:      per_cell = 12; break;
+        }
+        col_buf_sizes[c] = (size_t)active * per_cell;
+        total_scratch += col_buf_sizes[c];
+    }
+
+    /* Allocate column scratch buffers */
+    uint8_t stack_scratch[COL_BUF_STACK_BYTES];
+    uint8_t *scratch_base = (total_scratch <= COL_BUF_STACK_BYTES) ? stack_scratch : (uint8_t *)malloc(total_scratch);
+    uint8_t *col_buf[64];
+    {
+        uint8_t *p = scratch_base;
+        for (uint16_t c = 0; c < ncols; c++) {
+            col_buf[c] = p;
+            p += col_buf_sizes[c];
+        }
+    }
+
+    /* ---- Pass 1: column-major serialization ---- */
+    size_t total_data_bytes = 0; /* total serialized bytes (for wire estimation) */
 
     for (uint16_t c = 0; c < ncols; c++) {
-        if (block->cols[c].type != COLUMN_TYPE_TEXT) {
-            fixed_cols++;
-            continue;
-        }
         const struct col_block *cb = &block->cols[c];
-        if (n_text_cols >= MAX_TEXT_COLS_CACHED) {
-            /* Too many text columns to cache — fall back to strlen in serialization.
-             * Still compute total bytes for estimation. */
+        const uint8_t *cnulls = cb_nulls(cb);
+        uint32_t *offs = col_off_store[c];
+        uint16_t *lens = col_len_store[c];
+        uint32_t buf_pos = 0;
+
+        switch (cb->type) {
+        case COLUMN_TYPE_INT: {
+            const int32_t *vals = cb_i32(cb);
             for (uint16_t r = 0; r < active; r++) {
                 uint16_t ri = ri_buf[r];
-                if (!cb->nulls[ri] && cb->data.str[ri]) {
-                    size_t slen = cb->str_lens ? cb->str_lens[ri] : strlen(cb->data.str[ri]);
-                    text_total_bytes += slen + 4;
-                } else {
-                    text_total_bytes += 4;
-                }
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                size_t n = fast_i32_to_str(vals[ri], (char *)(col_buf[c] + buf_pos));
+                lens[r] = (uint16_t)n;
+                buf_pos += (uint32_t)n;
             }
-            n_text_cols++;
-            continue;
+            break;
         }
-        uint16_t *lens = text_lens_store[n_text_cols];
-        text_lens[c] = lens;
-        n_text_cols++;
-        for (uint16_t r = 0; r < active; r++) {
-            uint16_t ri = ri_buf[r];
-            if (!cb->nulls[ri] && cb->data.str[ri]) {
-                size_t slen = cb->str_lens ? cb->str_lens[ri] : strlen(cb->data.str[ri]);
+        case COLUMN_TYPE_SMALLINT: {
+            const int16_t *vals = cb_i16(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                size_t n = fast_i32_to_str((int32_t)vals[ri], (char *)(col_buf[c] + buf_pos));
+                lens[r] = (uint16_t)n;
+                buf_pos += (uint32_t)n;
+            }
+            break;
+        }
+        case COLUMN_TYPE_BIGINT: {
+            const int64_t *vals = cb_i64(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                size_t n = fast_i64_to_str(vals[ri], (char *)(col_buf[c] + buf_pos));
+                lens[r] = (uint16_t)n;
+                buf_pos += (uint32_t)n;
+            }
+            break;
+        }
+        case COLUMN_TYPE_BOOLEAN: {
+            const int32_t *vals = cb_i32(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                col_buf[c][buf_pos] = vals[ri] ? 't' : 'f';
+                lens[r] = 1;
+                buf_pos += 1;
+            }
+            break;
+        }
+        case COLUMN_TYPE_FLOAT:
+        case COLUMN_TYPE_NUMERIC: {
+            const double *vals = cb_f64(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                size_t n = fast_f64_to_str(vals[ri], (char *)(col_buf[c] + buf_pos));
+                lens[r] = (uint16_t)n;
+                buf_pos += (uint32_t)n;
+            }
+            break;
+        }
+        case COLUMN_TYPE_DATE: {
+            const int32_t *vals = cb_i32(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                size_t n = fast_date_to_str(vals[ri], (char *)(col_buf[c] + buf_pos));
+                lens[r] = (uint16_t)n;
+                buf_pos += (uint32_t)n;
+            }
+            break;
+        }
+        case COLUMN_TYPE_TIME: {
+            const int64_t *vals = cb_i64(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                size_t n = fast_time_to_str(vals[ri], (char *)(col_buf[c] + buf_pos));
+                lens[r] = (uint16_t)n;
+                buf_pos += (uint32_t)n;
+            }
+            break;
+        }
+        case COLUMN_TYPE_TIMESTAMP: {
+            const int64_t *vals = cb_i64(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                size_t n = fast_timestamp_to_str(vals[ri], (char *)(col_buf[c] + buf_pos));
+                lens[r] = (uint16_t)n;
+                buf_pos += (uint32_t)n;
+            }
+            break;
+        }
+        case COLUMN_TYPE_TIMESTAMPTZ: {
+            const int64_t *vals = cb_i64(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                size_t n = fast_timestamptz_to_str(vals[ri], (char *)(col_buf[c] + buf_pos));
+                lens[r] = (uint16_t)n;
+                buf_pos += (uint32_t)n;
+            }
+            break;
+        }
+        case COLUMN_TYPE_INTERVAL: {
+            const struct interval *vals = cb_iv(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                char tmp[68];
+                interval_to_str(vals[ri], tmp, sizeof(tmp));
+                size_t n = strlen(tmp);
+                memcpy(col_buf[c] + buf_pos, tmp, n);
+                lens[r] = (uint16_t)n;
+                buf_pos += (uint32_t)n;
+            }
+            break;
+        }
+        case COLUMN_TYPE_TEXT: {
+            /* For TEXT, we don't copy bytes into col_buf — we'll memcpy from
+             * the original string pointers in pass 2.  Just record lengths. */
+            char *const *strs = cb_str(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri] || !strs[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                size_t slen = cb->str_lens ? cb->str_lens[ri] : strlen(strs[ri]);
+                offs[r] = ri; /* store original row index for pass 2 */
                 lens[r] = (uint16_t)(slen > 65535 ? 65535 : slen);
-                text_total_bytes += slen + 4;
-            } else {
-                lens[r] = 0;
-                text_total_bytes += 4;
             }
+            break;
         }
-    }
-    #undef MAX_TEXT_COLS_CACHED
+        case COLUMN_TYPE_UUID: {
+            const struct uuid_val *vals = cb_uuid(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri]) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                uuid_format(&vals[ri], (char *)(col_buf[c] + buf_pos));
+                lens[r] = 36;
+                buf_pos += 36;
+            }
+            break;
+        }
+        case COLUMN_TYPE_VECTOR: {
+            uint16_t dim = cb->vec_dim;
+            const float *vdata = cb_vec(cb);
+            for (uint16_t r = 0; r < active; r++) {
+                uint16_t ri = ri_buf[r];
+                if (cnulls[ri] || !vdata || dim == 0) { offs[r] = 0; lens[r] = SER_NULL; continue; }
+                offs[r] = buf_pos;
+                char *wp = (char *)(col_buf[c] + buf_pos);
+                const float *vp = &vdata[ri * dim];
+                *wp++ = '[';
+                for (uint16_t d = 0; d < dim; d++) {
+                    if (d > 0) *wp++ = ',';
+                    wp += fast_f32_to_str(vp[d], wp);
+                }
+                *wp++ = ']';
+                uint16_t n = (uint16_t)(wp - (char *)(col_buf[c] + buf_pos));
+                lens[r] = n;
+                buf_pos += n;
+            }
+            break;
+        }
+        case COLUMN_TYPE_ENUM:
+            __builtin_unreachable();
+        }
 
-    /* Estimate VECTOR column sizes: "[0.1,0.2,...,0.N]" ≤ dim*16+3 per cell */
-    size_t vec_total_bytes = 0;
+        total_data_bytes += buf_pos;
+    }
+
+    /* ---- Pass 2: row-major assembly into wire buffer ----
+     * No type switch in the inner loop — just memcpy pre-serialized bytes. */
+    /* Each row: 'D'(1) + len(4) + ncols(2) + ncols * (4 len prefix) + serialized bytes */
+    size_t est = (size_t)active * (7 + (size_t)ncols * 4) + total_data_bytes
+               + (size_t)active * (size_t)ncols * 4; /* TEXT bytes not in total_data_bytes */
+    /* Add TEXT bytes explicitly */
     for (uint16_t c = 0; c < ncols; c++) {
-        if (block->cols[c].type == COLUMN_TYPE_VECTOR) {
-            uint16_t dim = block->cols[c].vec_dim;
-            vec_total_bytes += (size_t)active * (dim * 16 + 3 + 4);
+        if (block->cols[c].type == COLUMN_TYPE_TEXT) {
+            for (uint16_t r = 0; r < active; r++)
+                if (col_len_store[c][r] != SER_NULL)
+                    est += col_len_store[c][r];
         }
     }
-
-    size_t max_fixed_per_col = 68; /* interval is the widest fixed-size type */
-    size_t est = (size_t)active * (7 + fixed_cols * max_fixed_per_col) + text_total_bytes + vec_total_bytes;
     msgbuf_ensure(wire, est);
-
     uint8_t *dst = wire->data + wire->len;
 
     for (uint16_t r = 0; r < active; r++) {
-        uint16_t ri = ri_buf[r];
         uint8_t *row_start = dst;
         dst[0] = 'D';
-        dst += 5; /* skip header + length, fill later */
+        dst += 5; /* header + length placeholder */
         put_u16(dst, ncols);
         dst += 2;
 
         for (uint16_t c = 0; c < ncols; c++) {
-            const struct col_block *cb = &block->cols[c];
-            if (cb->nulls[ri]) {
+            uint16_t clen = col_len_store[c][r];
+            if (clen == SER_NULL) {
                 put_u32(dst, (uint32_t)-1);
                 dst += 4;
-                continue;
-            }
-            size_t len;
-            switch (cb->type) {
-            case COLUMN_TYPE_INT:
-                len = fast_i32_to_str(cb->data.i32[ri], (char *)(dst + 4));
-                put_u32(dst, (uint32_t)len); dst += 4 + len;
-                break;
-            case COLUMN_TYPE_BIGINT:
-                len = fast_i64_to_str(cb->data.i64[ri], (char *)(dst + 4));
-                put_u32(dst, (uint32_t)len); dst += 4 + len;
-                break;
-            case COLUMN_TYPE_SMALLINT:
-                len = fast_i32_to_str((int32_t)cb->data.i16[ri], (char *)(dst + 4));
-                put_u32(dst, (uint32_t)len); dst += 4 + len;
-                break;
-            case COLUMN_TYPE_BOOLEAN:
-                put_u32(dst, 1); dst += 4;
-                *dst++ = cb->data.i32[ri] ? 't' : 'f';
-                break;
-            case COLUMN_TYPE_FLOAT:
-            case COLUMN_TYPE_NUMERIC:
-                len = fast_f64_to_str(cb->data.f64[ri], (char *)(dst + 4));
-                put_u32(dst, (uint32_t)len); dst += 4 + len;
-                break;
-            case COLUMN_TYPE_DATE:
-                len = fast_date_to_str(cb->data.i32[ri], (char *)(dst + 4));
-                put_u32(dst, (uint32_t)len); dst += 4 + len;
-                break;
-            case COLUMN_TYPE_TIME:
-                len = fast_time_to_str(cb->data.i64[ri], (char *)(dst + 4));
-                put_u32(dst, (uint32_t)len); dst += 4 + len;
-                break;
-            case COLUMN_TYPE_TIMESTAMP:
-                len = fast_timestamp_to_str(cb->data.i64[ri], (char *)(dst + 4));
-                put_u32(dst, (uint32_t)len); dst += 4 + len;
-                break;
-            case COLUMN_TYPE_TIMESTAMPTZ:
-                len = fast_timestamptz_to_str(cb->data.i64[ri], (char *)(dst + 4));
-                put_u32(dst, (uint32_t)len); dst += 4 + len;
-                break;
-            case COLUMN_TYPE_INTERVAL: {
-                char buf[68];
-                interval_to_str(cb->data.iv[ri], buf, sizeof(buf));
-                len = strlen(buf);
-                put_u32(dst, (uint32_t)len); dst += 4;
-                memcpy(dst, buf, len); dst += len;
-                break;
-            }
-            case COLUMN_TYPE_TEXT: {
-                const char *s = cb->data.str[ri];
-                if (!s) {
-                    put_u32(dst, (uint32_t)-1); dst += 4;
-                } else {
-                    size_t slen = text_lens[c] ? text_lens[c][r] : strlen(s);
-                    put_u32(dst, (uint32_t)slen); dst += 4;
-                    memcpy(dst, s, slen); dst += slen;
-                }
-                break;
-            }
-            case COLUMN_TYPE_UUID:
-                uuid_format(&cb->data.uuid[ri], (char *)(dst + 4));
-                put_u32(dst, 36); dst += 4 + 36;
-                break;
-            case COLUMN_TYPE_VECTOR: {
-                uint16_t dim = cb->vec_dim;
-                if (dim > 0 && cb->data.vec) {
-                    uint8_t *len_pos = dst; dst += 4; /* backpatch length */
-                    const float *vp = &cb->data.vec[ri * dim];
-                    *dst++ = '[';
-                    for (uint16_t d = 0; d < dim; d++) {
-                        if (d > 0) *dst++ = ',';
-                        dst += fast_f32_to_str(vp[d], (char *)dst);
-                    }
-                    *dst++ = ']';
-                    put_u32(len_pos, (uint32_t)(dst - len_pos - 4));
-                } else {
-                    put_u32(dst, (uint32_t)-1); dst += 4;
-                }
-                break;
-            }
-            case COLUMN_TYPE_ENUM:
-                __builtin_unreachable();
+            } else if (block->cols[c].type == COLUMN_TYPE_TEXT) {
+                /* TEXT: copy from original string pointer */
+                uint16_t ri = (uint16_t)col_off_store[c][r];
+                const char *s = cb_str(&block->cols[c])[ri];
+                put_u32(dst, (uint32_t)clen);
+                dst += 4;
+                memcpy(dst, s, clen);
+                dst += clen;
+            } else {
+                /* Non-TEXT: copy from per-column scratch buffer */
+                put_u32(dst, (uint32_t)clen);
+                dst += 4;
+                memcpy(dst, col_buf[c] + col_off_store[c][r], clen);
+                dst += clen;
             }
         }
-        uint32_t body_len = (uint32_t)(dst - row_start - 1);
-        put_u32(row_start + 1, body_len);
+        put_u32(row_start + 1, (uint32_t)(dst - row_start - 1));
     }
 
     wire->len = (size_t)(dst - wire->data);
+    if (scratch_base != stack_scratch) free(scratch_base);
+    #undef SER_NULL
+    #undef COL_BUF_STACK_BYTES
     return active;
 }
 

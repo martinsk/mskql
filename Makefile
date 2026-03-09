@@ -27,7 +27,13 @@ bench: release
 bench-throughput: release
 	$(MAKE) -C src bench-throughput
 
+lib: release
+	$(MAKE) -C src lib
+
+bench-vs-duck: lib
+	$(MAKE) -C src bench-vs-duck
+
 perf: bench
 	bash bench/perf_analysis.sh
 
-.PHONY: all clean release test test-concurrent bench bench-throughput perf mskqlcli
+.PHONY: all clean release test test-concurrent bench bench-throughput bench-vs-duck lib perf mskqlcli

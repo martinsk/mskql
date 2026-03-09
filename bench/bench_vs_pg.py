@@ -733,7 +733,11 @@ def _pq(name):
 
 
 def _mskql_foreign(table_name, parquet_file):
-    return f"CREATE FOREIGN TABLE {table_name} OPTIONS (FILENAME '{_pq(parquet_file)}');"
+    """Return a list of setup statements: drop any existing table, then create foreign table."""
+    return [
+        f"DROP TABLE IF EXISTS {table_name};",
+        f"CREATE FOREIGN TABLE {table_name} OPTIONS (FILENAME '{_pq(parquet_file)}');",
+    ]
 
 
 def _duck_from_pq(table_name, parquet_file):
@@ -742,7 +746,7 @@ def _duck_from_pq(table_name, parquet_file):
 
 def bench_pq_full_scan():
     """Full scan of 50K-row Parquet file."""
-    mskql_setup = [_mskql_foreign("orders", "orders.parquet")]
+    mskql_setup = _mskql_foreign("orders", "orders.parquet")
     duck_setup = [_duck_from_pq("orders", "orders.parquet")]
     bench = ["SELECT * FROM orders;"] * 20
     return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
@@ -750,7 +754,7 @@ def bench_pq_full_scan():
 
 def bench_pq_where():
     """Filtered scan on 50K-row Parquet file."""
-    mskql_setup = [_mskql_foreign("events", "events.parquet")]
+    mskql_setup = _mskql_foreign("events", "events.parquet")
     duck_setup = [_duck_from_pq("events", "events.parquet")]
     bench = ["SELECT * FROM events WHERE amount > 500 AND score > 5000;"] * 50
     return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
@@ -758,7 +762,7 @@ def bench_pq_where():
 
 def bench_pq_aggregate():
     """GROUP BY aggregate on 50K-row Parquet file."""
-    mskql_setup = [_mskql_foreign("events", "events.parquet")]
+    mskql_setup = _mskql_foreign("events", "events.parquet")
     duck_setup = [_duck_from_pq("events", "events.parquet")]
     bench = [
         "SELECT event_type, COUNT(*), SUM(amount), AVG(score) "
@@ -769,7 +773,7 @@ def bench_pq_aggregate():
 
 def bench_pq_order_by():
     """Sort 50K-row Parquet file."""
-    mskql_setup = [_mskql_foreign("events", "events.parquet")]
+    mskql_setup = _mskql_foreign("events", "events.parquet")
     duck_setup = [_duck_from_pq("events", "events.parquet")]
     bench = ["SELECT * FROM events ORDER BY score DESC;"] * 10
     return {"mskql": (mskql_setup, bench), "duck": (duck_setup, bench), "pg": None}
@@ -777,7 +781,7 @@ def bench_pq_order_by():
 
 def bench_pq_wide_agg():
     """Wide aggregate on 50K-row 7-column Parquet file."""
-    mskql_setup = [_mskql_foreign("metrics", "metrics.parquet")]
+    mskql_setup = _mskql_foreign("metrics", "metrics.parquet")
     duck_setup = [_duck_from_pq("metrics", "metrics.parquet")]
     bench = [
         "SELECT sensor_id, COUNT(*), AVG(v1), SUM(v2), MIN(v3), MAX(v4), AVG(v5) "
@@ -788,10 +792,10 @@ def bench_pq_wide_agg():
 
 def bench_pq_join_two():
     """Join two Parquet files: orders (50K) x customers (2K)."""
-    mskql_setup = [
-        _mskql_foreign("pq_orders", "orders.parquet"),
-        _mskql_foreign("pq_customers", "customers.parquet"),
-    ]
+    mskql_setup = (
+        _mskql_foreign("pq_orders", "orders.parquet") +
+        _mskql_foreign("pq_customers", "customers.parquet")
+    )
     duck_setup = [
         _duck_from_pq("pq_orders", "orders.parquet"),
         _duck_from_pq("pq_customers", "customers.parquet"),
@@ -807,11 +811,11 @@ def bench_pq_join_two():
 
 def bench_pq_join_three():
     """Three-way join: orders x customers x products (all Parquet)."""
-    mskql_setup = [
-        _mskql_foreign("pq_orders", "orders.parquet"),
-        _mskql_foreign("pq_customers", "customers.parquet"),
-        _mskql_foreign("pq_products", "products.parquet"),
-    ]
+    mskql_setup = (
+        _mskql_foreign("pq_orders", "orders.parquet") +
+        _mskql_foreign("pq_customers", "customers.parquet") +
+        _mskql_foreign("pq_products", "products.parquet")
+    )
     duck_setup = [
         _duck_from_pq("pq_orders", "orders.parquet"),
         _duck_from_pq("pq_customers", "customers.parquet"),
@@ -839,7 +843,7 @@ def bench_pq_mixed_join():
         "INSERT INTO local_regions VALUES (2, 'east', 12);",
         "INSERT INTO local_regions VALUES (3, 'west', 9);",
     ]
-    mskql_setup = common_setup + [_mskql_foreign("pq_sales", "sales.parquet")]
+    mskql_setup = common_setup + _mskql_foreign("pq_sales", "sales.parquet")
     duck_setup = common_setup + [_duck_from_pq("pq_sales", "sales.parquet")]
     bench = [
         "SELECT lr.region_name, SUM(pq_sales.amount), "
@@ -853,10 +857,10 @@ def bench_pq_mixed_join():
 
 def bench_pq_subquery():
     """Subquery: filter Parquet events by customers from another Parquet file."""
-    mskql_setup = [
-        _mskql_foreign("pq_events", "events.parquet"),
-        _mskql_foreign("pq_customers", "customers.parquet"),
-    ]
+    mskql_setup = (
+        _mskql_foreign("pq_events", "events.parquet") +
+        _mskql_foreign("pq_customers", "customers.parquet")
+    )
     duck_setup = [
         _duck_from_pq("pq_events", "events.parquet"),
         _duck_from_pq("pq_customers", "customers.parquet"),
@@ -872,10 +876,10 @@ def bench_pq_subquery():
 
 def bench_pq_lineitem_agg():
     """Aggregate on 200K-row lineitem Parquet file."""
-    mskql_setup = [
-        _mskql_foreign("pq_lineitem", "lineitem.parquet"),
-        _mskql_foreign("pq_products", "products.parquet"),
-    ]
+    mskql_setup = (
+        _mskql_foreign("pq_lineitem", "lineitem.parquet") +
+        _mskql_foreign("pq_products", "products.parquet")
+    )
     duck_setup = [
         _duck_from_pq("pq_lineitem", "lineitem.parquet"),
         _duck_from_pq("pq_products", "products.parquet"),
@@ -892,11 +896,11 @@ def bench_pq_lineitem_agg():
 
 def bench_pq_analytical():
     """CTE + join + aggregate across Parquet files."""
-    mskql_setup = [
-        _mskql_foreign("pq_orders", "orders.parquet"),
-        _mskql_foreign("pq_customers", "customers.parquet"),
-        _mskql_foreign("pq_products", "products.parquet"),
-    ]
+    mskql_setup = (
+        _mskql_foreign("pq_orders", "orders.parquet") +
+        _mskql_foreign("pq_customers", "customers.parquet") +
+        _mskql_foreign("pq_products", "products.parquet")
+    )
     duck_setup = [
         _duck_from_pq("pq_orders", "orders.parquet"),
         _duck_from_pq("pq_customers", "customers.parquet"),
@@ -925,19 +929,19 @@ def bench_analytics_stress():
     generate_series bulk load, expression aggregates, multi-column ORDER BY.
     """
     # -- mskql setup: parquet foreign tables + in-memory tables --
-    mskql_setup = [
-        # parquet foreign tables
-        _mskql_foreign("as_orders", "orders.parquet"),
-        _mskql_foreign("as_events", "events.parquet"),
-        _mskql_foreign("as_regions", "ref_regions.parquet"),
-        # in-memory dimension tables
-        "DROP TABLE IF EXISTS as_customers;",
-        "CREATE TABLE as_customers (id INT, name TEXT, region TEXT, tier TEXT);",
-        "DROP TABLE IF EXISTS as_products;",
-        "CREATE TABLE as_products (id INT, name TEXT, category TEXT, price INT, weight INT);",
-        "DROP TABLE IF EXISTS as_returns;",
-        "CREATE TABLE as_returns (id INT, order_id INT, reason TEXT, refund_amount INT);",
-    ]
+    mskql_setup = list(
+        _mskql_foreign("as_orders", "orders.parquet") +
+        _mskql_foreign("as_events", "events.parquet") +
+        _mskql_foreign("as_regions", "ref_regions.parquet") +
+        [
+            "DROP TABLE IF EXISTS as_customers;",
+            "CREATE TABLE as_customers (id INT, name TEXT, region TEXT, tier TEXT);",
+            "DROP TABLE IF EXISTS as_products;",
+            "CREATE TABLE as_products (id INT, name TEXT, category TEXT, price INT, weight INT);",
+            "DROP TABLE IF EXISTS as_returns;",
+            "CREATE TABLE as_returns (id INT, order_id INT, reason TEXT, refund_amount INT);",
+        ]
+    )
     # customers: 2000 rows
     for i in range(2000):
         mskql_setup.append(
@@ -1208,11 +1212,11 @@ def _pg_stress_setup():
 
 def _mskql_stress_setup():
     """mskql setup: parquet foreign tables for the 3 large fixtures."""
-    return [
-        _mskql_foreign("st_txn", "large_transactions.parquet"),
-        _mskql_foreign("st_acct", "large_accounts.parquet"),
-        _mskql_foreign("st_merch", "large_merchants.parquet"),
-    ]
+    return (
+        _mskql_foreign("st_txn", "large_transactions.parquet") +
+        _mskql_foreign("st_acct", "large_accounts.parquet") +
+        _mskql_foreign("st_merch", "large_merchants.parquet")
+    )
 
 
 def _duck_stress_setup():

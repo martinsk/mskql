@@ -21,8 +21,11 @@ struct col_block {
     enum column_type type;
     uint16_t         count;                    /* 0..BLOCK_CAPACITY */
     uint16_t         vec_dim;                  /* VECTOR only: dimension per element */
-    uint8_t          nulls[BLOCK_CAPACITY];    /* 0=not-null, 1=null */
+    uint8_t          borrowed;                 /* 1 = ext_data/ext_nulls point into flat_table (read-only) */
+    uint8_t          nulls[BLOCK_CAPACITY];    /* 0=not-null, 1=null  (owned mode) */
     uint32_t        *str_lens;                 /* TEXT only: bump-alloc'd lengths, or NULL */
+    const void      *ext_data;                 /* borrowed mode: points into flat_table col_data */
+    const uint8_t   *ext_nulls;                /* borrowed mode: points into flat_table col_nulls */
     union {
         int16_t          i16[BLOCK_CAPACITY];         /* SMALLINT */
         int32_t          i32[BLOCK_CAPACITY];         /* INT, BOOLEAN, DATE */
@@ -95,9 +98,15 @@ static inline size_t cb_elem_size(const struct col_block *cb)
     return col_type_elem_size(cb->type);
 }
 
-/* Pointer to the data element at index i in a col_block (cast to void*). */
+/* Pointer to the data element at index i in a col_block (cast to void*).
+ * Handles both borrowed (ext_data) and owned (data.*) modes. */
 static inline void *cb_data_ptr(const struct col_block *cb, uint32_t i)
 {
+    if (cb->borrowed && cb->ext_data) {
+        size_t esz = col_type_elem_size(cb->type);
+        if (cb->type == COLUMN_TYPE_VECTOR) esz *= cb->vec_dim;
+        return (void *)((const char *)cb->ext_data + i * esz);
+    }
     switch (column_type_storage(cb->type)) {
     case STORE_I16:   return (void *)&cb->data.i16[i];
     case STORE_I32:   return (void *)&cb->data.i32[i];
@@ -111,14 +120,101 @@ static inline void *cb_data_ptr(const struct col_block *cb, uint32_t i)
     __builtin_unreachable();
 }
 
+/* ---- Zero-copy typed accessors ----
+ * These return pointers to the underlying data array, transparently handling
+ * borrowed (ext_data) vs owned (data.*) modes.  The null-bitmap accessor
+ * returns ext_nulls when borrowed, otherwise the embedded nulls[]. */
+static inline const uint8_t *cb_nulls(const struct col_block *cb)
+{
+    return cb->borrowed ? cb->ext_nulls : cb->nulls;
+}
+
+static inline const int16_t *cb_i16(const struct col_block *cb)
+{
+    return cb->borrowed ? (const int16_t *)cb->ext_data : cb->data.i16;
+}
+
+static inline const int32_t *cb_i32(const struct col_block *cb)
+{
+    return cb->borrowed ? (const int32_t *)cb->ext_data : cb->data.i32;
+}
+
+static inline const int64_t *cb_i64(const struct col_block *cb)
+{
+    return cb->borrowed ? (const int64_t *)cb->ext_data : cb->data.i64;
+}
+
+static inline const double *cb_f64(const struct col_block *cb)
+{
+    return cb->borrowed ? (const double *)cb->ext_data : cb->data.f64;
+}
+
+static inline char *const *cb_str(const struct col_block *cb)
+{
+    return cb->borrowed ? (char *const *)cb->ext_data : (char *const *)cb->data.str;
+}
+
+static inline const struct interval *cb_iv(const struct col_block *cb)
+{
+    return cb->borrowed ? (const struct interval *)cb->ext_data : cb->data.iv;
+}
+
+static inline const struct uuid_val *cb_uuid(const struct col_block *cb)
+{
+    return cb->borrowed ? (const struct uuid_val *)cb->ext_data : cb->data.uuid;
+}
+
+static inline const float *cb_vec(const struct col_block *cb)
+{
+    return cb->borrowed ? (const float *)cb->ext_data : cb->data.vec;
+}
+
+/* Materialize a borrowed col_block: copy ext_data/ext_nulls into the
+ * embedded arrays so that direct data.* / nulls[] access works.
+ * No-op if the block is already owned.  After this call, borrowed == 0. */
+static inline void cb_materialize(struct col_block *cb)
+{
+    if (!cb->borrowed) return;
+    uint16_t n = cb->count;
+    const void *src = cb->ext_data;
+    const uint8_t *snulls = cb->ext_nulls;
+    /* Clear borrowed BEFORE copying so we write into the embedded arrays */
+    cb->borrowed = 0;
+    cb->ext_data = NULL;
+    cb->ext_nulls = NULL;
+    if (snulls)
+        memcpy(cb->nulls, snulls, n);
+    if (src) {
+        if (cb->type == COLUMN_TYPE_VECTOR) {
+            /* data.vec is a pointer, not an embedded array — just adopt the
+             * external pointer (flat_table storage outlives the query). */
+            cb->data.vec = (float *)(uintptr_t)src;
+        } else {
+            size_t esz = col_type_elem_size(cb->type);
+            /* cb_data_ptr(cb, 0) now returns the embedded array since borrowed==0 */
+            memcpy(cb_data_ptr(cb, 0), src, (size_t)n * esz);
+        }
+    }
+}
+
+/* Materialize all borrowed col_blocks in a row_block. */
+static inline void row_block_materialize(struct row_block *rb)
+{
+    for (uint16_t i = 0; i < rb->ncols; i++)
+        cb_materialize(&rb->cols[i]);
+}
+
 /* Reset a row_block for reuse (zero counts, keep allocated memory).
- * Clears str_lens to prevent stale pointers across plan_next_block calls. */
+ * Clears str_lens and borrowed state to prevent stale pointers. */
 static inline void row_block_reset(struct row_block *rb)
 {
     rb->count = 0;
     for (uint16_t i = 0; i < rb->ncols; i++) {
         rb->cols[i].count = 0;
         rb->cols[i].str_lens = NULL;
+        rb->cols[i].borrowed = 0;
+        rb->cols[i].ext_data = NULL;
+        rb->cols[i].ext_nulls = NULL;
     }
     rb->sel = NULL;
     rb->sel_count = 0;
@@ -203,36 +299,36 @@ static inline uint32_t block_hash_str_n(const char *s, uint32_t len)
 /* Hash a col_block value at index i */
 static inline uint32_t block_hash_cell(const struct col_block *cb, uint16_t i)
 {
-    if (cb->nulls[i]) return 0;
+    if (cb_nulls(cb)[i]) return 0;
     switch (cb->type) {
         case COLUMN_TYPE_SMALLINT:
-            return block_hash_i32((int32_t)cb->data.i16[i]);
+            return block_hash_i32((int32_t)cb_i16(cb)[i]);
         case COLUMN_TYPE_INT:
         case COLUMN_TYPE_BOOLEAN:
         case COLUMN_TYPE_DATE:
-            return block_hash_i32(cb->data.i32[i]);
+            return block_hash_i32(cb_i32(cb)[i]);
         case COLUMN_TYPE_BIGINT:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_TIME:
-            return block_hash_i64(cb->data.i64[i]);
+            return block_hash_i64(cb_i64(cb)[i]);
         case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_NUMERIC:
-            return block_hash_f64(cb->data.f64[i]);
+            return block_hash_f64(cb_f64(cb)[i]);
         case COLUMN_TYPE_TEXT:
             if (cb->str_lens)
-                return block_hash_str_n(cb->data.str[i], cb->str_lens[i]);
-            return block_hash_str(cb->data.str[i]);
+                return block_hash_str_n(cb_str(cb)[i], cb->str_lens[i]);
+            return block_hash_str(cb_str(cb)[i]);
         case COLUMN_TYPE_ENUM:
-            return block_hash_i32(cb->data.i32[i]);
+            return block_hash_i32(cb_i32(cb)[i]);
         case COLUMN_TYPE_UUID: {
-            uint64_t uh = uuid_hash(cb->data.uuid[i]);
+            uint64_t uh = uuid_hash(cb_uuid(cb)[i]);
             return (uint32_t)(uh ^ (uh >> 32));
         }
         case COLUMN_TYPE_INTERVAL: {
-            /* hash all 16 bytes of the interval struct */
+            struct interval iv_val = cb_iv(cb)[i];
             uint32_t h = FNV_OFFSET;
-            uint8_t *p = (uint8_t *)&cb->data.iv[i];
+            uint8_t *p = (uint8_t *)&iv_val;
             for (int j = 0; j < (int)sizeof(struct interval); j++) {
                 h ^= p[j]; h *= FNV_PRIME;
             }
@@ -240,7 +336,7 @@ static inline uint32_t block_hash_cell(const struct col_block *cb, uint16_t i)
         }
         case COLUMN_TYPE_VECTOR: {
             uint32_t h = FNV_OFFSET;
-            uint8_t *p = (uint8_t *)&cb->data.vec[i * cb->vec_dim];
+            const uint8_t *p = (const uint8_t *)&cb_vec(cb)[i * cb->vec_dim];
             for (int j = 0; j < (int)(cb->vec_dim * sizeof(float)); j++) {
                 h ^= p[j]; h *= FNV_PRIME;
             }
@@ -254,42 +350,43 @@ static inline uint32_t block_hash_cell(const struct col_block *cb, uint16_t i)
 static inline int block_cell_eq(const struct col_block *a, uint16_t ai,
                                 const struct col_block *b, uint16_t bi)
 {
-    if (a->nulls[ai] || b->nulls[bi]) return 0; /* NULL != anything */
+    if (cb_nulls(a)[ai] || cb_nulls(b)[bi]) return 0; /* NULL != anything */
     switch (a->type) {
         case COLUMN_TYPE_SMALLINT:
-            return a->data.i16[ai] == b->data.i16[bi];
+            return cb_i16(a)[ai] == cb_i16(b)[bi];
         case COLUMN_TYPE_INT:
         case COLUMN_TYPE_BOOLEAN:
         case COLUMN_TYPE_DATE:
-            return a->data.i32[ai] == b->data.i32[bi];
+            return cb_i32(a)[ai] == cb_i32(b)[bi];
         case COLUMN_TYPE_BIGINT:
         case COLUMN_TYPE_TIMESTAMP:
         case COLUMN_TYPE_TIMESTAMPTZ:
         case COLUMN_TYPE_TIME:
-            return a->data.i64[ai] == b->data.i64[bi];
+            return cb_i64(a)[ai] == cb_i64(b)[bi];
         case COLUMN_TYPE_FLOAT:
         case COLUMN_TYPE_NUMERIC:
-            return a->data.f64[ai] == b->data.f64[bi];
-        case COLUMN_TYPE_TEXT:
-            if (!a->data.str[ai] || !b->data.str[bi])
-                return a->data.str[ai] == b->data.str[bi];
+            return cb_f64(a)[ai] == cb_f64(b)[bi];
+        case COLUMN_TYPE_TEXT: {
+            const char *sa = cb_str(a)[ai], *sb = cb_str(b)[bi];
+            if (!sa || !sb) return sa == sb;
             if (a->str_lens && b->str_lens) {
                 if (a->str_lens[ai] != b->str_lens[bi]) return 0;
-                return memcmp(a->data.str[ai], b->data.str[bi], a->str_lens[ai]) == 0;
+                return memcmp(sa, sb, a->str_lens[ai]) == 0;
             }
-            return strcmp(a->data.str[ai], b->data.str[bi]) == 0;
+            return strcmp(sa, sb) == 0;
+        }
         case COLUMN_TYPE_ENUM:
-            return a->data.i32[ai] == b->data.i32[bi];
+            return cb_i32(a)[ai] == cb_i32(b)[bi];
         case COLUMN_TYPE_UUID:
-            return uuid_equal(a->data.uuid[ai], b->data.uuid[bi]);
-        case COLUMN_TYPE_INTERVAL:
-            return a->data.iv[ai].months == b->data.iv[bi].months &&
-                   a->data.iv[ai].days == b->data.iv[bi].days &&
-                   a->data.iv[ai].usec == b->data.iv[bi].usec;
+            return uuid_equal(cb_uuid(a)[ai], cb_uuid(b)[bi]);
+        case COLUMN_TYPE_INTERVAL: {
+            struct interval ia = cb_iv(a)[ai], ib = cb_iv(b)[bi];
+            return ia.months == ib.months && ia.days == ib.days && ia.usec == ib.usec;
+        }
         case COLUMN_TYPE_VECTOR:
             return a->vec_dim == b->vec_dim &&
-                   memcmp(&a->data.vec[ai * a->vec_dim],
-                          &b->data.vec[bi * b->vec_dim],
+                   memcmp(&cb_vec(a)[ai * a->vec_dim],
+                          &cb_vec(b)[bi * b->vec_dim],
                           a->vec_dim * sizeof(float)) == 0;
     }
     __builtin_unreachable();

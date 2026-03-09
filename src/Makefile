@@ -27,6 +27,18 @@ ifeq ($(UNAME_S),Darwin)
 endif
 PQ_LDFLAGS += -lzstd -lz
 
+# ── DuckDB library (optional, for bench-vs-duck) ────────────────
+DUCKDB_INCFLAGS =
+DUCKDB_LDFLAGS  =
+ifeq ($(UNAME_S),Darwin)
+  DUCKDB_PREFIX := $(shell brew --prefix duckdb 2>/dev/null)
+  ifneq ($(DUCKDB_PREFIX),)
+    DUCKDB_INCFLAGS += -I$(DUCKDB_PREFIX)/include
+    DUCKDB_LDFLAGS  += -L$(DUCKDB_PREFIX)/lib
+  endif
+endif
+DUCKDB_LDFLAGS += -lduckdb
+
 # ── Compiler flags ───────────────────────────────────────────────
 CFLAGS         ?= -Wall -Wextra -Wswitch-enum -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -O1 -g -fsanitize=address -fno-omit-frame-pointer -MMD -MP
 CFLAGS         += $(PQ_INCFLAGS)
@@ -47,6 +59,8 @@ RELEASE_LIB_OBJS = $(patsubst %.c,$(BUILDDIR)/rel_%.o,$(LIB_SRCS))
 TARGET         = $(BUILDDIR)/mskql_debug
 RELEASE_TARGET = $(BUILDDIR)/mskql
 BENCH          = $(BUILDDIR)/mskql_bench
+BENCH_DUCK     = $(BUILDDIR)/mskql_bench_vs_duck
+LIBMSKQL       = $(BUILDDIR)/libmskql.a
 CLI_DBG        = $(BUILDDIR)/mskqlcli_debug
 CLI_REL        = $(BUILDDIR)/mskqlcli
 
@@ -60,6 +74,11 @@ release: $(RELEASE_OBJS)
 
 bench: $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_bench.o
 	$(CC) $(RELEASE_CFLAGS) -o $(BENCH) $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_bench.o -lm $(PQ_LDFLAGS)
+
+lib: $(LIBMSKQL)
+
+$(LIBMSKQL): $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_mskql_api.o
+	ar rcs $@ $(RELEASE_LIB_OBJS) $(BUILDDIR)/rel_mskql_api.o
 
 $(CLI_DBG): mskqlcli.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -o $@ $<
@@ -76,6 +95,15 @@ bench-throughput: | $(BUILDDIR)
 
 $(BUILDDIR)/rel_bench.o: ../bench/bench.c | $(BUILDDIR)
 	$(CC) $(RELEASE_CFLAGS) -c -o $@ $<
+
+$(BUILDDIR)/rel_mskql_api.o: mskql_api.c | $(BUILDDIR)
+	$(CC) $(RELEASE_CFLAGS) -c -o $@ $<
+
+$(BUILDDIR)/rel_bench_vs_duck.o: ../bench/bench_vs_duck.c | $(BUILDDIR)
+	$(CC) $(RELEASE_CFLAGS) $(DUCKDB_INCFLAGS) -c -o $@ $<
+
+bench-vs-duck: $(LIBMSKQL) $(BUILDDIR)/rel_bench_vs_duck.o
+	$(CC) $(RELEASE_CFLAGS) -o $(BENCH_DUCK) $(BUILDDIR)/rel_bench_vs_duck.o $(LIBMSKQL) -lm $(PQ_LDFLAGS) $(DUCKDB_LDFLAGS)
 
 $(BUILDDIR)/rel_%.o: %.c | $(BUILDDIR)
 	$(CC) $(RELEASE_CFLAGS) -c -o $@ $<
@@ -126,4 +154,4 @@ $(WASM_TARGET): $(WASM_SRCS) | $(BUILDDIR)
 -include $(OBJS:.o=.d)
 -include $(RELEASE_OBJS:.o=.d)
 
-.PHONY: all clean release bench bench-throughput wasm mskqlcli mskqlcli-debug
+.PHONY: all clean release bench bench-throughput bench-vs-duck lib wasm mskqlcli mskqlcli-debug
