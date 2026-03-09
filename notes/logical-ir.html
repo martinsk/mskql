@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Logical IR: three-stage query pipeline</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Logical IR: three-stage query pipeline</h1>
+<span class="subtitle">A 7-node canonical representation between the parser and the physical planner.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark is <code>bench_analytical_cte</code>: a CTE pipeline with
+    joins, aggregation, and sorting. The query touches three tables through a
+    multi-stage plan. Measured as wall-clock latency through the PostgreSQL wire
+    protocol.
+</p>
+
+<pre><code class="language-sql">WITH order_summary AS (
+    SELECT o.customer_id,
+           SUM(o.quantity * p.price) AS total
+    FROM orders o
+    JOIN products p ON o.product_id = p.id
+    GROUP BY o.customer_id
+)
+SELECT c.region, COUNT(*), SUM(os.total) AS revenue
+FROM order_summary os
+JOIN customers c ON os.customer_id = c.id
+GROUP BY c.region
+ORDER BY revenue DESC;</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    The parser emits a <code>struct query_select</code> with ~40 boolean flags:
+    <code>has_join</code>, <code>has_group_by</code>, <code>has_order_by</code>,
+    <code>has_distinct</code>, <code>has_having</code>, <code>has_window</code>,
+    <code>has_set_op</code>, and so on. The physical plan builder
+    (<code>plan.c</code>) had to pattern-match this flat flag soup directly,
+    leading to fragile if/else chains that grew with every new feature. Adding
+    projection pushdown or predicate pushdown required touching every builder
+    path.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    There was no intermediate representation between parsing and physical planning.
+    The parser produced a flat record of everything the query mentioned. The
+    planner consumed it directly. This meant every optimization had to understand
+    the raw parser output, and rewrite rules (merge two filters, push a filter
+    past a join) had nowhere to operate.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    Added <code>logical.c</code> (~660 lines) and <code>logical.h</code> (~180 lines)
+    implementing a three-stage pipeline:
+</p>
+
+<p>
+    <strong>Stage 1: <code>logical_build()</code></strong> &mdash; desugars the
+    parser AST into a minimal tree of 7 node types:
+</p>
+
+<ul>
+    <li><strong><code>L_SCAN</code></strong> &mdash; table scan, subquery, CTE, generate_series, or set operation</li>
+    <li><strong><code>L_FILTER</code></strong> &mdash; predicate (WHERE or HAVING)</li>
+    <li><strong><code>L_PROJECT</code></strong> &mdash; column selection and expressions</li>
+    <li><strong><code>L_JOIN</code></strong> &mdash; left + right children with explicit ON condition</li>
+    <li><strong><code>L_AGGREGATE</code></strong> &mdash; GROUP BY keys + aggregate expressions</li>
+    <li><strong><code>L_SORT</code></strong> &mdash; ORDER BY</li>
+    <li><strong><code>L_LIMIT</code></strong> &mdash; LIMIT + OFFSET</li>
+</ul>
+
+<p>
+    Sugar is fully lowered: HAVING becomes <code>L_FILTER</code> wrapping
+    <code>L_AGGREGATE</code>. DISTINCT becomes <code>L_AGGREGATE</code> with
+    all projected columns as group keys. DISTINCT ON desugars to
+    <code>L_SORT</code> + <code>L_AGGREGATE(first_row_only=1)</code>.
+</p>
+
+<p>
+    <strong>Stage 2: <code>logical_normalize()</code></strong> &mdash; applies
+    semantics-preserving tree rewrites in a single bottom-up pass:
+</p>
+
+<ul>
+    <li><strong>Filter merge</strong> &mdash;
+        <code>L_FILTER(L_FILTER(x, p1), p2) &rarr; L_FILTER(x, p1 AND p2)</code>.
+        Combines adjacent filters into one, reducing plan tree depth.</li>
+    <li><strong>Predicate pushdown</strong> &mdash;
+        <code>L_FILTER(L_JOIN(a, b), pred_on_a) &rarr; L_JOIN(L_FILTER(a, pred), b)</code>.
+        Moves single-column filters inside joins so the physical planner sees
+        <code>L_FILTER(L_SCAN)</code> on the left child, enabling index scan detection.</li>
+    <li><strong>Dead project elimination</strong> &mdash;
+        <code>L_PROJECT(L_PROJECT(x, c1), c2) &rarr; L_PROJECT(x, c2)</code>.
+        Removes redundant projections.</li>
+</ul>
+
+<p>
+    <strong>Stage 3: <code>logical_to_physical()</code></strong> (in <code>plan.c</code>)
+    &mdash; pattern-matches the normalized logical tree to physical plan nodes
+    (<code>PLAN_SEQ_SCAN</code>, <code>PLAN_HASH_JOIN</code>,
+    <code>PLAN_HASH_AGG</code>, <code>PLAN_TOP_N</code>, etc.). This is where
+    projection pushdown narrows scan width per join table based on which columns
+    are actually needed.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    The logical IR enabled two optimizations that would have been impractical
+    to implement against the raw parser output:
+</p>
+
+<ul>
+    <li><strong>Predicate pushdown</strong> &mdash; filters that reference only
+        the left side of a join are pushed below the join node. The physical
+        planner then applies them during the scan, reducing the number of rows
+        entering the join.</li>
+    <li><strong>Projection pushdown</strong> &mdash; the physical planner
+        analyzes which columns are referenced in join keys, GROUP BY, aggregates,
+        and filters, then narrows each table scan to only the needed columns.
+        For wide tables, this reduces memory traffic and intermediate tuple width.</li>
+</ul>
+
+<p>
+    The IR also made <code>EXPLAIN (LOGICAL)</code> possible: a human-readable
+    dump of the canonical tree before physical planning, useful for debugging
+    plan decisions.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

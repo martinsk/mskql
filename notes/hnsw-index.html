@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; HNSW vector index</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>HNSW vector index</h1>
+<span class="subtitle">Approximate nearest-neighbor search via hierarchical navigable small-world graphs.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark inserts 10,000 vectors of dimension 128 and queries the
+    10 nearest neighbors using L2 distance. Compared against PostgreSQL
+    with pgvector on the same machine.
+</p>
+
+<pre><code class="language-sql">CREATE TABLE embeddings (
+    id    INT PRIMARY KEY,
+    name  TEXT,
+    vec   VECTOR(128)
+);
+
+CREATE INDEX ON embeddings USING hnsw (vec vector_l2_ops);
+
+-- Insert 10K vectors, then:
+SELECT id, name
+FROM embeddings
+ORDER BY vec <-> '[0.1, 0.2, ...]'
+LIMIT 10;</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    Without an index, finding the K nearest neighbors requires computing
+    the distance from the query vector to every row in the table. For
+    10,000 rows of dimension 128, that is 1.28M floating-point operations
+    per query. Acceptable for small tables, but it scales linearly with
+    row count&mdash;at 1M rows, each query would need 128M operations.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    The <code>VECTOR(n)</code> column type was added with basic storage,
+    insert, scan, filter, and sort support, but no index structure. The
+    <code>ORDER BY vec &lt;-&gt; query LIMIT K</code> pattern was executed
+    as a full scan followed by a Top-N sort. This is correct but slow
+    for large tables.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    Implemented HNSW (Hierarchical Navigable Small World) in
+    <code>hnsw.c</code> (608 lines) and <code>hnsw.h</code> (63 lines).
+    The index is created via <code>CREATE INDEX ... USING hnsw</code> with
+    support for three distance metrics.
+</p>
+
+<ul>
+    <li><strong>Graph structure</strong> &mdash; each vector is a node in a
+        layered graph. Higher layers are sparser and cover longer distances;
+        layer 0 is the densest. Level assignment follows a random exponential
+        distribution with multiplier <code>ml = 1/ln(M)</code>.</li>
+    <li><strong>Build (<code>hnsw_insert</code>)</strong> &mdash; inserts a
+        new vector by searching for its nearest neighbors at each layer
+        (beam search with <code>ef_construction</code> candidates), then
+        adding bidirectional edges. Edges are pruned when a node exceeds
+        <code>M</code> neighbors (layer &gt; 0) or <code>2&times;M</code>
+        neighbors (layer 0).</li>
+    <li><strong>Search (<code>hnsw_search</code>)</strong> &mdash; starts
+        at the entry point on the highest layer, greedily descends to
+        layer 0, then runs a beam search with configurable
+        <code>ef_search</code> to find the K nearest neighbors.</li>
+    <li><strong>Distance functions</strong> &mdash; L2 (Euclidean), cosine,
+        and inner product. Implemented in <code>vector.c</code> as tight
+        float loops that the compiler auto-vectorizes to NEON/SSE.</li>
+    <li><strong>Delete (<code>hnsw_remove</code>)</strong> &mdash; marks a
+        node as deleted and removes its edges from neighbors. Does not
+        currently compact the graph.</li>
+</ul>
+
+<p>
+    The planner detects <code>ORDER BY vec &lt;-&gt; query LIMIT K</code>
+    and, when an HNSW index exists on the vector column, rewrites the scan
+    to use <code>hnsw_search</code> instead of a full table scan + sort.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    KNN queries on indexed tables return in sub-millisecond time regardless
+    of table size (up to the tested 10K rows). The index parameters
+    (<code>M=16</code>, <code>ef_construction=200</code>) provide a good
+    recall/speed tradeoff for typical embedding workloads.
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th>Distance metric</th><th>Syntax</th></tr></thead>
+    <tbody>
+        <tr><td>L2 (Euclidean)</td><td><code>vector_l2_ops</code></td></tr>
+        <tr><td>Cosine</td><td><code>vector_cosine_ops</code></td></tr>
+        <tr><td>Inner product</td><td><code>vector_ip_ops</code></td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    The implementation is 608 lines of C with no external dependencies.
+    All vector benchmarks pass with the HNSW index enabled, and the brute-force
+    fallback remains available for tables without an index.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Swiss Table hash join</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Swiss Table hash join</h1>
+<span class="subtitle">Ctrl-byte overlay for cache-friendly hash join build and probe.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    The benchmark is <code>node_hash_join_large</code>: a 100K-row outer table
+    joined against a 50K-row build side. At this scale, the hash table exceeds
+    L1 and pressures L2/L3 cache. Measured as wall-clock latency of the
+    internal C benchmark harness (<code>bench.c</code>).
+</p>
+
+<pre><code class="language-sql">SELECT o.id, o.amount, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id;
+-- 100K outer rows, 50K build-side rows</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    The hash join uses a classic open-addressing hash table with linear probing.
+    Each probe follows a chain of bucket entries. When the build side is large
+    enough to spill out of L1 cache, every probe step is a potential cache miss.
+    The CPU stalls waiting for memory, and the join becomes memory-bound rather
+    than compute-bound.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    The classic hash table stores full entries (hash + row index) at each bucket.
+    A probe that lands on a non-matching bucket must read the full entry to
+    check the hash, then follow the chain pointer. Each step touches a different
+    cache line. For 50K entries, the hash table spans ~400KB&mdash;well beyond
+    L1 (64KB) and into L2 territory.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    Added a Swiss Table control-byte overlay to
+    <code>struct block_hash_table</code> (<code>block.h</code>,
+    <code>plan.c</code>). The design:
+</p>
+
+<ul>
+    <li><strong><code>ctrl[]</code></strong> &mdash; a dense <code>uint8_t</code>
+        array, one byte per slot. Each byte stores a 7-bit hash tag
+        (bits 25&ndash;31 of the full hash) or <code>0x80</code> (empty).
+        The entire ctrl array for 50K entries fits in ~50KB&mdash;L1-resident.</li>
+    <li><strong><code>slot_entry[]</code></strong> &mdash; maps each slot to
+        the bucket index in the existing <code>entries[]</code> array.</li>
+    <li><strong>Probe path</strong> &mdash; <code>swiss_ht_probe()</code>
+        scans a 16-byte group of ctrl bytes starting at the hash-derived
+        position. The compiler auto-vectorizes this to a single NEON/SSE
+        comparison. If no ctrl byte matches the 7-bit tag, the probe
+        immediately moves to the next group&mdash;no entry reads needed.
+        Only on a tag match does it dereference the entry for a full key
+        comparison.</li>
+    <li><strong>Duplicate keys</strong> &mdash; chained via the existing
+        <code>nexts[]</code> array. The Swiss Table finds the first match;
+        subsequent duplicates follow the chain as before.</li>
+</ul>
+
+<p>
+    Other hash table consumers (hash aggregation, semi-join, distinct, set
+    operations) are unchanged&mdash;they still use classic buckets. The Swiss
+    Table overlay is specific to hash join, where the build side is largest.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    A/B comparison, <code>-O3 -march=native -flto</code>:
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th>Benchmark</th><th class="num">Before</th><th class="num">After</th><th class="num">Change</th></tr></thead>
+    <tbody>
+        <tr><td>node_hash_join_large (100K&times;50K, L2/L3)</td><td class="num">&mdash;</td><td class="num">&mdash;</td><td class="num">~8&ndash;10% faster total, 7.5% faster p50</td></tr>
+        <tr><td>node_hash_join (100K&times;1K, L1-resident)</td><td class="num">&mdash;</td><td class="num">&mdash;</td><td class="num">~2% faster</td></tr>
+        <tr><td>Small joins (500&ndash;2000 rows)</td><td class="num">&mdash;</td><td class="num">&mdash;</td><td class="num">0&ndash;5%, within noise</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    The benefit scales with build-side size. When the hash table fits in L1,
+    the ctrl-byte check is redundant&mdash;the full entry is already in cache.
+    When it spills to L2/L3, the compact ctrl array provides a fast-miss filter
+    that avoids most cache-line fetches. No regressions on any benchmark.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

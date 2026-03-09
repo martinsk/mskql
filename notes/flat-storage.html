@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Eliminating the legacy row-store</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Eliminating the legacy row-store</h1>
+<span class="subtitle">One storage format, one code path: flat columnar arrays everywhere.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    All benchmarks, all workloads. This was not a single-query optimization
+    but a structural change that affected every read and write path in the
+    engine.
+</p>
+
+<h2>Problem</h2>
+
+<p>
+    The engine had two storage representations living side by side:
+</p>
+
+<ul>
+    <li><strong><code>t-&gt;rows</code></strong> &mdash; an array of
+        <code>struct row</code>, where each row held a dynamic array of
+        <code>struct cell</code> values. This was the original storage format,
+        used by the legacy row-by-row executor (<code>query.c</code>).</li>
+    <li><strong><code>col_block</code></strong> &mdash; contiguous typed arrays
+        (<code>int32_t[]</code>, <code>double[]</code>, <code>uint8_t[]</code>
+        null bitmaps) used by the columnar plan executor (<code>plan.c</code>).
+        These were populated by scanning the row store.</li>
+</ul>
+
+<p>
+    Every query paid the cost of both representations. Inserts wrote to the
+    row store; the columnar executor then scanned the row store to build
+    column blocks. Deletes had to update both. The row store was the
+    authoritative copy, and the column blocks were ephemeral views rebuilt
+    on each query.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    The row store predated the columnar executor. When the plan executor was
+    added, it was built as a layer on top of the existing row store rather
+    than replacing it. This was the right incremental approach&mdash;it allowed
+    the new executor to be tested against the old one&mdash;but it left the
+    system with two representations that had to be kept in sync.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    Removed <code>t-&gt;rows</code> entirely. Tables now store data exclusively
+    in <code>struct flat_table</code>: one contiguous typed array per column,
+    plus a parallel null bitmap. The key changes:
+</p>
+
+<ul>
+    <li><strong><code>flat_snap</code> / <code>flat_snap_free</code></strong>
+        &mdash; when the legacy row-by-row executor (<code>query.c</code>)
+        needs row-oriented access, <code>flat_snap</code> creates a temporary
+        snapshot of <code>struct row</code> values from the flat arrays. This
+        is the reverse of the old direction: previously, column blocks were
+        built from rows; now, rows are built from columns when needed.</li>
+    <li><strong>INSERT path</strong> &mdash; inserts write directly to the
+        flat column arrays. No row struct is ever created for new data.</li>
+    <li><strong>DELETE / UPDATE path</strong> &mdash; operates on the flat
+        arrays via column index and row offset. Deletions shift column arrays
+        in place.</li>
+    <li><strong>TEXT string ownership</strong> &mdash; in the row store, each
+        cell owned its text string via <code>malloc</code>. In the flat store,
+        TEXT columns use a <code>char**</code> array where each string is
+        individually allocated. The flat table&rsquo;s free path walks the
+        string array and frees each entry.</li>
+</ul>
+
+<h2>Result</h2>
+
+<p>
+    A single storage representation simplifies every code path:
+</p>
+
+<ul>
+    <li><strong>No sync overhead</strong> &mdash; inserts, deletes, and updates
+        touch one data structure instead of two.</li>
+    <li><strong>No scan-to-build cost</strong> &mdash; the columnar executor
+        reads directly from the table&rsquo;s flat arrays. No intermediate
+        conversion step.</li>
+    <li><strong>Less memory</strong> &mdash; no duplicate storage for the row
+        array, its cell arrays, and the cell text pointers.</li>
+    <li><strong>Simpler code</strong> &mdash; removed hundreds of lines of
+        row-store management, row-to-column conversion, and dual-path
+        bookkeeping.</li>
+</ul>
+
+<p>
+    The legacy row-by-row executor still works via <code>flat_snap</code>,
+    so queries that fall back from the plan executor to the legacy path
+    (e.g. complex correlated subqueries) continue to produce correct results.
+    All 1,500+ tests pass under AddressSanitizer.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

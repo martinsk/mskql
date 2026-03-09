@@ -26,6 +26,41 @@
 
 <ol reversed style="list-style:none; padding:0; margin:1.5rem 0;">
     <li style="margin-bottom:1.2rem;">
+        <strong><a href="logical-ir.html">Logical IR: three-stage query pipeline</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        7-node canonical representation between parser and physical planner.
+        Predicate pushdown, filter merge, projection pushdown, dead project elimination.
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="swiss-table-join.html">Swiss Table hash join</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Ctrl-byte overlay for cache-friendly hash join build and probe.
+        ~8&ndash;10% faster on L2/L3 pressure workloads (100K&times;50K join).
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="custom-parquet.html">Hand-rolled Parquet reader</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Replaced third-party Carquet library with 884 lines of C.
+        Direct Thrift compact protocol decoder with zstd/zlib decompression.
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="hnsw-index.html">HNSW vector index</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Approximate nearest-neighbor search via hierarchical navigable small-world graphs.
+        L2, cosine, and inner-product distance metrics in 608 lines of C.
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="flat-storage.html">Eliminating the legacy row-store</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        One storage format, one code path: flat columnar arrays everywhere.
+        Removed dual row/column sync overhead.
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
         <strong><a href="result-cache.html">Result cache and join cache</a></strong>
         <br><span style="color:var(--fg-dim); font-size:0.92rem;">
         Wire-byte result cache + hash-join build-side cache.

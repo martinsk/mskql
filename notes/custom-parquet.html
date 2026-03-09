@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Hand-rolled Parquet reader</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Hand-rolled Parquet reader</h1>
+<span class="subtitle">Replacing a third-party library with 884 lines of C.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    12 Parquet benchmarks: full scan, filtered scan, aggregation, joins,
+    subqueries, and analytical queries on files ranging from 50K to 200K rows.
+    Measured as wall-clock latency through the PostgreSQL wire protocol.
+</p>
+
+<pre><code class="language-sql">CREATE FOREIGN TABLE events
+    OPTIONS (filename '/data/events.parquet');
+
+SELECT event_type, COUNT(*), SUM(amount)
+FROM events
+GROUP BY event_type;</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    The original Parquet support used Carquet, a third-party C library built
+    via CMake. It worked, but introduced a heavy build dependency: a full CMake
+    clone-and-build step, a large dependency tree, and a schema traversal API
+    that did not map cleanly to mskql&rsquo;s flat columnar storage. The build
+    was slow, the code was opaque, and bugs in the Thrift decoding layer were
+    impossible to diagnose without understanding the library&rsquo;s internals.
+</p>
+
+<h2>Cause</h2>
+
+<p>
+    Parquet files use Apache Thrift compact protocol for metadata serialization.
+    The format is simple&mdash;zigzag varints, field deltas, nested structs&mdash;but
+    the field IDs must match the official Parquet Thrift IDL exactly. Any
+    off-by-one in field mapping silently corrupts the metadata parse, producing
+    wrong column counts, wrong offsets, or garbage compression codecs.
+</p>
+
+<h2>Fix</h2>
+
+<p>
+    Replaced Carquet with <code>pq_reader.c</code> (884 lines): a minimal
+    read-only Parquet decoder that handles the full read path from file open
+    to materialized columns.
+</p>
+
+<ul>
+    <li><strong>Thrift compact protocol</strong> &mdash; hand-written decoder
+        for varints, zigzag encoding, field headers, nested structs, and
+        skip-ahead for unknown fields. Field IDs match the official Parquet
+        Thrift IDL: SchemaElement (10 fields), ColumnMetaData (11 fields),
+        RowGroup (3 fields), PageHeader (8 fields).</li>
+    <li><strong>Page decoding</strong> &mdash; supports PLAIN encoding for
+        all types (BOOLEAN, INT32, INT64, FLOAT, DOUBLE, BYTE_ARRAY),
+        RLE/bit-packed encoding for definition levels, and DELTA_BINARY_PACKED
+        for integer columns.</li>
+    <li><strong>Compression</strong> &mdash; zstd and zlib decompression via
+        system libraries. Uncompressed pages pass through directly.</li>
+    <li><strong>Dictionary pages</strong> &mdash; PLAIN_DICTIONARY encoding
+        with dictionary page support for string columns.</li>
+</ul>
+
+<p>
+    The build dependency shrank from a full CMake project to two linker flags:
+    <code>-lzstd -lz</code>.
+</p>
+
+<h3>Five bugs found in the first version</h3>
+
+<p>
+    The initial implementation had 5 bugs in Thrift field ID mapping that
+    prevented it from opening <em>any</em> Parquet file. These were invisible
+    in testing because the test runner swallowed setup errors (psql returns
+    exit 0 on SQL errors). After fixing the test harness to detect setup
+    failures:
+</p>
+
+<ol>
+    <li><strong>Stop byte handling</strong> &mdash; byte <code>0x00</code>
+        (Thrift struct stop) was treated as field delta=0, consuming extra
+        bytes and corrupting the stream.</li>
+    <li><strong>SchemaElement field IDs</strong> &mdash; fields 5&ndash;10
+        were off by one (field 5 mapped to <code>converted_type</code>
+        instead of <code>num_children</code>).</li>
+    <li><strong>ColumnMetaData field IDs</strong> &mdash; fields 4&ndash;11
+        were all shifted by one position relative to the Thrift IDL.</li>
+    <li><strong>RowGroup num_rows</strong> &mdash; field 2 was used for
+        <code>num_rows</code> but the spec says field 3 (field 2 is
+        <code>total_byte_size</code>).</li>
+    <li><strong>List/set/map type IDs</strong> &mdash; used 13/14/15 but
+        Thrift compact uses 9/10/11.</li>
+</ol>
+
+<h2>Result</h2>
+
+<p>
+    Zero external C dependencies beyond zstd and zlib. The Parquet reader
+    compiles in under a second. All 12 Parquet benchmarks pass with the
+    same or better performance. The code is fully auditable&mdash;every
+    field ID, every encoding, every decompression call is visible in a
+    single 884-line file.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>
