@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Stress benchmarks (500K rows)</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Stress benchmarks: 500K-row workloads</h1>
+<span class="subtitle">Eight workloads at 500K rows test how well the engine scales beyond L2 cache.</span>
+<hr class="title-rule">
+
+<h2>Motivation</h2>
+
+<p>
+    The standard benchmarks use 5K&ndash;50K rows, which fit comfortably in CPU
+    cache. Real analytical workloads often involve hundreds of thousands or millions
+    of rows. The stress benchmarks push mskql to 500K rows per table to expose
+    scaling bottlenecks in sorting, hashing, joining, and window functions.
+</p>
+
+<h2>Workloads</h2>
+
+<p>
+    All eight stress benchmarks run through the PostgreSQL wire protocol against
+    mskql, PostgreSQL, and DuckDB (in-process CLI). Each benchmark runs a single
+    iteration&mdash;no caching, no warm-up advantage.
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead>
+        <tr><th>Workload</th><th class="num">mskql</th><th class="num">PG</th><th class="num">Duck</th><th class="num">ms/pg</th><th class="num">ms/duck</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><strong>stress_full_agg</strong> (500K rows)</td><td class="num">360ms</td><td class="num">764ms</td><td class="num">74ms</td><td class="num">0.47&times;</td><td class="num">4.90&times;</td></tr>
+        <tr><td><strong>stress_high_card_gb</strong> (100K groups)</td><td class="num">249ms</td><td class="num">1,229ms</td><td class="num">245ms</td><td class="num">0.20&times;</td><td class="num">1.01&times;</td></tr>
+        <tr><td><strong>stress_large_sort</strong> (500K rows)</td><td class="num">408ms</td><td class="num">557ms</td><td class="num">87ms</td><td class="num">0.73&times;</td><td class="num">4.71&times;</td></tr>
+        <tr><td><strong>stress_join_2way</strong> (500K + 10K)</td><td class="num">350ms</td><td class="num">2,284ms</td><td class="num">109ms</td><td class="num">0.15&times;</td><td class="num">3.20&times;</td></tr>
+        <tr><td><strong>stress_join_3way</strong> (3 large tables)</td><td class="num">478ms</td><td class="num">2,941ms</td><td class="num">128ms</td><td class="num">0.16&times;</td><td class="num">3.73&times;</td></tr>
+        <tr><td><strong>stress_filtered_expr</strong> (WHERE + computed)</td><td class="num">298ms</td><td class="num">641ms</td><td class="num">134ms</td><td class="num">0.46&times;</td><td class="num">2.22&times;</td></tr>
+        <tr><td><strong>stress_window</strong> (RANK, 500K rows)</td><td class="num">327ms</td><td class="num">482ms</td><td class="num">115ms</td><td class="num">0.68&times;</td><td class="num">2.85&times;</td></tr>
+        <tr><td><strong>stress_nested_cte</strong> (3-level CTE)</td><td class="num">495ms</td><td class="num">1,057ms</td><td class="num">185ms</td><td class="num">0.47&times;</td><td class="num">2.67&times;</td></tr>
+    </tbody>
+</table>
+</div>
+
+<h2>Analysis</h2>
+
+<p>
+    <strong>mskql beats PostgreSQL on all 8 workloads</strong>, from 1.4&times; faster
+    (stress_large_sort) to 6.5&times; faster (stress_join_2way and stress_join_3way).
+    The join workloads show the largest gap: PostgreSQL&rsquo;s hash join with 500K
+    outer rows involves significant memory management overhead that mskql avoids
+    with arena allocation.
+</p>
+
+<p>
+    <strong>DuckDB wins all 8 workloads</strong> over the wire, from 1.01&times;
+    (stress_high_card_gb, essentially a tie) to 4.90&times; (stress_full_agg).
+    This is expected: DuckDB runs in-process with zero wire overhead, while mskql
+    serializes results through TCP. The in-process benchmarks
+    (<a href="../bench-vs-pg.html#in-process">Section&nbsp;2</a>) show mskql
+    winning 15 of 16 when both engines run in-process.
+</p>
+
+<p>
+    The <code>stress_high_card_gb</code> result (249ms vs 245ms, 1.01&times;) is
+    notable: mskql&rsquo;s hash aggregation matches DuckDB&rsquo;s SIMD-vectorized
+    implementation at 100K groups, even with wire protocol overhead.
+</p>
+
+<h2>What these benchmarks stress</h2>
+
+<ul>
+    <li><strong>Memory allocation:</strong> 500K rows push well beyond L2 cache.
+        Arena allocation avoids per-row malloc/free overhead.</li>
+    <li><strong>Sort scalability:</strong> The radix sort and pdqsort combination
+        handles 500K rows in 408ms, 1.4&times; faster than PostgreSQL&rsquo;s
+        tuplesort.</li>
+    <li><strong>Hash table scaling:</strong> The high-cardinality GROUP BY creates
+        100K hash buckets. The Swiss table implementation maintains performance
+        with minimal probe chains.</li>
+    <li><strong>Join materialization:</strong> Two- and three-way joins at 500K
+        rows test the hash join build/probe phases under memory pressure.</li>
+</ul>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

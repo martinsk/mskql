@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mskql &mdash; Projection pushdown</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<p class="breadcrumb"><a href="index.html">&larr; Notes</a></p>
+
+<h1>Projection pushdown: only read what the query needs</h1>
+<span class="subtitle">The plan executor skips columns that aren&rsquo;t referenced, reducing memory traffic and improving cache locality.</span>
+<hr class="title-rule">
+
+<h2>Setup</h2>
+
+<p>
+    Wide tables with many columns are common in analytics. A query like
+    <code>SELECT name, score FROM events</code> on a 10-column table should not
+    read the other 8 columns. The benchmark is <code>wc_wide_output</code>:
+    50,000 rows with 10 columns, sorted by one column.
+</p>
+
+<pre><code class="language-sql">SELECT id, name, score
+FROM wide_table
+ORDER BY score DESC;</code></pre>
+
+<h2>Problem</h2>
+
+<p>
+    Without projection pushdown, <code>PLAN_SEQ_SCAN</code> reads all columns from
+    the table into the pipeline, even if only a subset is needed. For wide tables,
+    this wastes memory bandwidth and pollutes the CPU cache with unused data.
+    The sort stage then shuffles full-width rows through the comparator.
+</p>
+
+<h2>How it works</h2>
+
+<p>
+    The plan builder analyzes the SELECT list, WHERE clause, ORDER BY, and GROUP BY
+    to determine which columns are actually referenced. It constructs a column mask
+    and passes it to the scan node. The scan node only materializes the needed columns
+    into <code>col_block</code> arrays.
+</p>
+
+<ol>
+    <li><strong>Column resolution:</strong> Walk the parsed query and collect every
+        column reference (select exprs, filter operands, sort keys, group keys).</li>
+    <li><strong>Mask construction:</strong> Build a bitmap of needed column indices.
+        If the query uses <code>SELECT *</code>, all columns are marked.</li>
+    <li><strong>Scan pruning:</strong> <code>PLAN_SEQ_SCAN</code> skips columns
+        not in the mask. For columnar storage this means entire column arrays are
+        never touched.</li>
+    <li><strong>Downstream nodes</strong> (sort, aggregate, join) operate on the
+        narrower tuple, improving cache utilization.</li>
+</ol>
+
+<h2>Impact on Parquet</h2>
+
+<p>
+    Projection pushdown is especially effective for Parquet foreign tables. The
+    Parquet reader can skip entire column chunks at the I/O level, avoiding both
+    decompression and deserialization of unused columns. A query selecting 2 of 10
+    columns reads ~80% less data from disk.
+</p>
+
+<h2>Result</h2>
+
+<p>
+    The wide output sort benchmark (<code>wc_wide_output</code>, 10 columns, 50K rows):
+</p>
+
+<div class="table-scroll">
+<table>
+    <thead><tr><th></th><th class="num">mskql</th><th class="num">PostgreSQL</th><th class="num">DuckDB</th></tr></thead>
+    <tbody>
+        <tr><td>wc_wide_output (cached)</td><td class="num">128ms</td><td class="num">170ms</td><td class="num">40ms</td></tr>
+        <tr><td>vs PostgreSQL ratio</td><td class="num" colspan="3">0.75&times; (mskql 1.3&times; faster)</td></tr>
+    </tbody>
+</table>
+</div>
+
+<p>
+    Projection pushdown is one of the reasons mskql beats PostgreSQL on every
+    analytical workload despite having no query planner or cost model. The plan
+    builder applies it unconditionally&mdash;there is no statistics-based decision
+    about whether to prune columns.
+</p>
+
+<footer class="site-footer">
+    <a href="https://www.linkedin.com/in/martinskristiansen">Martin S. Kristiansen</a>
+    &ensp;&middot;&ensp;
+    <a href="https://github.com/martinsk/mskql">Source on GitHub</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Documentation</a>
+    &ensp;&middot;&ensp;
+    <a href="index.html">Notes</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

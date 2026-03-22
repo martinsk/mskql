@@ -26,6 +26,20 @@
 
 <ol reversed style="list-style:none; padding:0; margin:1.5rem 0;">
     <li style="margin-bottom:1.2rem;">
+        <strong><a href="stress-benchmarks.html">Stress benchmarks: 500K-row workloads</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Eight workloads at 500K rows. mskql beats PostgreSQL on all 8.
+        DuckDB wins over the wire but ties on high-cardinality GROUP BY.
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
+        <strong><a href="projection-pushdown.html">Projection pushdown</a></strong>
+        <br><span style="color:var(--fg-dim); font-size:0.92rem;">
+        Only read columns the query references. Especially effective for
+        Parquet foreign tables where entire column chunks are skipped.
+        </span>
+    </li>
+    <li style="margin-bottom:1.2rem;">
         <strong><a href="logical-ir.html">Logical IR: three-stage query pipeline</a></strong>
         <br><span style="color:var(--fg-dim); font-size:0.92rem;">
         7-node canonical representation between parser and physical planner.
@@ -77,7 +91,7 @@
         <strong><a href="vec-project.html">Vectorized expression aggregates (VEC_PROJECT)</a></strong>
         <br><span style="color:var(--fg-dim); font-size:0.92rem;">
         Direct column-array arithmetic replaces per-row expression evaluation.
-        expression_agg: 15ms vs PostgreSQL 299ms (20&times;).
+        expression_agg: 14ms vs PostgreSQL 302ms (22&times;).
         </span>
     </li>
     <li style="margin-bottom:1.2rem;">
@@ -91,7 +105,7 @@
         <strong><a href="correlated-subquery.html">Correlated subquery decorrelation</a></strong>
         <br><span style="color:var(--fg-dim); font-size:0.92rem;">
         Materialized aggregate + LEFT HASH_JOIN replaces O(N&times;M) nested loop.
-        4ms vs PostgreSQL 3,636ms (826&times;).
+        6ms vs PostgreSQL 3,456ms (576&times;).
         </span>
     </li>
     <li style="margin-bottom:1.2rem;">
@@ -105,14 +119,14 @@
         <strong><a href="radix-sort.html">Radix sort for integer ORDER BY</a></strong>
         <br><span style="color:var(--fg-dim); font-size:0.92rem;">
         8-bit radix sort replaces comparison-based sort for integer keys.
-        large_sort: 77ms vs PostgreSQL 209ms.
+        large_sort: 135ms vs PostgreSQL 212ms.
         </span>
     </li>
     <li style="margin-bottom:1.2rem;">
         <strong><a href="arena-model.html">Zero steady-state allocation: the arena model</a></strong>
         <br><span style="color:var(--fg-dim); font-size:0.92rem;">
         Bump-slab arena with pointer rewind replaces malloc/free per query.
-        aggregate: 15ms vs PostgreSQL 265ms (18&times;).
+        aggregate: 15ms vs PostgreSQL 280ms (19&times;).
         </span>
     </li>
     <li style="margin-bottom:1.2rem;">
